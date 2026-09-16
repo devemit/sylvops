@@ -64,11 +64,11 @@ jobs:
         run: cargo test -p sylvops-daemon --test daemon_lifecycle
       - name: Test local transport
         run: cargo test -p sylvops-daemon --test local_transport
+      - name: Test PTY sessions
+        run: cargo test -p sylvops-test-support --test pty_session
       - name: Test persistent sessions
         run: cargo test -p sylvops-daemon --test persistent_sessions
       - name: Test managed worktrees
         run: cargo test -p sylvops-daemon --test worktree_sessions
       - name: Test Codex MVP
         run: cargo test -p sylvops-test-support --test codex_mvp
-      - name: Test PTY sessions
-        run: cargo test -p sylvops-test-support --test pty_session
