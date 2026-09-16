@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -350,9 +350,20 @@ pub enum ClientRequest {
     AddWorkspace {
         name: String,
     },
+    OpenWorkspace {
+        workspace_id: WorkspaceId,
+    },
     AddProject {
         workspace_id: WorkspaceId,
         repository_path: String,
+    },
+    EnsureProject {
+        workspace_id: WorkspaceId,
+        repository_path: String,
+    },
+    RenameProject {
+        project_id: ProjectId,
+        name: String,
     },
     CreateWorktree {
         project_id: ProjectId,
@@ -366,6 +377,10 @@ pub enum ClientRequest {
     RemoveWorktree {
         worktree_id: WorktreeId,
         confirmation_token: String,
+    },
+    RenameWorktree {
+        worktree_id: WorktreeId,
+        name: String,
     },
     CreateSession {
         worktree_id: WorktreeId,
@@ -403,6 +418,10 @@ pub enum ClientRequest {
     StopSession {
         session_id: SessionId,
     },
+    RenameSession {
+        session_id: SessionId,
+        name: String,
+    },
     GetDiff {
         worktree_id: WorktreeId,
     },
@@ -420,10 +439,24 @@ pub enum DaemonResponse {
         revision: u64,
         workspace: Workspace,
     },
+    WorkspaceOpened {
+        revision: u64,
+        workspace: Workspace,
+    },
     ProjectAdded {
         revision: u64,
         project: Project,
         root_worktree: Worktree,
+    },
+    ProjectReady {
+        revision: u64,
+        project: Project,
+        root_worktree: Worktree,
+        created: bool,
+    },
+    ProjectUpdated {
+        revision: u64,
+        project: Project,
     },
     WorktreeCreated {
         revision: u64,
@@ -435,11 +468,19 @@ pub enum DaemonResponse {
         revision: u64,
         worktree: Worktree,
     },
+    WorktreeUpdated {
+        revision: u64,
+        worktree: Worktree,
+    },
     SessionCreated {
         revision: u64,
         session: Session,
     },
     SessionResumed {
+        revision: u64,
+        session: Session,
+    },
+    SessionUpdated {
         revision: u64,
         session: Session,
     },
@@ -461,10 +502,18 @@ pub enum DaemonEvent {
         revision: u64,
         workspace: Workspace,
     },
+    WorkspaceOpened {
+        revision: u64,
+        workspace: Workspace,
+    },
     ProjectAdded {
         revision: u64,
         project: Project,
         root_worktree: Worktree,
+    },
+    ProjectUpdated {
+        revision: u64,
+        project: Project,
     },
     WorktreeAdded {
         revision: u64,
@@ -477,7 +526,15 @@ pub enum DaemonEvent {
         revision: u64,
         worktree: Worktree,
     },
+    WorktreeUpdated {
+        revision: u64,
+        worktree: Worktree,
+    },
     SessionCreated {
+        revision: u64,
+        session: Session,
+    },
+    SessionUpdated {
         revision: u64,
         session: Session,
     },
@@ -716,6 +773,36 @@ mod tests {
             },
             ClientRequest::GetDiff {
                 worktree_id: WorktreeId::new(),
+            },
+        ];
+
+        for request in requests {
+            let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
+            assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn beta_management_requests_round_trip() {
+        let requests = [
+            ClientRequest::OpenWorkspace {
+                workspace_id: WorkspaceId::new(),
+            },
+            ClientRequest::EnsureProject {
+                workspace_id: WorkspaceId::new(),
+                repository_path: "/tmp/repository".into(),
+            },
+            ClientRequest::RenameProject {
+                project_id: ProjectId::new(),
+                name: "renamed project".into(),
+            },
+            ClientRequest::RenameWorktree {
+                worktree_id: WorktreeId::new(),
+                name: "renamed worktree".into(),
+            },
+            ClientRequest::RenameSession {
+                session_id: SessionId::new(),
+                name: "renamed session".into(),
             },
         ];
 

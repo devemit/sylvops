@@ -1,16 +1,17 @@
-SYLVOPS 0.1.0 TEST BUILD
+SYLVOPS 0.1.0-beta.1
 ================================
 
 Requirements:
-- 64-bit Windows 10 or Windows 11
+- 64-bit Windows 10 version 1809 or newer, or Windows 11
 - Git available on PATH
 - A local Git repository to open
 
 No Rust installation or Visual Studio Build Tools are required.
 
 Double-click "Start SylvOps.cmd". Enter a Git repository path when
-prompted. The launcher starts the daemon, registers the repository, creates a
-plain-shell session on first use, and opens the terminal UI.
+prompted. The launcher starts the daemon, registers the repository
+idempotently, and opens the terminal UI. It does not start a shell or agent
+until you explicitly create a session.
 
 Useful keys:
 - Tab or h/l: move between panels

@@ -3,40 +3,25 @@ param()
 
 $ErrorActionPreference = "Stop"
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$builderImage = "sylvops-windows-builder:bookworm"
-$targetDirectory = Join-Path $repositoryRoot "target\windows-gnu-container"
-$releaseDirectory = Join-Path $targetDirectory "x86_64-pc-windows-gnu\release"
-$packageDirectory = Join-Path $repositoryRoot "dist\sylvops-windows-x64"
-$archivePath = Join-Path $repositoryRoot "dist\sylvops-windows-x64.zip"
+$releaseDirectory = Join-Path $repositoryRoot "target\release"
+$packageDirectory = Join-Path $repositoryRoot "dist\sylvops-windows-x86_64"
+$archivePath = Join-Path $repositoryRoot "dist\sylvops-windows-x86_64.zip"
 
-$dockerBuildArguments = @(
-    "build",
-    "--file", (Join-Path $repositoryRoot "packaging\windows\Dockerfile"),
-    "--tag", $builderImage,
-    $repositoryRoot
-)
-& docker @dockerBuildArguments
+& cargo build --release --locked -p sylvops-cli
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to build the Windows cross-compilation image."
+    throw "Failed to compile SylvOps with the native MSVC toolchain."
 }
 
-$dockerRunArguments = @(
-    "run", "--rm",
-    "--volume", "${repositoryRoot}:/workspace",
-    "--volume", "${targetDirectory}:/target",
-    "--volume", "${env:USERPROFILE}\.cargo\registry:/usr/local/cargo/registry",
-    $builderImage
-)
-& docker @dockerRunArguments
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to cross-compile SylvOps for Windows."
+if (Test-Path -LiteralPath $packageDirectory) {
+    Remove-Item -LiteralPath $packageDirectory -Recurse -Force
 }
-
 New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $releaseDirectory "sylvops.exe") -Destination $packageDirectory -Force
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "packaging\windows\Start-SylvOps.ps1") -Destination $packageDirectory -Force
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "packaging\windows\Start SylvOps.cmd") -Destination $packageDirectory -Force
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "packaging\windows\QUICKSTART.txt") -Destination $packageDirectory -Force
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") -Destination $packageDirectory -Force
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $packageDirectory -Force
 Compress-Archive -Path (Join-Path $packageDirectory "*") -DestinationPath $archivePath -Force
 
 Write-Host "Created $archivePath"

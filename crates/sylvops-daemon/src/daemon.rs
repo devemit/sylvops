@@ -250,10 +250,10 @@ pub async fn run(paths: RuntimePaths) -> Result<()> {
                 if let Some(Err(error)) = completed { tracing::warn!(%error, "client task panicked"); }
             }
             delivery = hook_deliveries.recv() => {
-                if let Some(delivery) = delivery {
-                    if let Err(error) = apply_hook_delivery(&state, delivery).await {
-                        tracing::warn!(%error, "provider hook event was refused");
-                    }
+                if let Some(delivery) = delivery
+                    && let Err(error) = apply_hook_delivery(&state, delivery).await
+                {
+                    tracing::warn!(%error, "provider hook event was refused");
                 }
             }
         }
@@ -502,6 +502,23 @@ async fn handle_request(
             });
             Ok(())
         }
+        ClientRequest::OpenWorkspace { workspace_id } => {
+            let (revision, workspace) = state.database.open_workspace(workspace_id).await?;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::WorkspaceOpened {
+                    revision,
+                    workspace: workspace.clone(),
+                },
+            )
+            .await?;
+            let _ = state.events.send(DaemonEvent::WorkspaceOpened {
+                revision,
+                workspace,
+            });
+            Ok(())
+        }
         ClientRequest::AddProject {
             workspace_id,
             repository_path,
@@ -525,6 +542,127 @@ async fn handle_request(
                 project,
                 root_worktree,
             });
+            Ok(())
+        }
+        ClientRequest::EnsureProject {
+            workspace_id,
+            repository_path,
+        } => {
+            let registration =
+                git::inspect_repository(workspace_id, Path::new(&repository_path)).await?;
+            let canonical = registration.canonical_repository_path.clone();
+            let snapshot = state.database.snapshot().await?;
+            if let Some(project) = snapshot
+                .projects
+                .iter()
+                .find(|project| project.canonical_repository_path == canonical)
+                .cloned()
+            {
+                if project.workspace_id != workspace_id {
+                    return Err(DaemonError::Git(format!(
+                        "repository is already registered in workspace {}",
+                        project.workspace_id
+                    )));
+                }
+                let root_worktree = snapshot
+                    .worktrees
+                    .into_iter()
+                    .find(|worktree| worktree.project_id == project.id && worktree.is_root_checkout)
+                    .ok_or_else(|| {
+                        DaemonError::Database(format!(
+                            "project {} has no root checkout record",
+                            project.id
+                        ))
+                    })?;
+                return send_response_queue(
+                    outgoing,
+                    request_id,
+                    &DaemonResponse::ProjectReady {
+                        revision: snapshot.revision,
+                        project,
+                        root_worktree,
+                        created: false,
+                    },
+                )
+                .await;
+            }
+
+            let (revision, project, root_worktree) =
+                match state.database.add_project(registration).await {
+                    Ok(created) => created,
+                    Err(insert_error) => {
+                        let snapshot = state.database.snapshot().await?;
+                        if let Some(project) = snapshot
+                            .projects
+                            .iter()
+                            .find(|project| project.canonical_repository_path == canonical)
+                            .cloned()
+                        {
+                            if project.workspace_id != workspace_id {
+                                return Err(DaemonError::Git(format!(
+                                    "repository is already registered in workspace {}",
+                                    project.workspace_id
+                                )));
+                            }
+                            let root_worktree = snapshot
+                                .worktrees
+                                .into_iter()
+                                .find(|worktree| {
+                                    worktree.project_id == project.id && worktree.is_root_checkout
+                                })
+                                .ok_or_else(|| {
+                                    DaemonError::Database(format!(
+                                        "project {} has no root checkout record",
+                                        project.id
+                                    ))
+                                })?;
+                            return send_response_queue(
+                                outgoing,
+                                request_id,
+                                &DaemonResponse::ProjectReady {
+                                    revision: snapshot.revision,
+                                    project,
+                                    root_worktree,
+                                    created: false,
+                                },
+                            )
+                            .await;
+                        }
+                        return Err(insert_error);
+                    }
+                };
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::ProjectReady {
+                    revision,
+                    project: project.clone(),
+                    root_worktree: root_worktree.clone(),
+                    created: true,
+                },
+            )
+            .await?;
+            let _ = state.events.send(DaemonEvent::ProjectAdded {
+                revision,
+                project,
+                root_worktree,
+            });
+            Ok(())
+        }
+        ClientRequest::RenameProject { project_id, name } => {
+            let (revision, project) = state.database.rename_project(project_id, name).await?;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::ProjectUpdated {
+                    revision,
+                    project: project.clone(),
+                },
+            )
+            .await?;
+            let _ = state
+                .events
+                .send(DaemonEvent::ProjectUpdated { revision, project });
             Ok(())
         }
         ClientRequest::CreateWorktree {
@@ -648,6 +786,22 @@ async fn handle_request(
             let _ = state
                 .events
                 .send(DaemonEvent::WorktreeRemoved { revision, worktree });
+            Ok(())
+        }
+        ClientRequest::RenameWorktree { worktree_id, name } => {
+            let (revision, worktree) = state.database.rename_worktree(worktree_id, name).await?;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::WorktreeUpdated {
+                    revision,
+                    worktree: worktree.clone(),
+                },
+            )
+            .await?;
+            let _ = state
+                .events
+                .send(DaemonEvent::WorktreeUpdated { revision, worktree });
             Ok(())
         }
         ClientRequest::CreateSession {
@@ -882,6 +1036,25 @@ async fn handle_request(
             let mut completed = managed.completed.clone();
             while !*completed.borrow() && completed.changed().await.is_ok() {}
             send_response_queue(outgoing, request_id, &DaemonResponse::Acknowledged).await
+        }
+        ClientRequest::RenameSession { session_id, name } => {
+            let (revision, session) = state.database.rename_session(session_id, name).await?;
+            if let Some(managed) = state.sessions.read().await.get(&session_id).cloned() {
+                *managed.record.write().await = session.clone();
+            }
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::SessionUpdated {
+                    revision,
+                    session: session.clone(),
+                },
+            )
+            .await?;
+            let _ = state
+                .events
+                .send(DaemonEvent::SessionUpdated { revision, session });
+            Ok(())
         }
         ClientRequest::ShutdownDaemon => {
             state

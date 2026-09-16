@@ -1,6 +1,6 @@
 # ADR-0010: Codex hooks and the replaceable MVP TUI
 
-Status: implementation candidate; acceptance pending cross-platform validation.
+Status: accepted for the MVP foundation; embedded terminal and management workflow details are superseded by ADR-0012, and Windows containment is superseded by ADR-0011.
 
 ## Decision
 

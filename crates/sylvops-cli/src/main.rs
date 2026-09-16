@@ -33,7 +33,7 @@ struct Arguments {
     state_dir: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -72,6 +72,25 @@ enum Command {
     },
     /// Open the four-panel mission-control interface.
     Tui,
+    /// Register or select a repository and open mission control.
+    Open {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Create or reuse this workspace instead of the active workspace.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Explicitly launch a session in the root checkout.
+        #[arg(long)]
+        provider: Option<ProviderKind>,
+        #[arg(long, requires = "provider")]
+        model: Option<String>,
+        #[arg(long, requires = "provider")]
+        effort: Option<String>,
+        #[arg(long, requires = "provider")]
+        prompt: Option<String>,
+    },
+    /// Run redacted installation, daemon, Git, provider, and PTY checks.
+    Doctor,
     #[command(hide = true)]
     Hook {
         #[command(subcommand)]
@@ -185,6 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let Arguments { state_dir, command } = Arguments::parse();
     let paths = RuntimePaths::discover(state_dir.as_deref())?;
+    let command = command.unwrap_or(Command::Tui);
 
     match command {
         Command::Daemon { command } => match command {
@@ -244,6 +264,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProviderCommand::Probe { provider } => probe_provider(&paths, provider).await?,
         },
         Command::Tui => run_tui(&paths, state_dir.as_deref()).await?,
+        Command::Open {
+            path,
+            workspace,
+            provider,
+            model,
+            effort,
+            prompt,
+        } => {
+            open_repository(
+                &paths,
+                state_dir.as_deref(),
+                path,
+                workspace,
+                provider,
+                model,
+                effort,
+                prompt,
+            )
+            .await?;
+        }
+        Command::Doctor => doctor(&paths).await?,
         Command::Hook {
             command: HookCommand::Emit,
         } => sylvops_daemon::hook::emit_from_environment()?,
@@ -256,14 +297,14 @@ async fn start_daemon(
     paths: &RuntimePaths,
     state_dir: Option<&Path>,
 ) -> sylvops_daemon::Result<()> {
-    if let Ok(client) = DaemonClient::connect(paths, "sylvops-cli").await {
-        if let Ok(DaemonResponse::Health(health)) = client.request(&ClientRequest::Health).await {
-            println!(
-                "SylvOps daemon is already running (pid {})",
-                health.process_id
-            );
-            return Ok(());
-        }
+    if let Ok(client) = DaemonClient::connect(paths, "sylvops-cli").await
+        && let Ok(DaemonResponse::Health(health)) = client.request(&ClientRequest::Health).await
+    {
+        println!(
+            "SylvOps daemon is already running (pid {})",
+            health.process_id
+        );
+        return Ok(());
     }
 
     paths.prepare()?;
@@ -295,19 +336,18 @@ async fn start_daemon(
     })?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(client) = DaemonClient::connect(paths, "sylvops-cli").await {
-            if let Ok(DaemonResponse::Health(health)) = client.request(&ClientRequest::Health).await
-            {
-                if health.process_id == child.id() {
-                    println!("SylvOps daemon started (pid {})", child.id());
-                } else {
-                    println!(
-                        "SylvOps daemon is already running (pid {})",
-                        health.process_id
-                    );
-                }
-                return Ok(());
+        if let Ok(client) = DaemonClient::connect(paths, "sylvops-cli").await
+            && let Ok(DaemonResponse::Health(health)) = client.request(&ClientRequest::Health).await
+        {
+            if health.process_id == child.id() {
+                println!("SylvOps daemon started (pid {})", child.id());
+            } else {
+                println!(
+                    "SylvOps daemon is already running (pid {})",
+                    health.process_id
+                );
             }
+            return Ok(());
         }
 
         if let Some(status) = child.try_wait().map_err(|error| {
@@ -645,6 +685,182 @@ async fn probe_provider(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn open_repository(
+    paths: &RuntimePaths,
+    state_dir: Option<&Path>,
+    path: PathBuf,
+    workspace_name: Option<String>,
+    provider: Option<ProviderKind>,
+    model: Option<String>,
+    effort: Option<String>,
+    prompt: Option<String>,
+) -> sylvops_daemon::Result<()> {
+    start_daemon(paths, state_dir).await?;
+    let client = DaemonClient::connect(paths, "sylvops-open").await?;
+    let snapshot = match client.request(&ClientRequest::GetSnapshot).await? {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => return unexpected("workspace discovery", response),
+    };
+    let workspace = if let Some(name) = workspace_name {
+        match snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == name)
+            .cloned()
+        {
+            Some(workspace) => workspace,
+            None => match client
+                .request(&ClientRequest::AddWorkspace { name })
+                .await?
+            {
+                DaemonResponse::WorkspaceAdded { workspace, .. } => workspace,
+                response => return unexpected("workspace creation", response),
+            },
+        }
+    } else if let Some(workspace) = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.is_open)
+        .or_else(|| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.name == "Local")
+        })
+        .cloned()
+    {
+        workspace
+    } else {
+        match client
+            .request(&ClientRequest::AddWorkspace {
+                name: "Local".into(),
+            })
+            .await?
+        {
+            DaemonResponse::WorkspaceAdded { workspace, .. } => workspace,
+            response => return unexpected("default workspace creation", response),
+        }
+    };
+    if !workspace.is_open {
+        match client
+            .request(&ClientRequest::OpenWorkspace {
+                workspace_id: workspace.id,
+            })
+            .await?
+        {
+            DaemonResponse::WorkspaceOpened { .. } => {}
+            response => return unexpected("workspace selection", response),
+        }
+    }
+    let repository_path = path
+        .to_str()
+        .ok_or_else(|| DaemonError::Git("repository path is not valid Unicode".into()))?
+        .to_owned();
+    let (project, root_worktree, created) = match client
+        .request(&ClientRequest::EnsureProject {
+            workspace_id: workspace.id,
+            repository_path,
+        })
+        .await?
+    {
+        DaemonResponse::ProjectReady {
+            project,
+            root_worktree,
+            created,
+            ..
+        } => (project, root_worktree, created),
+        response => return unexpected("repository selection", response),
+    };
+    println!(
+        "{} project '{}' in workspace '{}'",
+        if created { "Registered" } else { "Selected" },
+        project.name,
+        workspace.name
+    );
+    if let Some(provider) = provider {
+        match client
+            .request(&ClientRequest::CreateSession {
+                worktree_id: root_worktree.id,
+                provider,
+                display_name: None,
+                model,
+                effort,
+                initial_prompt: prompt,
+                columns: 80,
+                rows: 24,
+            })
+            .await?
+        {
+            DaemonResponse::SessionCreated { session, .. } => {
+                println!("Created session '{}'", session.display_name);
+            }
+            response => return unexpected("session creation", response),
+        }
+    }
+    drop(client);
+    run_tui(paths, state_dir).await
+}
+
+async fn doctor(paths: &RuntimePaths) -> sylvops_daemon::Result<()> {
+    println!("SylvOps doctor {}", env!("CARGO_PKG_VERSION"));
+    paths.prepare()?;
+    println!("[ok] local state directory is available");
+
+    let git = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("git")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| DaemonError::Lifecycle("Git version check timed out".into()))?
+    .map_err(|error| DaemonError::Lifecycle(format!("Git is unavailable: {error}")))?;
+    if !git.status.success() || git.stdout.len() > 64 * 1024 || git.stderr.len() > 64 * 1024 {
+        return Err(DaemonError::Lifecycle(
+            "Git version check failed or produced excessive output".into(),
+        ));
+    }
+    println!("[ok] {}", String::from_utf8_lossy(&git.stdout).trim());
+
+    let client = DaemonClient::connect(paths, "sylvops-doctor")
+        .await
+        .map_err(|error| {
+            DaemonError::Lifecycle(format!(
+                "daemon is not reachable; run `sylvops` to start it: {error}"
+            ))
+        })?;
+    match client.request(&ClientRequest::Health).await? {
+        DaemonResponse::Health(health) if health.database_ready => println!(
+            "[ok] daemon {} uses protocol {}.{}",
+            health.daemon_version, health.protocol_major, health.protocol_minor
+        ),
+        response => return unexpected("daemon health", response),
+    }
+    match client.request(&ClientRequest::ListProviders).await? {
+        DaemonResponse::Providers(providers) => {
+            for provider in providers {
+                println!(
+                    "[{}] provider {}{}",
+                    if provider.available { "ok" } else { "--" },
+                    provider.kind,
+                    if provider.available && !provider.authenticated {
+                        " (login required)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        response => return unexpected("provider diagnostics", response),
+    }
+    sylvops_daemon::session::run_pty_probe().await?;
+    println!("[ok] PTY spawn, output, exit, and cleanup probe passed");
+    println!("[ok] secrets and environment values were not printed");
+    Ok(())
+}
+
 async fn run_tui(paths: &RuntimePaths, state_dir: Option<&Path>) -> sylvops_daemon::Result<()> {
     if DaemonClient::connect(paths, "sylvops-tui-probe")
         .await
@@ -652,14 +868,8 @@ async fn run_tui(paths: &RuntimePaths, state_dir: Option<&Path>) -> sylvops_daem
     {
         start_daemon(paths, state_dir).await?;
     }
-    loop {
-        match sylvops_tui::run(paths).await? {
-            sylvops_tui::TuiExit::Quit => return Ok(()),
-            sylvops_tui::TuiExit::Attach(session_id) => {
-                attach_session(paths, session_id).await?;
-            }
-        }
-    }
+    let sylvops_tui::TuiExit::Quit = sylvops_tui::run(paths).await?;
+    Ok(())
 }
 
 async fn stop_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_daemon::Result<()> {

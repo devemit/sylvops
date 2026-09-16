@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for the Phase 2 implementation.
+Accepted for the Phase 2 implementation. Its Windows post-spawn containment caveat is superseded by ADR-0011.
 
 ## Decision
 

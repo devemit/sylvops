@@ -152,12 +152,11 @@ async fn collect_until(
             bytes,
             ..
         } = events.recv().await.unwrap()
+            && id == session_id
         {
-            if id == session_id {
-                output.extend(bytes);
-                if String::from_utf8_lossy(&output).contains(marker) {
-                    return output;
-                }
+            output.extend(bytes);
+            if String::from_utf8_lossy(&output).contains(marker) {
+                return output;
             }
         }
     }

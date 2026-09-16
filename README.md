@@ -2,9 +2,17 @@
 
 SylvOps is a local-first terminal mission control for supervising interactive coding-agent sessions in Git worktrees.
 
-## Build and run
+## Quick start
 
-SylvOps is currently an MVP implementation candidate, not a stable release. Install stable Rust 1.85 or newer and Git, then build it from the repository:
+SylvOps is currently a public-beta candidate, not a stable release. Once a beta archive is published, extract it, put the binary on `PATH`, and run this inside a Git repository:
+
+```text
+sylvops open .
+```
+
+This starts the local daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the TUI. It does not launch an agent until you press `n` in the Sessions panel or explicitly pass `--provider`.
+
+To build from source, install stable Rust 1.88 or newer, Git, and the platform C toolchain:
 
 ```text
 git clone https://github.com/devemit/sylvops.git
@@ -12,16 +20,15 @@ cd sylvops
 cargo build --release -p sylvops-cli
 ```
 
-The executable is written to `target/release/sylvops` (`sylvops.exe` on Windows). Start the daemon and open the TUI:
+The executable is written to `target/release/sylvops` (`sylvops.exe` on Windows):
 
 ```text
-./target/release/sylvops daemon start
-./target/release/sylvops tui
+./target/release/sylvops open .
 ```
 
 On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the unsigned portable Windows ZIP with `powershell -File scripts/package-windows.ps1`; generated packages are intentionally excluded from Git.
 
-The repository now contains an **MVP implementation candidate**. It includes:
+The repository now contains a **cross-platform beta candidate**. It includes:
 
 - versioned, length-prefixed MessagePack framing;
 - authenticated local Unix-socket and Windows named-pipe control transport;
@@ -40,16 +47,20 @@ The repository now contains an **MVP implementation candidate**. It includes:
 - bounded Codex discovery, version, and authentication probes;
 - application-owned Codex hook profiles plus an authenticated loopback hook relay;
 - deterministic attention states, external Codex session-ID capture, and guarded resume;
-- a four-panel Ratatui client with hierarchical navigation, attention selection, attachment handoff, and bounded read-only diff preview;
+- a four-panel Ratatui client with creation/rename/confirmation modals, workspace switching, attention selection, an embedded safe terminal view, and bounded read-only diff preview;
 - CLI workspace, project, worktree, provider, session, and TUI commands.
 
 Claude, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
 
-The Linux Docker validation gate passes formatting, warnings-as-errors Clippy, and the full workspace test suite, including the fake-Codex hook/resume end-to-end scenario. Windows-target strict Clippy also passes with the GNU toolchain. This candidate is not release-verified until native Windows tests and hosted CI pass: the current host is missing the MSVC linker and Windows SDK, and the post-spawn Windows Job Object assignment race still blocks a race-free Windows MVP claim.
+The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The cross-platform release claim remains gated on the complete hosted Windows, Linux, and macOS suite.
 
 ## Current commands
 
 ```text
+sylvops
+sylvops open .
+sylvops open . --provider codex --prompt "..."
+sylvops doctor
 sylvops daemon start
 sylvops daemon status
 sylvops workspace add my-workspace
@@ -79,4 +90,4 @@ cargo test --workspace --all-targets
 
 See [the MVP definition](docs/product/mvp.md) and [process architecture](docs/architecture/process-model.md).
 
-The standard Windows MSVC target requires the Visual C++ toolchain and Windows SDK; bundled SQLite also requires a supported C compiler. The current Windows Job Object assignment has a documented post-spawn race and is not claimed as release-hardened. See [ADR-0010](docs/decisions/0010-codex-hooks-and-mvp-tui.md).
+The standard Windows target requires Visual C++ Build Tools and the Windows SDK. See [the PTY architecture](docs/architecture/pty.md) for the atomic ConPTY/Job Object boundary.

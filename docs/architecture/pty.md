@@ -13,10 +13,10 @@ Only one client is the interactive controller. Other attached clients are observ
 Termination is idempotent: request graceful exit, wait a bounded interval, terminate the entire process tree, reap the root process, and persist exactly one terminal state.
 
 - Unix: the PTY child must lead a dedicated process group/session; termination targets that group.
-- Windows: the child is assigned to a Job Object with `KILL_ON_JOB_CLOSE`; production code should create it suspended, assign it, then resume it.
+- Windows: SylvOps creates ConPTY pipes and a kill-on-close Job Object before process creation. `CreateProcessW` receives both `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and `PROC_THREAD_ATTRIBUTE_JOB_LIST` in one `STARTUPINFOEX` list, so no uncontained post-spawn interval exists.
 
 ## Phase 2 boundary
 
-The production plain-shell path uses `portable-pty`, a dedicated Unix process group, or a Windows kill-on-close Job Object. Windows assignment still occurs immediately after spawn and therefore has a containment race. Provider and release hardening are gated on a suspended-spawn wrapper or equivalent proof.
+Unix uses `portable-pty` and requires the child to lead a dedicated process group. Windows uses the application-owned documented ConPTY boundary because `portable-pty` does not expose process-creation attributes. Handles are RAII-owned, arguments and Unicode environment blocks are constructed without a shell, and a partial failure cannot return a running uncontained process.
 
 Alternate-screen replay and eviction in the middle of an ANSI sequence require explicit tests. Replaying arbitrary truncated bytes alone is insufficient.

@@ -46,9 +46,18 @@ enum DatabaseCommand {
         name: String,
         reply: oneshot::Sender<Result<(u64, Workspace)>>,
     },
+    OpenWorkspace {
+        id: WorkspaceId,
+        reply: oneshot::Sender<Result<(u64, Workspace)>>,
+    },
     AddProject {
         registration: RepositoryRegistration,
         reply: oneshot::Sender<Result<(u64, Project, Worktree)>>,
+    },
+    RenameProject {
+        id: ProjectId,
+        name: String,
+        reply: oneshot::Sender<Result<(u64, Project)>>,
     },
     Worktree {
         id: WorktreeId,
@@ -70,6 +79,11 @@ enum DatabaseCommand {
         record: NewManagedWorktree,
         reply: oneshot::Sender<Result<(u64, Worktree)>>,
     },
+    RenameWorktree {
+        id: WorktreeId,
+        name: String,
+        reply: oneshot::Sender<Result<(u64, Worktree)>>,
+    },
     MarkWorktreeRemoved {
         id: WorktreeId,
         reply: oneshot::Sender<Result<(u64, Worktree)>>,
@@ -85,6 +99,11 @@ enum DatabaseCommand {
     CreateSession {
         record: NewSession,
         reply: oneshot::Sender<Result<Session>>,
+    },
+    RenameSession {
+        id: SessionId,
+        name: String,
+        reply: oneshot::Sender<Result<(u64, Session)>>,
     },
     MarkSessionRunning {
         id: SessionId,
@@ -222,6 +241,18 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Makes one workspace the active workspace and records the selection atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, not-found, transaction, or SQLite error.
+    pub async fn open_workspace(&self, id: WorkspaceId) -> Result<(u64, Workspace)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::OpenWorkspace { id, reply }
+        })
+        .await
+    }
+
     /// Inserts a project and root worktree in one transaction.
     ///
     /// # Errors
@@ -234,6 +265,18 @@ impl DatabaseHandle {
         request(&self.inner.commands, |reply| DatabaseCommand::AddProject {
             registration,
             reply,
+        })
+        .await
+    }
+
+    /// Changes only a project's display name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, not-found, transaction, or SQLite error.
+    pub async fn rename_project(&self, id: ProjectId, name: String) -> Result<(u64, Project)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::RenameProject { id, name, reply }
         })
         .await
     }
@@ -305,6 +348,18 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Changes only a worktree's display name; its path and branch are untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, not-found, transaction, or SQLite error.
+    pub async fn rename_worktree(&self, id: WorktreeId, name: String) -> Result<(u64, Worktree)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::RenameWorktree { id, name, reply }
+        })
+        .await
+    }
+
     /// Marks a non-root managed worktree removed and records an audit event.
     ///
     /// # Errors
@@ -349,6 +404,18 @@ impl DatabaseHandle {
     pub async fn create_session(&self, record: NewSession) -> Result<Session> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::CreateSession { record, reply }
+        })
+        .await
+    }
+
+    /// Changes only a session's display name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, not-found, transaction, or SQLite error.
+    pub async fn rename_session(&self, id: SessionId, name: String) -> Result<(u64, Session)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::RenameSession { id, name, reply }
         })
         .await
     }
@@ -547,6 +614,13 @@ fn database_thread(
                 });
                 let _ = reply.send(result);
             }
+            DatabaseCommand::OpenWorkspace { id, reply } => {
+                let result = open_workspace(&mut connection, id).map(|workspace| {
+                    revision = revision.saturating_add(1);
+                    (revision, workspace)
+                });
+                let _ = reply.send(result);
+            }
             DatabaseCommand::AddProject {
                 registration,
                 reply,
@@ -556,6 +630,13 @@ fn database_thread(
                         revision = revision.saturating_add(1);
                         (revision, project, worktree)
                     });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::RenameProject { id, name, reply } => {
+                let result = rename_project(&mut connection, id, &name).map(|project| {
+                    revision = revision.saturating_add(1);
+                    (revision, project)
+                });
                 let _ = reply.send(result);
             }
             DatabaseCommand::Worktree { id, reply } => {
@@ -581,6 +662,13 @@ fn database_thread(
                 });
                 let _ = reply.send(result);
             }
+            DatabaseCommand::RenameWorktree { id, name, reply } => {
+                let result = rename_worktree(&mut connection, id, &name).map(|worktree| {
+                    revision = revision.saturating_add(1);
+                    (revision, worktree)
+                });
+                let _ = reply.send(result);
+            }
             DatabaseCommand::MarkWorktreeRemoved { id, reply } => {
                 let result = mark_worktree_removed(&mut connection, id).map(|worktree| {
                     revision = revision.saturating_add(1);
@@ -600,6 +688,13 @@ fn database_thread(
             }
             DatabaseCommand::CreateSession { record, reply } => {
                 let _ = reply.send(insert_session(&mut connection, &record));
+            }
+            DatabaseCommand::RenameSession { id, name, reply } => {
+                let result = rename_session(&mut connection, id, &name).map(|session| {
+                    revision = revision.saturating_add(1);
+                    (revision, session)
+                });
+                let _ = reply.send(result);
             }
             DatabaseCommand::MarkSessionRunning {
                 id,
@@ -767,12 +862,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
 }
 
 fn insert_workspace(connection: &mut Connection, name: &str) -> Result<Workspace> {
-    let name = name.trim();
-    if name.is_empty() || name.chars().count() > 200 {
-        return Err(DaemonError::Database(
-            "workspace name must contain between 1 and 200 characters".into(),
-        ));
-    }
+    let name = validated_name(name, "workspace")?;
     let now = now_millis();
     let workspace = Workspace {
         id: WorkspaceId::new(),
@@ -784,6 +874,9 @@ fn insert_workspace(connection: &mut Connection, name: &str) -> Result<Workspace
     };
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    transaction
+        .execute("UPDATE workspaces SET is_open = 0 WHERE is_open = 1", [])
         .map_err(database_error)?;
     transaction
         .execute(
@@ -798,6 +891,43 @@ fn insert_workspace(connection: &mut Connection, name: &str) -> Result<Workspace
         "workspace",
         &workspace.id.to_string(),
     )?;
+    transaction.commit().map_err(database_error)?;
+    Ok(workspace)
+}
+
+fn open_workspace(connection: &mut Connection, id: WorkspaceId) -> Result<Workspace> {
+    let now = now_millis();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    if !transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = ?1)",
+            [id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error)?
+    {
+        return Err(DaemonError::Database(format!(
+            "workspace {id} does not exist"
+        )));
+    }
+    transaction
+        .execute("UPDATE workspaces SET is_open = 0 WHERE is_open = 1", [])
+        .map_err(database_error)?;
+    transaction
+        .execute(
+            "UPDATE workspaces SET is_open = 1, last_opened_at = ?2, updated_at = ?2 WHERE id = ?1",
+            params![id.to_string(), now],
+        )
+        .map_err(database_error)?;
+    insert_entity_audit(
+        &transaction,
+        "workspace_opened",
+        "workspace",
+        &id.to_string(),
+    )?;
+    let workspace = load_workspace(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(workspace)
 }
@@ -886,6 +1016,42 @@ fn insert_project(
     Ok((project, worktree))
 }
 
+fn rename_project(connection: &mut Connection, id: ProjectId, name: &str) -> Result<Project> {
+    let name = validated_name(name, "project")?;
+    let now = now_millis();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE projects SET name = ?2, last_activity_at = ?3 WHERE id = ?1",
+            params![id.to_string(), name, now],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(DaemonError::Database(format!(
+            "project {id} does not exist"
+        )));
+    }
+    insert_entity_audit(&transaction, "project_renamed", "project", &id.to_string())?;
+    let project = load_project(&transaction, id)?;
+    transaction.commit().map_err(database_error)?;
+    Ok(project)
+}
+
+fn load_workspace(connection: &Connection, id: WorkspaceId) -> Result<Workspace> {
+    connection
+        .query_row(
+            "SELECT id, name, created_at, updated_at, last_opened_at, is_open \
+             FROM workspaces WHERE id = ?1",
+            [id.to_string()],
+            workspace_from_row,
+        )
+        .optional()
+        .map_err(database_error)?
+        .ok_or_else(|| DaemonError::Database(format!("workspace {id} does not exist")))
+}
+
 fn load_worktree(connection: &Connection, id: WorktreeId) -> Result<Worktree> {
     connection
         .query_row(
@@ -951,6 +1117,42 @@ fn insert_worktree(connection: &mut Connection, record: &NewManagedWorktree) -> 
         &record.id.to_string(),
     )?;
     let worktree = load_worktree(&transaction, record.id)?;
+    transaction.commit().map_err(database_error)?;
+    Ok(worktree)
+}
+
+fn rename_worktree(connection: &mut Connection, id: WorktreeId, name: &str) -> Result<Worktree> {
+    let name = validated_name(name, "worktree")?;
+    let now = now_millis();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE worktrees SET name = ?2, last_activity_at = ?3 \
+             WHERE id = ?1 AND status != 'removed'",
+            params![id.to_string(), name, now],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(DaemonError::Database(format!(
+            "worktree {id} does not exist or has been removed"
+        )));
+    }
+    transaction
+        .execute(
+            "UPDATE projects SET last_activity_at = ?2 \
+             WHERE id = (SELECT project_id FROM worktrees WHERE id = ?1)",
+            params![id.to_string(), now],
+        )
+        .map_err(database_error)?;
+    insert_entity_audit(
+        &transaction,
+        "worktree_renamed",
+        "worktree",
+        &id.to_string(),
+    )?;
+    let worktree = load_worktree(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(worktree)
 }
@@ -1078,6 +1280,55 @@ fn insert_session(connection: &mut Connection, record: &NewSession) -> Result<Se
     let session = load_session(&transaction, record.id)?;
     transaction.commit().map_err(database_error)?;
     Ok(session)
+}
+
+fn rename_session(connection: &mut Connection, id: SessionId, name: &str) -> Result<Session> {
+    let name = validated_name(name, "session")?;
+    let now = now_millis();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE sessions SET display_name = ?2, last_activity_at = ?3 WHERE id = ?1",
+            params![id.to_string(), name, now],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(DaemonError::Database(format!(
+            "session {id} does not exist"
+        )));
+    }
+    transaction
+        .execute(
+            "UPDATE worktrees SET last_activity_at = ?2 \
+             WHERE id = (SELECT worktree_id FROM sessions WHERE id = ?1)",
+            params![id.to_string(), now],
+        )
+        .map_err(database_error)?;
+    transaction
+        .execute(
+            "UPDATE projects SET last_activity_at = ?2 WHERE id = (\
+                SELECT worktrees.project_id FROM worktrees \
+                JOIN sessions ON sessions.worktree_id = worktrees.id WHERE sessions.id = ?1\
+             )",
+            params![id.to_string(), now],
+        )
+        .map_err(database_error)?;
+    insert_entity_audit(&transaction, "session_renamed", "session", &id.to_string())?;
+    let session = load_session(&transaction, id)?;
+    transaction.commit().map_err(database_error)?;
+    Ok(session)
+}
+
+fn validated_name<'a>(name: &'a str, entity: &str) -> Result<&'a str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 200 {
+        return Err(DaemonError::Database(format!(
+            "{entity} name must contain between 1 and 200 characters"
+        )));
+    }
+    Ok(name)
 }
 
 fn upsert_provider(
@@ -1621,6 +1872,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_a_workspace_is_exclusive_and_revisioned() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
+        let (_, first) = database.add_workspace("First".into()).await.unwrap();
+        let (second_revision, second) = database.add_workspace("Second".into()).await.unwrap();
+        let (opened_revision, opened) = database.open_workspace(first.id).await.unwrap();
+        assert!(opened_revision > second_revision);
+        assert_eq!(opened.id, first.id);
+        let snapshot = database.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.is_open)
+                .count(),
+            1
+        );
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == first.id && workspace.is_open)
+        );
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == second.id && !workspace.is_open)
+        );
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn audit_events_validate_json_and_persist() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.db");
@@ -1724,6 +2008,21 @@ mod tests {
         let (running_revision, session) =
             database.mark_session_running(session_id, 42).await.unwrap();
         assert_eq!(session.state, SessionState::Running);
+        let (project_renamed_revision, renamed_project) = database
+            .rename_project(project.id, "Renamed project".into())
+            .await
+            .unwrap();
+        assert_eq!(renamed_project.name, "Renamed project");
+        let (worktree_renamed_revision, renamed_worktree) = database
+            .rename_worktree(worktree.id, "Renamed worktree".into())
+            .await
+            .unwrap();
+        assert_eq!(renamed_worktree.name, "Renamed worktree");
+        let (session_renamed_revision, renamed_session) = database
+            .rename_session(session_id, "Renamed session".into())
+            .await
+            .unwrap();
+        assert_eq!(renamed_session.display_name, "Renamed session");
         assert!(
             database
                 .worktree_has_live_sessions(managed_id)
@@ -1757,7 +2056,10 @@ mod tests {
         assert!(workspace_revision < project_revision);
         assert!(project_revision < worktree_revision);
         assert!(worktree_revision < running_revision);
-        assert!(running_revision < finished_revision);
+        assert!(running_revision < project_renamed_revision);
+        assert!(project_renamed_revision < worktree_renamed_revision);
+        assert!(worktree_renamed_revision < session_renamed_revision);
+        assert!(session_renamed_revision < finished_revision);
         assert!(finished_revision < seen_revision);
         let (removed_revision, removed) = database.mark_worktree_removed(managed_id).await.unwrap();
         assert_eq!(removed.status, WorktreeStatus::Removed);
