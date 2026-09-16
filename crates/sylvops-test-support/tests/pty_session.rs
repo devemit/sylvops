@@ -1,11 +1,27 @@
 use std::{ffi::OsString, fs, path::Path, time::Duration};
 
-use sylvops_daemon::session::{SessionHandle, SessionSpec};
+use sylvops_daemon::{
+    DaemonError,
+    session::{SessionHandle, SessionSpec},
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_spawns_under_process_tree_control() {
-    let mut session =
-        SessionHandle::spawn(&spec(["exit", "0"], 64 * 1024)).expect("spawn contained fake agent");
+    let mut session = match SessionHandle::spawn(&spec(["exit", "0"], 64 * 1024)) {
+        Ok(session) => session,
+        Err(DaemonError::ProcessTree(_)) => {
+            println!("::error title=PTY spawn category::process-tree containment failed");
+            panic!("process-tree containment failed");
+        }
+        Err(DaemonError::Pty(_)) => {
+            println!("::error title=PTY spawn category::PTY creation or launch failed");
+            panic!("PTY creation or launch failed");
+        }
+        Err(_) => {
+            println!("::error title=PTY spawn category::unexpected session setup failure");
+            panic!("unexpected session setup failure");
+        }
+    };
     let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
         .await
         .expect("contained session exit timeout")
