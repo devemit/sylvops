@@ -263,7 +263,7 @@ pub async fn create_managed_worktree(
         OsString::from("add"),
         OsString::from("-b"),
         OsString::from(branch),
-        destination.as_os_str().to_owned(),
+        git_path_argument(&destination),
         OsString::from(base_commit.as_str()),
     ];
     let output = run_git_mutation(&repository, &hooks, &arguments).await?;
@@ -490,7 +490,7 @@ pub async fn remove_managed_worktree(
         OsString::from("worktree"),
         OsString::from("remove"),
         OsString::from("--"),
-        path.as_os_str().to_owned(),
+        git_path_argument(&path),
     ];
     let output = run_git_mutation(&repository, &hooks, &arguments).await?;
     if !output.success {
@@ -708,12 +708,35 @@ async fn run_git(cwd: &Path, arguments: &[&str]) -> Result<GitOutput> {
 }
 
 async fn run_git_mutation(cwd: &Path, hooks: &Path, arguments: &[OsString]) -> Result<GitOutput> {
-    let mut configured = vec![
-        OsString::from("-c"),
-        OsString::from(format!("core.hooksPath={}", path_text(hooks)?)),
-    ];
+    let mut hooks_configuration = OsString::from("core.hooksPath=");
+    hooks_configuration.push(git_path_argument(hooks));
+    let mut configured = vec![OsString::from("-c"), hooks_configuration];
     configured.extend_from_slice(arguments);
     run_git_os(cwd, &configured).await
+}
+
+#[cfg(not(windows))]
+fn git_path_argument(path: &Path) -> OsString {
+    path.as_os_str().to_owned()
+}
+
+#[cfg(windows)]
+fn git_path_argument(path: &Path) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const VERBATIM_PREFIX: &[u16] = &[92, 92, 63, 92];
+    const VERBATIM_UNC_PREFIX: &[u16] = &[92, 92, 63, 92, 85, 78, 67, 92];
+
+    let encoded: Vec<_> = path.as_os_str().encode_wide().collect();
+    if let Some(remainder) = encoded.strip_prefix(VERBATIM_UNC_PREFIX) {
+        let mut ordinary_unc = vec![92, 92];
+        ordinary_unc.extend_from_slice(remainder);
+        OsString::from_wide(&ordinary_unc)
+    } else if let Some(remainder) = encoded.strip_prefix(VERBATIM_PREFIX) {
+        OsString::from_wide(remainder)
+    } else {
+        path.as_os_str().to_owned()
+    }
 }
 
 async fn run_git_os(cwd: &Path, arguments: &[OsString]) -> Result<GitOutput> {
