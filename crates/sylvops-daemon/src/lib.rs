@@ -9,6 +9,7 @@ pub mod git;
 pub mod hook;
 pub mod ipc;
 pub mod provider;
+mod pty;
 pub mod runtime;
 pub mod session;
 

@@ -59,7 +59,7 @@ async fn fake_codex_hooks_attention_and_resume() {
     client
         .request(&ClientRequest::SessionInput {
             session_id: source_session_id,
-            bytes: b"permission\n".to_vec(),
+            bytes: input_line("permission"),
         })
         .await
         .expect("permission input");
@@ -72,7 +72,7 @@ async fn fake_codex_hooks_attention_and_resume() {
     client
         .request(&ClientRequest::SessionInput {
             session_id: source_session_id,
-            bytes: b"finish\n".to_vec(),
+            bytes: input_line("finish"),
         })
         .await
         .expect("finish input");
@@ -107,7 +107,7 @@ async fn fake_codex_hooks_attention_and_resume() {
     client
         .request(&ClientRequest::SessionInput {
             session_id: resumed_id,
-            bytes: b"finish\n".to_vec(),
+            bytes: input_line("finish"),
         })
         .await
         .expect("resumed finish input");
@@ -164,24 +164,29 @@ async fn wait_for_session(
     session_id: SessionId,
     predicate: impl Fn(&Session) -> bool,
 ) -> Session {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let DaemonResponse::Snapshot(snapshot) = client
-                .request(&ClientRequest::GetSnapshot)
-                .await
-                .expect("snapshot response")
-                && let Some(session) = snapshot
-                    .sessions
-                    .into_iter()
-                    .find(|session| session.id == session_id && predicate(session))
-            {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_observed = None;
+    loop {
+        if let DaemonResponse::Snapshot(snapshot) = client
+            .request(&ClientRequest::GetSnapshot)
+            .await
+            .expect("snapshot response")
+            && let Some(session) = snapshot
+                .sessions
+                .into_iter()
+                .find(|session| session.id == session_id)
+        {
+            if predicate(&session) {
                 return session;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            last_observed = Some(session);
         }
-    })
-    .await
-    .expect("session state timeout")
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session state timeout; last observed: {last_observed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn connect_eventually(paths: &RuntimePaths) -> DaemonClient {
@@ -199,7 +204,11 @@ async fn connect_eventually(paths: &RuntimePaths) -> DaemonClient {
 
 fn install_fake_codex(directory: &Path) {
     let target = directory.join(if cfg!(windows) { "codex.exe" } else { "codex" });
-    std::fs::copy(env!("CARGO_BIN_EXE_fake-codex"), &target).expect("copy fake Codex");
+    let source = std::env::var_os("SYLVOPS_TEST_FAKE_CODEX").map_or_else(
+        || std::path::PathBuf::from(env!("CARGO_BIN_EXE_fake-codex")),
+        std::path::PathBuf::from,
+    );
+    std::fs::copy(source, &target).expect("copy fake Codex");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -209,6 +218,16 @@ fn install_fake_codex(directory: &Path) {
         permissions.set_mode(0o700);
         std::fs::set_permissions(target, permissions).expect("fake executable permissions");
     }
+}
+
+#[cfg(windows)]
+fn input_line(value: &str) -> Vec<u8> {
+    format!("{value}\r").into_bytes()
+}
+
+#[cfg(unix)]
+fn input_line(value: &str) -> Vec<u8> {
+    format!("{value}\n").into_bytes()
 }
 
 fn initialize_repository(path: &Path) {

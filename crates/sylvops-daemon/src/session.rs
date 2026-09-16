@@ -8,16 +8,76 @@ use std::{
     sync::Arc,
 };
 
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use uuid::Uuid;
 
-use crate::{DaemonError, Result, process_tree};
+use crate::{DaemonError, Result, process_tree, pty};
 
 const ACTOR_QUEUE_CAPACITY: usize = 128;
 const LIVE_OUTPUT_CAPACITY: usize = 256;
 const READ_CHUNK_SIZE: usize = 8192;
 const MAX_SCROLLBACK_CHUNKS: usize = 4096;
+const PTY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Exercises the production PTY backend with a bounded, non-shell child process.
+///
+/// The probe creates a pseudoterminal, captures output, waits for the child to be reaped, and
+/// drops all process-tree handles. It is intentionally independent of repositories and provider
+/// credentials so `sylvops doctor` can run before first-use setup.
+///
+/// # Errors
+///
+/// Returns an error when the platform diagnostic executable cannot be launched, the process does
+/// not exit before the timeout, it exits unsuccessfully, or no output reaches the PTY reader.
+pub async fn run_pty_probe() -> Result<()> {
+    #[cfg(unix)]
+    let (program, arguments) = (
+        PathBuf::from("/bin/echo"),
+        vec![OsString::from("sylvops-pty-ok")],
+    );
+
+    #[cfg(windows)]
+    let (program, arguments) = {
+        let windows = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        (windows.join("System32").join("hostname.exe"), Vec::new())
+    };
+
+    let cwd = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| DaemonError::Pty(format!("cannot resolve probe directory: {error}")))?;
+    let spec = SessionSpec {
+        program,
+        arguments,
+        cwd,
+        columns: 80,
+        rows: 24,
+        scrollback_bytes: 64 * 1024,
+    };
+    let mut handle = SessionHandle::spawn_sanitized(&spec, &BTreeMap::new())?;
+    let exit = if let Ok(result) = tokio::time::timeout(PTY_PROBE_TIMEOUT, handle.wait()).await {
+        result?
+    } else {
+        handle.stop().await?;
+        return Err(DaemonError::Pty(
+            "PTY probe did not exit within five seconds".into(),
+        ));
+    };
+    if exit.exit_code != 0 {
+        return Err(DaemonError::Pty(format!(
+            "PTY probe exited with status {}",
+            exit.exit_code
+        )));
+    }
+
+    let replay = handle.replay_after(0).await?;
+    if replay.chunks.iter().all(|chunk| chunk.bytes.is_empty()) {
+        return Err(DaemonError::Pty(
+            "PTY probe exited without observable terminal output".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct SessionSpec {
@@ -204,70 +264,21 @@ impl SessionHandle {
         environment: Option<&BTreeMap<OsString, OsString>>,
     ) -> Result<Self> {
         spec.validate()?;
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: spec.rows,
-                cols: spec.columns,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|error| DaemonError::Pty(error.to_string()))?;
-
-        let mut command = CommandBuilder::new(spec.program.as_os_str());
-        for argument in &spec.arguments {
-            command.arg(argument);
-        }
-        command.cwd(&spec.cwd);
-        if let Some(environment) = environment {
-            command.env_clear();
-            for (key, value) in environment {
-                command.env(key, value);
-            }
-        }
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| DaemonError::Pty(error.to_string()))?;
-        drop(pair.slave);
-
-        let process_id = child.process_id().ok_or_else(|| {
-            DaemonError::ProcessTree("PTY library did not report a process ID".into())
-        })?;
-        #[cfg(unix)]
-        let process_tree_result =
-            process_tree::attach(process_id, pair.master.process_group_leader());
-        #[cfg(windows)]
-        let process_tree_result = process_tree::attach(&*child);
-        let process_tree = match process_tree_result {
-            Ok(process_tree) => process_tree,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| DaemonError::Pty(error.to_string()))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|error| DaemonError::Pty(error.to_string()))?;
-        let writer = spawn_writer(writer);
+        let spawned = pty::spawn(spec, environment)?;
+        let writer = spawn_writer(spawned.writer);
 
         let (commands, command_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
         let (actor_events, actor_event_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
         let (live_output, _) = broadcast::channel(LIVE_OUTPUT_CAPACITY);
         let (exit_tx, exit) = watch::channel(None);
 
-        spawn_reader(reader, actor_events.clone());
-        spawn_waiter(child, actor_events.clone());
+        spawn_reader(spawned.reader, actor_events.clone());
+        spawn_waiter(spawned.child, actor_events.clone());
         tokio::spawn(
             Actor {
-                master: pair.master,
+                master: spawned.master,
                 writer: Some(writer),
-                process_tree,
+                process_tree: spawned.process_tree,
                 scrollback: Scrollback::new(spec.scrollback_bytes),
                 terminal: vt100::Parser::new(spec.rows, spec.columns, 0),
                 columns: spec.columns,
@@ -289,7 +300,7 @@ impl SessionHandle {
             commands,
             live_output,
             exit,
-            process_id,
+            process_id: spawned.process_id,
         })
     }
 
@@ -550,7 +561,7 @@ enum WriterCommand {
 }
 
 struct Actor {
-    master: Box<dyn MasterPty + Send>,
+    master: Box<dyn pty::PtyMaster>,
     writer: Option<mpsc::Sender<WriterCommand>>,
     process_tree: process_tree::ProcessTree,
     scrollback: Scrollback,
@@ -593,7 +604,10 @@ impl Actor {
                         if let Some((_, was_attached)) = pending_exit.as_mut() {
                             *was_attached = true;
                         }
-                        let resize_result = if role == sylvops_core::domain::AttachmentRole::Controller {
+                        let resize_result = if role == sylvops_core::domain::AttachmentRole::Controller
+                            && pending_exit.is_none()
+                            && !exit_published
+                        {
                             self.resize_terminal(columns, rows)
                         } else {
                             Ok(())
@@ -714,13 +728,13 @@ impl Actor {
                         }
                     }
                     ActorEvent::ForceStop => {
-                        if pending_exit.is_none() {
-                            if let Err(error) = self.process_tree.terminate() {
-                                for reply in self.stop_replies.drain(..) {
-                                    let _ = reply.send(Err(DaemonError::ProcessTree(
-                                        error.to_string(),
-                                    )));
-                                }
+                        if pending_exit.is_none()
+                            && let Err(error) = self.process_tree.terminate()
+                        {
+                            for reply in self.stop_replies.drain(..) {
+                                let _ = reply.send(Err(DaemonError::ProcessTree(
+                                    error.to_string(),
+                                )));
                             }
                         }
                     }
@@ -766,14 +780,7 @@ impl Actor {
 
     fn resize_terminal(&mut self, columns: u16, rows: u16) -> Result<()> {
         validate_dimensions(columns, rows)?;
-        self.master
-            .resize(PtySize {
-                rows,
-                cols: columns,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|error| DaemonError::Pty(error.to_string()))?;
+        self.master.resize(columns, rows)?;
         self.terminal.screen_mut().set_size(rows, columns);
         self.columns = columns;
         self.rows = rows;
@@ -840,14 +847,11 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, events: mpsc::Sender<ActorEven
     });
 }
 
-fn spawn_waiter(
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    events: mpsc::Sender<ActorEvent>,
-) {
+fn spawn_waiter(mut child: Box<dyn pty::PtyChild>, events: mpsc::Sender<ActorEvent>) {
     tokio::task::spawn_blocking(move || {
         let result = child.wait();
         let exit_code = match result {
-            Ok(status) => status.exit_code(),
+            Ok(exit_code) => exit_code,
             Err(error) => {
                 tracing::warn!(error = %error, "waiting for PTY child failed");
                 1
@@ -860,6 +864,11 @@ fn spawn_waiter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn diagnostic_probe_spawns_outputs_and_reaps() {
+        run_pty_probe().await.unwrap();
+    }
 
     #[test]
     fn scrollback_is_bounded_and_reports_a_gap() {

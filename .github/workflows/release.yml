@@ -1,0 +1,98 @@
+name: Release beta
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  package-windows:
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release --locked -p sylvops-cli
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item target/release/sylvops.exe package/
+          Copy-Item README.md,LICENSE package/
+          Copy-Item packaging/windows/Start-SylvOps.ps1 package/
+          Copy-Item "packaging/windows/Start SylvOps.cmd" package/
+          Copy-Item packaging/windows/QUICKSTART.txt package/
+          Compress-Archive package/* sylvops-windows-x86_64.zip
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: sylvops-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: sylvops-windows-x86_64.zip
+
+  package-unix:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: sylvops-linux-x86_64.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: sylvops-macos-x86_64.tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset: sylvops-macos-aarch64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked -p sylvops-cli --target "${{ matrix.target }}"
+      - name: Package
+        run: |
+          mkdir package
+          cp "target/${{ matrix.target }}/release/sylvops" README.md LICENSE package/
+          tar -C package -czf "${{ matrix.asset }}" sylvops README.md LICENSE
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    needs: [package-windows, package-unix]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify release tag matches the workspace version
+        run: |
+          version="$(sed -n '/\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          test "$GITHUB_REF_NAME" = "v$version"
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          pattern: "*package*"
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum sylvops-* > SHA256SUMS
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --prerelease --generate-notes

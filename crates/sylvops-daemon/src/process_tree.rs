@@ -54,7 +54,7 @@ mod platform {
     use windows_sys::Win32::{
         Foundation::HANDLE,
         System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             SetInformationJobObject, TerminateJobObject,
         },
@@ -75,10 +75,7 @@ mod platform {
     }
 
     impl ProcessTree {
-        pub fn attach(child: &(dyn portable_pty::Child + Send + Sync)) -> Result<Self> {
-            let process = child.as_raw_handle().ok_or_else(|| {
-                DaemonError::ProcessTree("PTY library did not report a process handle".into())
-            })? as HANDLE;
+        pub fn create() -> Result<Self> {
             // SAFETY: null security attributes and name request an unnamed job with defaults.
             let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
             if job.is_null() {
@@ -105,14 +102,11 @@ mod platform {
                 return Err(last_os_error("configure Windows Job Object"));
             }
 
-            // SAFETY: both handles are valid for this call.
-            let assigned =
-                unsafe { AssignProcessToJobObject(job.as_raw_handle().cast::<c_void>(), process) };
-            if assigned == 0 {
-                return Err(last_os_error("assign PTY process to Job Object"));
-            }
-
             Ok(Self { job })
+        }
+
+        pub fn raw_handle(&self) -> HANDLE {
+            self.job.as_raw_handle().cast::<c_void>()
         }
 
         pub fn terminate(&self) -> Result<()> {
@@ -137,6 +131,6 @@ pub(crate) fn attach(process_id: u32, reported_group: Option<i32>) -> Result<Pro
 }
 
 #[cfg(windows)]
-pub(crate) fn attach(child: &(dyn portable_pty::Child + Send + Sync)) -> Result<ProcessTree> {
-    ProcessTree::attach(child)
+pub(crate) fn create() -> Result<ProcessTree> {
+    ProcessTree::create()
 }

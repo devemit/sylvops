@@ -12,6 +12,7 @@ sylvops-daemon = { path = "../sylvops-daemon" }
 crossterm.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
+vt100.workspace = true
 
 [lints]
 workspace = true

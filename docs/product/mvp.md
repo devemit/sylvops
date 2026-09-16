@@ -14,7 +14,7 @@ SylvOps is a local-first terminal application for supervising interactive coding
 6. Reconnect, replay bounded scrollback, provide input, resize, and stop the complete process tree.
 7. Launch an authenticated local Codex CLI with an optional prompt/model/effort.
 8. Normalize observational hooks into reliable attention states and capture its external session ID.
-9. Reopen the four-panel TUI, select attention, inspect a bounded diff, attach, or resume.
+9. Reopen the four-panel TUI, select attention, inspect a bounded diff, attach in the terminal pane, or resume.
 
 The MVP never commits, pushes, merges, force-removes a worktree, stores credentials, executes repository content automatically, or exposes a network shell.
 
@@ -29,4 +29,4 @@ The MVP never commits, pushes, merges, force-removes a worktree, stores credenti
 
 ## Status
 
-The repository contains an implementation candidate for the Codex-first workflow: Phase 3 worktree reconciliation, provider adapters, Codex launch/probe/resume, authenticated lifecycle hooks, attention states, a four-panel TUI, bounded Git diff preview, and a fake-Codex hook/resume end-to-end scenario. The complete gate and that executable scenario pass in a Linux Docker environment, and Windows-target strict Clippy passes with the GNU toolchain. It is not yet an accepted cross-platform MVP: hosted CI has not run this change set, the native Windows host toolchain is incomplete, and Windows process containment still has a documented post-spawn Job Object race. See `README.md` for the exact implementation and validation boundary.
+The repository contains the Codex-first workflow plus beta usability: atomic Windows ConPTY/Job creation, protocol 1.5 workspace and rename operations, complete management modals, embedded attachment, one-command repository opening, redacted diagnostics, and release packaging. It becomes an accepted cross-platform beta only after the complete hosted Windows, Linux, and macOS gate passes.

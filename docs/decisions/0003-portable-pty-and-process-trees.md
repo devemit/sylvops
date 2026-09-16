@@ -1,6 +1,6 @@
 # ADR-0003: Portable PTY with platform process-tree control
 
-- Status: provisional pending Phase 0 test results
+- Status: accepted for Unix; the Windows `portable-pty` path is superseded by ADR-0011
 - Date: 2026-09-15
 
 ## Context
