@@ -263,7 +263,7 @@ fn run_git(path: &Path, arguments: &[&str]) {
 
 #[cfg(windows)]
 fn shell_echo_command(marker: &str) -> Vec<u8> {
-    format!("echo {marker}\r\n").into_bytes()
+    format!("echo {marker}\r").into_bytes()
 }
 
 #[cfg(unix)]

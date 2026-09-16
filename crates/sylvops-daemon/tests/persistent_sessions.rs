@@ -194,7 +194,7 @@ fn run_git(path: &Path, arguments: &[&str]) {
 
 #[cfg(windows)]
 fn shell_echo_command() -> Vec<u8> {
-    b"echo SYLVOPS_E2E\r\n".to_vec()
+    b"echo SYLVOPS_E2E\r".to_vec()
 }
 
 #[cfg(unix)]
