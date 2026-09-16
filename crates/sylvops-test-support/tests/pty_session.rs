@@ -11,13 +11,16 @@ async fn session_accepts_input_and_replays_after_detach() {
     let observer = session.subscribe();
     drop(observer); // Detaching an observer must not stop the process.
     session
-        .input(b"hello\n".to_vec())
+        .input(input_line("hello"))
         .await
         .expect("send input");
     wait_for_output(&session, "ECHO:hello").await;
 
     session.resize(100, 40).await.expect("resize PTY");
-    session.input(b"exit\n".to_vec()).await.expect("exit input");
+    session
+        .input(input_line("exit"))
+        .await
+        .expect("exit input");
     let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
         .await
         .expect("session exit timeout")
@@ -113,7 +116,7 @@ async fn attachment_lease_rejects_observer_input_and_requires_reattach() {
         sylvops_core::domain::AttachmentRole::Controller
     );
     session
-        .input_from(observer, b"exit\n".to_vec())
+        .input_from(observer, input_line("exit"))
         .await
         .unwrap();
     let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
@@ -121,6 +124,16 @@ async fn attachment_lease_rejects_observer_input_and_requires_reattach() {
         .unwrap()
         .unwrap();
     assert_eq!(exit.exit_code, 0);
+}
+
+#[cfg(windows)]
+fn input_line(value: &str) -> Vec<u8> {
+    format!("{value}\r").into_bytes()
+}
+
+#[cfg(unix)]
+fn input_line(value: &str) -> Vec<u8> {
+    format!("{value}\n").into_bytes()
 }
 
 fn spec(
