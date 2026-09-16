@@ -64,12 +64,14 @@ jobs:
         run: cargo test -p sylvops-daemon --test daemon_lifecycle
       - name: Test local transport
         run: cargo test -p sylvops-daemon --test local_transport
-      - name: Test PTY input and replay
-        run: cargo test -p sylvops-test-support --test pty_session session_accepts_input_and_replays_after_detach
-      - name: Test PTY process-tree termination
-        run: cargo test -p sylvops-test-support --test pty_session stopping_session_terminates_descendant_heartbeat
+      - name: Test PTY spawn and containment
+        run: cargo test -p sylvops-test-support --test pty_session session_spawns_under_process_tree_control
       - name: Test PTY bounded scrollback
         run: cargo test -p sylvops-test-support --test pty_session large_output_is_bounded_and_reports_eviction
+      - name: Test PTY process-tree termination
+        run: cargo test -p sylvops-test-support --test pty_session stopping_session_terminates_descendant_heartbeat
+      - name: Test PTY input and replay
+        run: cargo test -p sylvops-test-support --test pty_session session_accepts_input_and_replays_after_detach
       - name: Test PTY attachment control
         run: cargo test -p sylvops-test-support --test pty_session attachment_lease_rejects_observer_input_and_requires_reattach
       - name: Test persistent sessions

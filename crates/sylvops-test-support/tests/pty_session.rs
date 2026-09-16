@@ -3,6 +3,17 @@ use std::{ffi::OsString, fs, path::Path, time::Duration};
 use sylvops_daemon::session::{SessionHandle, SessionSpec};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_spawns_under_process_tree_control() {
+    let mut session =
+        SessionHandle::spawn(&spec(["exit", "0"], 64 * 1024)).expect("spawn contained fake agent");
+    let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
+        .await
+        .expect("contained session exit timeout")
+        .expect("contained session wait");
+    assert_eq!(exit.exit_code, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_accepts_input_and_replays_after_detach() {
     let mut session =
         SessionHandle::spawn(&spec(["interactive"], 64 * 1024)).expect("spawn fake agent");
