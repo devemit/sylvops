@@ -39,8 +39,7 @@ pub async fn run_pty_probe() -> Result<()> {
     #[cfg(windows)]
     let (program, arguments) = {
         let windows = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         (windows.join("System32").join("hostname.exe"), Vec::new())
     };
 
