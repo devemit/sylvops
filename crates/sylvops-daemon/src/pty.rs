@@ -140,7 +140,7 @@ mod platform {
     };
 
     use windows_sys::Win32::{
-        Foundation::{HANDLE, WAIT_OBJECT_0},
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0},
         System::{
             Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole},
             Pipes::CreatePipe,
@@ -149,8 +149,8 @@ mod platform {
                 EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
                 InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
                 PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                PROCESS_INFORMATION, STARTUPINFOEXW, UpdateProcThreadAttribute,
-                WaitForSingleObject,
+                PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+                UpdateProcThreadAttribute, WaitForSingleObject,
             },
         },
     };
@@ -211,6 +211,7 @@ mod platform {
 
     struct AttributeList {
         storage: Vec<usize>,
+        job_handle: Option<Box<HANDLE>>,
     }
 
     impl AttributeList {
@@ -226,6 +227,7 @@ mod platform {
             let words = bytes.div_ceil(size_of::<usize>());
             let mut list = Self {
                 storage: vec![0; words],
+                job_handle: None,
             };
             // SAFETY: the aligned storage is at least the byte count requested by Windows.
             if unsafe {
@@ -258,13 +260,15 @@ mod platform {
         }
 
         fn set_job(&mut self, job: HANDLE) -> Result<()> {
-            // SAFETY: the list is initialized and `job` remains alive through process spawn.
+            let job_handle = Box::new(job);
+            // SAFETY: the list is initialized and the boxed handle value remains at a stable
+            // address through process creation.
             if unsafe {
                 UpdateProcThreadAttribute(
                     self.as_ptr(),
                     0,
                     PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-                    (&raw const job).cast::<c_void>(),
+                    (&raw const *job_handle).cast::<c_void>(),
                     size_of::<HANDLE>(),
                     ptr::null_mut(),
                     ptr::null(),
@@ -273,6 +277,9 @@ mod platform {
             {
                 return Err(last_os_error("set Job Object process attribute"));
             }
+            // UpdateProcThreadAttribute retains the pointer rather than copying this handle list.
+            // Keep its heap allocation stable until after CreateProcessW consumes the attributes.
+            self.job_handle = Some(job_handle);
             Ok(())
         }
 
@@ -285,6 +292,7 @@ mod platform {
         fn drop(&mut self) {
             // SAFETY: successful construction initialized this list exactly once.
             unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+            drop(self.job_handle.take());
         }
     }
 
@@ -314,8 +322,6 @@ mod platform {
         let master = ConPtyMaster {
             handle: pseudoconsole,
         };
-        drop(console_input);
-        drop(console_output);
 
         let process_tree = process_tree::create()?;
         let mut attributes = AttributeList::new(2)?;
@@ -332,6 +338,12 @@ mod platform {
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb =
             u32::try_from(size_of::<STARTUPINFOEXW>()).expect("Windows startup structure fits u32");
+        // Prevent redirected or console standard handles from the daemon from bypassing ConPTY.
+        // The pseudoconsole supplies the child's actual terminal handles during process creation.
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+        startup.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+        startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
         startup.lpAttributeList = attributes.as_ptr();
         let mut process = PROCESS_INFORMATION::default();
         // SAFETY: all pointers refer to mutable or immutable, NUL-terminated buffers that remain
@@ -355,6 +367,10 @@ mod platform {
                 "create Windows PTY child atomically inside Job Object",
             ));
         }
+        // The ConPTY connection endpoints must remain open through CreateProcessW. The
+        // pseudoconsole owns its references after the child has been attached.
+        drop(console_input);
+        drop(console_output);
         // SAFETY: CreateProcessW returned these two independently owned handles.
         let process_handle = unsafe { OwnedHandle::from_raw_handle(process.hProcess) };
         // SAFETY: the initial thread is resumed by CreateProcessW and no longer needed.

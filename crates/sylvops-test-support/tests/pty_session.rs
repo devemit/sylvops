@@ -164,8 +164,12 @@ fn spec(
     arguments: impl IntoIterator<Item = impl Into<OsString>>,
     scrollback_bytes: usize,
 ) -> SessionSpec {
+    let program = std::env::var_os("SYLVOPS_TEST_FAKE_AGENT").map_or_else(
+        || Path::new(env!("CARGO_BIN_EXE_fake-agent")).to_path_buf(),
+        std::path::PathBuf::from,
+    );
     SessionSpec {
-        program: Path::new(env!("CARGO_BIN_EXE_fake-agent")).to_path_buf(),
+        program,
         arguments: arguments.into_iter().map(Into::into).collect(),
         cwd: std::env::current_dir().expect("current directory"),
         columns: 80,

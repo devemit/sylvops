@@ -604,7 +604,10 @@ impl Actor {
                         if let Some((_, was_attached)) = pending_exit.as_mut() {
                             *was_attached = true;
                         }
-                        let resize_result = if role == sylvops_core::domain::AttachmentRole::Controller {
+                        let resize_result = if role == sylvops_core::domain::AttachmentRole::Controller
+                            && pending_exit.is_none()
+                            && !exit_published
+                        {
                             self.resize_terminal(columns, rows)
                         } else {
                             Ok(())
