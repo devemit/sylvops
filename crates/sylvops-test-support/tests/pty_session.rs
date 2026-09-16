@@ -17,10 +17,7 @@ async fn session_accepts_input_and_replays_after_detach() {
     wait_for_output(&session, "ECHO:hello").await;
 
     session.resize(100, 40).await.expect("resize PTY");
-    session
-        .input(input_line("exit"))
-        .await
-        .expect("exit input");
+    session.input(input_line("exit")).await.expect("exit input");
     let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
         .await
         .expect("session exit timeout")
