@@ -26,8 +26,24 @@ jobs:
         run: cargo test -p sylvops-daemon --lib config_store::tests
       - name: Test daemon database
         run: cargo test -p sylvops-daemon --lib database::tests
-      - name: Test daemon Git operations
-        run: cargo test -p sylvops-daemon --lib git::tests
+      - name: Test Git repository registration
+        run: cargo test -p sylvops-daemon --lib git::tests::registers_unicode_repository_without_an_origin
+      - name: Test Git managed worktree lifecycle
+        run: cargo test -p sylvops-daemon --lib git::tests::creates_inspects_and_removes_a_managed_worktree
+      - name: Test Git dirty removal refusal
+        run: cargo test -p sylvops-daemon --lib git::tests::dirty_untracked_and_ignored_files_refuse_removal
+      - name: Test Git stale removal token
+        run: cargo test -p sylvops-daemon --lib git::tests::stale_clean_state_token_refuses_removal
+      - name: Test Git destination preservation
+        run: cargo test -p sylvops-daemon --lib git::tests::existing_destination_is_never_overwritten
+      - name: Test Git detached HEAD registration
+        run: cargo test -p sylvops-daemon --lib git::tests::detached_head_is_registered_without_inventing_a_branch
+      - name: Test Git branch validation
+        run: cargo test -p sylvops-daemon --lib git::tests::rejects_duplicate_or_unsafe_branches
+      - name: Test Git non-repository rejection
+        run: cargo test -p sylvops-daemon --lib git::tests::rejects_a_non_repository
+      - name: Test Git remote URL sanitization
+        run: cargo test -p sylvops-daemon --lib git::tests::remote_urls_are_sanitized_before_persistence
       - name: Test daemon hooks
         run: cargo test -p sylvops-daemon --lib hook::tests
       - name: Test daemon IPC
