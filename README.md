@@ -52,7 +52,7 @@ The repository now contains a **cross-platform beta candidate**. It includes:
 
 Claude, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
 
-The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The cross-platform release claim remains gated on the complete hosted Windows, Linux, and macOS suite.
+The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The complete hosted Windows, Linux, and macOS quality gates pass for the beta candidate.
 
 ## Current commands
 
