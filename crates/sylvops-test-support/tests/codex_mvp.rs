@@ -1,0 +1,258 @@
+#![allow(unsafe_code)]
+
+use std::{ffi::OsString, path::Path, process::Command, time::Duration};
+
+use sylvops_core::{
+    domain::{ProviderKind, Session, SessionState},
+    ids::{SessionId, WorktreeId},
+    protocol::{ClientRequest, DaemonResponse},
+};
+use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn fake_codex_hooks_attention_and_resume() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let repository = temporary.path().join("repository");
+    initialize_repository(&repository);
+    let bin_directory = temporary.path().join("bin");
+    std::fs::create_dir(&bin_directory).expect("fake provider bin directory");
+    install_fake_codex(&bin_directory);
+    let _path =
+        EnvironmentGuard::set(
+            "PATH",
+            std::env::join_paths(std::iter::once(bin_directory.clone()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .expect("test PATH"),
+        );
+    let _codex_home = EnvironmentGuard::set("CODEX_HOME", temporary.path().join("codex-home"));
+
+    let paths = RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("paths");
+    let daemon_paths = paths.clone();
+    let daemon_task = tokio::spawn(async move { daemon::run(daemon_paths).await });
+    let client = connect_eventually(&paths).await;
+
+    let workspace_id = match client
+        .request(&ClientRequest::AddWorkspace {
+            name: "codex-mvp".into(),
+        })
+        .await
+        .expect("workspace response")
+    {
+        DaemonResponse::WorkspaceAdded { workspace, .. } => workspace.id,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let worktree_id = match client
+        .request(&ClientRequest::AddProject {
+            workspace_id,
+            repository_path: repository.to_string_lossy().into_owned(),
+        })
+        .await
+        .expect("project response")
+    {
+        DaemonResponse::ProjectAdded { root_worktree, .. } => root_worktree.id,
+        response => panic!("unexpected project response: {response:?}"),
+    };
+    let source_session_id = create_codex_session(&client, worktree_id).await;
+    attach(&client, source_session_id).await;
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id: source_session_id,
+            bytes: b"permission\n".to_vec(),
+        })
+        .await
+        .expect("permission input");
+    let waiting = wait_for_session(&client, source_session_id, |session| {
+        session.state == SessionState::NeedsFeedback && session.external_session_id.is_some()
+    })
+    .await;
+    let external_id = waiting.external_session_id.expect("external Codex ID");
+
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id: source_session_id,
+            bytes: b"finish\n".to_vec(),
+        })
+        .await
+        .expect("finish input");
+    wait_for_session(&client, source_session_id, |session| {
+        session.process_id.is_none()
+            && matches!(
+                session.state,
+                SessionState::FinishedUnseen | SessionState::FinishedSeen
+            )
+    })
+    .await;
+
+    let resumed_id = match client
+        .request(&ClientRequest::ResumeSession {
+            session_id: source_session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("resume response")
+    {
+        DaemonResponse::SessionResumed { session, .. } => {
+            assert_eq!(
+                session.external_session_id.as_deref(),
+                Some(external_id.as_str())
+            );
+            session.id
+        }
+        response => panic!("unexpected resume response: {response:?}"),
+    };
+    attach(&client, resumed_id).await;
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id: resumed_id,
+            bytes: b"finish\n".to_vec(),
+        })
+        .await
+        .expect("resumed finish input");
+    wait_for_session(&client, resumed_id, |session| session.process_id.is_none()).await;
+
+    client
+        .request(&ClientRequest::ShutdownDaemon)
+        .await
+        .expect("shutdown response");
+    tokio::time::timeout(Duration::from_secs(10), daemon_task)
+        .await
+        .expect("daemon shutdown timeout")
+        .expect("daemon task")
+        .expect("daemon result");
+}
+
+async fn create_codex_session(client: &DaemonClient, worktree_id: WorktreeId) -> SessionId {
+    match client
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Codex,
+            display_name: Some("fake Codex".into()),
+            model: Some("fake-model".into()),
+            effort: Some("high".into()),
+            initial_prompt: Some("exercise hooks".into()),
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("session response")
+    {
+        DaemonResponse::SessionCreated { session, .. } => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    }
+}
+
+async fn attach(client: &DaemonClient, session_id: SessionId) {
+    assert!(matches!(
+        client
+            .request(&ClientRequest::AttachSession {
+                session_id,
+                from_sequence: 0,
+                columns: 80,
+                rows: 24,
+            })
+            .await
+            .expect("attach response"),
+        DaemonResponse::Attached { .. }
+    ));
+}
+
+async fn wait_for_session(
+    client: &DaemonClient,
+    session_id: SessionId,
+    predicate: impl Fn(&Session) -> bool,
+) -> Session {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let DaemonResponse::Snapshot(snapshot) = client
+                .request(&ClientRequest::GetSnapshot)
+                .await
+                .expect("snapshot response")
+                && let Some(session) = snapshot
+                    .sessions
+                    .into_iter()
+                    .find(|session| session.id == session_id && predicate(session))
+            {
+                return session;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("session state timeout")
+}
+
+async fn connect_eventually(paths: &RuntimePaths) -> DaemonClient {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(client) = DaemonClient::connect(paths, "fake-codex-test").await {
+                return client;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("daemon connection timeout")
+}
+
+fn install_fake_codex(directory: &Path) {
+    let target = directory.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-codex"), &target).expect("copy fake Codex");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&target)
+            .expect("fake metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(target, permissions).expect("fake executable permissions");
+    }
+}
+
+fn initialize_repository(path: &Path) {
+    std::fs::create_dir(path).expect("repository directory");
+    run_git(path, &["init", "--initial-branch=main"]);
+    run_git(path, &["config", "user.name", "SylvOps Test"]);
+    run_git(path, &["config", "user.email", "sylvops@example.invalid"]);
+    std::fs::write(path.join("README.md"), "fixture\n").expect("fixture file");
+    run_git(path, &["add", "README.md"]);
+    run_git(path, &["commit", "-m", "fixture"]);
+}
+
+fn run_git(path: &Path, arguments: &[&str]) {
+    let status = Command::new("git")
+        .args(arguments)
+        .current_dir(path)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {arguments:?} failed");
+}
+
+struct EnvironmentGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvironmentGuard {
+    fn set(name: &'static str, value: impl Into<OsString>) -> Self {
+        let previous = std::env::var_os(name);
+        // SAFETY: this test serializes all environment changes in its process and restores them.
+        unsafe { std::env::set_var(name, value.into()) };
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvironmentGuard {
+    fn drop(&mut self) {
+        // SAFETY: this test serializes all environment changes in its process and restores them.
+        unsafe {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+}

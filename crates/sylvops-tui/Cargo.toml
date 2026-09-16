@@ -1,0 +1,17 @@
+[package]
+name = "sylvops-tui"
+description = "Replaceable terminal UI client for SylvOps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sylvops-core = { path = "../sylvops-core" }
+sylvops-daemon = { path = "../sylvops-daemon" }
+crossterm.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "sylvops-test-support"
+description = "Deterministic local fixtures for SylvOps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fake-agent"
+path = "src/bin/fake-agent.rs"
+
+[[bin]]
+name = "fake-codex"
+path = "src/bin/fake-codex.rs"
+
+[dependencies]
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+sylvops-core = { path = "../sylvops-core" }
+sylvops-daemon = { path = "../sylvops-daemon" }
+tempfile = "3"
+uuid.workspace = true
+
+[lints]
+workspace = true

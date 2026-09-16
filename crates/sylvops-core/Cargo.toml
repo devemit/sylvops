@@ -1,0 +1,19 @@
+[package]
+name = "sylvops-core"
+description = "Shared domain and protocol types for SylvOps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
