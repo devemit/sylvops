@@ -326,7 +326,11 @@ fn create_pipe_server(
     // generic owner SID is insufficient for split administrator tokens: the default object owner
     // can be the Administrators group, which is deny-only in the unelevated client token.
     let user_sid = current_process_user_sid()?;
-    let sddl: Vec<u16> = format!("D:P(A;;FA;;;{user_sid})")
+    // Set the owner/group explicitly as the actual token user as well. On split administrator
+    // tokens Windows may otherwise select the deny-only Administrators group as the object's
+    // default owner. Use the concrete duplex-pipe mask instead of generic rights: READ_CONTROL,
+    // SYNCHRONIZE, and the data/attribute rights requested by Tokio's read/write client handle.
+    let sddl: Vec<u16> = format!("O:{user_sid}G:{user_sid}D:P(A;;0x0012019f;;;{user_sid})")
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -453,5 +457,21 @@ mod tests {
 
         drop(client);
         server_task.await.unwrap().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn current_user_can_connect_to_restricted_named_pipe() {
+        let endpoint = LocalEndpoint::windows_pipe(format!(
+            r"\\.\pipe\sylvops-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut listener = LocalListener::bind(&endpoint).expect("bind restricted named pipe");
+
+        let client = connect(&endpoint).await.expect("connect as current user");
+        let server = listener.accept().await.expect("accept current-user client");
+
+        drop(client);
+        drop(server);
     }
 }
