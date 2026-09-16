@@ -22,8 +22,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test core library
         run: cargo test -p sylvops-core --lib
-      - name: Test daemon library
-        run: cargo test -p sylvops-daemon --lib
+      - name: Test daemon configuration
+        run: cargo test -p sylvops-daemon --lib config_store::tests
+      - name: Test daemon database
+        run: cargo test -p sylvops-daemon --lib database::tests
+      - name: Test daemon Git operations
+        run: cargo test -p sylvops-daemon --lib git::tests
+      - name: Test daemon hooks
+        run: cargo test -p sylvops-daemon --lib hook::tests
+      - name: Test daemon IPC
+        run: cargo test -p sylvops-daemon --lib ipc::tests
+      - name: Test daemon providers
+        run: cargo test -p sylvops-daemon --lib provider::tests
+      - name: Test daemon runtime
+        run: cargo test -p sylvops-daemon --lib runtime::tests
+      - name: Test daemon sessions
+        run: cargo test -p sylvops-daemon --lib session::tests
       - name: Test TUI library
         run: cargo test -p sylvops-tui --lib
       - name: Test CLI binary
