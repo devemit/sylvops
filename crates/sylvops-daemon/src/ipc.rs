@@ -248,8 +248,21 @@ fn bind_unix(path: &Path) -> Result<LocalListener> {
         }
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        match std::fs::symlink_metadata(parent) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() {
+                    return Err(DaemonError::Ipc(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "IPC socket parent is not a directory",
+                    )));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(parent)?;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Err(error) => return Err(DaemonError::Ipc(error)),
+        }
     }
     let listener = tokio::net::UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;

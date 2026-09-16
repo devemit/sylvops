@@ -20,8 +20,16 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test library and binary targets
-        run: cargo test --workspace --lib --bins
+      - name: Test core library
+        run: cargo test -p sylvops-core --lib
+      - name: Test daemon library
+        run: cargo test -p sylvops-daemon --lib
+      - name: Test TUI library
+        run: cargo test -p sylvops-tui --lib
+      - name: Test CLI binary
+        run: cargo test -p sylvops-cli --bins
+      - name: Test support targets
+        run: cargo test -p sylvops-test-support --lib --bins
       - name: Test daemon lifecycle
         run: cargo test -p sylvops-daemon --test daemon_lifecycle
       - name: Test local transport

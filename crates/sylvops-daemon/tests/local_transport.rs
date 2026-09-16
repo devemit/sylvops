@@ -5,8 +5,12 @@ use sylvops_daemon::ipc::{
 
 #[tokio::test]
 async fn local_transport_serves_multiple_requests() {
+    #[cfg(unix)]
+    let parent_permissions = unix_parent_permissions();
     let endpoint = unique_endpoint();
     let mut listener = LocalListener::bind(&endpoint).expect("bind local endpoint");
+    #[cfg(unix)]
+    assert_eq!(unix_parent_permissions(), parent_permissions);
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept local client");
         serve_phase_zero_connection(stream).await
@@ -48,6 +52,16 @@ async fn connect_with_retry(endpoint: &LocalEndpoint) -> sylvops_daemon::ipc::Bo
 #[cfg(unix)]
 fn unique_endpoint() -> LocalEndpoint {
     LocalEndpoint::unix(std::env::temp_dir().join(format!("sylvops-{}.sock", uuid::Uuid::now_v7())))
+}
+
+#[cfg(unix)]
+fn unix_parent_permissions() -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(std::env::temp_dir())
+        .expect("temporary directory metadata")
+        .permissions()
+        .mode()
 }
 
 #[cfg(windows)]
