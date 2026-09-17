@@ -1,43 +1,60 @@
 //! Native, mouse-first `SylvOps` client backed exclusively by authenticated daemon IPC.
 
 mod bridge;
+mod forms;
+mod state;
+mod terminal;
+mod theme;
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use bridge::{Bridge, BridgeEvent, Operation};
+use forms::{Confirmation, FormModal, Modal};
 use iced::{
-    Background, Border, Center, Color, Element, Fill, Font, Length, Subscription, Theme,
+    Background, Border, Center, Color, Element, Fill, Font, Length, Subscription, Task, Theme,
     alignment::Vertical,
     keyboard,
     keyboard::{Key, key::Named},
-    theme::Palette,
-    time,
-    widget::{button, column, container, opaque, row, rule, scrollable, space, stack, text},
+    system, time,
+    widget::{
+        button, column, container, mouse_area, opaque, pane_grid, row, rule, scrollable, slider,
+        space, stack, text, text_input,
+    },
+    window,
 };
 use iced::{font::Weight, widget::button::Status};
 use sylvops_core::{
     domain::{
-        AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
-        Worktree, WorktreeStatus,
+        AttachmentRole, DaemonSnapshot, Project, Session, SessionState, Workspace, Worktree,
+        WorktreeStatus,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     provider::ProviderHealth,
-    ui::MainTab,
+    ui::{
+        DesktopDensity, DesktopPanel, DesktopState, DesktopTheme, MAX_OPEN_DESKTOP_SESSIONS,
+        MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT, MIN_DESKTOP_WIDTH, MIN_TERMINAL_FONT_SIZE,
+        MainTab,
+    },
+    ui_forms::{Form, FormKind},
 };
 use sylvops_daemon::runtime::RuntimePaths;
+use terminal::{TerminalState, encode_key as encode_terminal_key};
 
 const EVENT_TICK: Duration = Duration::from_millis(16);
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(75);
+const SUCCESS_DURATION: Duration = Duration::from_secs(4);
 const MAX_EVENTS_PER_TICK: usize = 512;
-const DEFAULT_TERMINAL_COLUMNS: u16 = 100;
-const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const NAV_HEIGHT: f32 = 40.0;
 const FOOTER_HEIGHT: f32 = 28.0;
 const SESSION_TAB_HEIGHT: f32 = 36.0;
 const PANEL_HEADER_HEIGHT: f32 = 32.0;
 const UI_TEXT_SIZE: f32 = 13.0;
 const UI_META_SIZE: f32 = 11.0;
-const TERMINAL_TEXT_SIZE: f32 = 13.0;
 #[cfg(windows)]
 const UI_FONT: Font = Font::with_name("Segoe UI");
 #[cfg(target_os = "macos")]
@@ -66,7 +83,12 @@ const UI_SEMIBOLD: Font = Font {
 /// Returns an error when the native window or renderer cannot be initialized.
 pub fn run(paths: RuntimePaths) -> iced::Result {
     iced::application(
-        move || DesktopApp::new(paths.clone()),
+        move || {
+            (
+                DesktopApp::new(paths.clone()),
+                system::theme().map(Message::SystemThemeChanged),
+            )
+        },
         DesktopApp::update,
         DesktopApp::view,
     )
@@ -75,15 +97,16 @@ pub fn run(paths: RuntimePaths) -> iced::Result {
     .subscription(subscription)
     .default_font(UI_FONT)
     .antialiasing(true)
-    .window_size((1_440.0, 900.0))
+    .window(iced::window::Settings {
+        size: iced::Size::new(1_440.0, 900.0),
+        min_size: Some(iced::Size::new(
+            f32::from(MIN_DESKTOP_WIDTH),
+            f32::from(MIN_DESKTOP_HEIGHT),
+        )),
+        exit_on_close_request: false,
+        ..iced::window::Settings::default()
+    })
     .run()
-}
-
-struct TerminalState {
-    role: AttachmentRole,
-    parser: vt100::Parser,
-    last_sequence: u64,
-    attached: bool,
 }
 
 struct DesktopApp {
@@ -101,8 +124,27 @@ struct DesktopApp {
     diff: Option<String>,
     error: Option<String>,
     snapshot_pending: bool,
-    settings_open: bool,
-    theme_choice: ThemeChoice,
+    modal: Option<Modal>,
+    desktop_state: DesktopState,
+    system_theme: iced::theme::Mode,
+    state_dirty_at: Option<Instant>,
+    state_save_pending: bool,
+    success: Option<(String, Instant)>,
+    window_id: Option<window::Id>,
+    closing_since: Option<Instant>,
+    pending_resize: Option<(SessionId, u16, u16, Instant)>,
+    panes: pane_grid::State<DesktopPane>,
+    pane_splits: [pane_grid::Split; 3],
+    restore_window_size: Option<(u16, u16)>,
+    narrow_main: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopPane {
+    Projects,
+    Worktrees,
+    Sessions,
+    Main,
 }
 
 #[derive(Clone, Debug)]
@@ -110,49 +152,6 @@ enum ConnectionState {
     Connecting,
     Connected,
     Disconnected,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ThemeChoice {
-    System,
-    Light,
-    Dark,
-    Nord,
-    TokyoNight,
-    CatppuccinMocha,
-}
-
-impl ThemeChoice {
-    const ALL: [Self; 6] = [
-        Self::System,
-        Self::Light,
-        Self::Dark,
-        Self::Nord,
-        Self::TokyoNight,
-        Self::CatppuccinMocha,
-    ];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::System => "System",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
-            Self::Nord => "Nord",
-            Self::TokyoNight => "Tokyo Night",
-            Self::CatppuccinMocha => "Catppuccin",
-        }
-    }
-
-    fn iced(self) -> Option<Theme> {
-        match self {
-            Self::System => None,
-            Self::Light => Some(sylvops_light_theme()),
-            Self::Dark => Some(sylvops_dark_theme()),
-            Self::Nord => Some(Theme::Nord),
-            Self::TokyoNight => Some(Theme::TokyoNight),
-            Self::CatppuccinMocha => Some(Theme::CatppuccinMocha),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,18 +165,57 @@ enum Message {
     SelectOpenSession(SessionId),
     CloseSessionTab(SessionId),
     SelectMainTab(MainTab),
-    CreateShell,
+    NewWorkspace,
+    NewProject,
+    NewWorktree,
+    NewSession,
+    RenameProject,
+    RenameWorktree,
+    RenameSession,
+    RemoveSelectedWorktree,
+    FormInput(usize, String),
+    PreviousProvider,
+    NextProvider,
+    SubmitForm,
+    CancelModal,
+    BrowseRepository,
+    FolderPicked(Result<Option<String>, String>),
+    ConfirmAction,
     Attach,
     Detach,
     Stop,
     Refresh,
     ToggleSettings,
-    SelectTheme(ThemeChoice),
+    SelectTheme(DesktopTheme),
+    SelectDensity(DesktopDensity),
+    SetTerminalFontSize(u8),
+    ResetLayout,
+    SelectCompactPanel(DesktopPanel),
+    WindowResized(window::Id, iced::Size),
+    SystemThemeChanged(iced::theme::Mode),
+    CloseRequested(window::Id),
+    PaneResized(pane_grid::ResizeEvent),
+    ShowNarrowNavigator,
+    ShowNarrowMain,
     ClearError,
 }
 
 impl DesktopApp {
     fn new(paths: RuntimePaths) -> Self {
+        let (mut panes, projects) = pane_grid::State::new(DesktopPane::Projects);
+        let (worktrees, first) = panes
+            .split(pane_grid::Axis::Vertical, projects, DesktopPane::Worktrees)
+            .expect("initial desktop pane split");
+        let (sessions, second) = panes
+            .split(pane_grid::Axis::Vertical, worktrees, DesktopPane::Sessions)
+            .expect("initial desktop pane split");
+        let (_, third) = panes
+            .split(pane_grid::Axis::Vertical, sessions, DesktopPane::Main)
+            .expect("initial desktop pane split");
+        let defaults = DesktopState::default();
+        panes.resize(first, f32::from(defaults.panel_ratios[0]) / 1000.0);
+        panes.resize(second, f32::from(defaults.panel_ratios[1]) / 1000.0);
+        panes.resize(third, f32::from(defaults.panel_ratios[2]) / 1000.0);
         Self {
             bridge: Bridge::spawn(paths),
             snapshot: DaemonSnapshot::default(),
@@ -193,14 +231,43 @@ impl DesktopApp {
             diff: None,
             error: None,
             snapshot_pending: false,
-            settings_open: false,
-            theme_choice: ThemeChoice::Dark,
+            modal: None,
+            desktop_state: DesktopState::default(),
+            system_theme: iced::theme::Mode::Dark,
+            state_dirty_at: None,
+            state_save_pending: false,
+            success: None,
+            window_id: None,
+            closing_since: None,
+            pending_resize: None,
+            panes,
+            pane_splits: [first, second, third],
+            restore_window_size: None,
+            narrow_main: false,
         }
     }
 
-    fn update(&mut self, message: Message) {
+    #[allow(clippy::too_many_lines)]
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => self.process_bridge_events(),
+            Message::Tick => {
+                self.process_bridge_events();
+                self.flush_timers();
+                if let (Some((width, height)), Some(window_id)) =
+                    (self.restore_window_size, self.window_id)
+                {
+                    self.restore_window_size = None;
+                    return window::resize(
+                        window_id,
+                        iced::Size::new(f32::from(width), f32::from(height)),
+                    );
+                }
+                if let (Some(started), Some(window_id)) = (self.closing_since, self.window_id)
+                    && (!self.state_save_pending || started.elapsed() >= Duration::from_secs(1))
+                {
+                    return window::close(window_id);
+                }
+            }
             Message::Keyboard(event) => self.handle_keyboard(event),
             Message::SelectWorkspace(workspace_id) => {
                 self.send_request(
@@ -217,6 +284,7 @@ impl DesktopApp {
                 self.selected_session_id = self
                     .selected_worktree_id
                     .and_then(|id| self.sessions_for(id).first().map(|session| session.id));
+                self.mark_state_dirty();
             }
             Message::SelectWorktree(worktree_id) => {
                 self.selected_worktree_id = Some(worktree_id);
@@ -225,17 +293,27 @@ impl DesktopApp {
                     .first()
                     .map(|session| session.id);
                 self.diff = None;
+                self.mark_state_dirty();
             }
             Message::SelectSession(session_id) => {
                 self.selected_session_id = Some(session_id);
                 self.active_session_id = Some(session_id);
                 if !self.open_sessions.contains(&session_id) {
+                    if self.open_sessions.len() == MAX_OPEN_DESKTOP_SESSIONS {
+                        self.open_sessions.remove(0);
+                    }
                     self.open_sessions.push(session_id);
+                }
+                self.mark_state_dirty();
+                if state::layout_mode(self.desktop_state.window_width) == state::LayoutMode::Narrow
+                {
+                    self.narrow_main = true;
                 }
             }
             Message::SelectOpenSession(session_id) => {
                 self.select_session_context(session_id);
                 self.active_session_id = Some(session_id);
+                self.mark_state_dirty();
             }
             Message::CloseSessionTab(session_id) => {
                 if self
@@ -256,38 +334,123 @@ impl DesktopApp {
                         self.select_session_context(next);
                     }
                 }
+                self.mark_state_dirty();
             }
             Message::SelectMainTab(tab) => {
                 self.main_tab = tab;
                 if tab == MainTab::Changes {
                     self.load_diff();
                 }
+                self.mark_state_dirty();
             }
-            Message::CreateShell => self.create_shell(),
+            Message::NewWorkspace => {
+                self.modal = Some(Modal::Form(FormModal::new(Form::workspace())));
+            }
+            Message::NewProject => self.open_project_form(),
+            Message::NewWorktree => self.open_worktree_form(),
+            Message::NewSession => self.open_session_form(),
+            Message::RenameProject => self.open_project_rename_form(),
+            Message::RenameWorktree => self.open_worktree_rename_form(),
+            Message::RenameSession => self.open_session_rename_form(),
+            Message::RemoveSelectedWorktree => self.inspect_worktree_removal(),
+            Message::FormInput(index, value) => self.update_form_field(index, value),
+            Message::PreviousProvider => self.change_provider(-1),
+            Message::NextProvider => self.change_provider(1),
+            Message::SubmitForm => self.submit_form(),
+            Message::CancelModal => self.modal = None,
+            Message::BrowseRepository => {
+                return Task::perform(pick_repository_folder(), Message::FolderPicked);
+            }
+            Message::FolderPicked(result) => self.apply_picked_folder(result),
+            Message::ConfirmAction => self.confirm_action(),
             Message::Attach => self.attach_active(),
             Message::Detach => self.detach_active(),
-            Message::Stop => self.stop_active(),
+            Message::Stop => self.open_stop_confirmation(),
             Message::Refresh => self.request_snapshot(),
-            Message::ToggleSettings => self.settings_open = !self.settings_open,
-            Message::SelectTheme(theme) => self.theme_choice = theme,
+            Message::ToggleSettings => {
+                self.modal = if matches!(self.modal, Some(Modal::Settings)) {
+                    None
+                } else {
+                    Some(Modal::Settings)
+                };
+            }
+            Message::SelectTheme(theme) => {
+                self.desktop_state.theme = theme;
+                self.mark_state_dirty();
+            }
+            Message::SelectDensity(density) => {
+                self.desktop_state.density = density;
+                self.mark_state_dirty();
+            }
+            Message::SetTerminalFontSize(size) => {
+                self.desktop_state.terminal_font_size =
+                    size.clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE);
+                self.mark_state_dirty();
+                self.queue_terminal_resize();
+            }
+            Message::ResetLayout => {
+                state::reset_layout(&mut self.desktop_state);
+                for (index, split) in self.pane_splits.iter().copied().enumerate() {
+                    self.panes.resize(
+                        split,
+                        f32::from(self.desktop_state.panel_ratios[index]) / 1000.0,
+                    );
+                }
+                self.mark_state_dirty();
+                self.queue_terminal_resize();
+            }
+            Message::SelectCompactPanel(panel) => {
+                self.desktop_state.compact_panel = panel;
+                self.mark_state_dirty();
+            }
+            Message::WindowResized(id, size) => self.window_resized(id, size),
+            Message::SystemThemeChanged(mode) => self.system_theme = mode,
+            Message::CloseRequested(id) => {
+                self.window_id = Some(id);
+                self.begin_close();
+            }
+            Message::PaneResized(event) => {
+                if let Some(index) = self
+                    .pane_splits
+                    .iter()
+                    .position(|split| *split == event.split)
+                {
+                    let mut ratios = self.desktop_state.panel_ratios;
+                    ratios[index] = bounded_u16(event.ratio * 1000.0, 100, 350);
+                    if state::panel_ratios_fit(self.desktop_state.window_width, ratios) {
+                        self.panes.resize(event.split, event.ratio);
+                        self.desktop_state.panel_ratios = ratios;
+                        self.mark_state_dirty();
+                        self.queue_terminal_resize();
+                    }
+                }
+            }
+            Message::ShowNarrowNavigator => self.narrow_main = false,
+            Message::ShowNarrowMain => self.narrow_main = true,
             Message::ClearError => self.error = None,
         }
+        Task::none()
     }
 
-    fn theme(&self) -> Option<Theme> {
-        self.theme_choice.iced()
+    fn theme(&self) -> Theme {
+        theme::resolve(self.desktop_state.theme, self.system_theme)
     }
 
     fn view(&self) -> Element<'_, Message> {
         let top = self.top_bar();
         let mission_control = self.mission_control();
-        let body: Element<'_, Message> = if self.settings_open {
-            let overlay = container(self.settings_view())
+        let body: Element<'_, Message> = if let Some(modal) = &self.modal {
+            let overlay = container(self.modal_view(modal))
                 .width(Fill)
                 .height(Fill)
                 .center_x(Fill)
                 .center_y(Fill)
                 .style(modal_scrim);
+            let overlay: Element<'_, Message> = if matches!(modal, Modal::Settings) {
+                mouse_area(overlay).on_press(Message::ToggleSettings).into()
+            } else {
+                overlay.into()
+            };
             stack([mission_control, opaque(overlay)]).into()
         } else {
             mission_control
@@ -307,6 +470,13 @@ impl DesktopApp {
                     .align_y(Center),
                 )
                 .padding([8, 12]),
+            );
+        }
+        if let Some((message, _)) = &self.success {
+            content = content.push(
+                container(text(message).style(text::success))
+                    .padding([6, 12])
+                    .width(Fill),
             );
         }
         container(content).width(Fill).height(Fill).into()
@@ -335,6 +505,13 @@ impl DesktopApp {
             workspaces = workspaces.push(action);
         }
         workspaces = workspaces
+            .push(
+                button(text("+").font(UI_MEDIUM).size(16))
+                    .on_press(Message::NewWorkspace)
+                    .height(28)
+                    .padding([3, 9])
+                    .style(chrome_action_style),
+            )
             .push(space::horizontal())
             .push(
                 button(text("↻").size(17))
@@ -360,27 +537,67 @@ impl DesktopApp {
     }
 
     fn mission_control(&self) -> Element<'_, Message> {
-        row![
-            self.projects_column(),
-            rule::vertical(1),
-            self.worktrees_column(),
-            rule::vertical(1),
-            self.sessions_column(),
-            rule::vertical(1),
-            self.workspace_view(),
-        ]
-        .width(Fill)
-        .height(Fill)
-        .into()
+        match state::layout_mode(self.desktop_state.window_width) {
+            state::LayoutMode::Wide => pane_grid(&self.panes, |_pane, kind, _maximized| {
+                let content = match kind {
+                    DesktopPane::Projects => self.projects_column(),
+                    DesktopPane::Worktrees => self.worktrees_column(),
+                    DesktopPane::Sessions => self.sessions_column(),
+                    DesktopPane::Main => self.workspace_view(),
+                };
+                pane_grid::Content::new(content)
+            })
+            .spacing(1)
+            .min_size(150)
+            .on_resize(8, Message::PaneResized)
+            .into(),
+            state::LayoutMode::Compact => row![
+                self.compact_navigator(),
+                rule::vertical(1),
+                self.workspace_view(),
+            ]
+            .width(Fill)
+            .height(Fill)
+            .into(),
+            state::LayoutMode::Narrow => {
+                let toggle = row![
+                    button("Navigator")
+                        .on_press(Message::ShowNarrowNavigator)
+                        .style(if self.narrow_main {
+                            button::secondary
+                        } else {
+                            button::primary
+                        }),
+                    button("Main")
+                        .on_press(Message::ShowNarrowMain)
+                        .style(if self.narrow_main {
+                            button::primary
+                        } else {
+                            button::secondary
+                        }),
+                ]
+                .spacing(4);
+                let content = if self.narrow_main {
+                    self.workspace_view()
+                } else {
+                    self.compact_navigator()
+                };
+                column![container(toggle).padding([4, 6]), content]
+                    .width(Fill)
+                    .height(Fill)
+                    .into()
+            }
+        }
     }
 
     fn projects_column(&self) -> Element<'_, Message> {
-        let mut items = column![column_heading("Projects", None)].spacing(4);
+        let mut items = column![column_heading("Projects", Some(Message::NewProject))].spacing(4);
         for project in self.visible_projects() {
             items = items.push(select_button(
                 &project.name,
                 self.selected_project_id == Some(project.id),
                 Message::SelectProject(project.id),
+                self.desktop_state.density,
             ));
         }
         if self.visible_projects().is_empty() {
@@ -390,7 +607,8 @@ impl DesktopApp {
     }
 
     fn worktrees_column(&self) -> Element<'_, Message> {
-        let mut items = column![column_heading("Worktrees", None)].spacing(4);
+        let create = self.selected_project_id.map(|_| Message::NewWorktree);
+        let mut items = column![column_heading("Worktrees", create)].spacing(4);
         if let Some(project_id) = self.selected_project_id {
             for worktree in self.worktrees_for(project_id) {
                 let branch = worktree.branch.as_deref().unwrap_or("detached");
@@ -403,6 +621,7 @@ impl DesktopApp {
                     &label,
                     self.selected_worktree_id == Some(worktree.id),
                     Message::SelectWorktree(worktree.id),
+                    self.desktop_state.density,
                 ));
             }
         }
@@ -413,7 +632,7 @@ impl DesktopApp {
     }
 
     fn sessions_column(&self) -> Element<'_, Message> {
-        let create = self.selected_worktree_id.map(|_| Message::CreateShell);
+        let create = self.selected_worktree_id.map(|_| Message::NewSession);
         let mut items = column![column_heading("Sessions", create)].spacing(4);
         if let Some(worktree_id) = self.selected_worktree_id {
             for session in self.sessions_for(worktree_id) {
@@ -427,6 +646,7 @@ impl DesktopApp {
                     &label,
                     self.selected_session_id == Some(session.id),
                     Message::SelectSession(session.id),
+                    self.desktop_state.density,
                 ));
             }
         }
@@ -434,6 +654,43 @@ impl DesktopApp {
             items = items.push(empty_hint("Select a worktree."));
         }
         panel(scrollable(items), 255.0)
+    }
+
+    fn compact_navigator(&self) -> Element<'_, Message> {
+        let tabs = row![
+            compact_panel_button(
+                "Projects",
+                DesktopPanel::Projects,
+                self.desktop_state.compact_panel
+            ),
+            compact_panel_button(
+                "Worktrees",
+                DesktopPanel::Worktrees,
+                self.desktop_state.compact_panel
+            ),
+            compact_panel_button(
+                "Sessions",
+                DesktopPanel::Sessions,
+                self.desktop_state.compact_panel
+            ),
+        ]
+        .spacing(3);
+        let panel = match self.desktop_state.compact_panel {
+            DesktopPanel::Projects => self.projects_column(),
+            DesktopPanel::Worktrees => self.worktrees_column(),
+            DesktopPanel::Sessions => self.sessions_column(),
+        };
+        container(column![container(tabs).padding([4, 5]), panel])
+            .width(
+                if state::layout_mode(self.desktop_state.window_width) == state::LayoutMode::Compact
+                {
+                    Length::Fixed(280.0)
+                } else {
+                    Fill
+                },
+            )
+            .height(Fill)
+            .into()
     }
 
     fn workspace_view(&self) -> Element<'_, Message> {
@@ -568,7 +825,7 @@ impl DesktopApp {
                 scrollable(
                     text(contents)
                         .font(TERMINAL_FONT)
-                        .size(TERMINAL_TEXT_SIZE)
+                        .size(u32::from(self.desktop_state.terminal_font_size))
                         .width(Fill)
                 )
                 .height(Fill),
@@ -587,7 +844,9 @@ impl DesktopApp {
             "Select a worktree and open Changes. The daemon will load a bounded, read-only diff.",
         );
         container(scrollable(
-            text(body).font(TERMINAL_FONT).size(TERMINAL_TEXT_SIZE),
+            text(body)
+                .font(TERMINAL_FONT)
+                .size(u32::from(self.desktop_state.terminal_font_size)),
         ))
         .padding(14)
         .width(Fill)
@@ -597,58 +856,106 @@ impl DesktopApp {
     }
 
     fn details_view(&self) -> Element<'_, Message> {
-        let Some(session_id) = self.active_session_id else {
-            return centered_message("Select a session to inspect its details.");
-        };
-        let Some(session) = self.session(session_id) else {
-            return centered_message("The selected session is no longer available.");
-        };
-        let worktree = self
-            .snapshot
-            .worktrees
-            .iter()
-            .find(|worktree| worktree.id == session.worktree_id);
-        container(
-            column![
-                text(&session.display_name).size(24),
-                detail("Provider", session.provider_kind.to_string()),
-                detail("State", session.state.to_string()),
-                detail(
-                    "Worktree",
-                    worktree.map_or_else(|| "Unknown".into(), |item| item.name.clone())
-                ),
-                detail("Working directory", session.cwd.clone()),
-                detail(
-                    "Process",
-                    session
-                        .process_id
-                        .map_or_else(|| "—".into(), |id| id.to_string())
-                ),
-                detail(
+        let mut content = column![text("Selection details").font(UI_SEMIBOLD).size(24)].spacing(12);
+        if let Some(project) = self
+            .selected_project_id
+            .and_then(|id| self.snapshot.projects.iter().find(|item| item.id == id))
+        {
+            content = content
+                .push(detail("Project", project.name.clone()))
+                .push(detail(
+                    "Repository",
+                    project.canonical_repository_path.clone(),
+                ));
+        }
+        if let Some(worktree) = self.selected_worktree() {
+            content = content
+                .push(detail("Worktree", worktree.name.clone()))
+                .push(detail(
+                    "Branch",
+                    worktree.branch.clone().unwrap_or_else(|| "Detached".into()),
+                ))
+                .push(detail("Path", worktree.canonical_path.clone()));
+        }
+        if let Some(session) = self.active_session_id.and_then(|id| self.session(id)) {
+            content = content
+                .push(rule::horizontal(1))
+                .push(text(&session.display_name).font(UI_SEMIBOLD).size(18))
+                .push(detail("Provider", session.provider_kind.to_string()))
+                .push(detail("State", session.state.to_string()))
+                .push(detail(
+                    "Controller",
+                    self.terminals
+                        .get(&session.id)
+                        .map_or_else(|| "Detached".into(), |terminal| terminal.role.to_string()),
+                ))
+                .push(detail(
                     "Resume",
                     if session.external_session_id.is_some() {
-                        "Available".into()
+                        "Available"
                     } else {
-                        "Unavailable".into()
+                        "Unavailable"
                     }
-                ),
-            ]
-            .spacing(12),
-        )
-        .padding(20)
-        .width(Fill)
-        .height(Fill)
-        .style(workspace_surface)
-        .into()
+                    .into(),
+                ));
+        }
+        let mut actions = row![].spacing(8);
+        if self.selected_project_id.is_some() {
+            actions = actions.push(button("Rename project").on_press(Message::RenameProject));
+        }
+        if self.selected_worktree_id.is_some() {
+            actions = actions.push(button("Rename worktree").on_press(Message::RenameWorktree));
+        }
+        if self.active_session_id.is_some() {
+            actions = actions
+                .push(button("Rename session").on_press(Message::RenameSession))
+                .push(
+                    button("Stop session")
+                        .on_press(Message::Stop)
+                        .style(button::danger),
+                );
+        }
+        if self
+            .selected_worktree()
+            .is_some_and(|worktree| !worktree.is_root_checkout)
+        {
+            actions = actions.push(
+                button("Remove worktree")
+                    .on_press(Message::RemoveSelectedWorktree)
+                    .style(button::danger),
+            );
+        }
+        content = content.push(rule::horizontal(1)).push(actions);
+        container(content)
+            .padding(20)
+            .width(Fill)
+            .height(Fill)
+            .style(workspace_surface)
+            .into()
+    }
+
+    fn modal_view<'a>(&'a self, modal: &'a Modal) -> Element<'a, Message> {
+        match modal {
+            Modal::Settings => self.settings_view(),
+            Modal::Form(form) => Self::form_view(form),
+            Modal::Confirmation(confirmation) => Self::confirmation_view(confirmation),
+        }
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
         let mut themes = row![].spacing(8);
-        for choice in ThemeChoice::ALL {
+        for choice in [
+            DesktopTheme::System,
+            DesktopTheme::Light,
+            DesktopTheme::Dark,
+            DesktopTheme::Nord,
+            DesktopTheme::TokyoNight,
+            DesktopTheme::Catppuccin,
+        ] {
             themes = themes.push(
-                button(choice.label())
+                button(theme::label(choice))
                     .on_press(Message::SelectTheme(choice))
-                    .style(if self.theme_choice == choice {
+                    .style(if self.desktop_state.theme == choice {
                         button::primary
                     } else {
                         button::secondary
@@ -671,6 +978,24 @@ impl DesktopApp {
                 text("Theme changes apply immediately. SylvOps uses the platform UI font and native monospace terminal font.")
                     .style(text::secondary),
                 themes,
+                row![
+                    text("Density").width(Length::Fixed(120.0)),
+                    button("Comfortable")
+                        .on_press(Message::SelectDensity(DesktopDensity::Comfortable))
+                        .style(if self.desktop_state.density == DesktopDensity::Comfortable { button::primary } else { button::secondary }),
+                    button("Compact")
+                        .on_press(Message::SelectDensity(DesktopDensity::Compact))
+                        .style(if self.desktop_state.density == DesktopDensity::Compact { button::primary } else { button::secondary }),
+                ].spacing(8).align_y(Center),
+                row![
+                    text(format!("Terminal font: {} px", self.desktop_state.terminal_font_size)).width(Length::Fixed(180.0)),
+                    slider(
+                        MIN_TERMINAL_FONT_SIZE..=MAX_TERMINAL_FONT_SIZE,
+                        self.desktop_state.terminal_font_size,
+                        Message::SetTerminalFontSize,
+                    ).width(Length::Fixed(260.0)),
+                ].spacing(8).align_y(Center),
+                button("Reset layout").on_press(Message::ResetLayout),
                 rule::horizontal(1),
                 text("Safety").font(UI_SEMIBOLD).size(16),
                 text("The desktop remains an IPC client. The daemon still owns PTYs, Git mutations, process cleanup, and audit events.")
@@ -680,6 +1005,126 @@ impl DesktopApp {
         )
         .padding(22)
         .width(Length::Fixed(640.0))
+        .style(modal_card)
+        .into()
+    }
+
+    fn form_view(modal: &FormModal) -> Element<'_, Message> {
+        let form = &modal.form;
+        let mut fields = column![].spacing(10);
+        if form.is_session() {
+            let provider = form.provider();
+            let provider_text = provider.map_or_else(
+                || "No providers".into(),
+                |item| {
+                    let status = if !item.available {
+                        "unavailable"
+                    } else if item.kind == sylvops_core::domain::ProviderKind::Codex
+                        && !item.authenticated
+                    {
+                        "available, login required"
+                    } else {
+                        "ready"
+                    };
+                    format!("{} — {}", item.kind, status)
+                },
+            );
+            fields = fields.push(
+                row![
+                    button("‹")
+                        .on_press_maybe((!modal.pending).then_some(Message::PreviousProvider)),
+                    text(provider_text).width(Fill),
+                    button("›").on_press_maybe((!modal.pending).then_some(Message::NextProvider)),
+                ]
+                .spacing(8)
+                .align_y(Center),
+            );
+        }
+        for (index, field) in form
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.visible)
+        {
+            let input = text_input(field.label, &field.value)
+                .on_input_maybe(
+                    (!modal.pending).then_some(move |value| Message::FormInput(index, value)),
+                )
+                .on_submit(Message::SubmitForm)
+                .padding(8);
+            let mut group =
+                column![text(field.label).font(UI_MEDIUM).size(UI_META_SIZE), input].spacing(4);
+            if let Some(error) = &field.error {
+                group = group.push(text(error).style(text::danger));
+            }
+            if matches!(form.kind, FormKind::RegisterProject(_)) && index == 0 {
+                group = group.push(button("Choose folder…").on_press(Message::BrowseRepository));
+            }
+            fields = fields.push(group);
+        }
+        if let Some(error) = &form.submission_error {
+            fields = fields.push(text(error).style(text::danger));
+        }
+        let submit = if modal.pending {
+            "Working…"
+        } else {
+            "Continue"
+        };
+        container(
+            column![
+                text(&form.title).font(UI_SEMIBOLD).size(22),
+                fields,
+                row![
+                    space::horizontal(),
+                    button("Cancel").on_press(Message::CancelModal),
+                    button(submit)
+                        .on_press_maybe((!modal.pending).then_some(Message::SubmitForm))
+                        .style(button::primary),
+                ]
+                .spacing(8),
+            ]
+            .spacing(16),
+        )
+        .padding(22)
+        .width(Length::Fixed(560.0))
+        .style(modal_card)
+        .into()
+    }
+
+    fn confirmation_view(confirmation: &Confirmation) -> Element<'_, Message> {
+        let (title, explanation) = match confirmation {
+            Confirmation::StopSession { session_name, cwd } => (
+                "Stop session",
+                format!(
+                    "Stop “{session_name}” in {cwd} and terminate its complete process tree? Its history remains available."
+                ),
+            ),
+            Confirmation::RemoveWorktree {
+                name,
+                canonical_path,
+                ..
+            } => (
+                "Remove clean worktree",
+                format!("Remove “{name}” at {canonical_path}? The Git branch is preserved."),
+            ),
+        };
+        container(
+            column![
+                text(title).font(UI_SEMIBOLD).size(22),
+                text(explanation),
+                row![
+                    space::horizontal(),
+                    button("Cancel").on_press(Message::CancelModal),
+                    button("Confirm")
+                        .on_press(Message::ConfirmAction)
+                        .style(button::danger),
+                ]
+                .spacing(8),
+            ]
+            .spacing(16),
+        )
+        .padding(22)
+        .width(Length::Fixed(520.0))
         .style(modal_card)
         .into()
     }
@@ -723,6 +1168,7 @@ impl DesktopApp {
         if self.bridge.take_overflowed() {
             self.request_snapshot();
             if let Some(session_id) = self.active_session_id {
+                let (columns, rows) = self.terminal_dimensions();
                 let from_sequence = self
                     .terminals
                     .get(&session_id)
@@ -732,8 +1178,8 @@ impl DesktopApp {
                     ClientRequest::AttachSession {
                         session_id,
                         from_sequence,
-                        columns: DEFAULT_TERMINAL_COLUMNS,
-                        rows: DEFAULT_TERMINAL_ROWS,
+                        columns,
+                        rows,
                     },
                 );
             }
@@ -748,11 +1194,18 @@ impl DesktopApp {
             BridgeEvent::Connected {
                 snapshot,
                 providers,
+                desktop_state,
             } => {
                 self.snapshot = snapshot;
                 self.providers = providers;
                 self.connection = ConnectionState::Connected;
+                if let Some(state) = desktop_state {
+                    self.apply_desktop_state(state);
+                }
                 self.restore_selection();
+                if self.snapshot.workspaces.is_empty() {
+                    self.modal = Some(Modal::Form(FormModal::new(Form::workspace())));
+                }
             }
             BridgeEvent::Daemon(event) => self.handle_daemon_event(event),
             BridgeEvent::Response {
@@ -765,7 +1218,27 @@ impl DesktopApp {
                 if matches!(operation, Some(Operation::RefreshSnapshot)) {
                     self.snapshot_pending = false;
                 }
-                self.error = Some(message);
+                if matches!(operation, Some(Operation::SaveDesktopState)) {
+                    self.state_save_pending = false;
+                }
+                let form_operation = matches!(
+                    operation,
+                    Some(
+                        Operation::CreateWorkspace
+                            | Operation::RegisterProject
+                            | Operation::CreateWorktree
+                            | Operation::CreateSession(_)
+                            | Operation::RenameProject
+                            | Operation::RenameWorktree
+                            | Operation::RenameSession
+                    )
+                );
+                if form_operation && let Some(Modal::Form(modal)) = &mut self.modal {
+                    modal.pending = false;
+                    modal.form.submission_error = Some(message);
+                } else {
+                    self.error = Some(message);
+                }
             }
             BridgeEvent::Closed => {
                 self.connection = ConnectionState::Disconnected;
@@ -800,6 +1273,8 @@ impl DesktopApp {
                     terminal.parser = vt100::Parser::new(rows, columns, 10_000);
                     terminal.parser.process(&terminal_snapshot);
                     terminal.last_sequence = snapshot_sequence;
+                    terminal.columns = columns;
+                    terminal.rows = rows;
                 }
             }
             _ => self.request_snapshot(),
@@ -833,7 +1308,7 @@ impl DesktopApp {
                 self.request_snapshot();
             }
             (
-                Operation::CreateShell(worktree_id),
+                Operation::CreateSession(worktree_id),
                 DaemonResponse::SessionCreated { session, .. },
             ) => {
                 self.selected_worktree_id = Some(worktree_id);
@@ -842,12 +1317,16 @@ impl DesktopApp {
                 if !self.open_sessions.contains(&session.id) {
                     self.open_sessions.push(session.id);
                 }
+                self.modal = None;
+                self.show_success("Session created.");
+                self.mark_state_dirty();
                 self.request_snapshot();
             }
             (Operation::Stop(session_id), DaemonResponse::Acknowledged) => {
                 if let Some(terminal) = self.terminals.get_mut(&session_id) {
                     terminal.attached = false;
                 }
+                self.show_success("Session stopped; its history remains available.");
                 self.request_snapshot();
             }
             (
@@ -859,24 +1338,24 @@ impl DesktopApp {
                     ..
                 },
             ) => {
+                let (columns, rows) = self.terminal_dimensions();
                 let terminal = self
                     .terminals
                     .entry(session_id)
                     .or_insert_with(|| TerminalState {
                         role,
-                        parser: vt100::Parser::new(
-                            DEFAULT_TERMINAL_ROWS,
-                            DEFAULT_TERMINAL_COLUMNS,
-                            10_000,
-                        ),
+                        parser: vt100::Parser::new(rows, columns, 10_000),
                         last_sequence: 0,
                         attached: true,
+                        columns,
+                        rows,
                     });
                 terminal.role = role;
                 terminal.attached = true;
+                terminal.columns = columns;
+                terminal.rows = rows;
                 if let Some(snapshot) = terminal_snapshot {
-                    terminal.parser =
-                        vt100::Parser::new(DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLUMNS, 10_000);
+                    terminal.parser = vt100::Parser::new(rows, columns, 10_000);
                     terminal.parser.process(&snapshot);
                     terminal.last_sequence = replay_through_sequence;
                 }
@@ -903,6 +1382,78 @@ impl DesktopApp {
                     self.error =
                         Some("Terminal input was acknowledged after the tab closed.".into());
                 }
+            }
+            (Operation::Resize, DaemonResponse::Acknowledged) => {}
+            (Operation::SaveDesktopState, DaemonResponse::DesktopStateSaved) => {
+                self.state_save_pending = false;
+                if self.closing_since.is_some()
+                    && let Some(id) = self.window_id
+                {
+                    let _ = id;
+                }
+            }
+            (Operation::CreateWorkspace, DaemonResponse::WorkspaceAdded { workspace, .. }) => {
+                self.modal = None;
+                self.show_success(format!("Workspace “{}” created.", workspace.name));
+                self.request_snapshot();
+            }
+            (
+                Operation::RegisterProject,
+                DaemonResponse::ProjectReady {
+                    project,
+                    root_worktree,
+                    ..
+                },
+            ) => {
+                self.selected_project_id = Some(project.id);
+                self.selected_worktree_id = Some(root_worktree.id);
+                self.selected_session_id = None;
+                self.modal = None;
+                self.show_success("Repository registered.");
+                self.mark_state_dirty();
+                self.request_snapshot();
+            }
+            (Operation::CreateWorktree, DaemonResponse::WorktreeCreated { worktree, .. }) => {
+                self.selected_worktree_id = Some(worktree.id);
+                self.selected_session_id = None;
+                self.modal = None;
+                self.show_success("Managed worktree created.");
+                self.mark_state_dirty();
+                self.request_snapshot();
+            }
+            (Operation::RenameProject, DaemonResponse::ProjectUpdated { .. })
+            | (Operation::RenameWorktree, DaemonResponse::WorktreeUpdated { .. })
+            | (Operation::RenameSession, DaemonResponse::SessionUpdated { .. }) => {
+                self.modal = None;
+                self.show_success("Display name updated.");
+                self.request_snapshot();
+            }
+            (Operation::InspectRemoval(worktree_id), DaemonResponse::WorktreeStatus(state)) => {
+                if !state.clean {
+                    self.error = Some(format!(
+                        "Worktree is not clean: {} tracked, {} untracked, and {} ignored entries. SylvOps will not remove it.",
+                        state.tracked_changes, state.untracked_files, state.ignored_files,
+                    ));
+                } else if state.removal_confirmation_token.is_none() {
+                    self.error =
+                        Some("The daemon did not authorize removal of this worktree.".into());
+                } else if let Some(worktree) = self
+                    .snapshot
+                    .worktrees
+                    .iter()
+                    .find(|item| item.id == worktree_id)
+                {
+                    self.modal = Some(Modal::Confirmation(Confirmation::RemoveWorktree {
+                        state,
+                        name: worktree.name.clone(),
+                        canonical_path: worktree.canonical_path.clone(),
+                    }));
+                }
+            }
+            (Operation::RemoveWorktree, DaemonResponse::WorktreeRemoved { .. }) => {
+                self.modal = None;
+                self.show_success("Worktree removed; its branch was preserved.");
+                self.request_snapshot();
             }
             (operation, DaemonResponse::Error(failure)) => {
                 self.error = Some(format!("{operation:?}: {}", failure.message));
@@ -931,9 +1482,9 @@ impl DesktopApp {
         else {
             return;
         };
-        if self.settings_open {
+        if self.modal.is_some() {
             if matches!(key, Key::Named(Named::Escape)) {
-                self.settings_open = false;
+                self.modal = None;
             }
             return;
         }
@@ -974,24 +1525,258 @@ impl DesktopApp {
             .request(Operation::RefreshSnapshot, ClientRequest::GetSnapshot);
     }
 
-    fn create_shell(&mut self) {
+    fn open_project_form(&mut self) {
+        let Some(workspace_id) = self.active_workspace().map(|workspace| workspace.id) else {
+            self.error = Some("Create a workspace before registering a repository.".into());
+            self.modal = Some(Modal::Form(FormModal::new(Form::workspace())));
+            return;
+        };
+        self.modal = Some(Modal::Form(FormModal::new(Form::repository(workspace_id))));
+    }
+
+    fn open_worktree_form(&mut self) {
+        let Some(project_id) = self.selected_project_id else {
+            self.error = Some("Select a project before creating a worktree.".into());
+            return;
+        };
+        self.modal = Some(Modal::Form(FormModal::new(Form::worktree(project_id))));
+    }
+
+    fn open_session_form(&mut self) {
         let Some(worktree_id) = self.selected_worktree_id else {
             self.error = Some("Select a worktree before creating a session.".into());
             return;
         };
+        self.modal = Some(Modal::Form(FormModal::new(Form::session(
+            worktree_id,
+            self.providers.clone(),
+        ))));
+    }
+
+    fn open_project_rename_form(&mut self) {
+        let Some(project) = self
+            .selected_project_id
+            .and_then(|id| self.snapshot.projects.iter().find(|item| item.id == id))
+        else {
+            self.error = Some("Select a project to rename.".into());
+            return;
+        };
+        self.modal = Some(Modal::Form(FormModal::new(Form::rename(
+            "Rename project",
+            &project.name,
+            FormKind::RenameProject(project.id),
+        ))));
+    }
+
+    fn open_worktree_rename_form(&mut self) {
+        let Some(worktree) = self.selected_worktree() else {
+            self.error = Some("Select a worktree to rename.".into());
+            return;
+        };
+        self.modal = Some(Modal::Form(FormModal::new(Form::rename(
+            "Rename worktree label",
+            &worktree.name,
+            FormKind::RenameWorktree(worktree.id),
+        ))));
+    }
+
+    fn open_session_rename_form(&mut self) {
+        let Some(session) = self.selected_session_id.and_then(|id| self.session(id)) else {
+            self.error = Some("Select a session to rename.".into());
+            return;
+        };
+        self.modal = Some(Modal::Form(FormModal::new(Form::rename(
+            "Rename session",
+            &session.display_name,
+            FormKind::RenameSession(session.id),
+        ))));
+    }
+
+    fn update_form_field(&mut self, index: usize, value: String) {
+        if value.len() > 8 * 1024 {
+            return;
+        }
+        if let Some(Modal::Form(modal)) = &mut self.modal
+            && !modal.pending
+        {
+            let mirror_branch_name = index == 0
+                && matches!(modal.form.kind, FormKind::CreateWorktree(_))
+                && modal.form.fields.get(1).is_some_and(|name| {
+                    name.value.is_empty()
+                        || modal
+                            .form
+                            .fields
+                            .first()
+                            .is_some_and(|branch| name.value == branch.value)
+                });
+            if let Some(field) = modal.form.fields.get_mut(index) {
+                field.value.clone_from(&value);
+                field.error = None;
+            }
+            modal.form.submission_error = None;
+            if mirror_branch_name && let Some(name) = modal.form.fields.get_mut(1) {
+                name.value = value;
+            }
+        }
+    }
+
+    fn change_provider(&mut self, delta: isize) {
+        if let Some(Modal::Form(modal)) = &mut self.modal
+            && !modal.pending
+        {
+            modal.form.select_next_provider(delta);
+        }
+    }
+
+    fn submit_form(&mut self) {
+        let Some(Modal::Form(modal)) = &mut self.modal else {
+            return;
+        };
+        if modal.pending || !modal.form.validate() {
+            return;
+        }
+        let form = modal.form.clone();
+        modal.pending = true;
+        match form.kind {
+            FormKind::CreateWorkspace => self.send_request(
+                Operation::CreateWorkspace,
+                ClientRequest::AddWorkspace {
+                    name: form.fields[0].value.trim().to_owned(),
+                },
+            ),
+            FormKind::RegisterProject(workspace_id) => self.send_request(
+                Operation::RegisterProject,
+                ClientRequest::EnsureProject {
+                    workspace_id,
+                    repository_path: form.fields[0].value.trim().to_owned(),
+                },
+            ),
+            FormKind::CreateWorktree(project_id) => self.send_request(
+                Operation::CreateWorktree,
+                ClientRequest::CreateWorktree {
+                    project_id,
+                    branch: form.fields[0].value.trim().to_owned(),
+                    name: trimmed_option(&form.fields[1].value),
+                    base_ref: trimmed_option(&form.fields[2].value),
+                },
+            ),
+            FormKind::CreateSession(worktree_id) => {
+                let Some(provider) = form.provider() else {
+                    return;
+                };
+                let (columns, rows) = self.terminal_dimensions();
+                self.send_request(
+                    Operation::CreateSession(worktree_id),
+                    ClientRequest::CreateSession {
+                        worktree_id,
+                        provider: provider.kind,
+                        display_name: trimmed_option(&form.fields[0].value),
+                        model: trimmed_option(&form.fields[1].value),
+                        effort: trimmed_option(&form.fields[2].value),
+                        initial_prompt: trimmed_option(&form.fields[3].value),
+                        columns,
+                        rows,
+                    },
+                );
+            }
+            FormKind::RenameProject(project_id) => self.send_request(
+                Operation::RenameProject,
+                ClientRequest::RenameProject {
+                    project_id,
+                    name: form.fields[0].value.trim().to_owned(),
+                },
+            ),
+            FormKind::RenameWorktree(worktree_id) => self.send_request(
+                Operation::RenameWorktree,
+                ClientRequest::RenameWorktree {
+                    worktree_id,
+                    name: form.fields[0].value.trim().to_owned(),
+                },
+            ),
+            FormKind::RenameSession(session_id) => self.send_request(
+                Operation::RenameSession,
+                ClientRequest::RenameSession {
+                    session_id,
+                    name: form.fields[0].value.trim().to_owned(),
+                },
+            ),
+        }
+    }
+
+    fn apply_picked_folder(&mut self, result: Result<Option<String>, String>) {
+        match result {
+            Ok(Some(path)) => self.update_form_field(0, path),
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(Modal::Form(modal)) = &mut self.modal {
+                    modal.form.submission_error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn open_stop_confirmation(&mut self) {
+        let Some(session) = self.active_session_id.and_then(|id| self.session(id)) else {
+            self.error = Some("Select a session before stopping it.".into());
+            return;
+        };
+        self.modal = Some(Modal::Confirmation(Confirmation::StopSession {
+            session_name: session.display_name.clone(),
+            cwd: session.cwd.clone(),
+        }));
+    }
+
+    fn inspect_worktree_removal(&mut self) {
+        let Some(worktree) = self.selected_worktree() else {
+            self.error = Some("Select a managed worktree first.".into());
+            return;
+        };
+        if worktree.is_root_checkout {
+            self.error = Some("The root checkout cannot be removed by SylvOps.".into());
+            return;
+        }
+        if worktree.status != WorktreeStatus::Active {
+            self.error = Some("Only an active managed worktree can be removed.".into());
+            return;
+        }
         self.send_request(
-            Operation::CreateShell(worktree_id),
-            ClientRequest::CreateSession {
-                worktree_id,
-                provider: ProviderKind::Shell,
-                display_name: None,
-                model: None,
-                effort: None,
-                initial_prompt: None,
-                columns: DEFAULT_TERMINAL_COLUMNS,
-                rows: DEFAULT_TERMINAL_ROWS,
+            Operation::InspectRemoval(worktree.id),
+            ClientRequest::GetWorktreeStatus {
+                worktree_id: worktree.id,
             },
         );
+    }
+
+    fn confirm_action(&mut self) {
+        let Some(Modal::Confirmation(confirmation)) = self.modal.clone() else {
+            return;
+        };
+        match confirmation {
+            Confirmation::StopSession { .. } => {
+                if let Some(session_id) = self.active_session_id {
+                    self.send_request(
+                        Operation::Stop(session_id),
+                        ClientRequest::StopSession { session_id },
+                    );
+                    self.modal = None;
+                }
+            }
+            Confirmation::RemoveWorktree { state, .. } => {
+                let Some(token) = state.removal_confirmation_token else {
+                    self.error =
+                        Some("The removal authorization expired. Refresh and try again.".into());
+                    self.modal = None;
+                    return;
+                };
+                self.send_request(
+                    Operation::RemoveWorktree,
+                    ClientRequest::RemoveWorktree {
+                        worktree_id: state.worktree_id,
+                        confirmation_token: token,
+                    },
+                );
+            }
+        }
     }
 
     fn attach_active(&mut self) {
@@ -1003,13 +1788,14 @@ impl DesktopApp {
             .terminals
             .get(&session_id)
             .map_or(0, |terminal| terminal.last_sequence);
+        let (columns, rows) = self.terminal_dimensions();
         self.send_request(
             Operation::Attach(session_id),
             ClientRequest::AttachSession {
                 session_id,
                 from_sequence,
-                columns: DEFAULT_TERMINAL_COLUMNS,
-                rows: DEFAULT_TERMINAL_ROWS,
+                columns,
+                rows,
             },
         );
     }
@@ -1023,15 +1809,6 @@ impl DesktopApp {
         }
     }
 
-    fn stop_active(&mut self) {
-        if let Some(session_id) = self.active_session_id {
-            self.send_request(
-                Operation::Stop(session_id),
-                ClientRequest::StopSession { session_id },
-            );
-        }
-    }
-
     fn load_diff(&mut self) {
         if let Some(worktree_id) = self.selected_worktree_id {
             self.diff = Some("Loading diff…".into());
@@ -1040,6 +1817,150 @@ impl DesktopApp {
                 ClientRequest::GetDiff { worktree_id },
             );
         }
+    }
+
+    fn persisted_state(&self) -> DesktopState {
+        DesktopState {
+            selected_project_id: self.selected_project_id,
+            selected_worktree_id: self.selected_worktree_id,
+            selected_session_id: self.selected_session_id,
+            selected_main_tab: self.main_tab,
+            open_session_ids: self.open_sessions.clone(),
+            ..self.desktop_state.clone()
+        }
+        .normalized()
+    }
+
+    fn apply_desktop_state(&mut self, state: DesktopState) {
+        let state = state.normalized();
+        self.selected_project_id = state.selected_project_id;
+        self.selected_worktree_id = state.selected_worktree_id;
+        self.selected_session_id = state.selected_session_id;
+        self.active_session_id = state.selected_session_id;
+        self.open_sessions = state.open_session_ids.clone();
+        self.main_tab = state.selected_main_tab;
+        self.restore_window_size = Some((state.window_width, state.window_height));
+        self.desktop_state = state;
+        for (index, split) in self.pane_splits.iter().copied().enumerate() {
+            self.panes.resize(
+                split,
+                f32::from(self.desktop_state.panel_ratios[index]) / 1000.0,
+            );
+        }
+    }
+
+    fn mark_state_dirty(&mut self) {
+        self.state_dirty_at = Some(Instant::now());
+    }
+
+    fn save_desktop_state(&mut self) {
+        if self.state_save_pending {
+            return;
+        }
+        let state = self.persisted_state();
+        if self.bridge.request(
+            Operation::SaveDesktopState,
+            ClientRequest::SaveDesktopState { state },
+        ) {
+            self.state_dirty_at = None;
+            self.state_save_pending = true;
+        }
+    }
+
+    fn flush_timers(&mut self) {
+        let now = Instant::now();
+        if self
+            .success
+            .as_ref()
+            .is_some_and(|(_, created)| now.duration_since(*created) >= SUCCESS_DURATION)
+        {
+            self.success = None;
+        }
+        if self
+            .state_dirty_at
+            .is_some_and(|changed| now.duration_since(changed) >= SAVE_DEBOUNCE)
+        {
+            self.save_desktop_state();
+        }
+        if let Some((session_id, columns, rows, changed)) = self.pending_resize
+            && now.duration_since(changed) >= RESIZE_DEBOUNCE
+        {
+            self.pending_resize = None;
+            self.send_request(
+                Operation::Resize,
+                ClientRequest::ResizeSession {
+                    session_id,
+                    columns,
+                    rows,
+                },
+            );
+        }
+    }
+
+    fn show_success(&mut self, message: impl Into<String>) {
+        self.success = Some((message.into(), Instant::now()));
+        self.error = None;
+    }
+
+    fn begin_close(&mut self) {
+        if self.closing_since.is_none() {
+            let now = Instant::now();
+            self.closing_since = Some(now);
+            self.state_dirty_at = Some(now.checked_sub(SAVE_DEBOUNCE).unwrap_or(now));
+            self.save_desktop_state();
+        }
+    }
+
+    fn window_resized(&mut self, id: window::Id, size: iced::Size) {
+        self.window_id = Some(id);
+        if self.restore_window_size.is_some() {
+            return;
+        }
+        self.desktop_state.window_width = bounded_u16(size.width, MIN_DESKTOP_WIDTH, u16::MAX);
+        self.desktop_state.window_height = bounded_u16(size.height, MIN_DESKTOP_HEIGHT, u16::MAX);
+        self.mark_state_dirty();
+        self.queue_terminal_resize();
+    }
+
+    fn queue_terminal_resize(&mut self) {
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        if !self.terminals.get(&session_id).is_some_and(|terminal| {
+            terminal.attached && terminal.role == AttachmentRole::Controller
+        }) {
+            return;
+        }
+        let (columns, rows) = self.terminal_dimensions();
+        if let Some(terminal) = self.terminals.get_mut(&session_id) {
+            if terminal.columns == columns && terminal.rows == rows {
+                return;
+            }
+            terminal.parser.screen_mut().set_size(rows, columns);
+            terminal.columns = columns;
+            terminal.rows = rows;
+        }
+        self.pending_resize = Some((session_id, columns, rows, Instant::now()));
+    }
+
+    fn terminal_dimensions(&self) -> (u16, u16) {
+        let main_width = match state::layout_mode(self.desktop_state.window_width) {
+            state::LayoutMode::Wide => {
+                let mut remaining = u32::from(self.desktop_state.window_width);
+                for ratio in self.desktop_state.panel_ratios {
+                    let pane = remaining.saturating_mul(u32::from(ratio)) / 1000;
+                    remaining = remaining.saturating_sub(pane);
+                }
+                u16::try_from(remaining).unwrap_or(u16::MAX)
+            }
+            state::LayoutMode::Compact => self.desktop_state.window_width.saturating_sub(285),
+            state::LayoutMode::Narrow => self.desktop_state.window_width,
+        };
+        let font = u16::from(self.desktop_state.terminal_font_size);
+        let columns = (main_width / font.saturating_mul(3).saturating_div(5).max(1)).clamp(1, 500);
+        let rows = (self.desktop_state.window_height.saturating_sub(150) / font.saturating_add(3))
+            .clamp(1, 200);
+        (columns, rows)
     }
 
     fn restore_selection(&mut self) {
@@ -1157,12 +2078,15 @@ fn subscription(_: &DesktopApp) -> Subscription<Message> {
     Subscription::batch([
         time::every(EVENT_TICK).map(|_| Message::Tick),
         keyboard::listen().map(Message::Keyboard),
+        window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
+        window::close_requests().map(Message::CloseRequested),
+        system::theme_changes().map(Message::SystemThemeChanged),
     ])
 }
 
-fn panel<'a>(content: impl Into<Element<'a, Message>>, width: f32) -> Element<'a, Message> {
+fn panel<'a>(content: impl Into<Element<'a, Message>>, _width: f32) -> Element<'a, Message> {
     container(content)
-        .width(Length::Fixed(width))
+        .width(Fill)
         .height(Fill)
         .padding([4, 5])
         .style(panel_surface)
@@ -1194,7 +2118,16 @@ fn column_heading(label: &str, action: Option<Message>) -> Element<'_, Message> 
         .into()
 }
 
-fn select_button(label: &str, selected: bool, message: Message) -> Element<'static, Message> {
+fn select_button(
+    label: &str,
+    selected: bool,
+    message: Message,
+    density: DesktopDensity,
+) -> Element<'static, Message> {
+    let (height, padding) = match density {
+        DesktopDensity::Comfortable => (32, [6, 8]),
+        DesktopDensity::Compact => (26, [3, 7]),
+    };
     button(
         text(label.to_owned())
             .font(if selected { UI_MEDIUM } else { UI_FONT })
@@ -1204,8 +2137,8 @@ fn select_button(label: &str, selected: bool, message: Message) -> Element<'stat
     .on_press(message)
     .style(move |theme, status| list_item_style(theme, status, selected))
     .width(Fill)
-    .height(32)
-    .padding([6, 8])
+    .height(height)
+    .padding(padding)
     .into()
 }
 
@@ -1217,6 +2150,45 @@ fn tab_button(label: &str, tab: MainTab, active: MainTab) -> Element<'_, Message
         .padding([5, 10])
         .style(move |theme, status| content_tab_style(theme, status, selected))
         .into()
+}
+
+fn compact_panel_button(
+    label: &str,
+    panel: DesktopPanel,
+    active: DesktopPanel,
+) -> Element<'_, Message> {
+    button(text(label).size(UI_META_SIZE))
+        .on_press(Message::SelectCompactPanel(panel))
+        .style(if panel == active {
+            button::primary
+        } else {
+            button::secondary
+        })
+        .into()
+}
+
+fn trimmed_option(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn bounded_u16(value: f32, minimum: u16, maximum: u16) -> u16 {
+    if !value.is_finite() {
+        return minimum;
+    }
+    value.round().clamp(f32::from(minimum), f32::from(maximum)) as u16
+}
+
+async fn pick_repository_folder() -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(|| {
+        Ok(rfd::FileDialog::new()
+            .set_title("Choose a Git repository")
+            .pick_folder()
+            .map(|path| path.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|error| format!("folder picker failed: {error}"))?
 }
 
 fn centered_message(message: &str) -> Element<'_, Message> {
@@ -1239,34 +2211,6 @@ fn footer_item(label: &str) -> Element<'static, Message> {
         .size(UI_META_SIZE)
         .style(text::secondary)
         .into()
-}
-
-fn sylvops_dark_theme() -> Theme {
-    Theme::custom(
-        "SylvOps Dark",
-        Palette {
-            background: Color::from_rgb8(21, 24, 30),
-            text: Color::from_rgb8(224, 226, 231),
-            primary: Color::from_rgb8(108, 142, 239),
-            success: Color::from_rgb8(102, 187, 131),
-            warning: Color::from_rgb8(220, 170, 92),
-            danger: Color::from_rgb8(218, 103, 111),
-        },
-    )
-}
-
-fn sylvops_light_theme() -> Theme {
-    Theme::custom(
-        "SylvOps Light",
-        Palette {
-            background: Color::from_rgb8(247, 248, 250),
-            text: Color::from_rgb8(31, 38, 49),
-            primary: Color::from_rgb8(50, 98, 210),
-            success: Color::from_rgb8(37, 135, 74),
-            warning: Color::from_rgb8(177, 108, 18),
-            danger: Color::from_rgb8(190, 57, 67),
-        },
-    )
 }
 
 fn chrome_surface(theme: &Theme) -> container::Style {
@@ -1461,44 +2405,6 @@ fn detail(label: &str, value: String) -> Element<'_, Message> {
     .into()
 }
 
-fn encode_terminal_key(
-    key: &Key,
-    modifiers: keyboard::Modifiers,
-    produced_text: Option<&str>,
-) -> Option<Vec<u8>> {
-    let mut bytes = match key.as_ref() {
-        Key::Named(Named::Enter) => vec![b'\r'],
-        Key::Named(Named::Tab) if modifiers.shift() => b"\x1b[Z".to_vec(),
-        Key::Named(Named::Tab) => vec![b'\t'],
-        Key::Named(Named::Backspace) => vec![0x7f],
-        Key::Named(Named::Escape) => vec![0x1b],
-        Key::Named(Named::ArrowUp) => b"\x1b[A".to_vec(),
-        Key::Named(Named::ArrowDown) => b"\x1b[B".to_vec(),
-        Key::Named(Named::ArrowRight) => b"\x1b[C".to_vec(),
-        Key::Named(Named::ArrowLeft) => b"\x1b[D".to_vec(),
-        Key::Named(Named::Home) => b"\x1b[H".to_vec(),
-        Key::Named(Named::End) => b"\x1b[F".to_vec(),
-        Key::Named(Named::Delete) => b"\x1b[3~".to_vec(),
-        Key::Named(Named::Insert) => b"\x1b[2~".to_vec(),
-        Key::Named(Named::PageUp) => b"\x1b[5~".to_vec(),
-        Key::Named(Named::PageDown) => b"\x1b[6~".to_vec(),
-        Key::Character(character) if modifiers.control() => {
-            let character = character.chars().next()?;
-            if !character.is_ascii() {
-                return None;
-            }
-            let byte = u8::try_from(u32::from(character.to_ascii_uppercase())).ok()?;
-            vec![byte & 0x1f]
-        }
-        Key::Character(character) => produced_text.unwrap_or(character).as_bytes().to_vec(),
-        _ => return None,
-    };
-    if modifiers.alt() && bytes.first() != Some(&0x1b) {
-        bytes.insert(0, 0x1b);
-    }
-    Some(bytes)
-}
-
 const fn status_symbol(state: SessionState) -> &'static str {
     match state {
         SessionState::Fresh => "○",
@@ -1508,26 +2414,5 @@ const fn status_symbol(state: SessionState) -> &'static str {
         SessionState::FinishedSeen => "✓",
         SessionState::Failed => "×",
         SessionState::Terminated | SessionState::Disconnected => "—",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn terminal_keyboard_reserves_detach_outside_encoder_and_encodes_navigation() {
-        assert_eq!(
-            encode_terminal_key(
-                &Key::Named(Named::ArrowUp),
-                keyboard::Modifiers::empty(),
-                None,
-            ),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(
-            encode_terminal_key(&Key::Character("c".into()), keyboard::Modifiers::CTRL, None,),
-            Some(vec![0x03])
-        );
     }
 }

@@ -476,6 +476,20 @@ async fn handle_request(
             state.database.save_tui_state(tui_state).await?;
             send_response_queue(outgoing, request_id, &DaemonResponse::TuiStateSaved).await
         }
+        ClientRequest::GetDesktopState => {
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::DesktopState(state.database.desktop_state().await?),
+            )
+            .await
+        }
+        ClientRequest::SaveDesktopState {
+            state: desktop_state,
+        } => {
+            state.database.save_desktop_state(desktop_state).await?;
+            send_response_queue(outgoing, request_id, &DaemonResponse::DesktopStateSaved).await
+        }
         ClientRequest::ListProviders => {
             let health = state.providers.probe_all().await;
             for item in &health {

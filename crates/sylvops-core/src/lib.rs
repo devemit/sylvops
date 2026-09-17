@@ -8,5 +8,6 @@ pub mod protocol;
 pub mod provider;
 pub mod status;
 pub mod ui;
+pub mod ui_forms;
 
 pub use error::{CoreError, Result};

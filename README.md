@@ -47,7 +47,7 @@ The repository now contains a **cross-platform beta candidate**. It includes:
 - bounded Codex discovery, version, and authentication probes;
 - application-owned Codex hook profiles plus an authenticated loopback hook relay;
 - deterministic attention states, external Codex session-ID capture, and guarded resume;
-- a native, mouse-first desktop client with workspace tabs, dedicated project/worktree/session columns, a dominant terminal workspace, session tabs, Changes/Details views, live theme selection, and daemon-backed terminal attachment;
+- a native, mouse-first desktop client with workspace tabs, guided repository/worktree/session management, responsive resizable navigation, a dominant terminal workspace, session tabs, Changes/Details views, persisted appearance and layout, and daemon-backed terminal attachment;
 - a hierarchical Ratatui mission-control client with an explorer, Terminal/Changes/Details tabs, guided forms, keyboard and mouse controls, attention selection, safe embedded terminal rendering, bounded read-only diffs, and restored navigation context;
 - CLI workspace, project, worktree, provider, session, desktop, and TUI commands.
 
@@ -70,7 +70,7 @@ The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoco
 - The top bar switches workspaces. Projects, worktrees, and sessions stay visible beside the large Terminal/Changes/Details area.
 - Select a session, click **Attach**, and interact normally. `Ctrl+]` detaches without stopping it.
 - The footer always shows the version, workspace, branch, current view, daemon connectivity, and key hints.
-- Settings currently provide System, Light, Dark, Nord, Tokyo Night, and Catppuccin themes. The terminal TUI remains the complete management surface while desktop creation forms are completed.
+- Settings provide System, Light, Dark, Nord, Tokyo Night, and Catppuccin themes plus comfortable/compact density, terminal font sizing, and layout reset. The terminal TUI remains available as a keyboard-first alternative.
 
 ## Current commands
 

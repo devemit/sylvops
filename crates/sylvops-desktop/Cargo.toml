@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 crossbeam-channel.workspace = true
 iced.workspace = true
+rfd.workspace = true
 sylvops-core = { path = "../sylvops-core" }
 sylvops-daemon = { path = "../sylvops-daemon" }
 tokio.workspace = true
