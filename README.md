@@ -1,16 +1,16 @@
 # SylvOps
 
-SylvOps is a local-first terminal mission control for supervising interactive coding-agent sessions in Git worktrees.
+SylvOps is a local-first mission control for supervising interactive coding-agent sessions in Git worktrees. It ships a native desktop client and retains a keyboard-first terminal client.
 
 ## Quick start
 
 SylvOps is currently a public-beta candidate, not a stable release. Once a beta archive is published, extract it, put the binary on `PATH`, and run this inside a Git repository:
 
 ```text
-sylvops open .
+sylvops up .
 ```
 
-This starts the local daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the TUI. It does not launch an agent until you select a worktree and press `n`, click **New**, or explicitly pass `--provider`.
+This starts the local daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the native desktop app. It does not launch an agent automatically. `sylvops open .` is a compatibility alias, while `sylvops tui` opens the terminal interface.
 
 To build from source, install stable Rust 1.88 or newer, Git, and the platform C toolchain:
 
@@ -23,7 +23,7 @@ cargo build --release -p sylvops-cli
 The executable is written to `target/release/sylvops` (`sylvops.exe` on Windows):
 
 ```text
-./target/release/sylvops open .
+./target/release/sylvops up .
 ```
 
 On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the unsigned portable Windows ZIP with `powershell -File scripts/package-windows.ps1`; generated packages are intentionally excluded from Git.
@@ -47,8 +47,9 @@ The repository now contains a **cross-platform beta candidate**. It includes:
 - bounded Codex discovery, version, and authentication probes;
 - application-owned Codex hook profiles plus an authenticated loopback hook relay;
 - deterministic attention states, external Codex session-ID capture, and guarded resume;
+- a native, mouse-first desktop client with workspace tabs, dedicated project/worktree/session columns, a dominant terminal workspace, session tabs, Changes/Details views, live theme selection, and daemon-backed terminal attachment;
 - a hierarchical Ratatui mission-control client with an explorer, Terminal/Changes/Details tabs, guided forms, keyboard and mouse controls, attention selection, safe embedded terminal rendering, bounded read-only diffs, and restored navigation context;
-- CLI workspace, project, worktree, provider, session, and TUI commands.
+- CLI workspace, project, worktree, provider, session, desktop, and TUI commands.
 
 Claude, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
 
@@ -63,10 +64,19 @@ The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoco
 - `n`, `r`, and `d` create, rename, and stop/remove in context. `/` searches commands and entities.
 - Mouse selection, tabs, actions, forms, confirmations, and wheel navigation are supported. Terminal mouse-protocol forwarding is intentionally deferred.
 
+### Desktop essentials
+
+- `sylvops` or `sylvops up [PATH]` opens the native window; closing it leaves daemon-owned sessions running.
+- The top bar switches workspaces. Projects, worktrees, and sessions stay visible beside the large Terminal/Changes/Details area.
+- Select a session, click **Attach**, and interact normally. `Ctrl+]` detaches without stopping it.
+- The footer always shows the version, workspace, branch, current view, daemon connectivity, and key hints.
+- Settings currently provide System, Light, Dark, Nord, Tokyo Night, and Catppuccin themes. The terminal TUI remains the complete management surface while desktop creation forms are completed.
+
 ## Current commands
 
 ```text
 sylvops
+sylvops up .
 sylvops open .
 sylvops open . --provider codex --prompt "..."
 sylvops doctor
