@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 5;
+pub const PROTOCOL_MINOR: u16 = 6;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -343,6 +343,10 @@ pub enum ClientRequest {
     Hello(HelloRequest),
     Health,
     GetSnapshot,
+    GetTuiState,
+    SaveTuiState {
+        state: crate::ui::TuiState,
+    },
     ListProviders,
     ProbeProvider {
         kind: ProviderKind,
@@ -433,6 +437,8 @@ pub enum DaemonResponse {
     Welcome(WelcomeResponse),
     Health(DaemonHealth),
     Snapshot(DaemonSnapshot),
+    TuiState(Option<crate::ui::TuiState>),
+    TuiStateSaved,
     Providers(Vec<ProviderHealth>),
     Provider(ProviderHealth),
     WorkspaceAdded {
@@ -643,6 +649,7 @@ fn take_uuid(bytes: &[u8], position: &mut usize) -> Result<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::{MainTab, TuiState};
 
     #[test]
     fn messagepack_frame_round_trips() {
@@ -655,6 +662,22 @@ mod tests {
         assert_eq!(decoded.class, MessageClass::Request);
         assert_eq!(decoded.opcode, 1);
         assert_eq!(decoded.payload_as::<PhaseZeroRequest>().unwrap(), request);
+    }
+
+    #[test]
+    fn protocol_1_6_tui_state_round_trips() {
+        let request = ClientRequest::SaveTuiState {
+            state: TuiState {
+                selected_project_id: Some(crate::ids::ProjectId::new()),
+                selected_worktree_id: Some(crate::ids::WorktreeId::new()),
+                selected_session_id: Some(crate::ids::SessionId::new()),
+                selected_main_tab: MainTab::Details,
+            },
+        };
+        let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
+        let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
+        assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
+        assert_eq!(PROTOCOL_MINOR, 6);
     }
 
     #[test]

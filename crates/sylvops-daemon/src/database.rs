@@ -17,12 +17,16 @@ use sylvops_core::domain::{
     WorktreeStatus,
 };
 use sylvops_core::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
+use sylvops_core::ui::TuiState;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::{DaemonError, Result};
 
 const ACTOR_CAPACITY: usize = 128;
+const TUI_STATE_SCOPE: &str = "tui";
+const TUI_STATE_KEY: &str = "navigation.v1";
+const MAX_TUI_STATE_BYTES: usize = 4 * 1024;
 const MIGRATIONS: &[(i64, &str, &str)] =
     &[(1, "initial", include_str!("../migrations/0001_initial.sql"))];
 
@@ -41,6 +45,13 @@ struct DatabaseInner {
 enum DatabaseCommand {
     Snapshot {
         reply: oneshot::Sender<Result<DaemonSnapshot>>,
+    },
+    GetTuiState {
+        reply: oneshot::Sender<Result<Option<TuiState>>>,
+    },
+    SaveTuiState {
+        state: TuiState,
+        reply: oneshot::Sender<Result<()>>,
     },
     AddWorkspace {
         name: String,
@@ -227,6 +238,32 @@ impl DatabaseHandle {
         receive
             .await
             .map_err(|_| DaemonError::Database("snapshot request was cancelled".into()))?
+    }
+
+    /// Loads the last safe TUI navigation selection, ignoring corrupt values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor or SQLite query error.
+    pub async fn tui_state(&self) -> Result<Option<TuiState>> {
+        request(&self.inner.commands, |reply| DatabaseCommand::GetTuiState {
+            reply,
+        })
+        .await
+    }
+
+    /// Atomically stores bounded, non-sensitive TUI navigation state.
+    ///
+    /// This does not advance the authoritative entity revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, serialization, size, or SQLite write error.
+    pub async fn save_tui_state(&self, state: TuiState) -> Result<()> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::SaveTuiState { state, reply }
+        })
+        .await
     }
 
     /// Inserts a validated workspace and its audit event transactionally.
@@ -606,6 +643,12 @@ fn database_thread(
         match command {
             DatabaseCommand::Snapshot { reply } => {
                 let _ = reply.send(load_snapshot(&connection, revision));
+            }
+            DatabaseCommand::GetTuiState { reply } => {
+                let _ = reply.send(load_tui_state(&connection));
+            }
+            DatabaseCommand::SaveTuiState { state, reply } => {
+                let _ = reply.send(save_tui_state(&connection, &state));
             }
             DatabaseCommand::AddWorkspace { name, reply } => {
                 let result = insert_workspace(&mut connection, &name).map(|workspace| {
@@ -1636,6 +1679,41 @@ fn insert_audit_event(
     Ok(())
 }
 
+fn load_tui_state(connection: &Connection) -> Result<Option<TuiState>> {
+    let value = connection
+        .query_row(
+            "SELECT value_json FROM ui_state WHERE client_scope = ?1 AND key = ?2",
+            params![TUI_STATE_SCOPE, TUI_STATE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    Ok(value.and_then(|value| {
+        if value.len() > MAX_TUI_STATE_BYTES {
+            None
+        } else {
+            serde_json::from_str(&value).ok()
+        }
+    }))
+}
+
+fn save_tui_state(connection: &Connection, state: &TuiState) -> Result<()> {
+    let value = serde_json::to_string(state)
+        .map_err(|error| DaemonError::Database(format!("cannot serialize TUI state: {error}")))?;
+    if value.len() > MAX_TUI_STATE_BYTES {
+        return Err(DaemonError::Database("TUI state exceeds size limit".into()));
+    }
+    connection
+        .execute(
+            "INSERT INTO ui_state(client_scope, key, value_json, updated_at) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(client_scope, key) DO UPDATE SET value_json = excluded.value_json, \
+             updated_at = excluded.updated_at",
+            params![TUI_STATE_SCOPE, TUI_STATE_KEY, value, now_millis()],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
 fn load_snapshot(connection: &Connection, revision: u64) -> Result<DaemonSnapshot> {
     Ok(DaemonSnapshot {
         revision,
@@ -1850,6 +1928,7 @@ fn database_error(error: rusqlite::Error) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sylvops_core::ui::MainTab;
 
     #[tokio::test]
     async fn migrates_and_returns_empty_snapshot() {
@@ -1858,6 +1937,43 @@ mod tests {
         let snapshot = database.snapshot().await.unwrap();
         assert_eq!(snapshot.revision, 1);
         assert!(snapshot.workspaces.is_empty());
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tui_state_round_trips_without_advancing_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
+        let revision = database.snapshot().await.unwrap().revision;
+        let state = TuiState {
+            selected_project_id: Some(ProjectId::new()),
+            selected_worktree_id: Some(WorktreeId::new()),
+            selected_session_id: Some(SessionId::new()),
+            selected_main_tab: MainTab::Changes,
+        };
+        database.save_tui_state(state.clone()).await.unwrap();
+        assert_eq!(database.tui_state().await.unwrap(), Some(state));
+        assert_eq!(database.snapshot().await.unwrap().revision, revision);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_tui_state_is_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let database = DatabaseHandle::open(&path).unwrap();
+        database.shutdown().await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO ui_state(client_scope, key, value_json, updated_at) \
+                 VALUES ('tui', 'navigation.v1', 'not-json', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let database = DatabaseHandle::open(&path).unwrap();
+        assert_eq!(database.tui_state().await.unwrap(), None);
         database.shutdown().await.unwrap();
     }
 

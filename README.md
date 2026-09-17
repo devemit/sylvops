@@ -10,7 +10,7 @@ SylvOps is currently a public-beta candidate, not a stable release. Once a beta 
 sylvops open .
 ```
 
-This starts the local daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the TUI. It does not launch an agent until you press `n` in the Sessions panel or explicitly pass `--provider`.
+This starts the local daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the TUI. It does not launch an agent until you select a worktree and press `n`, click **New**, or explicitly pass `--provider`.
 
 To build from source, install stable Rust 1.88 or newer, Git, and the platform C toolchain:
 
@@ -47,12 +47,21 @@ The repository now contains a **cross-platform beta candidate**. It includes:
 - bounded Codex discovery, version, and authentication probes;
 - application-owned Codex hook profiles plus an authenticated loopback hook relay;
 - deterministic attention states, external Codex session-ID capture, and guarded resume;
-- a four-panel Ratatui client with creation/rename/confirmation modals, workspace switching, attention selection, an embedded safe terminal view, and bounded read-only diff preview;
+- a hierarchical Ratatui mission-control client with an explorer, Terminal/Changes/Details tabs, guided forms, keyboard and mouse controls, attention selection, safe embedded terminal rendering, bounded read-only diffs, and restored navigation context;
 - CLI workspace, project, worktree, provider, session, and TUI commands.
 
 Claude, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
 
-The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The complete hosted Windows, Linux, and macOS quality gates pass for the beta candidate.
+The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The prior beta baseline passed the complete hosted Windows, Linux, and macOS quality gates; the redesigned UX must pass those gates before `v0.1.0-beta.1` is published.
+
+### TUI essentials
+
+- The explorer shows the active workspace hierarchy: project → worktree → session.
+- `Tab` switches between Explorer and Main; arrows navigate and collapse/expand.
+- `1`, `2`, and `3` open Terminal, Changes, and Details.
+- `Enter` explicitly attaches a selected session; `Ctrl+]` detaches without stopping it.
+- `n`, `r`, and `d` create, rename, and stop/remove in context. `/` searches commands and entities.
+- Mouse selection, tabs, actions, forms, confirmations, and wheel navigation are supported. Terminal mouse-protocol forwarding is intentionally deferred.
 
 ## Current commands
 

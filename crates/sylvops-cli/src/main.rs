@@ -70,7 +70,7 @@ enum Command {
         #[command(subcommand)]
         command: ProviderCommand,
     },
-    /// Open the four-panel mission-control interface.
+    /// Open the hierarchical mission-control interface.
     Tui,
     /// Register or select a repository and open mission control.
     Open {
