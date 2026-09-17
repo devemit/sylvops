@@ -31,6 +31,7 @@ pub(crate) enum Confirmation {
 #[derive(Clone, Debug)]
 pub(crate) enum Modal {
     Settings,
+    Shortcuts,
     Form(FormModal),
     Confirmation(Confirmation),
 }
