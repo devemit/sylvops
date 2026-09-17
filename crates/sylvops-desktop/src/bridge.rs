@@ -21,16 +21,26 @@ const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 4_096;
 const CRITICAL_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum Operation {
     RefreshSnapshot,
+    CreateWorkspace,
     OpenWorkspace(WorkspaceId),
-    CreateShell(WorktreeId),
+    RegisterProject,
+    CreateWorktree,
+    CreateSession(WorktreeId),
+    RenameProject,
+    RenameWorktree,
+    RenameSession,
+    InspectRemoval(WorktreeId),
+    RemoveWorktree,
     Attach(SessionId),
     Detach(SessionId),
     Stop(SessionId),
+    Resize,
     LoadDiff(WorktreeId),
     Input(SessionId),
+    SaveDesktopState,
 }
 
 #[derive(Debug)]
@@ -47,6 +57,7 @@ pub(crate) enum BridgeEvent {
     Connected {
         snapshot: DaemonSnapshot,
         providers: Vec<ProviderHealth>,
+        desktop_state: Option<sylvops_core::ui::DesktopState>,
     },
     Daemon(DaemonEvent),
     Response {
@@ -127,6 +138,7 @@ fn run_worker(
     runtime.block_on(run_worker_async(paths, commands, events, overflowed));
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_worker_async(
     paths: RuntimePaths,
     mut commands: mpsc::Receiver<BridgeCommand>,
@@ -171,11 +183,26 @@ async fn run_worker_async(
             return;
         }
     };
+    let desktop_state = match client.request(&ClientRequest::GetDesktopState).await {
+        Ok(DaemonResponse::DesktopState(state)) => state,
+        Ok(response) => {
+            send_startup_error(
+                &events,
+                format!("unexpected desktop-state response: {response:?}"),
+            );
+            return;
+        }
+        Err(error) => {
+            send_startup_error(&events, format!("cannot load desktop preferences: {error}"));
+            return;
+        }
+    };
     if events
         .send_timeout(
             BridgeEvent::Connected {
                 snapshot,
                 providers,
+                desktop_state,
             },
             CRITICAL_EVENT_TIMEOUT,
         )

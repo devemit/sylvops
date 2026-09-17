@@ -17,7 +17,7 @@ use sylvops_core::domain::{
     WorktreeStatus,
 };
 use sylvops_core::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
-use sylvops_core::ui::TuiState;
+use sylvops_core::ui::{DesktopState, TuiState};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -27,6 +27,9 @@ const ACTOR_CAPACITY: usize = 128;
 const TUI_STATE_SCOPE: &str = "tui";
 const TUI_STATE_KEY: &str = "navigation.v1";
 const MAX_TUI_STATE_BYTES: usize = 4 * 1024;
+const DESKTOP_STATE_SCOPE: &str = "desktop";
+const DESKTOP_STATE_KEY: &str = "navigation.v1";
+const MAX_DESKTOP_STATE_BYTES: usize = 16 * 1024;
 const MIGRATIONS: &[(i64, &str, &str)] =
     &[(1, "initial", include_str!("../migrations/0001_initial.sql"))];
 
@@ -51,6 +54,13 @@ enum DatabaseCommand {
     },
     SaveTuiState {
         state: TuiState,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    GetDesktopState {
+        reply: oneshot::Sender<Result<Option<DesktopState>>>,
+    },
+    SaveDesktopState {
+        state: DesktopState,
         reply: oneshot::Sender<Result<()>>,
     },
     AddWorkspace {
@@ -262,6 +272,30 @@ impl DatabaseHandle {
     pub async fn save_tui_state(&self, state: TuiState) -> Result<()> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::SaveTuiState { state, reply }
+        })
+        .await
+    }
+
+    /// Loads the last bounded native desktop state, ignoring corrupt values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor or SQLite query error.
+    pub async fn desktop_state(&self) -> Result<Option<DesktopState>> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::GetDesktopState { reply }
+        })
+        .await
+    }
+
+    /// Stores native desktop state without advancing the entity revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, serialization, size, or SQLite write error.
+    pub async fn save_desktop_state(&self, state: DesktopState) -> Result<()> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::SaveDesktopState { state, reply }
         })
         .await
     }
@@ -649,6 +683,12 @@ fn database_thread(
             }
             DatabaseCommand::SaveTuiState { state, reply } => {
                 let _ = reply.send(save_tui_state(&connection, &state));
+            }
+            DatabaseCommand::GetDesktopState { reply } => {
+                let _ = reply.send(load_desktop_state(&connection));
+            }
+            DatabaseCommand::SaveDesktopState { state, reply } => {
+                let _ = reply.send(save_desktop_state(&connection, &state));
             }
             DatabaseCommand::AddWorkspace { name, reply } => {
                 let result = insert_workspace(&mut connection, &name).map(|workspace| {
@@ -1714,6 +1754,46 @@ fn save_tui_state(connection: &Connection, state: &TuiState) -> Result<()> {
     Ok(())
 }
 
+fn load_desktop_state(connection: &Connection) -> Result<Option<DesktopState>> {
+    let value = connection
+        .query_row(
+            "SELECT value_json FROM ui_state WHERE client_scope = ?1 AND key = ?2",
+            params![DESKTOP_STATE_SCOPE, DESKTOP_STATE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    Ok(value.and_then(|value| {
+        if value.len() > MAX_DESKTOP_STATE_BYTES {
+            None
+        } else {
+            serde_json::from_str::<DesktopState>(&value)
+                .ok()
+                .map(DesktopState::normalized)
+        }
+    }))
+}
+
+fn save_desktop_state(connection: &Connection, state: &DesktopState) -> Result<()> {
+    let value = serde_json::to_string(&state.clone().normalized()).map_err(|error| {
+        DaemonError::Database(format!("cannot serialize desktop state: {error}"))
+    })?;
+    if value.len() > MAX_DESKTOP_STATE_BYTES {
+        return Err(DaemonError::Database(
+            "desktop state exceeds size limit".into(),
+        ));
+    }
+    connection
+        .execute(
+            "INSERT INTO ui_state(client_scope, key, value_json, updated_at) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(client_scope, key) DO UPDATE SET value_json = excluded.value_json, \
+             updated_at = excluded.updated_at",
+            params![DESKTOP_STATE_SCOPE, DESKTOP_STATE_KEY, value, now_millis()],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
 fn load_snapshot(connection: &Connection, revision: u64) -> Result<DaemonSnapshot> {
     Ok(DaemonSnapshot {
         revision,
@@ -1928,7 +2008,7 @@ fn database_error(error: rusqlite::Error) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sylvops_core::ui::MainTab;
+    use sylvops_core::ui::{DesktopDensity, DesktopState, DesktopTheme, MainTab};
 
     #[tokio::test]
     async fn migrates_and_returns_empty_snapshot() {
@@ -1974,6 +2054,47 @@ mod tests {
         drop(connection);
         let database = DatabaseHandle::open(&path).unwrap();
         assert_eq!(database.tui_state().await.unwrap(), None);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_state_round_trips_without_advancing_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
+        let revision = database.snapshot().await.unwrap().revision;
+        let state = DesktopState {
+            selected_project_id: Some(ProjectId::new()),
+            selected_worktree_id: Some(WorktreeId::new()),
+            selected_session_id: Some(SessionId::new()),
+            selected_main_tab: MainTab::Details,
+            theme: DesktopTheme::Nord,
+            density: DesktopDensity::Compact,
+            terminal_font_size: 17,
+            ..DesktopState::default()
+        };
+        database.save_desktop_state(state.clone()).await.unwrap();
+        assert_eq!(database.desktop_state().await.unwrap(), Some(state));
+        assert_eq!(database.snapshot().await.unwrap().revision, revision);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_desktop_state_is_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let database = DatabaseHandle::open(&path).unwrap();
+        database.shutdown().await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO ui_state(client_scope, key, value_json, updated_at) \
+                 VALUES ('desktop', 'navigation.v1', 'not-json', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let database = DatabaseHandle::open(&path).unwrap();
+        assert_eq!(database.desktop_state().await.unwrap(), None);
         database.shutdown().await.unwrap();
     }
 

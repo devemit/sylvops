@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 6;
+pub const PROTOCOL_MINOR: u16 = 7;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -347,6 +347,10 @@ pub enum ClientRequest {
     SaveTuiState {
         state: crate::ui::TuiState,
     },
+    GetDesktopState,
+    SaveDesktopState {
+        state: crate::ui::DesktopState,
+    },
     ListProviders,
     ProbeProvider {
         kind: ProviderKind,
@@ -439,6 +443,8 @@ pub enum DaemonResponse {
     Snapshot(DaemonSnapshot),
     TuiState(Option<crate::ui::TuiState>),
     TuiStateSaved,
+    DesktopState(Option<crate::ui::DesktopState>),
+    DesktopStateSaved,
     Providers(Vec<ProviderHealth>),
     Provider(ProviderHealth),
     WorkspaceAdded {
@@ -665,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_6_tui_state_round_trips() {
+    fn protocol_1_7_ui_state_round_trips() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -677,7 +683,13 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 6);
+        assert_eq!(PROTOCOL_MINOR, 7);
+
+        let desktop = ClientRequest::SaveDesktopState {
+            state: crate::ui::DesktopState::default(),
+        };
+        let frame = Frame::message(MessageClass::Request, 10, &desktop).unwrap();
+        assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), desktop);
     }
 
     #[test]
