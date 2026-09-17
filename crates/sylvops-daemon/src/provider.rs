@@ -205,9 +205,15 @@ impl ProviderAdapter for ShellAdapter {
     }
 
     fn build_launch(&self, context: LaunchContext) -> sylvops_core::Result<LaunchSpec> {
+        #[cfg(windows)]
+        let arguments = vec![OsString::from("/D")];
+        #[cfg(unix)]
+        let arguments = Vec::new();
         Ok(LaunchSpec {
             executable: self.executable.clone(),
-            arguments: Vec::new(),
+            // `/D` keeps cmd.exe interactive while disabling user AutoRun entries that can
+            // silently replace the daemon-supplied worktree working directory.
+            arguments,
             environment: safe_environment(context.session_id, context.worktree_id, false),
         })
     }
@@ -719,6 +725,29 @@ mod tests {
         assert!(!environment_allowed(OsStr::new("OPENAI_API_KEY")));
         assert!(!environment_allowed(OsStr::new("GH_TOKEN")));
         assert!(environment_allowed(OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn shell_launch_disables_windows_autorun_without_changing_directory() {
+        let adapter = ShellAdapter::new().expect("resolve platform shell");
+        let spec = adapter
+            .build_launch(LaunchContext {
+                session_id: sylvops_core::ids::SessionId::new(),
+                worktree_id: sylvops_core::ids::WorktreeId::new(),
+                cwd: PathBuf::from(if cfg!(windows) {
+                    r"C:\work trees\feature"
+                } else {
+                    "/tmp/work trees/feature"
+                }),
+                model: None,
+                effort: None,
+                initial_prompt: None,
+            })
+            .expect("shell launch specification");
+        #[cfg(windows)]
+        assert_eq!(spec.arguments, vec![OsString::from("/D")]);
+        #[cfg(unix)]
+        assert!(spec.arguments.is_empty());
     }
 
     #[test]

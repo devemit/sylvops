@@ -57,6 +57,11 @@ fn run() -> io::Result<u8> {
                 .unwrap_or(0);
             Ok(code)
         }
+        "cwd" => {
+            println!("CWD={}", env::current_dir()?.display());
+            io::stdout().flush()?;
+            Ok(0)
+        }
         unknown => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unknown scenario {unknown}"),
