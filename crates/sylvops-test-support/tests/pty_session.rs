@@ -30,6 +30,35 @@ async fn session_spawns_under_process_tree_control() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_starts_in_the_selected_worktree() {
+    let directory = tempfile::Builder::new()
+        .prefix("sylvops cwd ")
+        .tempdir()
+        .expect("temporary worktree");
+    let expected = directory.path().canonicalize().expect("canonical worktree");
+    let mut launch = spec(["cwd"], 64 * 1024);
+    launch.cwd = expected.clone();
+    let mut session = SessionHandle::spawn(&launch).expect("spawn cwd reporter");
+    let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
+        .await
+        .expect("cwd reporter timeout")
+        .expect("cwd reporter wait");
+    assert_eq!(exit.exit_code, 0);
+
+    let replay = session.replay_after(0).await.expect("cwd replay");
+    let output: Vec<u8> = replay
+        .chunks
+        .iter()
+        .flat_map(|chunk| chunk.bytes.iter().copied())
+        .collect();
+    let output = String::from_utf8_lossy(&output);
+    assert!(
+        output.contains(&expected.to_string_lossy().to_string()),
+        "child cwd did not match selected worktree: {output:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_accepts_input_and_replays_after_detach() {
     let mut session =
         SessionHandle::spawn(&spec(["interactive"], 64 * 1024)).expect("spawn fake agent");

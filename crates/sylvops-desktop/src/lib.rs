@@ -89,7 +89,10 @@ pub fn run(paths: RuntimePaths) -> iced::Result {
         move || {
             (
                 DesktopApp::new(paths.clone()),
-                system::theme().map(Message::SystemThemeChanged),
+                Task::batch([
+                    system::theme().map(Message::SystemThemeChanged),
+                    window::latest().map(Message::WindowReady),
+                ]),
             )
         },
         DesktopApp::update,
@@ -142,6 +145,7 @@ struct DesktopApp {
     narrow_main: bool,
     keyboard_panel: DesktopPanel,
     terminal_focus: TerminalFocus,
+    window_mode: window::Mode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,12 +209,14 @@ enum Message {
     Stop,
     Refresh,
     ToggleSettings,
+    ToggleFullscreen,
     SelectTheme(DesktopTheme),
     SelectDensity(DesktopDensity),
     SetTerminalFontSize(u8),
     ResetLayout,
     SelectCompactPanel(DesktopPanel),
     WindowResized(window::Id, iced::Size),
+    WindowReady(Option<window::Id>),
     SystemThemeChanged(iced::theme::Mode),
     CloseRequested(window::Id),
     PaneResized(pane_grid::ResizeEvent),
@@ -265,6 +271,7 @@ impl DesktopApp {
             narrow_main: false,
             keyboard_panel: DesktopPanel::Projects,
             terminal_focus: TerminalFocus::Unfocused,
+            window_mode: window::Mode::Windowed,
         }
     }
 
@@ -364,6 +371,18 @@ impl DesktopApp {
                     Some(Modal::Settings)
                 };
             }
+            Message::ToggleFullscreen => {
+                let Some(window_id) = self.window_id else {
+                    self.error = Some("The application window is not ready yet.".into());
+                    return Task::none();
+                };
+                self.window_mode = if self.window_mode == window::Mode::Fullscreen {
+                    window::Mode::Windowed
+                } else {
+                    window::Mode::Fullscreen
+                };
+                return window::set_mode(window_id, self.window_mode);
+            }
             Message::SelectTheme(theme) => {
                 self.desktop_state.theme = theme;
                 self.mark_state_dirty();
@@ -396,6 +415,7 @@ impl DesktopApp {
                 self.mark_state_dirty();
             }
             Message::WindowResized(id, size) => self.window_resized(id, size),
+            Message::WindowReady(id) => self.window_id = id,
             Message::SystemThemeChanged(mode) => self.system_theme = mode,
             Message::CloseRequested(id) => {
                 self.window_id = Some(id);
@@ -481,14 +501,26 @@ impl DesktopApp {
     }
 
     fn top_bar(&self) -> Element<'_, Message> {
+        let compact = self.desktop_state.window_width < 1_000;
+        let fullscreen_label = fullscreen_label(self.window_mode, compact);
         let worktree_context = self.selected_worktree().map_or_else(
-            || "Worktree: none selected".to_owned(),
+            || {
+                if compact {
+                    "WT · none".to_owned()
+                } else {
+                    "Worktree: none selected".to_owned()
+                }
+            },
             |worktree| {
-                format!(
-                    "Worktree: {}  ·  {}",
-                    worktree.name,
-                    worktree.branch.as_deref().unwrap_or("detached")
-                )
+                if compact {
+                    format!("WT · {}", worktree.name)
+                } else {
+                    format!(
+                        "Worktree: {}  ·  {}",
+                        worktree.name,
+                        worktree.branch.as_deref().unwrap_or("detached")
+                    )
+                }
             },
         );
         let brand = container(
@@ -499,12 +531,20 @@ impl DesktopApp {
             .spacing(7)
             .align_y(Center),
         )
-        .width(Length::Fixed(170.0))
+        .width(Length::Fixed(if compact { 120.0 } else { 170.0 }))
         .padding([0, 8]);
         let mut workspaces = row![brand].spacing(4).align_y(Center);
         for workspace in &self.snapshot.workspaces {
-            let label = workspace.name.clone();
             let active = workspace.is_open;
+            let label = if active {
+                format!(
+                    "{} · {}",
+                    if compact { "WS" } else { "Workspace" },
+                    workspace.name
+                )
+            } else {
+                workspace.name.clone()
+            };
             let action = button(text(label).font(UI_MEDIUM).size(UI_TEXT_SIZE))
                 .on_press(Message::SelectWorkspace(workspace.id))
                 .height(ACTION_HEIGHT)
@@ -533,6 +573,13 @@ impl DesktopApp {
                     .on_press(Message::Refresh)
                     .height(ACTION_HEIGHT)
                     .padding([5, 10])
+                    .style(chrome_action_style),
+            )
+            .push(
+                button(text(fullscreen_label).font(UI_MEDIUM).size(12))
+                    .on_press(Message::ToggleFullscreen)
+                    .height(ACTION_HEIGHT)
+                    .padding([6, 11])
                     .style(chrome_action_style),
             )
             .push(
@@ -785,6 +832,11 @@ impl DesktopApp {
         let Some(session_id) = self.active_session_id else {
             return text("No session selected").style(text::secondary).into();
         };
+        let Some(session) = self.session(session_id) else {
+            return text("Session is no longer available")
+                .style(text::secondary)
+                .into();
+        };
         let attached = self
             .terminals
             .get(&session_id)
@@ -798,24 +850,40 @@ impl DesktopApp {
                     .padding([6, 10])
                     .style(chrome_action_style),
             );
-        } else {
+        } else if session_can_stop(session.state) || session_can_replay(session.state) {
+            let label = if session_can_stop(session.state) {
+                "Attach"
+            } else {
+                "View output"
+            };
             actions = actions.push(
-                button(text("Attach").font(UI_MEDIUM).size(12))
+                button(text(label).font(UI_MEDIUM).size(12))
                     .on_press(Message::Attach)
                     .height(ACTION_HEIGHT)
                     .padding([6, 10])
                     .style(button::primary),
             );
         }
-        actions
-            .push(
+        if session_can_stop(session.state) {
+            actions = actions.push(
                 button(text("Stop").font(UI_MEDIUM).size(12))
                     .on_press(Message::Stop)
                     .height(ACTION_HEIGHT)
                     .padding([6, 10])
                     .style(button::danger),
-            )
-            .into()
+            );
+        } else {
+            actions = actions.push(
+                container(
+                    text(format!("History retained · {}", session.state))
+                        .size(UI_META_SIZE)
+                        .style(text::secondary),
+                )
+                .height(ACTION_HEIGHT)
+                .align_y(Vertical::Center),
+            );
+        }
+        actions.into()
     }
 
     fn terminal_view(&self) -> Element<'_, Message> {
@@ -823,6 +891,16 @@ impl DesktopApp {
             return centered_message("Choose a session, then click Attach.");
         };
         let Some(terminal) = self.terminals.get(&session_id) else {
+            if let Some(session) = self.session(session_id)
+                && matches!(
+                    session.state,
+                    SessionState::Terminated | SessionState::Disconnected
+                )
+            {
+                return centered_message(
+                    "This session is no longer running. Its metadata remains in Details; terminal output was not persisted.",
+                );
+            }
             return centered_message("Session selected. Click Attach to load its terminal.");
         };
         let role = if !terminal.attached {
@@ -866,11 +944,22 @@ impl DesktopApp {
         let body = self.diff.as_deref().unwrap_or(
             "Select a worktree and open Changes. The daemon will load a bounded, read-only diff.",
         );
-        container(scrollable(
-            text(body)
-                .font(TERMINAL_FONT)
-                .size(u32::from(self.desktop_state.terminal_font_size)),
-        ))
+        container(column![
+            container(
+                text("Read-only Git changes · running sessions continue, but terminal input is disabled in this tab")
+                    .font(UI_MEDIUM)
+                    .size(UI_META_SIZE)
+                    .style(text::secondary)
+            )
+            .height(28)
+            .align_y(Vertical::Center),
+            scrollable(
+                text(body)
+                    .font(TERMINAL_FONT)
+                    .size(u32::from(self.desktop_state.terminal_font_size)),
+            )
+            .height(Fill),
+        ].spacing(6))
         .padding(14)
         .width(Fill)
         .height(Fill)
@@ -929,14 +1018,15 @@ impl DesktopApp {
         if self.selected_worktree_id.is_some() {
             actions = actions.push(button("Rename worktree").on_press(Message::RenameWorktree));
         }
-        if self.active_session_id.is_some() {
-            actions = actions
-                .push(button("Rename session").on_press(Message::RenameSession))
-                .push(
+        if let Some(session) = self.active_session_id.and_then(|id| self.session(id)) {
+            actions = actions.push(button("Rename session").on_press(Message::RenameSession));
+            if session_can_stop(session.state) {
+                actions = actions.push(
                     button("Stop session")
                         .on_press(Message::Stop)
                         .style(button::danger),
                 );
+            }
         }
         if self
             .selected_worktree()
@@ -1331,6 +1421,15 @@ impl DesktopApp {
                     terminal.columns = columns;
                     terminal.rows = rows;
                 }
+            }
+            DaemonEvent::SessionExited { session_id, .. } => {
+                if let Some(terminal) = self.terminals.get_mut(&session_id) {
+                    terminal.attached = false;
+                }
+                if self.active_session_id == Some(session_id) {
+                    self.terminal_focus = TerminalFocus::Unfocused;
+                }
+                self.request_snapshot();
             }
             _ => self.request_snapshot(),
         }
@@ -1930,6 +2029,13 @@ impl DesktopApp {
             self.error = Some("Select a session before stopping it.".into());
             return;
         };
+        if !session_can_stop(session.state) {
+            self.error = Some(format!(
+                "Session “{}” is already {}; its history remains available.",
+                session.display_name, session.state
+            ));
+            return;
+        }
         self.modal = Some(Modal::Confirmation(Confirmation::StopSession {
             session_name: session.display_name.clone(),
             cwd: session.cwd.clone(),
@@ -1994,6 +2100,17 @@ impl DesktopApp {
             self.error = Some("Select a session before attaching.".into());
             return;
         };
+        let Some(session) = self.session(session_id) else {
+            self.error = Some("The selected session no longer exists.".into());
+            return;
+        };
+        if !session_can_stop(session.state) && !session_can_replay(session.state) {
+            self.error = Some(format!(
+                "Session “{}” is {}; only its metadata is retained.",
+                session.display_name, session.state
+            ));
+            return;
+        }
         let from_sequence = self
             .terminals
             .get(&session_id)
@@ -2240,6 +2357,7 @@ impl DesktopApp {
         self.selected_session_id = self
             .selected_worktree_id
             .and_then(|id| self.sessions_for(id).first().map(|session| session.id));
+        self.activate_selected_session_context();
         self.diff = None;
         self.mark_state_dirty();
     }
@@ -2253,6 +2371,7 @@ impl DesktopApp {
             .sessions_for(worktree_id)
             .first()
             .map(|session| session.id);
+        self.activate_selected_session_context();
         self.diff = None;
         self.mark_state_dirty();
     }
@@ -2272,6 +2391,21 @@ impl DesktopApp {
         self.mark_state_dirty();
         if state::layout_mode(self.desktop_state.window_width) == state::LayoutMode::Narrow {
             self.narrow_main = true;
+        }
+    }
+
+    fn activate_selected_session_context(&mut self) {
+        let Some(session_id) = self.selected_session_id else {
+            self.active_session_id = None;
+            self.main_tab = MainTab::Details;
+            return;
+        };
+        self.active_session_id = Some(session_id);
+        if !self.open_sessions.contains(&session_id) {
+            if self.open_sessions.len() == MAX_OPEN_DESKTOP_SESSIONS {
+                self.open_sessions.remove(0);
+            }
+            self.open_sessions.push(session_id);
         }
     }
 
@@ -2381,6 +2515,15 @@ fn next_selection<T: Copy + PartialEq>(
         (current + 1) % items.len()
     };
     items.get(next).copied()
+}
+
+const fn fullscreen_label(mode: window::Mode, compact: bool) -> &'static str {
+    match (mode, compact) {
+        (window::Mode::Fullscreen, true) => "Window",
+        (window::Mode::Fullscreen, false) => "Exit full screen",
+        (_, true) => "Full",
+        (_, false) => "Full screen",
+    }
 }
 
 fn panel<'a>(content: impl Into<Element<'a, Message>>, _width: f32) -> Element<'a, Message> {
@@ -2744,5 +2887,45 @@ const fn status_symbol(state: SessionState) -> &'static str {
         SessionState::FinishedSeen => "✓",
         SessionState::Failed => "×",
         SessionState::Terminated | SessionState::Disconnected => "—",
+    }
+}
+
+const fn session_can_stop(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Fresh
+            | SessionState::Starting
+            | SessionState::Running
+            | SessionState::NeedsFeedback
+    )
+}
+
+const fn session_can_replay(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::FinishedUnseen | SessionState::FinishedSeen | SessionState::Failed
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_session_actions_are_safe_and_explicit() {
+        assert!(session_can_stop(SessionState::Running));
+        assert!(!session_can_stop(SessionState::Terminated));
+        assert!(session_can_replay(SessionState::FinishedSeen));
+        assert!(session_can_replay(SessionState::Failed));
+        assert!(!session_can_replay(SessionState::Disconnected));
+        assert!(!session_can_replay(SessionState::Terminated));
+    }
+
+    #[test]
+    fn keyboard_selection_wraps_in_both_directions() {
+        let items = [10, 20, 30];
+        assert_eq!(next_selection(&items, Some(30), 1), Some(10));
+        assert_eq!(next_selection(&items, Some(10), -1), Some(30));
+        assert_eq!(next_selection::<u8>(&[], None, 1), None);
     }
 }
