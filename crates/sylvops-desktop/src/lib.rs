@@ -6,12 +6,13 @@ use std::{collections::HashMap, time::Duration};
 
 use bridge::{Bridge, BridgeEvent, Operation};
 use iced::{
-    Background, Border, Center, Element, Fill, Font, Length, Subscription, Theme,
+    Background, Border, Center, Color, Element, Fill, Font, Length, Subscription, Theme,
     alignment::Vertical,
     keyboard,
     keyboard::{Key, key::Named},
+    theme::Palette,
     time,
-    widget::{button, column, container, row, rule, scrollable, space, text},
+    widget::{button, column, container, opaque, row, rule, scrollable, space, stack, text},
 };
 use iced::{font::Weight, widget::button::Status};
 use sylvops_core::{
@@ -145,8 +146,8 @@ impl ThemeChoice {
     fn iced(self) -> Option<Theme> {
         match self {
             Self::System => None,
-            Self::Light => Some(Theme::Light),
-            Self::Dark => Some(Theme::Dark),
+            Self::Light => Some(sylvops_light_theme()),
+            Self::Dark => Some(sylvops_dark_theme()),
             Self::Nord => Some(Theme::Nord),
             Self::TokyoNight => Some(Theme::TokyoNight),
             Self::CatppuccinMocha => Some(Theme::CatppuccinMocha),
@@ -193,7 +194,7 @@ impl DesktopApp {
             error: None,
             snapshot_pending: false,
             settings_open: false,
-            theme_choice: ThemeChoice::System,
+            theme_choice: ThemeChoice::Dark,
         }
     }
 
@@ -279,10 +280,17 @@ impl DesktopApp {
 
     fn view(&self) -> Element<'_, Message> {
         let top = self.top_bar();
-        let body = if self.settings_open {
-            self.settings_view()
+        let mission_control = self.mission_control();
+        let body: Element<'_, Message> = if self.settings_open {
+            let overlay = container(self.settings_view())
+                .width(Fill)
+                .height(Fill)
+                .center_x(Fill)
+                .center_y(Fill)
+                .style(modal_scrim);
+            stack([mission_control, opaque(overlay)]).into()
         } else {
-            self.mission_control()
+            mission_control
         };
         let footer = self.footer();
         let mut content = column![top, rule::horizontal(1), body, rule::horizontal(1), footer]
@@ -346,7 +354,7 @@ impl DesktopApp {
             .height(NAV_HEIGHT)
             .width(Fill)
             .padding([4, 8])
-            .center_y(Fill)
+            .align_y(Vertical::Center)
             .style(chrome_surface)
             .into()
     }
@@ -556,7 +564,7 @@ impl DesktopApp {
                         .style(text::secondary)
                 )
                 .height(26)
-                .center_y(Fill),
+                .align_y(Vertical::Center),
                 scrollable(
                     text(contents)
                         .font(TERMINAL_FONT)
@@ -650,9 +658,13 @@ impl DesktopApp {
         container(
             column![
                 row![
-                text("Settings").font(UI_SEMIBOLD).size(24),
+                    text("Settings").font(UI_SEMIBOLD).size(24),
                     space::horizontal(),
-                    button("Done").on_press(Message::ToggleSettings)
+                    button(text("Done").font(UI_MEDIUM).size(12))
+                        .on_press(Message::ToggleSettings)
+                        .height(28)
+                        .padding([4, 10])
+                        .style(chrome_action_style)
                 ]
                 .align_y(Center),
                 text("Appearance").font(UI_SEMIBOLD).size(16),
@@ -666,9 +678,9 @@ impl DesktopApp {
             ]
             .spacing(16),
         )
-        .padding(24)
-        .width(Fill)
-        .height(Fill)
+        .padding(22)
+        .width(Length::Fixed(640.0))
+        .style(modal_card)
         .into()
     }
 
@@ -910,7 +922,22 @@ impl DesktopApp {
     }
 
     fn handle_keyboard(&mut self, event: keyboard::Event) {
-        if self.settings_open || self.main_tab != MainTab::Terminal {
+        let keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            text,
+            ..
+        } = event
+        else {
+            return;
+        };
+        if self.settings_open {
+            if matches!(key, Key::Named(Named::Escape)) {
+                self.settings_open = false;
+            }
+            return;
+        }
+        if self.main_tab != MainTab::Terminal {
             return;
         }
         let Some(session_id) = self.active_session_id else {
@@ -922,15 +949,6 @@ impl DesktopApp {
         if !terminal.attached {
             return;
         }
-        let keyboard::Event::KeyPressed {
-            key,
-            modifiers,
-            text,
-            ..
-        } = event
-        else {
-            return;
-        };
         if modifiers.control() && matches!(key.as_ref(), Key::Character("]")) {
             self.detach_active();
             return;
@@ -1223,6 +1241,34 @@ fn footer_item(label: &str) -> Element<'static, Message> {
         .into()
 }
 
+fn sylvops_dark_theme() -> Theme {
+    Theme::custom(
+        "SylvOps Dark",
+        Palette {
+            background: Color::from_rgb8(21, 24, 30),
+            text: Color::from_rgb8(224, 226, 231),
+            primary: Color::from_rgb8(108, 142, 239),
+            success: Color::from_rgb8(102, 187, 131),
+            warning: Color::from_rgb8(220, 170, 92),
+            danger: Color::from_rgb8(218, 103, 111),
+        },
+    )
+}
+
+fn sylvops_light_theme() -> Theme {
+    Theme::custom(
+        "SylvOps Light",
+        Palette {
+            background: Color::from_rgb8(247, 248, 250),
+            text: Color::from_rgb8(31, 38, 49),
+            primary: Color::from_rgb8(50, 98, 210),
+            success: Color::from_rgb8(37, 135, 74),
+            warning: Color::from_rgb8(177, 108, 18),
+            danger: Color::from_rgb8(190, 57, 67),
+        },
+    )
+}
+
 fn chrome_surface(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
@@ -1256,6 +1302,26 @@ fn tab_strip_surface(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
         background: Some(Background::Color(palette.background.weakest.color)),
+        ..container::Style::default()
+    }
+}
+
+fn modal_scrim(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba8(8, 10, 14, 0.68))),
+        ..container::Style::default()
+    }
+}
+
+fn modal_card(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.base.color)),
+        border: Border {
+            width: 1.0,
+            radius: 10.0.into(),
+            color: palette.background.strong.color,
+        },
         ..container::Style::default()
     }
 }
