@@ -444,10 +444,35 @@ mod tests {
             .expect("hook headers");
         stream.write_all(body).await.expect("hook body");
         let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("hook response");
+        // A zero-length HTTP response is complete at the header terminator. Waiting for TCP EOF
+        // is not portable because some systems reset a rejected request with an unread body.
+        loop {
+            let mut chunk = [0_u8; 256];
+            match stream.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    response.extend_from_slice(&chunk[..read]);
+                    if find_bytes(&response, b"\r\n\r\n").is_some() {
+                        break;
+                    }
+                    assert!(
+                        response.len() < HEADER_LIMIT,
+                        "hook response header too large"
+                    );
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ConnectionReset
+                        && find_bytes(&response, b"\r\n\r\n").is_some() =>
+                {
+                    break;
+                }
+                Err(error) => panic!("hook response: {error}"),
+            }
+        }
+        assert!(
+            find_bytes(&response, b"\r\n\r\n").is_some(),
+            "hook response header was incomplete"
+        );
         String::from_utf8_lossy(&response).into_owned()
     }
 
