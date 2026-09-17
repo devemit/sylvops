@@ -6,13 +6,14 @@ use std::{collections::HashMap, time::Duration};
 
 use bridge::{Bridge, BridgeEvent, Operation};
 use iced::{
-    Center, Element, Fill, Font, Length, Subscription, Theme,
+    Background, Border, Center, Element, Fill, Font, Length, Subscription, Theme,
     alignment::Vertical,
     keyboard,
     keyboard::{Key, key::Named},
     time,
     widget::{button, column, container, row, rule, scrollable, space, text},
 };
+use iced::{font::Weight, widget::button::Status};
 use sylvops_core::{
     domain::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
@@ -29,6 +30,33 @@ const EVENT_TICK: Duration = Duration::from_millis(16);
 const MAX_EVENTS_PER_TICK: usize = 512;
 const DEFAULT_TERMINAL_COLUMNS: u16 = 100;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
+const NAV_HEIGHT: f32 = 40.0;
+const FOOTER_HEIGHT: f32 = 28.0;
+const SESSION_TAB_HEIGHT: f32 = 36.0;
+const PANEL_HEADER_HEIGHT: f32 = 32.0;
+const UI_TEXT_SIZE: f32 = 13.0;
+const UI_META_SIZE: f32 = 11.0;
+const TERMINAL_TEXT_SIZE: f32 = 13.0;
+#[cfg(windows)]
+const UI_FONT: Font = Font::with_name("Segoe UI");
+#[cfg(target_os = "macos")]
+const UI_FONT: Font = Font::with_name("SF Pro Text");
+#[cfg(all(not(windows), not(target_os = "macos")))]
+const UI_FONT: Font = Font::DEFAULT;
+#[cfg(windows)]
+const TERMINAL_FONT: Font = Font::with_name("Consolas");
+#[cfg(target_os = "macos")]
+const TERMINAL_FONT: Font = Font::with_name("Menlo");
+#[cfg(all(not(windows), not(target_os = "macos")))]
+const TERMINAL_FONT: Font = Font::MONOSPACE;
+const UI_MEDIUM: Font = Font {
+    weight: Weight::Medium,
+    ..UI_FONT
+};
+const UI_SEMIBOLD: Font = Font {
+    weight: Weight::Semibold,
+    ..UI_FONT
+};
 
 /// Opens the native `SylvOps` desktop client.
 ///
@@ -44,7 +72,9 @@ pub fn run(paths: RuntimePaths) -> iced::Result {
     .title("SylvOps")
     .theme(DesktopApp::theme)
     .subscription(subscription)
-    .window_size((1_280.0, 800.0))
+    .default_font(UI_FONT)
+    .antialiasing(true)
+    .window_size((1_440.0, 900.0))
     .run()
 }
 
@@ -275,26 +305,49 @@ impl DesktopApp {
     }
 
     fn top_bar(&self) -> Element<'_, Message> {
-        let mut workspaces = row![text("✦ SylvOps").size(20)].spacing(8).align_y(Center);
+        let brand = container(
+            row![
+                text("✦").size(16).style(text::primary),
+                text("SylvOps").font(UI_SEMIBOLD).size(15)
+            ]
+            .spacing(7)
+            .align_y(Center),
+        )
+        .width(Length::Fixed(170.0))
+        .padding([0, 8]);
+        let mut workspaces = row![brand].spacing(4).align_y(Center);
         for workspace in &self.snapshot.workspaces {
-            let label = if workspace.is_open {
-                format!("● {}", workspace.name)
-            } else {
-                workspace.name.clone()
-            };
-            let action =
-                button(text(label).size(14)).on_press(Message::SelectWorkspace(workspace.id));
+            let label = workspace.name.clone();
+            let active = workspace.is_open;
+            let action = button(text(label).font(UI_MEDIUM).size(UI_TEXT_SIZE))
+                .on_press(Message::SelectWorkspace(workspace.id))
+                .height(32)
+                .padding([6, 12])
+                .style(move |theme, status| workspace_tab_style(theme, status, active));
             workspaces = workspaces.push(action);
         }
         workspaces = workspaces
             .push(space::horizontal())
-            .push(button("Refresh").on_press(Message::Refresh))
-            .push(button("Settings").on_press(Message::ToggleSettings));
+            .push(
+                button(text("↻").size(17))
+                    .on_press(Message::Refresh)
+                    .height(28)
+                    .padding([3, 9])
+                    .style(chrome_action_style),
+            )
+            .push(
+                button(text("Settings").font(UI_MEDIUM).size(12))
+                    .on_press(Message::ToggleSettings)
+                    .height(28)
+                    .padding([5, 10])
+                    .style(chrome_action_style),
+            );
         container(workspaces)
-            .height(52)
+            .height(NAV_HEIGHT)
             .width(Fill)
-            .padding([8, 12])
+            .padding([4, 8])
             .center_y(Fill)
+            .style(chrome_surface)
             .into()
     }
 
@@ -325,7 +378,7 @@ impl DesktopApp {
         if self.visible_projects().is_empty() {
             items = items.push(empty_hint("No repositories in this workspace."));
         }
-        panel(scrollable(items), 180.0)
+        panel(scrollable(items), 190.0)
     }
 
     fn worktrees_column(&self) -> Element<'_, Message> {
@@ -348,7 +401,7 @@ impl DesktopApp {
         if self.selected_project_id.is_none() {
             items = items.push(empty_hint("Select a project."));
         }
-        panel(scrollable(items), 220.0)
+        panel(scrollable(items), 225.0)
     }
 
     fn sessions_column(&self) -> Element<'_, Message> {
@@ -372,20 +425,26 @@ impl DesktopApp {
         if self.selected_worktree_id.is_none() {
             items = items.push(empty_hint("Select a worktree."));
         }
-        panel(scrollable(items), 250.0)
+        panel(scrollable(items), 255.0)
     }
 
     fn workspace_view(&self) -> Element<'_, Message> {
         let tabs = self.session_tabs();
-        let views = row![
-            tab_button("Terminal", MainTab::Terminal, self.main_tab),
-            tab_button("Changes", MainTab::Changes, self.main_tab),
-            tab_button("Details", MainTab::Details, self.main_tab),
-            space::horizontal(),
-            self.session_actions(),
-        ]
-        .spacing(6)
-        .align_y(Center);
+        let views = container(
+            row![
+                tab_button("Terminal", MainTab::Terminal, self.main_tab),
+                tab_button("Changes", MainTab::Changes, self.main_tab),
+                tab_button("Details", MainTab::Details, self.main_tab),
+                space::horizontal(),
+                self.session_actions(),
+            ]
+            .spacing(4)
+            .align_y(Center),
+        )
+        .height(38)
+        .padding([4, 8])
+        .width(Fill)
+        .style(tab_strip_surface);
         let content = match self.main_tab {
             MainTab::Terminal => self.terminal_view(),
             MainTab::Changes => self.changes_view(),
@@ -410,18 +469,24 @@ impl DesktopApp {
                 let label = format!("{} {}", status_symbol(session.state), session.display_name);
                 tabs = tabs
                     .push(
-                        button(text(label).size(13))
+                        button(text(label).font(UI_MEDIUM).size(UI_TEXT_SIZE))
                             .on_press(Message::SelectOpenSession(session.id))
-                            .style(if self.active_session_id == Some(session.id) {
-                                button::primary
-                            } else {
-                                button::secondary
+                            .height(28)
+                            .padding([4, 10])
+                            .style(move |theme, status| {
+                                session_tab_style(
+                                    theme,
+                                    status,
+                                    self.active_session_id == Some(session.id),
+                                )
                             }),
                     )
                     .push(
                         button("×")
                             .on_press(Message::CloseSessionTab(session.id))
-                            .style(button::text),
+                            .height(26)
+                            .padding([2, 7])
+                            .style(chrome_action_style),
                     );
             }
         }
@@ -429,9 +494,10 @@ impl DesktopApp {
             tabs = tabs.push(text("Select a session to open it").style(text::secondary));
         }
         container(tabs)
-            .height(44)
-            .padding([6, 10])
+            .height(SESSION_TAB_HEIGHT)
+            .padding([3, 8])
             .width(Fill)
+            .style(tab_strip_surface)
             .into()
     }
 
@@ -445,15 +511,31 @@ impl DesktopApp {
             .is_some_and(|terminal| terminal.attached);
         let mut actions = row![].spacing(6);
         if attached {
-            actions = actions.push(button("Detach").on_press(Message::Detach));
+            actions = actions.push(
+                button(text("Detach").font(UI_MEDIUM).size(12))
+                    .on_press(Message::Detach)
+                    .height(28)
+                    .padding([4, 10])
+                    .style(chrome_action_style),
+            );
         } else {
             actions = actions.push(
-                button("Attach")
+                button(text("Attach").font(UI_MEDIUM).size(12))
                     .on_press(Message::Attach)
+                    .height(28)
+                    .padding([4, 10])
                     .style(button::primary),
             );
         }
-        actions.push(button("Stop").on_press(Message::Stop)).into()
+        actions
+            .push(
+                button(text("Stop").font(UI_MEDIUM).size(12))
+                    .on_press(Message::Stop)
+                    .height(28)
+                    .padding([4, 10])
+                    .style(button::danger),
+            )
+            .into()
     }
 
     fn terminal_view(&self) -> Element<'_, Message> {
@@ -463,18 +545,32 @@ impl DesktopApp {
         let Some(terminal) = self.terminals.get(&session_id) else {
             return centered_message("Session selected. Click Attach to load its terminal.");
         };
-        let role = format!("{} · Ctrl+] detaches", terminal.role);
+        let role = format!("{}  ·  Ctrl+] detaches", terminal.role);
         let contents = terminal.parser.screen().contents();
         container(
             column![
-                text(role).size(12).style(text::secondary),
-                scrollable(text(contents).font(Font::MONOSPACE).size(14).width(Fill)).height(Fill),
+                container(
+                    text(role)
+                        .font(UI_MEDIUM)
+                        .size(UI_META_SIZE)
+                        .style(text::secondary)
+                )
+                .height(26)
+                .center_y(Fill),
+                scrollable(
+                    text(contents)
+                        .font(TERMINAL_FONT)
+                        .size(TERMINAL_TEXT_SIZE)
+                        .width(Fill)
+                )
+                .height(Fill),
             ]
-            .spacing(8),
+            .spacing(4),
         )
-        .padding(14)
+        .padding([8, 12])
         .width(Fill)
         .height(Fill)
+        .style(workspace_surface)
         .into()
     }
 
@@ -482,11 +578,14 @@ impl DesktopApp {
         let body = self.diff.as_deref().unwrap_or(
             "Select a worktree and open Changes. The daemon will load a bounded, read-only diff.",
         );
-        container(scrollable(text(body).font(Font::MONOSPACE).size(13)))
-            .padding(14)
-            .width(Fill)
-            .height(Fill)
-            .into()
+        container(scrollable(
+            text(body).font(TERMINAL_FONT).size(TERMINAL_TEXT_SIZE),
+        ))
+        .padding(14)
+        .width(Fill)
+        .height(Fill)
+        .style(workspace_surface)
+        .into()
     }
 
     fn details_view(&self) -> Element<'_, Message> {
@@ -531,6 +630,7 @@ impl DesktopApp {
         .padding(20)
         .width(Fill)
         .height(Fill)
+        .style(workspace_surface)
         .into()
     }
 
@@ -550,17 +650,17 @@ impl DesktopApp {
         container(
             column![
                 row![
-                    text("Settings").size(28),
+                text("Settings").font(UI_SEMIBOLD).size(24),
                     space::horizontal(),
                     button("Done").on_press(Message::ToggleSettings)
                 ]
                 .align_y(Center),
-                text("Appearance").size(18),
-                text("Theme changes apply immediately. Persistence and terminal typography follow in the settings milestone.")
+                text("Appearance").font(UI_SEMIBOLD).size(16),
+                text("Theme changes apply immediately. SylvOps uses the platform UI font and native monospace terminal font.")
                     .style(text::secondary),
                 themes,
                 rule::horizontal(1),
-                text("Safety").size(18),
+                text("Safety").font(UI_SEMIBOLD).size(16),
                 text("The desktop remains an IPC client. The daemon still owns PTYs, Git mutations, process cleanup, and audit events.")
                     .style(text::secondary),
             ]
@@ -587,20 +687,23 @@ impl DesktopApp {
         };
         container(
             row![
-                text(format!("SylvOps v{}", env!("CARGO_PKG_VERSION"))),
-                text(workspace).style(text::secondary),
-                text(branch).style(text::secondary),
-                text(format!("{:?}", self.main_tab)).style(text::secondary),
+                text(format!("SylvOps {}", env!("CARGO_PKG_VERSION")))
+                    .font(UI_MEDIUM)
+                    .size(UI_META_SIZE),
+                footer_item(workspace),
+                footer_item(branch),
+                footer_item(&format!("{:?}", self.main_tab)),
                 space::horizontal(),
-                text(connection).style(text::secondary),
-                text("Ctrl+K Commands · Ctrl+] Detach").style(text::secondary),
+                footer_item(connection),
+                footer_item("Ctrl+K Commands  ·  Ctrl+] Detach"),
             ]
-            .spacing(14)
+            .spacing(12)
             .align_y(Center),
         )
-        .height(36)
-        .padding([6, 12])
+        .height(FOOTER_HEIGHT)
+        .padding([3, 10])
         .width(Fill)
+        .style(chrome_surface)
         .into()
     }
 
@@ -1043,43 +1146,58 @@ fn panel<'a>(content: impl Into<Element<'a, Message>>, width: f32) -> Element<'a
     container(content)
         .width(Length::Fixed(width))
         .height(Fill)
-        .padding(6)
+        .padding([4, 5])
+        .style(panel_surface)
         .into()
 }
 
 fn column_heading(label: &str, action: Option<Message>) -> Element<'_, Message> {
-    let mut heading = row![text(label).size(12), space::horizontal()].align_y(Center);
+    let mut heading = row![
+        text(label)
+            .font(UI_SEMIBOLD)
+            .size(UI_META_SIZE)
+            .style(text::secondary),
+        space::horizontal()
+    ]
+    .align_y(Center);
     if let Some(action) = action {
-        heading = heading.push(button("+").on_press(action).style(button::text));
+        heading = heading.push(
+            button(text("+").font(UI_MEDIUM).size(15))
+                .on_press(action)
+                .height(24)
+                .padding([1, 7])
+                .style(chrome_action_style),
+        );
     }
     container(heading)
-        .height(38)
-        .padding([6, 8])
+        .height(PANEL_HEADER_HEIGHT)
+        .padding([4, 7])
         .width(Fill)
         .into()
 }
 
 fn select_button(label: &str, selected: bool, message: Message) -> Element<'static, Message> {
-    button(text(label.to_owned()).size(13).width(Fill))
-        .on_press(message)
-        .style(if selected {
-            button::primary
-        } else {
-            button::text
-        })
-        .width(Fill)
-        .padding([7, 8])
-        .into()
+    button(
+        text(label.to_owned())
+            .font(if selected { UI_MEDIUM } else { UI_FONT })
+            .size(UI_TEXT_SIZE)
+            .width(Fill),
+    )
+    .on_press(message)
+    .style(move |theme, status| list_item_style(theme, status, selected))
+    .width(Fill)
+    .height(32)
+    .padding([6, 8])
+    .into()
 }
 
 fn tab_button(label: &str, tab: MainTab, active: MainTab) -> Element<'_, Message> {
-    button(label)
+    let selected = tab == active;
+    button(text(label).font(UI_MEDIUM).size(UI_TEXT_SIZE))
         .on_press(Message::SelectMainTab(tab))
-        .style(if tab == active {
-            button::primary
-        } else {
-            button::text
-        })
+        .height(30)
+        .padding([5, 10])
+        .style(move |theme, status| content_tab_style(theme, status, selected))
         .into()
 }
 
@@ -1092,10 +1210,178 @@ fn centered_message(message: &str) -> Element<'_, Message> {
 }
 
 fn empty_hint(message: &str) -> Element<'_, Message> {
-    container(text(message).size(12).style(text::secondary))
+    container(text(message).size(UI_META_SIZE).style(text::secondary))
         .padding(8)
         .width(Fill)
         .into()
+}
+
+fn footer_item(label: &str) -> Element<'static, Message> {
+    text(label.to_owned())
+        .size(UI_META_SIZE)
+        .style(text::secondary)
+        .into()
+}
+
+fn chrome_surface(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.weakest.color)),
+        border: Border {
+            width: 1.0,
+            color: palette.background.weak.color,
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+fn panel_surface(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.weakest.color)),
+        ..container::Style::default()
+    }
+}
+
+fn workspace_surface(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.base.color)),
+        ..container::Style::default()
+    }
+}
+
+fn tab_strip_surface(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.weakest.color)),
+        ..container::Style::default()
+    }
+}
+
+fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let background = match status {
+        Status::Hovered => Some(palette.background.weak.color),
+        Status::Pressed => Some(palette.background.neutral.color),
+        Status::Active | Status::Disabled => None,
+    };
+    button::Style {
+        background: background.map(Background::Color),
+        text_color: palette
+            .background
+            .base
+            .text
+            .scale_alpha(if status == Status::Disabled {
+                0.45
+            } else {
+                1.0
+            }),
+        border: Border {
+            radius: 6.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::Style {
+    let palette = theme.extended_palette();
+    let pair = if active {
+        palette.background.base
+    } else if status == Status::Hovered {
+        palette.background.weak
+    } else {
+        palette.background.weakest
+    };
+    button::Style {
+        background: Some(Background::Color(pair.color)),
+        text_color: pair.text.scale_alpha(if status == Status::Disabled {
+            0.45
+        } else {
+            1.0
+        }),
+        border: Border {
+            radius: 7.0.into(),
+            color: if active {
+                palette.background.weak.color
+            } else {
+                pair.color
+            },
+            width: if active { 1.0 } else { 0.0 },
+        },
+        ..button::Style::default()
+    }
+}
+
+fn list_item_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
+    let palette = theme.extended_palette();
+    let pair = if selected {
+        palette.primary.weak
+    } else if status == Status::Hovered {
+        palette.background.weak
+    } else {
+        palette.background.weakest
+    };
+    button::Style {
+        background: Some(Background::Color(pair.color)),
+        text_color: pair.text.scale_alpha(if status == Status::Disabled {
+            0.45
+        } else {
+            1.0
+        }),
+        border: Border {
+            radius: 5.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+fn content_tab_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
+    let palette = theme.extended_palette();
+    let pair = if selected {
+        palette.primary.weak
+    } else if status == Status::Hovered {
+        palette.background.weak
+    } else {
+        palette.background.base
+    };
+    button::Style {
+        background: Some(Background::Color(pair.color)),
+        text_color: pair.text,
+        border: Border {
+            radius: 5.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+fn session_tab_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
+    let palette = theme.extended_palette();
+    let pair = if selected {
+        palette.background.base
+    } else if status == Status::Hovered {
+        palette.background.weak
+    } else {
+        palette.background.weakest
+    };
+    button::Style {
+        background: Some(Background::Color(pair.color)),
+        text_color: pair.text,
+        border: Border {
+            radius: 5.0.into(),
+            color: if selected {
+                palette.background.weak.color
+            } else {
+                pair.color
+            },
+            width: if selected { 1.0 } else { 0.0 },
+        },
+        ..button::Style::default()
+    }
 }
 
 fn detail(label: &str, value: String) -> Element<'_, Message> {
