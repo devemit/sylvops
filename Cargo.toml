@@ -3,6 +3,7 @@ members = [
     "crates/sylvops-core",
     "crates/sylvops-daemon",
     "crates/sylvops-tui",
+    "crates/sylvops-desktop",
     "crates/sylvops-cli",
     "crates/sylvops-test-support",
 ]
@@ -19,6 +20,8 @@ repository = "https://github.com/devemit/sylvops"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
+crossbeam-channel = "0.5"
+iced = { version = "0.14", features = ["advanced", "tokio"] }
 ratatui = "0.28"
 portable-pty = "0.9"
 rmp-serde = "1.3"

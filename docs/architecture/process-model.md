@@ -2,20 +2,20 @@
 
 ## Roles
 
-The `sylvops` executable has two long-running roles:
+The `sylvops` executable has one authoritative service role and two replaceable client roles:
 
 - `sylvops daemon run` owns SQLite, PTYs, child processes, Git mutations, hooks, and IPC subscriptions.
+- `sylvops desktop` is the internal native-window entry point. Users launch it through `sylvops` or `sylvops up [PATH]`; it owns presentation and input routing only.
 - `sylvops tui` connects to that daemon and owns only presentation and input routing.
 
 Non-interactive CLI commands are short-lived daemon clients. Closing any client must leave the daemon and sessions running.
 
 ```text
-TUI clients ─┐
-CLI clients ─┼─ local IPC ─► daemon ─┬─ database actor
-             │                       ├─ Git coordinators
-             │                       ├─ session actors ─► PTYs/process trees
-             │                       └─ loopback hook receiver
-             └──────────────────────────────────────────────
+Desktop clients ─┐
+TUI clients ─────┼─ local IPC ─► daemon ─┬─ database actor
+CLI clients ─────┘                       ├─ Git coordinators
+                                        ├─ session actors ─► PTYs/process trees
+                                        └─ loopback hook receiver
 ```
 
 ## Concurrency

@@ -1,0 +1,18 @@
+[package]
+name = "sylvops-desktop"
+description = "Native desktop mission-control client for SylvOps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+iced.workspace = true
+sylvops-core = { path = "../sylvops-core" }
+sylvops-daemon = { path = "../sylvops-daemon" }
+tokio.workspace = true
+vt100.workspace = true
+
+[lints]
+workspace = true

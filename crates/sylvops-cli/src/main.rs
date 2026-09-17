@@ -38,6 +38,11 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start or reconnect to `SylvOps` and open the native desktop app.
+    Up {
+        /// Optionally register and select this Git repository before opening.
+        path: Option<PathBuf>,
+    },
     /// Manage the authoritative background daemon.
     Daemon {
         #[command(subcommand)]
@@ -91,6 +96,9 @@ enum Command {
     },
     /// Run redacted installation, daemon, Git, provider, and PTY checks.
     Doctor,
+    /// Internal native desktop process entry point.
+    #[command(hide = true)]
+    Desktop,
     #[command(hide = true)]
     Hook {
         #[command(subcommand)]
@@ -195,18 +203,51 @@ enum DaemonCommand {
     Stop,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
 
-    let Arguments { state_dir, command } = Arguments::parse();
-    let paths = RuntimePaths::discover(state_dir.as_deref())?;
-    let command = command.unwrap_or(Command::Tui);
+    let arguments = Arguments::parse();
+    let paths = RuntimePaths::discover(arguments.state_dir.as_deref())?;
+    if matches!(arguments.command, Some(Command::Desktop)) {
+        sylvops_desktop::run(paths)?;
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_command(arguments, paths))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_command(
+    arguments: Arguments,
+    paths: RuntimePaths,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Arguments { state_dir, command } = arguments;
+    let command = command.unwrap_or(Command::Up { path: None });
 
     match command {
+        Command::Up { path } => {
+            if let Some(path) = path {
+                open_repository(
+                    &paths,
+                    state_dir.as_deref(),
+                    path,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            } else {
+                start_daemon(&paths, state_dir.as_deref()).await?;
+                launch_desktop(&paths, state_dir.as_deref())?;
+            }
+        }
         Command::Daemon { command } => match command {
             DaemonCommand::Start => start_daemon(&paths, state_dir.as_deref()).await?,
             DaemonCommand::Run => sylvops_daemon::daemon::run(paths).await?,
@@ -285,6 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Command::Doctor => doctor(&paths).await?,
+        Command::Desktop => unreachable!("desktop mode is handled before starting Tokio"),
         Command::Hook {
             command: HookCommand::Emit,
         } => sylvops_daemon::hook::emit_from_environment()?,
@@ -799,7 +841,32 @@ async fn open_repository(
         }
     }
     drop(client);
-    run_tui(paths, state_dir).await
+    launch_desktop(paths, state_dir)
+}
+
+fn launch_desktop(paths: &RuntimePaths, state_dir: Option<&Path>) -> sylvops_daemon::Result<()> {
+    let executable = std::env::current_exe().map_err(|error| {
+        DaemonError::Lifecycle(format!("failed to resolve current executable: {error}"))
+    })?;
+    let desktop_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.data_directory.join("desktop.log"))
+        .map_err(|error| DaemonError::Lifecycle(format!("failed to open desktop log: {error}")))?;
+    let mut command = ProcessCommand::new(executable);
+    if let Some(root) = state_dir {
+        command.arg("--state-dir").arg(root);
+    }
+    command
+        .arg("desktop")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(desktop_log));
+    configure_detached_process(&mut command);
+    command.spawn().map_err(|error| {
+        DaemonError::Lifecycle(format!("failed to launch native desktop app: {error}"))
+    })?;
+    Ok(())
 }
 
 async fn doctor(paths: &RuntimePaths) -> sylvops_daemon::Result<()> {

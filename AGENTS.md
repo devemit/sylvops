@@ -4,8 +4,9 @@
 
 - `sylvops-core`: domain types, validated IDs/paths, configuration, provider contracts, status state machine, and the versioned IPC protocol.
 - `sylvops-daemon`: authoritative state, SQLite, local IPC server, PTY/process ownership, scrollback, Git operations, provider adapters, hooks, recovery, and audit events.
+- `sylvops-desktop`: replaceable Iced client. It owns native rendering and input routing only; all stateful actions go through bounded authenticated IPC.
 - `sylvops-tui`: replaceable Ratatui/Crossterm client. It renders daemon state and never owns agent processes or mutates Git directly.
-- `sylvops-cli`: the `sylvops` executable, daemon lifecycle, TUI entry point, and non-interactive commands.
+- `sylvops-cli`: the `sylvops` executable, daemon lifecycle, desktop/TUI entry points, and non-interactive commands.
 - `sylvops-test-support`: temporary repositories, fake executables, PTY/IPC fixtures, bounded waits, and cleanup helpers.
 
 ## Trust boundaries
@@ -42,6 +43,6 @@ Process-tree and local-transport behavior is platform-specific; changes there re
 
 ## Feature status
 
-Cross-platform beta implementation candidate: protocol 1.6, authenticated local IPC, SQLite state, repository/worktree lifecycle and reconciliation, daemon-owned plain-shell and Codex PTYs, provider probing, bounded scrollback and VT snapshots, authenticated observational Codex hooks, deterministic attention states, resume, read-only bounded diff, hierarchical explorer plus Terminal/Changes/Details workspace, guided management forms, mouse controls, restored navigation context, embedded terminal attachment, `sylvops open`, `doctor`, and portable release workflows. Worktree removal is non-forced, refuses tracked/untracked/ignored content, and preserves branches.
+Cross-platform beta implementation candidate: protocol 1.6, authenticated local IPC, SQLite state, repository/worktree lifecycle and reconciliation, daemon-owned plain-shell and Codex PTYs, provider probing, bounded scrollback and VT snapshots, authenticated observational Codex hooks, deterministic attention states, resume, read-only bounded diff, hierarchical TUI plus a native desktop mission-control shell, mouse controls, restored TUI navigation context, embedded terminal attachment, `sylvops up`, `sylvops open`, `doctor`, and portable release workflows. Worktree removal is non-forced, refuses tracked/untracked/ignored content, and preserves branches. The desktop client currently covers browsing, shell creation, attachment, input, stop, diff, details, and live theme selection; full desktop entity forms and persisted desktop preferences remain in progress.
 
 Windows uses an application-owned ConPTY launch with pseudoconsole and Job Object attributes applied atomically by `CreateProcessW`; Unix retains `portable-pty` plus process groups. The prior beta baseline passed Windows/Linux/macOS; UX changes must pass the same hosted matrix before release. Planned after beta: explicit external-worktree import, Claude, GitHub, commit/push/PR actions, history/file-finder/Git-grep tools, notifications, remote execution, and signed/native installers. UI controls and documentation must not claim planned behavior is available.
