@@ -464,6 +464,18 @@ async fn handle_request(
             )
             .await
         }
+        ClientRequest::GetTuiState => {
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::TuiState(state.database.tui_state().await?),
+            )
+            .await
+        }
+        ClientRequest::SaveTuiState { state: tui_state } => {
+            state.database.save_tui_state(tui_state).await?;
+            send_response_queue(outgoing, request_id, &DaemonResponse::TuiStateSaved).await
+        }
         ClientRequest::ListProviders => {
             let health = state.providers.probe_all().await;
             for item in &health {
