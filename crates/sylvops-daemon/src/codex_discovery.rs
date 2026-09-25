@@ -61,7 +61,10 @@ impl DiscoveryRoots {
             })
             .unwrap_or_default();
         let mut direct_candidates = Vec::new();
+        #[cfg(windows)]
         let mut desktop_cache_roots = Vec::new();
+        #[cfg(not(windows))]
+        let desktop_cache_roots = Vec::new();
 
         if let Some(home) = platform_home() {
             let standalone = home
