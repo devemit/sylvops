@@ -12,7 +12,10 @@ use std::{
 
 use subtle::ConstantTimeEq;
 use sylvops_core::{
-    domain::{DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, WorktreeStatus},
+    domain::{
+        DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, WorktreeStatus,
+        state_allows_resume,
+    },
     ids::{ProjectId, ProviderProfileId, SessionId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, Frame, HelloRequest, MessageClass,
@@ -909,13 +912,7 @@ async fn handle_request(
             let external_session_id = source.external_session_id.clone().ok_or_else(|| {
                 DaemonError::Provider("session has no verified provider resume identifier".into())
             })?;
-            if !matches!(
-                source.state,
-                SessionState::FinishedSeen
-                    | SessionState::FinishedUnseen
-                    | SessionState::Failed
-                    | SessionState::Disconnected
-            ) {
+            if !state_allows_resume(source.state) {
                 return Err(DaemonError::Provider(
                     "only inactive sessions may be resumed".into(),
                 ));

@@ -1,6 +1,6 @@
 # Codex provider
 
-The daemon-side adapter resolves a canonical native `codex` executable from `PATH`, runs bounded `codex --version` and `codex login status` probes, and launches the interactive CLI using an executable plus argument vector. Optional prompt, model, effort, working directory, profile, and resume ID are separate arguments; no user text is interpolated into a shell command.
+The daemon-side adapter resolves a canonical native `codex` executable from an explicit absolute override, `PATH`, official npm or standalone layouts, or supported desktop-app locations. Candidate searches are bounded and validate the platform's native file signature before and after canonicalization. Package-manager `.cmd`, PowerShell, JavaScript, and shell shims are never parsed or executed. The adapter then runs bounded `codex --version` and `codex login status` probes and launches the interactive CLI using an executable plus argument vector. Optional prompt, model, effort, working directory, profile, and resume ID are separate arguments; no user text is interpolated into a shell command.
 
 The environment starts from a platform allowlist, retains `CODEX_HOME` so an existing login remains usable, injects only SylvOps session/worktree/hook identifiers, and excludes GitHub and provider API-key variables. SylvOps never initiates login, copies credentials, persists auth state, or logs environment values.
 

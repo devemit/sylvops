@@ -29,7 +29,7 @@ use iced::{font::Weight, widget::button::Status};
 use sylvops_core::{
     domain::{
         AttachmentRole, DaemonSnapshot, Project, Session, SessionState, Workspace, Worktree,
-        WorktreeStatus,
+        WorktreeStatus, state_allows_resume,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
@@ -995,21 +995,37 @@ impl DesktopApp {
                 .push(text(&session.display_name).font(UI_SEMIBOLD).size(18))
                 .push(detail("Provider", session.provider_kind.to_string()))
                 .push(detail("State", session.state.to_string()))
+                .push(detail("Working directory", session.cwd.clone()))
+                .push(detail(
+                    "Started (Unix ms)",
+                    optional_number(session.started_at, "Not started"),
+                ))
+                .push(detail(
+                    "Ended (Unix ms)",
+                    optional_number(session.ended_at, "Not ended"),
+                ))
+                .push(detail(
+                    "Exit code",
+                    optional_number(session.exit_code, "Not recorded"),
+                ))
+                .push(detail(
+                    "Failure / recovery reason",
+                    session
+                        .failure_reason
+                        .clone()
+                        .unwrap_or_else(|| "None".into()),
+                ))
+                .push(detail(
+                    "Terminal output",
+                    "Memory-only; unavailable after a daemon restart".into(),
+                ))
                 .push(detail(
                     "Controller",
                     self.terminals
                         .get(&session.id)
                         .map_or_else(|| "Detached".into(), |terminal| terminal.role.to_string()),
                 ))
-                .push(detail(
-                    "Resume",
-                    if session.external_session_id.is_some() {
-                        "Available"
-                    } else {
-                        "Unavailable"
-                    }
-                    .into(),
-                ));
+                .push(detail("Resume", session_resume_label(session).into()));
         }
         let mut actions = row![].spacing(8);
         if self.selected_project_id.is_some() {
@@ -2515,6 +2531,18 @@ fn next_selection<T: Copy + PartialEq>(
         (current + 1) % items.len()
     };
     items.get(next).copied()
+}
+
+fn optional_number<T: ToString>(value: Option<T>, fallback: &str) -> String {
+    value.map_or_else(|| fallback.to_owned(), |value| value.to_string())
+}
+
+const fn session_resume_label(session: &Session) -> &'static str {
+    if session.external_session_id.is_some() && state_allows_resume(session.state) {
+        "Available from the CLI"
+    } else {
+        "Unavailable"
+    }
 }
 
 const fn fullscreen_label(mode: window::Mode, compact: bool) -> &'static str {

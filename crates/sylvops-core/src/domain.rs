@@ -200,3 +200,46 @@ pub const fn attention_priority(state: SessionState) -> u8 {
         _ => 4,
     }
 }
+
+/// Whether a terminal session state is eligible for provider-level resume.
+///
+/// A verified external session identifier is still required by the daemon.
+#[must_use]
+pub const fn state_allows_resume(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::FinishedSeen
+            | SessionState::FinishedUnseen
+            | SessionState::Failed
+            | SessionState::Disconnected
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionState, state_allows_resume};
+
+    #[test]
+    fn only_inactive_provider_states_allow_resume() {
+        for state in [
+            SessionState::FinishedSeen,
+            SessionState::FinishedUnseen,
+            SessionState::Failed,
+            SessionState::Disconnected,
+        ] {
+            assert!(state_allows_resume(state), "{state} should allow resume");
+        }
+        for state in [
+            SessionState::Fresh,
+            SessionState::Starting,
+            SessionState::Running,
+            SessionState::NeedsFeedback,
+            SessionState::Terminated,
+        ] {
+            assert!(
+                !state_allows_resume(state),
+                "{state} should not allow resume"
+            );
+        }
+    }
+}

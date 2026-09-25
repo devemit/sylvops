@@ -21,7 +21,7 @@ use sylvops_core::{
 };
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
-use crate::{DaemonError, Result};
+use crate::{DaemonError, Result, codex_discovery::discover_codex_executable};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
@@ -242,7 +242,7 @@ struct CodexAdapter {
 
 impl CodexAdapter {
     fn discover() -> Self {
-        match resolve_path_executable("codex") {
+        match discover_codex_executable() {
             Ok(path) => Self {
                 executable: Some(path),
                 discovery_error: None,
@@ -545,52 +545,6 @@ async fn read_probe_output<R: tokio::io::AsyncRead + Unpin>(
         return Err("probe output exceeded 64 KiB".into());
     }
     Ok(bytes)
-}
-
-fn resolve_path_executable(name: &str) -> sylvops_core::Result<PathBuf> {
-    let path = std::env::var_os("PATH").ok_or_else(|| provider_error("PATH is unavailable"))?;
-    #[cfg(windows)]
-    let extensions = ["exe", "com"];
-    #[cfg(unix)]
-    let extensions = [""];
-    for directory in std::env::split_paths(&path) {
-        for extension in extensions {
-            let candidate = if extension.is_empty() {
-                directory.join(name)
-            } else {
-                directory.join(format!("{name}.{extension}"))
-            };
-            if executable_candidate(&candidate) {
-                let canonical = std::fs::canonicalize(candidate).map_err(|error| {
-                    provider_error(format!("cannot canonicalize provider executable: {error}"))
-                })?;
-                if executable_candidate(&canonical) {
-                    return Ok(canonical);
-                }
-            }
-        }
-    }
-    Err(provider_error(format!(
-        "{name} was not found as a native executable on PATH"
-    )))
-}
-
-fn executable_candidate(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(windows)]
-    {
-        true
-    }
 }
 
 fn safe_environment(

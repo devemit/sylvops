@@ -2,6 +2,7 @@
 
 mod atomic_file;
 pub mod client;
+mod codex_discovery;
 pub mod config_store;
 pub mod daemon;
 pub mod database;
