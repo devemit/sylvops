@@ -12,6 +12,10 @@ pub(crate) fn resolve(choice: DesktopTheme, system: iced::theme::Mode) -> Theme 
         DesktopTheme::Nord => Theme::Nord,
         DesktopTheme::TokyoNight => Theme::TokyoNight,
         DesktopTheme::Catppuccin => Theme::CatppuccinMocha,
+        DesktopTheme::Dracula => Theme::Dracula,
+        DesktopTheme::GruvboxDark => Theme::GruvboxDark,
+        DesktopTheme::SolarizedLight => Theme::SolarizedLight,
+        DesktopTheme::SolarizedDark => Theme::SolarizedDark,
     }
 }
 
@@ -23,6 +27,10 @@ pub(crate) const fn label(theme: DesktopTheme) -> &'static str {
         DesktopTheme::Nord => "Nord",
         DesktopTheme::TokyoNight => "Tokyo Night",
         DesktopTheme::Catppuccin => "Catppuccin",
+        DesktopTheme::Dracula => "Dracula",
+        DesktopTheme::GruvboxDark => "Gruvbox Dark",
+        DesktopTheme::SolarizedLight => "Solarized Light",
+        DesktopTheme::SolarizedDark => "Solarized Dark",
     }
 }
 

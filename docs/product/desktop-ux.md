@@ -21,14 +21,16 @@ First-run guidance names both the user-facing and domain terms where that distin
 
 - Workspace and session tabs scroll horizontally instead of pushing fixed actions outside the window.
 - Workspace tabs retain creation order when the active workspace changes; a newly created workspace is appended instead of moving the active tab to the left.
-- Workspace tabs are opaque, full-height segments separated by vertical rules. The active segment uses a persistent contrast-safe accent; inactive segments and flat controls use restrained neutral hover and pressed fills.
+- Workspace tabs are full-height segments separated by vertical rules. Selected tabs and rows use a restrained theme tint, a contrast-safe accent outline, and stronger type instead of saturated text backgrounds; inactive controls remain transparent until hover or press.
 - A session label and its close action are one visual group.
 - Session navigator rows use `Name · State`; open-session tabs show only the name and never prepend a status glyph.
-- Double-clicking a session row or pressing `R` focuses its inline rename editor. Enter saves through the daemon, and Escape cancels before submission. Validation and IPC errors preserve the entered value.
-- Navigator interaction clears terminal keyboard focus without detaching the session. Long single-line navigation labels stay inside their controls and expose the complete value in a tooltip.
+- Double-clicking a session row or pressing `R` focuses its inline rename editor. Enter saves through the daemon; Escape or clicking away cancels before submission. The editor has no redundant Save or Cancel buttons. Validation and IPC errors preserve the entered value.
+- Navigator interaction clears terminal keyboard focus without detaching the session. Long single-line navigation labels stay clipped inside their controls. SylvOps does not show hover tooltips; important meaning must be visible in the interface or available through the shortcuts panel.
 - An active managed checkout exposes `Delete` on its selected row. The existing state-bound confirmation still refuses root, external, dirty, missing, invalid, or live-session removal and preserves the Git branch.
 - Desktop copy says `Open terminal` and `Leave terminal`; the protocol continues to model the operation as explicit attachment and detachment.
+- `Open terminal` / `Leave terminal` and `Stop` are session-lifecycle actions, so they live at the trailing edge of the active session-tab header rather than beside Terminal/Changes/Details view navigation.
 - The native platform UI family remains the default for cross-platform availability. Body text is 14 px, secondary labels are 12 px, and the footer uses a dedicated 12 px status scale.
+- Appearance preferences include System, Light, Dark, Nord, Tokyo Night, Catppuccin, Dracula, Gruvbox Dark, Solarized Light, and Solarized Dark themes; terminal typeface choices include the platform monospace default, JetBrains Mono, Cascadia Code, and Fira Code. Missing named fonts fall back through the renderer.
 - The footer contains version, current workspace/checkout context, connection health, and essential shortcuts. Internal enum names and keyboard-panel debug state are not user-facing status.
 
 ## Embedded terminal baseline

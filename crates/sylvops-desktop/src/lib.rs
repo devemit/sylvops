@@ -22,8 +22,7 @@ use iced::{
     mouse, system, time,
     widget::{
         self, button, column, container, mouse_area, opaque, pane_grid, responsive, rich_text, row,
-        rule, scrollable, sensor, slider, space, span, stack, text, text_input, tooltip,
-        vertical_slider,
+        rule, scrollable, sensor, slider, space, span, stack, text, text_input, vertical_slider,
     },
     window,
 };
@@ -37,9 +36,9 @@ use sylvops_core::{
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     provider::ProviderHealth,
     ui::{
-        DesktopDensity, DesktopPanel, DesktopState, DesktopTheme, MAX_OPEN_DESKTOP_SESSIONS,
-        MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT, MIN_DESKTOP_WIDTH, MIN_TERMINAL_FONT_SIZE,
-        MainTab,
+        DesktopDensity, DesktopPanel, DesktopState, DesktopTerminalFont, DesktopTheme,
+        MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT, MIN_DESKTOP_WIDTH,
+        MIN_TERMINAL_FONT_SIZE, MainTab,
     },
     ui_forms::{Form, FormKind},
 };
@@ -76,11 +75,11 @@ const UI_FONT: Font = Font::with_name("SF Pro Text");
 #[cfg(all(not(windows), not(target_os = "macos")))]
 const UI_FONT: Font = Font::DEFAULT;
 #[cfg(windows)]
-const TERMINAL_FONT: Font = Font::with_name("Consolas");
+const SYSTEM_TERMINAL_FONT: Font = Font::with_name("Consolas");
 #[cfg(target_os = "macos")]
-const TERMINAL_FONT: Font = Font::with_name("Menlo");
+const SYSTEM_TERMINAL_FONT: Font = Font::with_name("Menlo");
 #[cfg(all(not(windows), not(target_os = "macos")))]
-const TERMINAL_FONT: Font = Font::MONOSPACE;
+const SYSTEM_TERMINAL_FONT: Font = Font::MONOSPACE;
 const UI_MEDIUM: Font = Font {
     weight: Weight::Medium,
     ..UI_FONT
@@ -293,6 +292,7 @@ enum Message {
     ToggleFullscreen,
     SelectTheme(DesktopTheme),
     SelectDensity(DesktopDensity),
+    SelectTerminalFont(DesktopTerminalFont),
     SetTerminalFontSize(u8),
     ResetLayout,
     SelectCompactPanel(DesktopPanel),
@@ -556,6 +556,11 @@ impl DesktopApp {
                 self.desktop_state.density = density;
                 self.mark_state_dirty();
             }
+            Message::SelectTerminalFont(font) => {
+                self.desktop_state.terminal_font = font;
+                self.mark_state_dirty();
+                self.queue_terminal_resize();
+            }
             Message::SetTerminalFontSize(size) => {
                 self.desktop_state.terminal_font_size =
                     size.clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE);
@@ -665,7 +670,14 @@ impl DesktopApp {
             );
         }
         content = content.push(rule::horizontal(1)).push(self.footer());
-        container(content).width(Fill).height(Fill).into()
+        let content: Element<'_, Message> = container(content).width(Fill).height(Fill).into();
+        if self.inline_session_rename.is_some() {
+            mouse_area(content)
+                .on_press(Message::CancelSessionRename)
+                .into()
+        } else {
+            content
+        }
     }
 
     fn top_bar(&self) -> Element<'_, Message> {
@@ -708,7 +720,7 @@ impl DesktopApp {
             .height(ACTION_HEIGHT)
             .padding([6, 14])
             .style(move |theme, status| workspace_tab_style(theme, status, active));
-            workspace_tabs = workspace_tabs.push(navigation_tooltip(action, label));
+            workspace_tabs = workspace_tabs.push(action);
         }
         if !self.snapshot.workspaces.is_empty() {
             workspace_tabs = workspace_tabs.push(rule::vertical(1));
@@ -960,7 +972,7 @@ impl DesktopApp {
                         .on_press(Message::SelectSession(session.id))
                         .on_double_click(Message::BeginSessionRename(session.id))
                         .interaction(mouse::Interaction::Pointer);
-                    items = items.push(navigation_tooltip(interaction, label));
+                    items = items.push(interaction);
                 }
             }
             if sessions.is_empty() {
@@ -980,26 +992,12 @@ impl DesktopApp {
         let Some(rename) = &self.inline_session_rename else {
             return space::vertical().height(0).into();
         };
-        let controls = row![
-            text_input("Session name", &rename.value)
-                .id(rename.input_id.clone())
-                .on_input_maybe((!rename.pending).then_some(Message::SessionRenameInput))
-                .on_submit_maybe((!rename.pending).then_some(Message::SubmitSessionRename))
-                .padding([6, 8])
-                .size(UI_TEXT_SIZE),
-            button(if rename.pending { "…" } else { "Save" })
-                .on_press_maybe((!rename.pending).then_some(Message::SubmitSessionRename))
-                .height(32)
-                .padding([5, 8])
-                .style(primary_action_style),
-            button("Cancel")
-                .on_press_maybe((!rename.pending).then_some(Message::CancelSessionRename))
-                .height(32)
-                .padding([5, 8])
-                .style(chrome_action_style),
-        ]
-        .spacing(4)
-        .align_y(Center);
+        let controls = text_input("Session name", &rename.value)
+            .id(rename.input_id.clone())
+            .on_input_maybe((!rename.pending).then_some(Message::SessionRenameInput))
+            .on_submit_maybe((!rename.pending).then_some(Message::SubmitSessionRename))
+            .padding([6, 8])
+            .size(UI_TEXT_SIZE);
         let mut content = column![controls].spacing(4);
         if let Some(error) = &rename.error {
             content = content.push(text(error).size(UI_META_SIZE).style(text::danger));
@@ -1051,8 +1049,6 @@ impl DesktopApp {
                 tab_button("Terminal", MainTab::Terminal, self.main_tab),
                 tab_button("Changes", MainTab::Changes, self.main_tab),
                 tab_button("Details", MainTab::Details, self.main_tab),
-                space::horizontal(),
-                self.session_actions(),
             ]
             .spacing(4)
             .align_y(Center),
@@ -1097,14 +1093,11 @@ impl DesktopApp {
                             .height(30)
                             .padding([5, 9])
                             .style(move |theme, status| { tab_label_style(theme, status, active) }),
-                            navigation_tooltip(
-                                button(text("×").size(15))
-                                    .on_press(Message::CloseSessionTab(session.id))
-                                    .height(30)
-                                    .padding([4, 8])
-                                    .style(tab_close_style),
-                                "Close tab — session keeps running".into(),
-                            ),
+                            button(text("×").size(15))
+                                .on_press(Message::CloseSessionTab(session.id))
+                                .height(30)
+                                .padding([4, 8])
+                                .style(tab_close_style),
                         ]
                         .spacing(0)
                         .align_y(Center),
@@ -1121,11 +1114,17 @@ impl DesktopApp {
             );
         }
         container(
-            scrollable(tabs)
-                .direction(scrollable::Direction::Horizontal(
-                    scrollable::Scrollbar::hidden(),
-                ))
-                .height(ACTION_HEIGHT),
+            row![
+                scrollable(tabs)
+                    .direction(scrollable::Direction::Horizontal(
+                        scrollable::Scrollbar::hidden(),
+                    ))
+                    .height(ACTION_HEIGHT)
+                    .width(Fill),
+                self.session_actions(),
+            ]
+            .spacing(8)
+            .align_y(Center),
         )
         .height(SESSION_TAB_HEIGHT)
         .padding([4, 8])
@@ -1200,6 +1199,8 @@ impl DesktopApp {
             }
             actions.into()
         })
+        .width(Length::Shrink)
+        .height(ACTION_HEIGHT)
         .into()
     }
 
@@ -1238,9 +1239,11 @@ impl DesktopApp {
         } else {
             "Click to type  ·  drag to select terminal text".to_owned()
         };
+        let terminal_font = terminal_font(self.desktop_state.terminal_font);
         let spans = terminal_spans(
             terminal_display_runs(terminal, self.terminal_focus.is_focused()),
             &self.theme(),
+            terminal_font,
         );
         let mut terminal_header = row![
             text(role)
@@ -1268,7 +1271,7 @@ impl DesktopApp {
                 container(
                     rich_text(spans)
                         .on_link_click(|()| Message::TerminalSelectionStarted)
-                        .font(TERMINAL_FONT)
+                        .font(terminal_font)
                         .size(u32::from(self.desktop_state.terminal_font_size))
                         .line_height(TERMINAL_LINE_HEIGHT_RATIO)
                         .wrapping(text::Wrapping::None)
@@ -1310,7 +1313,7 @@ impl DesktopApp {
             .align_y(Vertical::Center),
             scrollable(
                 text(body)
-                    .font(TERMINAL_FONT)
+                    .font(terminal_font(self.desktop_state.terminal_font))
                     .size(u32::from(self.desktop_state.terminal_font_size)),
             )
             .height(Fill),
@@ -1477,19 +1480,42 @@ impl DesktopApp {
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
-        let mut themes = row![].spacing(8);
-        for choice in [
+        let theme_choices = [
             DesktopTheme::System,
             DesktopTheme::Light,
             DesktopTheme::Dark,
             DesktopTheme::Nord,
             DesktopTheme::TokyoNight,
             DesktopTheme::Catppuccin,
+            DesktopTheme::Dracula,
+            DesktopTheme::GruvboxDark,
+            DesktopTheme::SolarizedLight,
+            DesktopTheme::SolarizedDark,
+        ];
+        let mut theme_rows = column![].spacing(8);
+        for choices in theme_choices.chunks(5) {
+            let mut themes = row![].spacing(8);
+            for &choice in choices {
+                let selected = self.desktop_state.theme == choice;
+                themes = themes.push(
+                    button(theme::label(choice))
+                        .on_press(Message::SelectTheme(choice))
+                        .style(move |theme, status| content_tab_style(theme, status, selected)),
+                );
+            }
+            theme_rows = theme_rows.push(themes);
+        }
+        let mut terminal_fonts = row![].spacing(8);
+        for choice in [
+            DesktopTerminalFont::System,
+            DesktopTerminalFont::JetBrainsMono,
+            DesktopTerminalFont::CascadiaCode,
+            DesktopTerminalFont::FiraCode,
         ] {
-            let selected = self.desktop_state.theme == choice;
-            themes = themes.push(
-                button(theme::label(choice))
-                    .on_press(Message::SelectTheme(choice))
+            let selected = self.desktop_state.terminal_font == choice;
+            terminal_fonts = terminal_fonts.push(
+                button(terminal_font_label(choice))
+                    .on_press(Message::SelectTerminalFont(choice))
                     .style(move |theme, status| content_tab_style(theme, status, selected)),
             );
         }
@@ -1506,9 +1532,9 @@ impl DesktopApp {
                 ]
                 .align_y(Center),
                 text("Appearance").font(UI_SEMIBOLD).size(16),
-                text("Theme changes apply immediately. SylvOps uses the platform UI font and native monospace terminal font.")
+                text("Appearance changes apply immediately and persist locally for this desktop.")
                     .style(text::secondary),
-                themes,
+                theme_rows,
                 row![
                     text("Density").width(Length::Fixed(120.0)),
                     button("Comfortable")
@@ -1519,7 +1545,11 @@ impl DesktopApp {
                         .style(move |theme, status| content_tab_style(theme, status, self.desktop_state.density == DesktopDensity::Compact)),
                 ].spacing(8).align_y(Center),
                 row![
-                    text(format!("Terminal font: {} px", self.desktop_state.terminal_font_size)).width(Length::Fixed(180.0)),
+                    text("Terminal font").width(Length::Fixed(120.0)),
+                    terminal_fonts,
+                ].spacing(8).align_y(Center),
+                row![
+                    text(format!("Text size: {} px", self.desktop_state.terminal_font_size)).width(Length::Fixed(180.0)),
                     slider(
                         MIN_TERMINAL_FONT_SIZE..=MAX_TERMINAL_FONT_SIZE,
                         self.desktop_state.terminal_font_size,
@@ -2215,10 +2245,7 @@ impl DesktopApp {
         else {
             return;
         };
-        if self.modal.is_some() {
-            if matches!(key, Key::Named(Named::Escape)) {
-                self.modal = None;
-            }
+        if self.handle_transient_keyboard(&key) {
             return;
         }
         if self.terminal_focus.is_focused() {
@@ -2306,6 +2333,22 @@ impl DesktopApp {
             Key::Character("?") => self.modal = Some(Modal::Shortcuts),
             Key::Character(value) if value.eq_ignore_ascii_case("q") => self.begin_close(),
             _ => {}
+        }
+    }
+
+    fn handle_transient_keyboard(&mut self, key: &Key) -> bool {
+        if self.modal.is_some() {
+            if matches!(key, Key::Named(Named::Escape)) {
+                self.modal = None;
+            }
+            true
+        } else if self.inline_session_rename.is_some() {
+            if matches!(key, Key::Named(Named::Escape)) {
+                cancel_inline_session_rename(&mut self.inline_session_rename);
+            }
+            true
+        } else {
+            false
         }
     }
 
@@ -3406,6 +3449,24 @@ const fn terminal_clipboard_shortcut() -> &'static str {
     }
 }
 
+const fn terminal_font_label(choice: DesktopTerminalFont) -> &'static str {
+    match choice {
+        DesktopTerminalFont::System => "System mono",
+        DesktopTerminalFont::JetBrainsMono => "JetBrains Mono",
+        DesktopTerminalFont::CascadiaCode => "Cascadia Code",
+        DesktopTerminalFont::FiraCode => "Fira Code",
+    }
+}
+
+const fn terminal_font(choice: DesktopTerminalFont) -> Font {
+    match choice {
+        DesktopTerminalFont::System => SYSTEM_TERMINAL_FONT,
+        DesktopTerminalFont::JetBrainsMono => Font::with_name("JetBrains Mono"),
+        DesktopTerminalFont::CascadiaCode => Font::with_name("Cascadia Code"),
+        DesktopTerminalFont::FiraCode => Font::with_name("Fira Code"),
+    }
+}
+
 fn panel<'a>(content: impl Into<Element<'a, Message>>, _width: f32) -> Element<'a, Message> {
     container(content)
         .width(Fill)
@@ -3466,22 +3527,7 @@ fn select_button(
         .width(Fill)
         .height(height)
         .padding(padding);
-    navigation_tooltip(action, label)
-}
-
-fn navigation_tooltip(
-    content: impl Into<Element<'static, Message>>,
-    label: String,
-) -> Element<'static, Message> {
-    tooltip(
-        content,
-        container(text(label).font(UI_FONT).size(UI_META_SIZE))
-            .padding([5, 8])
-            .style(tooltip_surface),
-        tooltip::Position::FollowCursor,
-    )
-    .gap(6)
-    .into()
+    action.into()
 }
 
 const fn worktree_can_delete(worktree: &Worktree) -> bool {
@@ -3651,7 +3697,11 @@ fn terminal_point_to_cell(
     (row < rows && column < columns).then_some((row, column))
 }
 
-fn terminal_spans(runs: Vec<DisplayRun>, theme: &Theme) -> Vec<text::Span<'static, (), Font>> {
+fn terminal_spans(
+    runs: Vec<DisplayRun>,
+    theme: &Theme,
+    terminal_font: Font,
+) -> Vec<text::Span<'static, (), Font>> {
     let palette = theme.extended_palette();
     let default_foreground = palette.background.base.text;
     let default_background = palette.background.base.color;
@@ -3674,7 +3724,7 @@ fn terminal_spans(runs: Vec<DisplayRun>, theme: &Theme) -> Vec<text::Span<'stati
                 foreground = palette.primary.strong.text;
                 background = palette.primary.strong.color;
             }
-            let mut font = TERMINAL_FONT;
+            let mut font = terminal_font;
             if run.style.bold {
                 font.weight = Weight::Bold;
             }
@@ -3865,13 +3915,14 @@ fn workspace_surface(theme: &Theme) -> container::Style {
 
 fn selected_context_style(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
+    let pair = palette.primary.weak;
     container::Style {
-        background: Some(Background::Color(palette.primary.base.color)),
-        text_color: Some(palette.primary.base.text),
+        background: Some(Background::Color(pair.color)),
+        text_color: Some(contrast_safe_text(pair.color, pair.text)),
         border: Border {
             width: 1.0,
             radius: 4.0.into(),
-            color: palette.primary.strong.color,
+            color: palette.primary.base.color,
         },
         ..container::Style::default()
     }
@@ -3922,20 +3973,6 @@ fn modal_card(theme: &Theme) -> container::Style {
     }
 }
 
-fn tooltip_surface(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
-    container::Style {
-        background: Some(Background::Color(palette.background.strong.color)),
-        text_color: Some(palette.background.strong.text),
-        border: Border {
-            width: 1.0,
-            radius: 4.0.into(),
-            color: palette.background.strong.color,
-        },
-        ..container::Style::default()
-    }
-}
-
 fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
     let palette = theme.extended_palette();
     let pair = match status {
@@ -3961,7 +3998,11 @@ fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
 
 fn primary_action_style(theme: &Theme, status: Status) -> button::Style {
     let palette = theme.extended_palette();
-    let pair = palette.primary.base;
+    let pair = if status == Status::Pressed {
+        palette.primary.base
+    } else {
+        palette.primary.weak
+    };
     button::Style {
         background: Some(Background::Color(pair.color)),
         text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
@@ -3973,12 +4014,8 @@ fn primary_action_style(theme: &Theme, status: Status) -> button::Style {
         ),
         border: Border {
             radius: 4.0.into(),
-            color: palette.primary.strong.color,
-            width: if matches!(status, Status::Hovered | Status::Pressed) {
-                1.0
-            } else {
-                0.0
-            },
+            color: palette.primary.base.color,
+            width: if status == Status::Hovered { 2.0 } else { 1.0 },
         },
         ..button::Style::default()
     }
@@ -3986,7 +4023,11 @@ fn primary_action_style(theme: &Theme, status: Status) -> button::Style {
 
 fn danger_action_style(theme: &Theme, status: Status) -> button::Style {
     let palette = theme.extended_palette();
-    let pair = palette.danger.base;
+    let pair = if status == Status::Pressed {
+        palette.danger.base
+    } else {
+        palette.danger.weak
+    };
     button::Style {
         background: Some(Background::Color(pair.color)),
         text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
@@ -3998,12 +4039,8 @@ fn danger_action_style(theme: &Theme, status: Status) -> button::Style {
         ),
         border: Border {
             radius: 4.0.into(),
-            color: palette.danger.strong.color,
-            width: if matches!(status, Status::Hovered | Status::Pressed) {
-                1.0
-            } else {
-                0.0
-            },
+            color: palette.danger.base.color,
+            width: if status == Status::Hovered { 2.0 } else { 1.0 },
         },
         ..button::Style::default()
     }
@@ -4048,7 +4085,7 @@ fn contrast_safe_text(background: Color, preferred: Color) -> Color {
 fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::Style {
     let palette = theme.extended_palette();
     let pair = if active {
-        palette.primary.base
+        palette.primary.weak
     } else {
         match status {
             Status::Hovered => palette.background.weak,
@@ -4057,15 +4094,23 @@ fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::S
         }
     };
     button::Style {
-        background: Some(Background::Color(pair.color)),
-        text_color: pair.text.scale_alpha(if status == Status::Disabled {
-            0.45
-        } else {
-            1.0
-        }),
+        background: (active || matches!(status, Status::Hovered | Status::Pressed))
+            .then_some(Background::Color(pair.color)),
+        text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
+            if status == Status::Disabled {
+                0.45
+            } else {
+                1.0
+            },
+        ),
         border: Border {
             radius: 0.0.into(),
-            ..Border::default()
+            color: if active {
+                palette.primary.base.color
+            } else {
+                pair.color
+            },
+            width: if active { 1.0 } else { 0.0 },
         },
         ..button::Style::default()
     }
@@ -4074,7 +4119,7 @@ fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::S
 fn list_item_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
-        palette.primary.base
+        palette.primary.weak
     } else {
         match status {
             Status::Hovered => palette.background.weak,
@@ -4083,20 +4128,23 @@ fn list_item_style(theme: &Theme, status: Status, selected: bool) -> button::Sty
         }
     };
     button::Style {
-        background: Some(Background::Color(pair.color)),
-        text_color: pair.text.scale_alpha(if status == Status::Disabled {
-            0.45
-        } else {
-            1.0
-        }),
+        background: (selected || matches!(status, Status::Hovered | Status::Pressed))
+            .then_some(Background::Color(pair.color)),
+        text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
+            if status == Status::Disabled {
+                0.45
+            } else {
+                1.0
+            },
+        ),
         border: Border {
             radius: 4.0.into(),
             color: if selected {
-                palette.primary.strong.color
+                palette.primary.base.color
             } else {
                 pair.color
             },
-            width: if selected { 2.0 } else { 0.0 },
+            width: if selected { 1.0 } else { 0.0 },
         },
         ..button::Style::default()
     }
@@ -4120,7 +4168,7 @@ fn list_item_container_style(theme: &Theme, selected: bool, hovered: bool) -> co
 fn content_tab_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
-        palette.primary.base
+        palette.primary.weak
     } else {
         match status {
             Status::Hovered => palette.background.weak,
@@ -4129,12 +4177,17 @@ fn content_tab_style(theme: &Theme, status: Status, selected: bool) -> button::S
         }
     };
     button::Style {
-        background: Some(Background::Color(pair.color)),
-        text_color: pair.text.scale_alpha(if selected { 1.0 } else { 0.82 }),
+        background: (selected || matches!(status, Status::Hovered | Status::Pressed))
+            .then_some(Background::Color(pair.color)),
+        text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(if selected {
+            1.0
+        } else {
+            0.82
+        }),
         border: Border {
             radius: 4.0.into(),
             color: if selected {
-                palette.primary.strong.color
+                palette.primary.base.color
             } else {
                 pair.color
             },
@@ -4147,17 +4200,17 @@ fn content_tab_style(theme: &Theme, status: Status, selected: bool) -> button::S
 fn session_tab_group_style(theme: &Theme, selected: bool) -> container::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
-        palette.primary.base
+        palette.primary.weak
     } else {
         palette.background.weakest
     };
     container::Style {
         background: Some(Background::Color(pair.color)),
-        text_color: Some(pair.text),
+        text_color: Some(contrast_safe_text(pair.color, pair.text)),
         border: Border {
             radius: 4.0.into(),
             color: if selected {
-                palette.primary.strong.color
+                palette.primary.base.color
             } else {
                 palette.background.weak.color
             },
@@ -4170,7 +4223,7 @@ fn session_tab_group_style(theme: &Theme, selected: bool) -> container::Style {
 fn tab_label_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
-        palette.primary.base
+        palette.primary.weak
     } else {
         match status {
             Status::Hovered => palette.background.weak,
@@ -4181,7 +4234,7 @@ fn tab_label_style(theme: &Theme, status: Status, selected: bool) -> button::Sty
     button::Style {
         background: (!selected && !matches!(status, Status::Active | Status::Disabled))
             .then_some(Background::Color(pair.color)),
-        text_color: pair.text,
+        text_color: contrast_safe_text(pair.color, pair.text),
         border: Border {
             radius: 4.0.into(),
             ..Border::default()
@@ -4347,6 +4400,21 @@ mod tests {
         );
     }
 
+    fn assert_session_tab_contrast(theme_name: &str, theme: &Theme) {
+        let session_group = session_tab_group_style(theme, true);
+        let Some(Background::Color(group_background)) = session_group.background else {
+            panic!("selected session tabs need a solid background");
+        };
+        for status in [Status::Active, Status::Hovered, Status::Pressed] {
+            let session_label = tab_label_style(theme, status, true);
+            assert!(session_label.background.is_none());
+            assert!(
+                group_background.relative_contrast(session_label.text_color) >= 4.5,
+                "{theme_name} selected session-tab text must remain readable"
+            );
+        }
+    }
+
     #[test]
     fn terminal_view_has_no_nested_scroll_viewport() {
         let source = include_str!("lib.rs");
@@ -4400,7 +4468,7 @@ mod tests {
     }
 
     #[test]
-    fn navigator_labels_are_single_line_and_clipped() {
+    fn navigator_labels_are_single_line_clipped_and_have_no_tooltips() {
         let source = include_str!("lib.rs");
         let select_button = source
             .split_once("fn select_button(")
@@ -4410,7 +4478,38 @@ mod tests {
 
         assert!(select_button.contains("Wrapping::None"));
         assert!(select_button.contains(".clip(true)"));
-        assert!(select_button.contains("tooltip("));
+        assert!(!select_button.contains("tooltip("));
+    }
+
+    #[test]
+    fn inline_rename_uses_keyboard_and_click_away_without_buttons() {
+        let source = include_str!("lib.rs");
+        let rename = source
+            .split_once("    fn session_rename_row(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn compact_navigator(&self)"))
+            .map(|(body, _)| body)
+            .expect("session rename source");
+
+        assert!(rename.contains("on_submit_maybe"));
+        assert!(!rename.contains("Save"));
+        assert!(!rename.contains("Cancel"));
+        assert!(source.contains(".on_press(Message::CancelSessionRename)"));
+    }
+
+    #[test]
+    fn lifecycle_actions_live_with_the_active_session_tabs() {
+        let source = include_str!("lib.rs");
+        let workspace = source
+            .split_once("    fn workspace_view(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn session_actions(&self)"))
+            .map(|(body, _)| body)
+            .expect("workspace header source");
+
+        let session_tabs = workspace
+            .split_once("    fn session_tabs(&self)")
+            .map(|(_, body)| body)
+            .expect("session tabs source");
+        assert!(session_tabs.contains("self.session_actions()"));
     }
 
     #[test]
@@ -4452,30 +4551,40 @@ mod tests {
 
     #[test]
     fn custom_button_styles_remain_readable_and_have_distinct_hover_states() {
-        let themes = [
-            (
-                "light",
-                theme::resolve(DesktopTheme::Light, iced::theme::Mode::Light),
-            ),
-            (
-                "dark",
-                theme::resolve(DesktopTheme::Dark, iced::theme::Mode::Dark),
-            ),
-            (
-                "nord",
-                theme::resolve(DesktopTheme::Nord, iced::theme::Mode::Dark),
-            ),
+        let choices = [
+            ("light", DesktopTheme::Light, iced::theme::Mode::Light),
+            ("dark", DesktopTheme::Dark, iced::theme::Mode::Dark),
+            ("nord", DesktopTheme::Nord, iced::theme::Mode::Dark),
             (
                 "tokyo night",
-                theme::resolve(DesktopTheme::TokyoNight, iced::theme::Mode::Dark),
+                DesktopTheme::TokyoNight,
+                iced::theme::Mode::Dark,
             ),
             (
                 "catppuccin",
-                theme::resolve(DesktopTheme::Catppuccin, iced::theme::Mode::Dark),
+                DesktopTheme::Catppuccin,
+                iced::theme::Mode::Dark,
+            ),
+            ("dracula", DesktopTheme::Dracula, iced::theme::Mode::Dark),
+            (
+                "gruvbox dark",
+                DesktopTheme::GruvboxDark,
+                iced::theme::Mode::Dark,
+            ),
+            (
+                "solarized light",
+                DesktopTheme::SolarizedLight,
+                iced::theme::Mode::Light,
+            ),
+            (
+                "solarized dark",
+                DesktopTheme::SolarizedDark,
+                iced::theme::Mode::Dark,
             ),
         ];
 
-        for (theme_name, theme) in themes {
+        for (theme_name, choice, mode) in choices {
+            let theme = theme::resolve(choice, mode);
             let styles = [
                 ("chrome active", chrome_action_style(&theme, Status::Active)),
                 ("chrome hover", chrome_action_style(&theme, Status::Hovered)),
@@ -4531,18 +4640,7 @@ mod tests {
                 chrome_action_style(&theme, Status::Hovered).background,
                 "hover must be visible without changing text contrast"
             );
-            let session_group = session_tab_group_style(&theme, true);
-            let Some(Background::Color(group_background)) = session_group.background else {
-                panic!("selected session tabs need a solid background");
-            };
-            for status in [Status::Active, Status::Hovered, Status::Pressed] {
-                let session_label = tab_label_style(&theme, status, true);
-                assert!(session_label.background.is_none());
-                assert!(
-                    group_background.relative_contrast(session_label.text_color) >= 4.5,
-                    "{theme_name} selected session-tab text must remain readable"
-                );
-            }
+            assert_session_tab_contrast(theme_name, &theme);
         }
     }
 
