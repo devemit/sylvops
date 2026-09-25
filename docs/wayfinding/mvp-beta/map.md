@@ -19,10 +19,11 @@ Reach a defensible `v0.1.0-beta.1`: a developer on Windows, Linux, or macOS can 
 
 - [Safe Codex discovery](tickets/safe-codex-discovery.md): resolve only canonical native binaries, including official npm payloads and desktop caches, without executing package-manager or shell shims.
 - [Inactive-session history](tickets/inactive-session-history.md): retain outcome metadata indefinitely, keep terminal output memory-only, and resume eligible provider sessions into new records.
+- [First-run and provider recovery](tickets/first-run-recovery.md): guide an empty desktop through Workspace → Project/root Worktree → Session, keep Shell as the fallback, and re-probe Codex after explicit install or login repair.
 
 ## Not yet specified
 
-- Fresh-machine acceptance may expose platform-specific onboarding or packaging gaps that cannot be specified until the provider and recovery decisions are settled.
+- Fresh-machine acceptance may expose platform-specific onboarding or packaging gaps not covered by the bounded desktop flow.
 - Real-user desktop testing may expose a small final polish set; only beta-blocking failures graduate into tickets.
 
 ## Out of scope

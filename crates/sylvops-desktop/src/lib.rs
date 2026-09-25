@@ -28,8 +28,8 @@ use iced::{
 use iced::{font::Weight, widget::button::Status};
 use sylvops_core::{
     domain::{
-        AttachmentRole, DaemonSnapshot, Project, Session, SessionState, Workspace, Worktree,
-        WorktreeStatus, state_allows_resume,
+        AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
+        Worktree, WorktreeStatus, state_allows_resume,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
@@ -198,6 +198,7 @@ enum Message {
     FormInput(usize, String),
     PreviousProvider,
     NextProvider,
+    ProbeProvider,
     SubmitForm,
     CancelModal,
     BrowseRepository,
@@ -351,6 +352,7 @@ impl DesktopApp {
             Message::FormInput(index, value) => self.update_form_field(index, value),
             Message::PreviousProvider => self.change_provider(-1),
             Message::NextProvider => self.change_provider(1),
+            Message::ProbeProvider => self.probe_selected_provider(),
             Message::SubmitForm => self.submit_form(),
             Message::CancelModal => self.modal = None,
             Message::BrowseRepository => {
@@ -1172,33 +1174,13 @@ impl DesktopApp {
     fn form_view(modal: &FormModal) -> Element<'_, Message> {
         let form = &modal.form;
         let mut fields = column![].spacing(10);
+        if modal.first_run
+            && let Some(guidance) = first_run_guidance(form.kind)
+        {
+            fields = fields.push(text(guidance).style(text::secondary));
+        }
         if form.is_session() {
-            let provider = form.provider();
-            let provider_text = provider.map_or_else(
-                || "No providers".into(),
-                |item| {
-                    let status = if !item.available {
-                        "unavailable"
-                    } else if item.kind == sylvops_core::domain::ProviderKind::Codex
-                        && !item.authenticated
-                    {
-                        "available, login required"
-                    } else {
-                        "ready"
-                    };
-                    format!("{} — {}", item.kind, status)
-                },
-            );
-            fields = fields.push(
-                row![
-                    button("‹")
-                        .on_press_maybe((!modal.pending).then_some(Message::PreviousProvider)),
-                    text(provider_text).width(Fill),
-                    button("›").on_press_maybe((!modal.pending).then_some(Message::NextProvider)),
-                ]
-                .spacing(8)
-                .align_y(Center),
-            );
+            fields = fields.push(Self::provider_picker(form, modal.pending));
         }
         for (index, field) in form
             .fields
@@ -1227,6 +1209,8 @@ impl DesktopApp {
         }
         let submit = if modal.pending {
             "Working…"
+        } else if modal.first_run && matches!(form.kind, FormKind::CreateSession(_)) {
+            "Launch session"
         } else {
             "Continue"
         };
@@ -1248,6 +1232,49 @@ impl DesktopApp {
         .padding(22)
         .width(Length::Fixed(560.0))
         .style(modal_card)
+        .into()
+    }
+
+    fn provider_picker(form: &Form, pending: bool) -> Element<'_, Message> {
+        let provider = form.provider();
+        let provider_text = provider.map_or_else(
+            || "No providers".into(),
+            |item| {
+                let status = if !item.available {
+                    "unavailable"
+                } else if item.kind == ProviderKind::Codex && !item.authenticated {
+                    "available, login required"
+                } else {
+                    "ready"
+                };
+                format!("{} — {status}", item.kind)
+            },
+        );
+        let recovery = provider.map_or_else(
+            || "The daemon returned no providers. Check again to retry discovery.".into(),
+            provider_recovery_message,
+        );
+        column![
+            row![
+                button("‹").on_press_maybe((!pending).then_some(Message::PreviousProvider)),
+                text(provider_text).width(Fill),
+                button("›").on_press_maybe((!pending).then_some(Message::NextProvider)),
+            ]
+            .spacing(8)
+            .align_y(Center),
+            row![
+                text(recovery).width(Fill).style(text::secondary),
+                button(if pending {
+                    "Checking…"
+                } else {
+                    "Check again"
+                })
+                .on_press_maybe((!pending).then_some(Message::ProbeProvider)),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        ]
+        .spacing(10)
         .into()
     }
 
@@ -1365,7 +1392,7 @@ impl DesktopApp {
                 }
                 self.restore_selection();
                 if self.snapshot.workspaces.is_empty() {
-                    self.modal = Some(Modal::Form(FormModal::new(Form::workspace())));
+                    self.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
                 }
             }
             BridgeEvent::Daemon(event) => self.handle_daemon_event(event),
@@ -1386,6 +1413,7 @@ impl DesktopApp {
                     operation,
                     Some(
                         Operation::CreateWorkspace
+                            | Operation::ProbeProvider(_)
                             | Operation::RegisterProject
                             | Operation::CreateWorktree
                             | Operation::CreateSession(_)
@@ -1410,6 +1438,9 @@ impl DesktopApp {
 
     fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
+            DaemonEvent::ProviderHealthChanged { health } => {
+                self.update_provider_health(health);
+            }
             DaemonEvent::SessionOutput {
                 session_id,
                 sequence,
@@ -1453,6 +1484,13 @@ impl DesktopApp {
 
     #[allow(clippy::too_many_lines)]
     fn handle_response(&mut self, operation: Operation, response: DaemonResponse) {
+        let first_run = matches!(
+            &self.modal,
+            Some(Modal::Form(FormModal {
+                first_run: true,
+                ..
+            }))
+        );
         match (operation, response) {
             (Operation::RefreshSnapshot, DaemonResponse::Snapshot(snapshot)) => {
                 self.snapshot_pending = false;
@@ -1488,7 +1526,11 @@ impl DesktopApp {
                     self.open_sessions.push(session.id);
                 }
                 self.modal = None;
-                self.show_success("Session created.");
+                self.show_success(if first_run {
+                    "Session launched. Click Attach to open its terminal."
+                } else {
+                    "Session created."
+                });
                 self.mark_state_dirty();
                 self.request_snapshot();
             }
@@ -1574,9 +1616,24 @@ impl DesktopApp {
                     let _ = id;
                 }
             }
+            (Operation::ProbeProvider(kind), DaemonResponse::Provider(health))
+                if health.kind == kind =>
+            {
+                self.update_provider_health(health);
+                if let Some(Modal::Form(modal)) = &mut self.modal {
+                    modal.pending = false;
+                    modal.form.submission_error = None;
+                }
+            }
             (Operation::CreateWorkspace, DaemonResponse::WorkspaceAdded { workspace, .. }) => {
-                self.modal = None;
                 self.show_success(format!("Workspace “{}” created.", workspace.name));
+                self.modal = if first_run {
+                    Some(Modal::Form(FormModal::first_run(Form::repository(
+                        workspace.id,
+                    ))))
+                } else {
+                    None
+                };
                 self.request_snapshot();
             }
             (
@@ -1590,8 +1647,15 @@ impl DesktopApp {
                 self.selected_project_id = Some(project.id);
                 self.selected_worktree_id = Some(root_worktree.id);
                 self.selected_session_id = None;
-                self.modal = None;
                 self.show_success("Repository registered.");
+                self.modal = if first_run {
+                    Some(Modal::Form(FormModal::first_run(Form::session(
+                        root_worktree.id,
+                        self.providers.clone(),
+                    ))))
+                } else {
+                    None
+                };
                 self.mark_state_dirty();
                 self.request_snapshot();
             }
@@ -1638,7 +1702,23 @@ impl DesktopApp {
                 self.request_snapshot();
             }
             (operation, DaemonResponse::Error(failure)) => {
-                self.error = Some(format!("{operation:?}: {}", failure.message));
+                let form_operation = matches!(
+                    operation,
+                    Operation::CreateWorkspace
+                        | Operation::ProbeProvider(_)
+                        | Operation::RegisterProject
+                        | Operation::CreateWorktree
+                        | Operation::CreateSession(_)
+                        | Operation::RenameProject
+                        | Operation::RenameWorktree
+                        | Operation::RenameSession
+                );
+                if form_operation && let Some(Modal::Form(modal)) = &mut self.modal {
+                    modal.pending = false;
+                    modal.form.submission_error = Some(failure.message);
+                } else {
+                    self.error = Some(format!("{operation:?}: {}", failure.message));
+                }
             }
             (operation, response) => {
                 self.error = Some(format!(
@@ -1950,6 +2030,59 @@ impl DesktopApp {
             && !modal.pending
         {
             modal.form.select_next_provider(delta);
+            modal.form.submission_error = None;
+        }
+    }
+
+    fn probe_selected_provider(&mut self) {
+        let kind = {
+            let Some(Modal::Form(modal)) = &mut self.modal else {
+                return;
+            };
+            if modal.pending {
+                return;
+            }
+            let Some(kind) = modal.form.provider().map(|provider| provider.kind) else {
+                modal.form.submission_error =
+                    Some("The daemon returned no providers to check.".into());
+                return;
+            };
+            modal.pending = true;
+            modal.form.submission_error = None;
+            kind
+        };
+        if !self.bridge.request(
+            Operation::ProbeProvider(kind),
+            ClientRequest::ProbeProvider { kind },
+        ) && let Some(Modal::Form(modal)) = &mut self.modal
+        {
+            modal.pending = false;
+            modal.form.submission_error =
+                Some("The desktop IPC command queue is busy. Try again.".into());
+        }
+    }
+
+    fn update_provider_health(&mut self, health: ProviderHealth) {
+        if let Some(provider) = self
+            .providers
+            .iter_mut()
+            .find(|provider| provider.kind == health.kind)
+        {
+            provider.clone_from(&health);
+        } else {
+            self.providers.push(health.clone());
+        }
+        if let Some(Modal::Form(modal)) = &mut self.modal {
+            if let Some(provider) = modal
+                .form
+                .providers
+                .iter_mut()
+                .find(|provider| provider.kind == health.kind)
+            {
+                provider.clone_from(&health);
+            } else if modal.form.is_session() {
+                modal.form.providers.push(health);
+            }
         }
     }
 
@@ -2642,6 +2775,46 @@ fn trimmed_option(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+fn first_run_guidance(kind: FormKind) -> Option<&'static str> {
+    match kind {
+        FormKind::CreateWorkspace => Some(
+            "Step 1 of 3 · A Workspace is a local group of repositories you supervise together.",
+        ),
+        FormKind::RegisterProject(_) => Some(
+            "Step 2 of 3 · A Project is an existing Git repository. Its current checkout is registered as the root Worktree.",
+        ),
+        FormKind::CreateSession(_) => Some(
+            "Step 3 of 3 · A Worktree is an isolated checkout. A Session runs Shell or Codex inside the selected Worktree.",
+        ),
+        FormKind::CreateWorktree(_)
+        | FormKind::RenameProject(_)
+        | FormKind::RenameWorktree(_)
+        | FormKind::RenameSession(_) => None,
+    }
+}
+
+fn provider_recovery_message(provider: &ProviderHealth) -> String {
+    if !provider.available {
+        let diagnostic = provider
+            .diagnostic
+            .as_deref()
+            .map_or_else(String::new, |message| format!(" ({message})"));
+        return match provider.kind {
+            ProviderKind::Codex => format!(
+                "Codex is unavailable{diagnostic}. Install the Codex CLI, then check again, or select Shell to continue now."
+            ),
+            _ => format!(
+                "{} is unavailable{diagnostic}. Fix its local configuration, then check again.",
+                provider.kind
+            ),
+        };
+    }
+    if provider.kind == ProviderKind::Codex && !provider.authenticated {
+        return "Run `codex login` in a terminal, finish sign-in, then check again, or select Shell to continue now.".into();
+    }
+    format!("{} is ready.", provider.kind)
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn bounded_u16(value: f32, minimum: u16, maximum: u16) -> u16 {
     if !value.is_finite() {
@@ -2938,6 +3111,20 @@ const fn session_can_replay(state: SessionState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sylvops_core::provider::ProviderCapabilities;
+
+    fn provider_health(kind: ProviderKind, available: bool, authenticated: bool) -> ProviderHealth {
+        ProviderHealth {
+            kind,
+            available,
+            authenticated,
+            executable_path: None,
+            version: None,
+            diagnostic: (!available).then(|| "not found".into()),
+            capabilities: ProviderCapabilities::default(),
+            checked_at: 0,
+        }
+    }
 
     #[test]
     fn inactive_session_actions_are_safe_and_explicit() {
@@ -2955,5 +3142,34 @@ mod tests {
         assert_eq!(next_selection(&items, Some(30), 1), Some(10));
         assert_eq!(next_selection(&items, Some(10), -1), Some(30));
         assert_eq!(next_selection::<u8>(&[], None, 1), None);
+    }
+
+    #[test]
+    fn first_run_copy_explains_the_hierarchy_in_order() {
+        assert!(
+            first_run_guidance(FormKind::CreateWorkspace)
+                .is_some_and(|message| message.contains("Workspace"))
+        );
+        assert!(
+            first_run_guidance(FormKind::RegisterProject(WorkspaceId::new()))
+                .is_some_and(|message| message.contains("Project") && message.contains("Worktree"))
+        );
+        assert!(
+            first_run_guidance(FormKind::CreateSession(WorktreeId::new()))
+                .is_some_and(|message| message.contains("Worktree") && message.contains("Session"))
+        );
+    }
+
+    #[test]
+    fn provider_recovery_copy_offers_retry_and_shell_fallback() {
+        let unavailable =
+            provider_recovery_message(&provider_health(ProviderKind::Codex, false, false));
+        assert!(unavailable.contains("Install the Codex CLI"));
+        assert!(unavailable.contains("select Shell"));
+
+        let unauthenticated =
+            provider_recovery_message(&provider_health(ProviderKind::Codex, true, false));
+        assert!(unauthenticated.contains("codex login"));
+        assert!(unauthenticated.contains("check again"));
     }
 }
