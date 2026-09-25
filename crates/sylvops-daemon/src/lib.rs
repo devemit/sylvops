@@ -1,6 +1,7 @@
 //! Authoritative daemon, persistence, local IPC, and runtime supervision building blocks.
 
 mod atomic_file;
+mod background_process;
 pub mod client;
 mod codex_discovery;
 pub mod config_store;
@@ -49,3 +50,22 @@ pub enum DaemonError {
 }
 
 pub type Result<T, E = DaemonError> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn background_commands_use_the_hidden_process_factory() {
+        for (name, source) in [
+            ("git", include_str!("git.rs")),
+            ("provider", include_str!("provider.rs")),
+        ] {
+            let production = source
+                .split_once("#[cfg(test)]")
+                .map_or(source, |(code, _)| code);
+            assert!(
+                !production.contains("Command::new("),
+                "{name} launches a background command without the Windows no-window policy"
+            );
+        }
+    }
+}

@@ -20,8 +20,8 @@ use iced::{
     keyboard::{Key, key::Named},
     mouse, system, time,
     widget::{
-        button, column, container, mouse_area, opaque, pane_grid, row, rule, scrollable, slider,
-        space, stack, text, text_input,
+        button, column, container, mouse_area, opaque, pane_grid, row, rule, scrollable, sensor,
+        slider, space, stack, text, text_input,
     },
     window,
 };
@@ -58,6 +58,12 @@ const PANEL_HEADER_HEIGHT: f32 = 40.0;
 const UI_TEXT_SIZE: f32 = 13.0;
 const UI_META_SIZE: f32 = 11.0;
 const ACTION_HEIGHT: f32 = 32.0;
+const TERMINAL_HORIZONTAL_PADDING: f32 = 24.0;
+const TERMINAL_VERTICAL_PADDING: f32 = 16.0;
+const TERMINAL_HEADER_HEIGHT: f32 = 26.0;
+const TERMINAL_HEADER_SPACING: f32 = 4.0;
+const TERMINAL_CELL_WIDTH_RATIO: f32 = 0.6;
+const TERMINAL_LINE_HEIGHT_RATIO: f32 = 1.3;
 #[cfg(windows)]
 const UI_FONT: Font = Font::with_name("Segoe UI");
 #[cfg(target_os = "macos")]
@@ -145,6 +151,7 @@ struct DesktopApp {
     narrow_main: bool,
     keyboard_panel: DesktopPanel,
     terminal_focus: TerminalFocus,
+    terminal_viewport: Option<iced::Size>,
     window_mode: window::Mode,
 }
 
@@ -208,6 +215,7 @@ enum Message {
     FocusTerminal,
     ScrollTerminal(mouse::ScrollDelta),
     LatestTerminal,
+    TerminalViewportResized(iced::Size),
     Stop,
     Refresh,
     ToggleSettings,
@@ -273,6 +281,7 @@ impl DesktopApp {
             narrow_main: false,
             keyboard_panel: DesktopPanel::Projects,
             terminal_focus: TerminalFocus::Unfocused,
+            terminal_viewport: None,
             window_mode: window::Mode::Windowed,
         }
     }
@@ -365,6 +374,12 @@ impl DesktopApp {
             Message::FocusTerminal => self.focus_terminal(),
             Message::ScrollTerminal(delta) => self.scroll_terminal(delta),
             Message::LatestTerminal => self.show_latest_terminal(),
+            Message::TerminalViewportResized(size) => {
+                if self.terminal_viewport != Some(size) {
+                    self.terminal_viewport = Some(size);
+                    self.queue_terminal_resize();
+                }
+            }
             Message::Stop => self.open_stop_confirmation(),
             Message::Refresh => self.request_snapshot(),
             Message::ToggleSettings => {
@@ -937,7 +952,9 @@ impl DesktopApp {
 
     fn terminal_view(&self) -> Element<'_, Message> {
         let Some(session_id) = self.active_session_id else {
-            return centered_message("Choose a session, then click Attach.");
+            return observed_terminal_viewport(centered_message(
+                "Choose a session, then click Attach.",
+            ));
         };
         let Some(terminal) = self.terminals.get(&session_id) else {
             if let Some(session) = self.session(session_id)
@@ -946,15 +963,15 @@ impl DesktopApp {
                     SessionState::Terminated | SessionState::Disconnected
                 )
             {
-                return centered_message(
+                return observed_terminal_viewport(centered_message(
                     "This session is no longer running. Its metadata remains in Details; terminal output was not persisted.",
-                );
+                ));
             }
-            return centered_action(
+            return observed_terminal_viewport(centered_action(
                 "Session is ready. Attach to open its terminal.",
                 "Attach terminal",
                 Message::Attach,
-            );
+            ));
         };
         let scrollback_rows = terminal.scrollback_rows();
         let role = if scrollback_rows > 0 {
@@ -996,6 +1013,8 @@ impl DesktopApp {
                     text(contents)
                         .font(TERMINAL_FONT)
                         .size(u32::from(self.desktop_state.terminal_font_size))
+                        .line_height(TERMINAL_LINE_HEIGHT_RATIO)
+                        .wrapping(text::Wrapping::None)
                         .width(Fill),
                 )
                 .height(Fill)
@@ -1007,10 +1026,12 @@ impl DesktopApp {
         .width(Fill)
         .height(Fill)
         .style(move |theme| terminal_surface(theme, self.terminal_focus.is_focused()));
-        mouse_area(surface)
-            .on_press(Message::FocusTerminal)
-            .on_scroll(Message::ScrollTerminal)
-            .into()
+        observed_terminal_viewport(
+            mouse_area(surface)
+                .on_press(Message::FocusTerminal)
+                .on_scroll(Message::ScrollTerminal)
+                .into(),
+        )
     }
 
     fn changes_view(&self) -> Element<'_, Message> {
@@ -2633,6 +2654,9 @@ impl DesktopApp {
     }
 
     fn terminal_dimensions(&self) -> (u16, u16) {
+        if let Some(viewport) = self.terminal_viewport {
+            return terminal_grid_dimensions(viewport, self.desktop_state.terminal_font_size);
+        }
         let main_width = match state::layout_mode(self.desktop_state.window_width) {
             state::LayoutMode::Wide => {
                 let mut remaining = u32::from(self.desktop_state.window_width);
@@ -3046,6 +3070,28 @@ async fn pick_repository_folder() -> Result<Option<String>, String> {
     .map_err(|error| format!("folder picker failed: {error}"))?
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn terminal_grid_dimensions(viewport: iced::Size, font_size: u8) -> (u16, u16) {
+    let screen_width = (viewport.width - TERMINAL_HORIZONTAL_PADDING).max(1.0);
+    let screen_height = (viewport.height
+        - TERMINAL_VERTICAL_PADDING
+        - TERMINAL_HEADER_HEIGHT
+        - TERMINAL_HEADER_SPACING)
+        .max(1.0);
+    let font_size = f32::from(font_size);
+    let cell_width = (font_size * TERMINAL_CELL_WIDTH_RATIO).max(1.0);
+    let line_height = (font_size * TERMINAL_LINE_HEIGHT_RATIO).max(1.0);
+    let columns = (screen_width / cell_width).floor().clamp(1.0, 500.0) as u16;
+    let rows = (screen_height / line_height).floor().clamp(1.0, 200.0) as u16;
+    (columns, rows)
+}
+
+fn observed_terminal_viewport(content: Element<'_, Message>) -> Element<'_, Message> {
+    sensor(content)
+        .on_resize(Message::TerminalViewportResized)
+        .into()
+}
+
 fn centered_message(message: &str) -> Element<'_, Message> {
     container(text(message).style(text::secondary))
         .width(Fill)
@@ -3391,6 +3437,25 @@ mod tests {
             terminal_view.contains(".on_scroll("),
             "the fixed VT viewport must still route wheel input to terminal-owned scrollback"
         );
+    }
+
+    #[test]
+    fn measured_terminal_viewport_keeps_the_grid_inside_the_visible_screen() {
+        let viewport = iced::Size::new(600.0, 400.0);
+        let font_size = 14;
+        let (columns, rows) = terminal_grid_dimensions(viewport, font_size);
+        let screen_width = viewport.width - TERMINAL_HORIZONTAL_PADDING;
+        let screen_height = viewport.height
+            - TERMINAL_VERTICAL_PADDING
+            - TERMINAL_HEADER_HEIGHT
+            - TERMINAL_HEADER_SPACING;
+        let cell_width = f32::from(font_size) * TERMINAL_CELL_WIDTH_RATIO;
+        let line_height = f32::from(font_size) * TERMINAL_LINE_HEIGHT_RATIO;
+
+        assert!(f32::from(columns) * cell_width <= screen_width);
+        assert!(f32::from(columns + 1) * cell_width > screen_width);
+        assert!(f32::from(rows) * line_height <= screen_height);
+        assert!(f32::from(rows + 1) * line_height > screen_height);
     }
 
     #[test]
