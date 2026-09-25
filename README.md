@@ -12,6 +12,8 @@ sylvops up .
 
 This starts the local daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the native desktop app. It does not launch an agent automatically. `sylvops open .` is a compatibility alias, while `sylvops tui` opens the terminal interface.
 
+The beta is distributed as unsigned portable archives and does not edit `PATH`. Verify the downloaded archive against the release's `SHA256SUMS` before extracting it. Windows may show an unrecognized-app warning; after verifying the checksum, choose **More info → Run anyway** for this build. macOS may block an unidentified, unnotarized binary; after verifying the checksum and attempting to run it, use **System Settings → Privacy & Security → Open Anyway**, confirm **Open**, and do not disable Gatekeeper globally. Linux desktop launch requires a graphical session and the system libraries normally provided by a supported desktop installation.
+
 To build from source, install stable Rust 1.88 or newer, Git, and the platform C toolchain:
 
 ```text

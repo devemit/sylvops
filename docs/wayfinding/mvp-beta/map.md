@@ -21,11 +21,12 @@ Reach a defensible `v0.1.0-beta.1`: a developer on Windows, Linux, or macOS can 
 - [Inactive-session history](tickets/inactive-session-history.md): retain outcome metadata indefinitely, keep terminal output memory-only, and resume eligible provider sessions into new records.
 - [First-run and provider recovery](tickets/first-run-recovery.md): guide an empty desktop through Workspace → Project/root Worktree → Session, keep Shell as the fallback, and re-probe Codex after explicit install or login repair.
 - [Beta acceptance contract](tickets/beta-acceptance-contract.md): block release on the exact cross-platform package, client, daemon, worktree, Shell, Codex, recovery, safety, and evidence clauses; permit only the named beta limitations.
+- [Fresh-machine release proof](tickets/release-proof.md): stage exactly four validated, checksummed, attested archives behind a protected publication gate, then require immutable native clean-host evidence for every contract scenario and record all missing or failed checks.
 
 ## Still to prove and decide
 
-- The fresh-machine release-proof ticket must collect the contract's Windows, Linux, macOS, archive, Shell, recovery, worktree, TUI, doctor, and opt-in real-Codex evidence. The current Windows archive quickstart contradicts the desktop launcher and is a recorded blocker.
-- The beta-cut ticket must apply the contract to that evidence and make the final ship-or-delay decision.
+- The release-proof process is resolved, but no staged-candidate, clean-host, or opt-in real-Codex evidence has been collected. Every such row remains `NOT_RUN` and release-blocking.
+- The beta-cut ticket must apply the contract to a complete evidence bundle and make the final ship-or-delay decision before the protected publication gate is approved.
 - Real-user desktop testing may expose a small final polish set; only beta-blocking failures graduate into tickets.
 
 ## Out of scope
