@@ -18,7 +18,7 @@ use iced::{
     alignment::Vertical,
     keyboard,
     keyboard::{Key, key::Named},
-    system, time,
+    mouse, system, time,
     widget::{
         button, column, container, mouse_area, opaque, pane_grid, row, rule, scrollable, slider,
         space, stack, text, text_input,
@@ -206,6 +206,8 @@ enum Message {
     Attach,
     Detach,
     FocusTerminal,
+    ScrollTerminal(mouse::ScrollDelta),
+    LatestTerminal,
     Stop,
     Refresh,
     ToggleSettings,
@@ -361,6 +363,8 @@ impl DesktopApp {
             Message::Attach => self.attach_active(),
             Message::Detach => self.detach_active(),
             Message::FocusTerminal => self.focus_terminal(),
+            Message::ScrollTerminal(delta) => self.scroll_terminal(delta),
+            Message::LatestTerminal => self.show_latest_terminal(),
             Message::Stop => self.open_stop_confirmation(),
             Message::Refresh => self.request_snapshot(),
             Message::ToggleSettings => {
@@ -907,7 +911,10 @@ impl DesktopApp {
                 Message::Attach,
             );
         };
-        let role = if !terminal.attached {
+        let scrollback_rows = terminal.scrollback_rows();
+        let role = if scrollback_rows > 0 {
+            format!("History  ·  {scrollback_rows} lines back")
+        } else if !terminal.attached {
             "Detached  ·  click Attach to reconnect".to_owned()
         } else if terminal.role == AttachmentRole::Observer {
             "Read-only observer  ·  another client controls input".to_owned()
@@ -917,16 +924,29 @@ impl DesktopApp {
             "Controller  ·  click anywhere in the terminal to type".to_owned()
         };
         let contents = terminal_display_contents(terminal, self.terminal_focus.is_focused());
+        let mut terminal_header = row![
+            text(role)
+                .font(UI_MEDIUM)
+                .size(UI_META_SIZE)
+                .style(text::secondary),
+            space::horizontal(),
+        ]
+        .align_y(Center);
+        if scrollback_rows > 0 {
+            terminal_header = terminal_header.push(
+                button(text("Latest").font(UI_MEDIUM).size(UI_META_SIZE))
+                    .on_press(Message::LatestTerminal)
+                    .height(24)
+                    .padding([3, 8])
+                    .style(button::primary),
+            );
+        }
         let surface = container(
             column![
-                container(
-                    text(role)
-                        .font(UI_MEDIUM)
-                        .size(UI_META_SIZE)
-                        .style(text::secondary)
-                )
-                .height(26)
-                .align_y(Vertical::Center),
+                container(terminal_header)
+                    .height(26)
+                    .width(Fill)
+                    .align_y(Vertical::Center),
                 container(
                     text(contents)
                         .font(TERMINAL_FONT)
@@ -942,7 +962,10 @@ impl DesktopApp {
         .width(Fill)
         .height(Fill)
         .style(move |theme| terminal_surface(theme, self.terminal_focus.is_focused()));
-        mouse_area(surface).on_press(Message::FocusTerminal).into()
+        mouse_area(surface)
+            .on_press(Message::FocusTerminal)
+            .on_scroll(Message::ScrollTerminal)
+            .into()
     }
 
     fn changes_view(&self) -> Element<'_, Message> {
@@ -1095,6 +1118,10 @@ impl DesktopApp {
                 detail("1 / 2 / 3", "Terminal / Changes / Details".into()),
                 detail("N / R / D", "New / rename / stop or remove".into()),
                 detail("A / G", "Attach terminal / show Git changes".into()),
+                detail(
+                    "Wheel / Shift+PageUp",
+                    "Read terminal history; Shift+End returns to latest".into(),
+                ),
                 detail("Ctrl+]", "Detach the focused terminal".into()),
                 text("Shortcuts are paused while a form is open. When the terminal says “keyboard active”, ordinary keys go to the running process.")
                     .style(text::secondary),
@@ -1513,6 +1540,7 @@ impl DesktopApp {
                     terminal.last_sequence = snapshot_sequence;
                     terminal.columns = columns;
                     terminal.rows = rows;
+                    terminal.prepare_for_input();
                 }
             }
             DaemonEvent::SessionExited { session_id, .. } => {
@@ -1603,14 +1631,7 @@ impl DesktopApp {
                 let terminal = self
                     .terminals
                     .entry(session_id)
-                    .or_insert_with(|| TerminalState {
-                        role,
-                        parser: vt100::Parser::new(rows, columns, 10_000),
-                        last_sequence: 0,
-                        attached: true,
-                        columns,
-                        rows,
-                    });
+                    .or_insert_with(|| TerminalState::new(role, rows, columns, 10_000));
                 terminal.role = role;
                 terminal.attached = true;
                 terminal.columns = columns;
@@ -1620,6 +1641,7 @@ impl DesktopApp {
                     terminal.parser.process(&snapshot);
                     terminal.last_sequence = replay_through_sequence;
                 }
+                terminal.prepare_for_input();
                 self.main_tab = MainTab::Terminal;
                 self.terminal_focus = if role == AttachmentRole::Controller {
                     TerminalFocus::Focused
@@ -1809,7 +1831,7 @@ impl DesktopApp {
                 self.terminal_focus = TerminalFocus::Unfocused;
                 return;
             };
-            let Some(terminal) = self.terminals.get(&session_id) else {
+            let Some(terminal) = self.terminals.get_mut(&session_id) else {
                 self.terminal_focus = TerminalFocus::Unfocused;
                 return;
             };
@@ -1821,9 +1843,31 @@ impl DesktopApp {
                 self.detach_active();
                 return;
             }
+            if modifiers.shift() {
+                match key.as_ref() {
+                    Key::Named(Named::PageUp) => {
+                        terminal.scroll_page(1);
+                        return;
+                    }
+                    Key::Named(Named::PageDown) => {
+                        terminal.scroll_page(-1);
+                        return;
+                    }
+                    Key::Named(Named::Home) => {
+                        terminal.scroll_to_oldest();
+                        return;
+                    }
+                    Key::Named(Named::End) => {
+                        terminal.prepare_for_input();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             let Some(bytes) = encode_terminal_key(&key, modifiers, text.as_deref()) else {
                 return;
             };
+            terminal.prepare_for_input();
             self.send_request(
                 Operation::Input(session_id),
                 ClientRequest::SessionInput { session_id, bytes },
@@ -2364,7 +2408,7 @@ impl DesktopApp {
         let Some(session_id) = self.active_session_id else {
             return;
         };
-        let Some(terminal) = self.terminals.get(&session_id) else {
+        let Some(terminal) = self.terminals.get_mut(&session_id) else {
             self.error = Some("Click Attach before typing in this terminal.".into());
             return;
         };
@@ -2378,8 +2422,32 @@ impl DesktopApp {
             );
             return;
         }
+        terminal.prepare_for_input();
         self.terminal_focus = TerminalFocus::Focused;
         self.error = None;
+    }
+
+    fn scroll_terminal(&mut self, delta: mouse::ScrollDelta) {
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        let font_size = f32::from(self.desktop_state.terminal_font_size);
+        let lines = match delta {
+            mouse::ScrollDelta::Lines { y, .. } => y * 3.0,
+            mouse::ScrollDelta::Pixels { y, .. } => y / (font_size + 3.0),
+        };
+        if let Some(terminal) = self.terminals.get_mut(&session_id) {
+            terminal.scroll_lines(lines);
+        }
+    }
+
+    fn show_latest_terminal(&mut self) {
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        if let Some(terminal) = self.terminals.get_mut(&session_id) {
+            terminal.prepare_for_input();
+        }
     }
 
     fn load_diff(&mut self) {
@@ -2512,6 +2580,7 @@ impl DesktopApp {
             terminal.parser.screen_mut().set_size(rows, columns);
             terminal.columns = columns;
             terminal.rows = rows;
+            terminal.prepare_for_input();
         }
         self.pending_resize = Some((session_id, columns, rows, Instant::now()));
     }
@@ -3231,6 +3300,10 @@ mod tests {
         assert!(
             !terminal_view.contains("scrollable("),
             "the VT screen owns its viewport; a nested desktop scroll area breaks terminal input and resizing"
+        );
+        assert!(
+            terminal_view.contains(".on_scroll("),
+            "the fixed VT viewport must still route wheel input to terminal-owned scrollback"
         );
     }
 
