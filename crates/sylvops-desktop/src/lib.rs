@@ -477,8 +477,7 @@ impl DesktopApp {
         } else {
             mission_control
         };
-        let footer = self.footer();
-        let mut content = column![top, rule::horizontal(1), body, rule::horizontal(1), footer]
+        let mut content = column![top, rule::horizontal(1), body]
             .width(Fill)
             .height(Fill);
         if let Some(error) = &self.error {
@@ -493,14 +492,14 @@ impl DesktopApp {
                 )
                 .padding([8, 12]),
             );
-        }
-        if let Some((message, _)) = &self.success {
+        } else if let Some((message, _)) = &self.success {
             content = content.push(
                 container(text(message).style(text::success))
                     .padding([6, 12])
                     .width(Fill),
             );
         }
+        content = content.push(rule::horizontal(1)).push(self.footer());
         container(content).width(Fill).height(Fill).into()
     }
 
@@ -558,11 +557,15 @@ impl DesktopApp {
         }
         workspaces = workspaces
             .push(
-                button(text("+").font(UI_MEDIUM).size(16))
-                    .on_press(Message::NewWorkspace)
-                    .height(ACTION_HEIGHT)
-                    .padding([5, 10])
-                    .style(chrome_action_style),
+                button(
+                    text(if compact { "+" } else { "+ Workspace" })
+                        .font(UI_MEDIUM)
+                        .size(if compact { 16 } else { 12 }),
+                )
+                .on_press(Message::NewWorkspace)
+                .height(ACTION_HEIGHT)
+                .padding([5, 10])
+                .style(chrome_action_style),
             )
             .push(space::horizontal())
             .push(
@@ -572,13 +575,7 @@ impl DesktopApp {
                     .align_y(Vertical::Center)
                     .style(selected_context_style),
             )
-            .push(
-                button(text("↻").size(17))
-                    .on_press(Message::Refresh)
-                    .height(ACTION_HEIGHT)
-                    .padding([5, 10])
-                    .style(chrome_action_style),
-            )
+            .push(self.refresh_button(compact))
             .push(
                 button(text(fullscreen_label).font(UI_MEDIUM).size(12))
                     .on_press(Message::ToggleFullscreen)
@@ -602,7 +599,28 @@ impl DesktopApp {
             .into()
     }
 
+    fn refresh_button(&self, compact: bool) -> Element<'static, Message> {
+        let can_refresh =
+            matches!(self.connection, ConnectionState::Connected) && !self.snapshot_pending;
+        let label = if self.snapshot_pending {
+            if compact { "…" } else { "Refreshing…" }
+        } else if compact {
+            "↻"
+        } else {
+            "Refresh"
+        };
+        button(text(label).size(if compact { 17 } else { 12 }))
+            .on_press_maybe(can_refresh.then_some(Message::Refresh))
+            .height(ACTION_HEIGHT)
+            .padding([5, 10])
+            .style(chrome_action_style)
+            .into()
+    }
+
     fn mission_control(&self) -> Element<'_, Message> {
+        if matches!(self.connection, ConnectionState::Connecting) {
+            return centered_message("Connecting to the SylvOps daemon…");
+        }
         match state::layout_mode(self.desktop_state.window_width) {
             state::LayoutMode::Wide => pane_grid(&self.panes, |_pane, kind, _maximized| {
                 let content = match kind {
@@ -658,7 +676,8 @@ impl DesktopApp {
 
     fn projects_column(&self) -> Element<'_, Message> {
         let mut items = column![column_heading("Projects", Some(Message::NewProject))].spacing(4);
-        for project in self.visible_projects() {
+        let projects = self.visible_projects();
+        for project in &projects {
             items = items.push(select_button(
                 &project.name,
                 self.selected_project_id == Some(project.id),
@@ -666,8 +685,20 @@ impl DesktopApp {
                 self.desktop_state.density,
             ));
         }
-        if self.visible_projects().is_empty() {
-            items = items.push(empty_hint("No repositories in this workspace."));
+        if projects.is_empty() {
+            items = items.push(if self.active_workspace().is_some() {
+                empty_action(
+                    "No repositories in this workspace yet.",
+                    "Register repository",
+                    Message::NewProject,
+                )
+            } else {
+                empty_action(
+                    "Create a workspace to begin.",
+                    "Create workspace",
+                    Message::NewWorkspace,
+                )
+            });
         }
         panel(scrollable(items), 190.0)
     }
@@ -676,7 +707,8 @@ impl DesktopApp {
         let create = self.selected_project_id.map(|_| Message::NewWorktree);
         let mut items = column![column_heading("Worktrees", create)].spacing(4);
         if let Some(project_id) = self.selected_project_id {
-            for worktree in self.worktrees_for(project_id) {
+            let worktrees = self.worktrees_for(project_id);
+            for worktree in &worktrees {
                 let branch = worktree.branch.as_deref().unwrap_or("detached");
                 let label = if worktree.is_root_checkout {
                     format!("{}  ·  {branch}  ·  root", worktree.name)
@@ -690,8 +722,14 @@ impl DesktopApp {
                     self.desktop_state.density,
                 ));
             }
-        }
-        if self.selected_project_id.is_none() {
+            if worktrees.is_empty() {
+                items = items.push(empty_action(
+                    "No worktrees are available for this project.",
+                    "Create worktree",
+                    Message::NewWorktree,
+                ));
+            }
+        } else {
             items = items.push(empty_hint("Select a project."));
         }
         panel(scrollable(items), 225.0)
@@ -701,7 +739,8 @@ impl DesktopApp {
         let create = self.selected_worktree_id.map(|_| Message::NewSession);
         let mut items = column![column_heading("Sessions", create)].spacing(4);
         if let Some(worktree_id) = self.selected_worktree_id {
-            for session in self.sessions_for(worktree_id) {
+            let sessions = self.sessions_for(worktree_id);
+            for session in &sessions {
                 let label = format!(
                     "{}  ·  {} {}",
                     status_symbol(session.state),
@@ -715,8 +754,14 @@ impl DesktopApp {
                     self.desktop_state.density,
                 ));
             }
-        }
-        if self.selected_worktree_id.is_none() {
+            if sessions.is_empty() {
+                items = items.push(empty_action(
+                    "No sessions in this worktree yet.",
+                    "New session",
+                    Message::NewSession,
+                ));
+            }
+        } else {
             items = items.push(empty_hint("Select a worktree."));
         }
         panel(scrollable(items), 255.0)
@@ -1210,7 +1255,11 @@ impl DesktopApp {
             fields = fields.push(text(guidance).style(text::secondary));
         }
         if form.is_session() {
-            fields = fields.push(Self::provider_picker(form, modal.provider_probe));
+            fields = fields.push(Self::provider_picker(
+                form,
+                modal.provider_probe,
+                modal.pending,
+            ));
         }
         for (index, field) in form
             .fields
@@ -1230,7 +1279,10 @@ impl DesktopApp {
                 group = group.push(text(error).style(text::danger));
             }
             if matches!(form.kind, FormKind::RegisterProject(_)) && index == 0 {
-                group = group.push(button("Choose folder…").on_press(Message::BrowseRepository));
+                group = group.push(
+                    button("Choose folder…")
+                        .on_press_maybe((!modal.pending).then_some(Message::BrowseRepository)),
+                );
             }
             fields = fields.push(group);
         }
@@ -1241,26 +1293,15 @@ impl DesktopApp {
             form.provider()
                 .is_some_and(|provider| provider.kind == kind)
         });
-        let submit = if modal.pending {
-            "Working…"
-        } else if selected_provider_checking {
-            "Checking Codex…"
-        } else if form.is_session() {
-            match form.provider().map(|provider| provider.kind) {
-                Some(ProviderKind::Codex) => "Start Codex",
-                Some(ProviderKind::Shell) => "Open Shell",
-                Some(_) | None => "Start session",
-            }
-        } else {
-            "Continue"
-        };
+        let submit = form_submit_label(form, modal.pending, selected_provider_checking);
         container(
             column![
                 text(&form.title).font(UI_SEMIBOLD).size(22),
                 fields,
                 row![
                     space::horizontal(),
-                    button("Cancel").on_press(Message::CancelModal),
+                    button("Cancel")
+                        .on_press_maybe((!modal.pending).then_some(Message::CancelModal)),
                     button(submit)
                         .on_press_maybe(
                             (!modal.pending && !selected_provider_checking)
@@ -1278,7 +1319,11 @@ impl DesktopApp {
         .into()
     }
 
-    fn provider_picker(form: &Form, probing: Option<ProviderKind>) -> Element<'_, Message> {
+    fn provider_picker(
+        form: &Form,
+        probing: Option<ProviderKind>,
+        form_pending: bool,
+    ) -> Element<'_, Message> {
         let provider = form.provider();
         let provider_text = provider.map_or_else(
             || "No providers".into(),
@@ -1286,7 +1331,7 @@ impl DesktopApp {
                 let status = if !item.available {
                     "unavailable"
                 } else if item.kind == ProviderKind::Codex && !item.authenticated {
-                    "available, login required"
+                    "available, sign-in required"
                 } else {
                     "ready"
                 };
@@ -1303,7 +1348,7 @@ impl DesktopApp {
             if form.providers.iter().any(|provider| provider.kind == kind) {
                 choices = choices.push(
                     button(text(kind.to_string()).font(UI_MEDIUM))
-                        .on_press(Message::SelectProvider(kind))
+                        .on_press_maybe((!form_pending).then_some(Message::SelectProvider(kind)))
                         .style(if selected == Some(kind) {
                             button::primary
                         } else {
@@ -1324,7 +1369,9 @@ impl DesktopApp {
                 } else {
                     "Retry discovery"
                 })
-                .on_press_maybe((!checking_selected).then_some(Message::ProbeProvider)),
+                .on_press_maybe(
+                    (!checking_selected && !form_pending).then_some(Message::ProbeProvider),
+                ),
             ]
             .spacing(8)
             .align_y(Center)
@@ -2918,6 +2965,28 @@ fn trimmed_option(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+fn form_submit_label(form: &Form, pending: bool, selected_provider_checking: bool) -> &'static str {
+    if pending {
+        return "Working…";
+    }
+    if selected_provider_checking {
+        return "Checking Codex…";
+    }
+    match form.kind {
+        FormKind::CreateWorkspace => "Create workspace",
+        FormKind::RegisterProject(_) => "Register repository",
+        FormKind::CreateWorktree(_) => "Create worktree",
+        FormKind::CreateSession(_) => match form.provider().map(|provider| provider.kind) {
+            Some(ProviderKind::Codex) => "Start Codex",
+            Some(ProviderKind::Shell) => "Open Shell",
+            Some(_) | None => "Start session",
+        },
+        FormKind::RenameProject(_) | FormKind::RenameWorktree(_) | FormKind::RenameSession(_) => {
+            "Save name"
+        }
+    }
+}
+
 fn first_run_guidance(kind: FormKind) -> Option<&'static str> {
     match kind {
         FormKind::CreateWorkspace => Some(
@@ -3009,6 +3078,23 @@ fn empty_hint(message: &str) -> Element<'_, Message> {
         .padding(8)
         .width(Fill)
         .into()
+}
+
+fn empty_action(
+    message: &'static str,
+    label: &'static str,
+    action: Message,
+) -> Element<'static, Message> {
+    container(
+        column![
+            text(message).size(UI_META_SIZE).style(text::secondary),
+            button(label).on_press(action).style(button::secondary),
+        ]
+        .spacing(8),
+    )
+    .padding(8)
+    .width(Fill)
+    .into()
 }
 
 fn footer_item(label: &str) -> Element<'static, Message> {
@@ -3352,5 +3438,32 @@ mod tests {
             provider_recovery_message(&provider_health(ProviderKind::Codex, true, false));
         assert!(unauthenticated.contains("Sign in to Codex"));
         assert!(unauthenticated.contains("retry discovery"));
+    }
+
+    #[test]
+    fn forms_use_specific_primary_action_labels() {
+        assert_eq!(
+            form_submit_label(&Form::workspace(), false, false),
+            "Create workspace"
+        );
+        assert_eq!(
+            form_submit_label(&Form::repository(WorkspaceId::new()), false, false),
+            "Register repository"
+        );
+        assert_eq!(
+            form_submit_label(&Form::worktree(ProjectId::new()), false, false),
+            "Create worktree"
+        );
+        assert_eq!(
+            form_submit_label(
+                &Form::session(
+                    WorktreeId::new(),
+                    vec![provider_health(ProviderKind::Shell, true, true)],
+                ),
+                false,
+                false,
+            ),
+            "Open Shell"
+        );
     }
 }
