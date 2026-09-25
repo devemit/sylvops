@@ -1,5 +1,32 @@
 use iced::keyboard::{self, Key, key::Named};
 use sylvops_core::domain::AttachmentRole;
+use sylvops_core::protocol::MAX_PTY_CHUNK_SIZE;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CellPosition {
+    row: u16,
+    column: u16,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TerminalStyle {
+    pub foreground: vt100::Color,
+    pub background: vt100::Color,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+    pub selected: bool,
+    pub cursor: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DisplayRun {
+    pub text: String,
+    pub style: TerminalStyle,
+}
 
 pub(crate) struct TerminalState {
     pub role: AttachmentRole,
@@ -9,6 +36,8 @@ pub(crate) struct TerminalState {
     pub columns: u16,
     pub rows: u16,
     scroll_fraction: f32,
+    selection_anchor: Option<CellPosition>,
+    selection_focus: Option<CellPosition>,
 }
 
 impl TerminalState {
@@ -26,6 +55,8 @@ impl TerminalState {
             columns,
             rows,
             scroll_fraction: 0.0,
+            selection_anchor: None,
+            selection_focus: None,
         }
     }
 
@@ -75,6 +106,7 @@ impl TerminalState {
     pub(crate) fn prepare_for_input(&mut self) {
         self.parser.screen_mut().set_scrollback(0);
         self.scroll_fraction = 0.0;
+        self.clear_selection();
     }
 
     pub(crate) fn is_scrolled_back(&self) -> bool {
@@ -83,6 +115,91 @@ impl TerminalState {
 
     pub(crate) fn scrollback_rows(&self) -> usize {
         self.parser.screen().scrollback()
+    }
+
+    pub(crate) fn begin_selection(&mut self, row: u16, column: u16) {
+        let position = self.clamp_position(row, column);
+        self.selection_anchor = Some(position);
+        self.selection_focus = Some(position);
+    }
+
+    pub(crate) fn update_selection(&mut self, row: u16, column: u16) {
+        if self.selection_anchor.is_some() {
+            self.selection_focus = Some(self.clamp_position(row, column));
+        }
+    }
+
+    pub(crate) fn finish_selection(&mut self) {
+        if self.selection_anchor == self.selection_focus {
+            self.clear_selection();
+        }
+    }
+
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_focus = None;
+    }
+
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        let screen = self.parser.screen();
+        let mut selected = String::new();
+
+        for row in start.row..=end.row {
+            let first_column = if row == start.row { start.column } else { 0 };
+            let last_column = if row == end.row {
+                end.column
+            } else {
+                self.columns.saturating_sub(1)
+            };
+            let line_start = selected.len();
+            for column in first_column..=last_column {
+                let Some(cell) = screen.cell(row, column) else {
+                    selected.push(' ');
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                if cell.has_contents() {
+                    selected.push_str(cell.contents());
+                } else {
+                    selected.push(' ');
+                }
+            }
+            while selected.len() > line_start && selected.ends_with(' ') {
+                selected.pop();
+            }
+            if row < end.row {
+                selected.push('\n');
+            }
+        }
+
+        (!selected.is_empty()).then_some(selected)
+    }
+
+    fn clamp_position(&self, row: u16, column: u16) -> CellPosition {
+        CellPosition {
+            row: row.min(self.rows.saturating_sub(1)),
+            column: column.min(self.columns.saturating_sub(1)),
+        }
+    }
+
+    fn selection(&self) -> Option<(CellPosition, CellPosition)> {
+        let anchor = self.selection_anchor?;
+        let focus = self.selection_focus?;
+        Some(if anchor <= focus {
+            (anchor, focus)
+        } else {
+            (focus, anchor)
+        })
+    }
+
+    fn is_selected(&self, row: u16, column: u16) -> bool {
+        self.selection().is_some_and(|(start, end)| {
+            let position = CellPosition { row, column };
+            position >= start && position <= end
+        })
     }
 }
 
@@ -125,58 +242,123 @@ pub(crate) fn encode_key(
     Some(bytes)
 }
 
-/// Produces a plain-text view of the maintained terminal screen and adds a
-/// visible cursor marker. Provider escape sequences stay inside the VT parser.
-pub(crate) fn display_contents(terminal: &TerminalState, focused: bool) -> String {
+pub(crate) fn encode_paste(contents: &str, bracketed: bool) -> Vec<u8> {
+    let normalized = contents.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = if bracketed {
+        normalized
+    } else {
+        normalized.replace('\n', "\r")
+    };
+    let prefix = if bracketed {
+        b"\x1b[200~".as_slice()
+    } else {
+        &[]
+    };
+    let suffix = if bracketed {
+        b"\x1b[201~".as_slice()
+    } else {
+        &[]
+    };
+    let budget = MAX_PTY_CHUNK_SIZE.saturating_sub(prefix.len() + suffix.len());
+    let mut end = normalized.len().min(budget);
+    while !normalized.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+
+    let mut bytes = Vec::with_capacity(prefix.len() + end + suffix.len());
+    bytes.extend_from_slice(prefix);
+    bytes.extend_from_slice(&normalized.as_bytes()[..end]);
+    bytes.extend_from_slice(suffix);
+    bytes
+}
+
+pub(crate) fn display_runs(terminal: &TerminalState, focused: bool) -> Vec<DisplayRun> {
     let screen = terminal.parser.screen();
     let (cursor_row, cursor_column) = screen.cursor_position();
     let show_cursor = terminal.attached
         && terminal.role == AttachmentRole::Controller
         && !terminal.is_scrolled_back()
         && !screen.hide_cursor();
-    let cursor_marker = if focused { '█' } else { '▯' };
 
     let mut last_row = cursor_row;
     for row in 0..terminal.rows {
         if (0..terminal.columns).any(|column| {
-            screen
-                .cell(row, column)
-                .is_some_and(vt100::Cell::has_contents)
+            terminal.is_selected(row, column)
+                || screen.cell(row, column).is_some_and(|cell| {
+                    cell.has_contents() || cell.bgcolor() != vt100::Color::Default
+                })
         }) {
             last_row = row;
         }
     }
 
-    let mut contents = String::new();
+    let mut runs = Vec::new();
     for row in 0..=last_row.min(terminal.rows.saturating_sub(1)) {
-        let mut line = String::new();
-        for column in 0..terminal.columns {
-            if show_cursor && row == cursor_row && column == cursor_column {
-                line.push(cursor_marker);
+        let last_column = (0..terminal.columns)
+            .rfind(|column| {
+                (show_cursor && row == cursor_row && *column == cursor_column)
+                    || terminal.is_selected(row, *column)
+                    || screen.cell(row, *column).is_some_and(|cell| {
+                        cell.has_contents() || cell.bgcolor() != vt100::Color::Default
+                    })
+            })
+            .unwrap_or(0);
+        for column in 0..=last_column {
+            let cell = screen.cell(row, column);
+            if cell.is_some_and(vt100::Cell::is_wide_continuation) {
                 continue;
             }
-            let Some(cell) = screen.cell(row, column) else {
-                line.push(' ');
-                continue;
-            };
-            if cell.is_wide_continuation() {
-                continue;
-            }
-            if cell.has_contents() {
-                line.push_str(cell.contents());
+            let cursor = show_cursor && row == cursor_row && column == cursor_column;
+            let text = if cursor && focused {
+                "█"
+            } else if cursor {
+                "▯"
+            } else if let Some(cell) = cell.filter(|cell| cell.has_contents()) {
+                cell.contents()
             } else {
-                line.push(' ');
-            }
+                " "
+            };
+            let style = TerminalStyle {
+                foreground: cell.map_or(vt100::Color::Default, vt100::Cell::fgcolor),
+                background: cell.map_or(vt100::Color::Default, vt100::Cell::bgcolor),
+                bold: cell.is_some_and(vt100::Cell::bold),
+                dim: cell.is_some_and(vt100::Cell::dim),
+                italic: cell.is_some_and(vt100::Cell::italic),
+                underline: cell.is_some_and(vt100::Cell::underline),
+                inverse: cell.is_some_and(vt100::Cell::inverse),
+                selected: terminal.is_selected(row, column),
+                cursor: cursor && focused,
+            };
+            push_run(&mut runs, text, style);
         }
-        while line.ends_with(' ') {
-            line.pop();
-        }
-        contents.push_str(&line);
         if row < last_row {
-            contents.push('\n');
+            push_run(&mut runs, "\n", TerminalStyle::default());
         }
     }
-    contents
+    runs
+}
+
+fn push_run(runs: &mut Vec<DisplayRun>, text: &str, style: TerminalStyle) {
+    if let Some(last) = runs.last_mut()
+        && last.style == style
+    {
+        last.text.push_str(text);
+        return;
+    }
+    runs.push(DisplayRun {
+        text: text.to_owned(),
+        style,
+    });
+}
+
+/// Produces a plain-text view of the maintained terminal screen and adds a
+/// visible cursor marker. Provider escape sequences stay inside the VT parser.
+#[cfg(test)]
+fn display_contents(terminal: &TerminalState, focused: bool) -> String {
+    display_runs(terminal, focused)
+        .into_iter()
+        .map(|run| run.text)
+        .collect()
 }
 
 #[cfg(test)]
@@ -251,5 +433,39 @@ mod tests {
         assert!(terminal.is_scrolled_back());
         terminal.prepare_for_input();
         assert!(display_contents(&terminal, true).contains("six"));
+    }
+
+    #[test]
+    fn ansi_styles_survive_terminal_rendering() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 20, 100);
+        terminal.parser.process(b"\x1b[1;31merror\x1b[0m plain");
+
+        let runs = display_runs(&terminal, true);
+
+        assert!(runs.iter().any(|run| {
+            run.text == "error" && run.style.bold && run.style.foreground == vt100::Color::Idx(1)
+        }));
+        assert!(runs.iter().any(|run| run.text.contains("plain")));
+    }
+
+    #[test]
+    fn selected_terminal_text_can_be_copied() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 20, 100);
+        terminal.parser.process(b"alpha beta");
+        terminal.begin_selection(0, 0);
+        terminal.update_selection(0, 4);
+        terminal.finish_selection();
+
+        assert_eq!(terminal.selected_text().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn paste_honors_bracketed_mode_and_protocol_limit() {
+        let pasted = encode_paste("one\r\ntwo", true);
+
+        assert!(pasted.starts_with(b"\x1b[200~"));
+        assert!(pasted.ends_with(b"\x1b[201~"));
+        assert!(pasted.windows(7).any(|window| window == b"one\ntwo"));
+        assert!(pasted.len() <= sylvops_core::protocol::MAX_PTY_CHUNK_SIZE);
     }
 }
