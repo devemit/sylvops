@@ -14,8 +14,17 @@ jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
-  package-windows:
+  validate-release:
     needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify release sources and tag
+        shell: pwsh
+        run: ./scripts/validate-release.ps1 -ExpectedTag "$env:GITHUB_REF_NAME"
+
+  package-windows:
+    needs: validate-release
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -32,6 +41,9 @@ jobs:
           Copy-Item "packaging/windows/Start SylvOps.cmd" package/
           Copy-Item packaging/windows/QUICKSTART.txt package/
           Compress-Archive package/* sylvops-windows-x86_64.zip
+      - name: Validate package contents
+        shell: pwsh
+        run: ./scripts/validate-release.ps1 -ArchivePath sylvops-windows-x86_64.zip -ExpectedTag "$env:GITHUB_REF_NAME"
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: sylvops-windows-x86_64.zip
@@ -41,7 +53,7 @@ jobs:
           path: sylvops-windows-x86_64.zip
 
   package-unix:
-    needs: verify
+    needs: validate-release
     strategy:
       matrix:
         include:
@@ -64,9 +76,13 @@ jobs:
         run: cargo build --release --locked -p sylvops-cli --target "${{ matrix.target }}"
       - name: Package
         run: |
+          test -x "target/${{ matrix.target }}/release/sylvops"
           mkdir package
           cp "target/${{ matrix.target }}/release/sylvops" README.md LICENSE package/
           tar -C package -czf "${{ matrix.asset }}" sylvops README.md LICENSE
+      - name: Validate package contents
+        shell: pwsh
+        run: ./scripts/validate-release.ps1 -ArchivePath "${{ matrix.asset }}" -ExpectedTag "$env:GITHUB_REF_NAME"
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ matrix.asset }}
@@ -75,15 +91,11 @@ jobs:
           name: package-${{ matrix.target }}
           path: ${{ matrix.asset }}
 
-  publish:
+  stage-release:
     needs: [package-windows, package-unix]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Verify release tag matches the workspace version
-        run: |
-          version="$(sed -n '/\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
-          test "$GITHUB_REF_NAME" = "v$version"
       - uses: actions/download-artifact@v5
         with:
           path: dist
@@ -92,6 +104,28 @@ jobs:
       - name: Create checksums
         working-directory: dist
         run: sha256sum sylvops-* > SHA256SUMS
+      - name: Validate staged release candidate
+        shell: pwsh
+        run: ./scripts/validate-release.ps1 -DistDirectory dist -ExpectedTag "$env:GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: stage-release
+    runs-on: ubuntu-latest
+    environment: beta-release
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: dist
+      - name: Revalidate approved release candidate
+        shell: pwsh
+        run: ./scripts/validate-release.ps1 -DistDirectory dist -ExpectedTag "$env:GITHUB_REF_NAME"
       - name: Publish GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}

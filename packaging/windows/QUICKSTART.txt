@@ -8,23 +8,38 @@ Requirements:
 
 No Rust installation or Visual Studio Build Tools are required.
 
-Double-click "Start SylvOps.cmd". Enter a Git repository path when
-prompted. The launcher starts the daemon, registers the repository
-idempotently, and opens the terminal UI. It does not start a shell or agent
-until you explicitly create a session.
+Open PowerShell in this directory and run the launcher with a Git repository:
 
-Useful keys:
-- Tab or h/l: move between panels
-- j/k: move selection
-- Enter: attach to the selected session
-- Ctrl+]: detach without stopping the session
-- g: show the bounded Git diff
-- Shift+A: select the highest-priority attention item
-- ?: show help
-- q: close the UI while sessions continue
+  .\Start-SylvOps.ps1 -Repository C:\path\to\repository
+
+From Command Prompt, the equivalent is:
+
+  "Start SylvOps.cmd" "C:\path\to\repository"
+
+If no repository argument is supplied, the launcher uses the current
+directory. It starts the daemon, registers the repository idempotently, and
+opens the native desktop. It does not start a shell or agent until you
+explicitly create a session. In the desktop, use the guided Workspace ->
+Project/root Worktree -> Session flow. Shell is selected by default;
+attaching to a session is always explicit.
+
+For the keyboard-first terminal UI, open PowerShell in this directory and
+run:
+
+  .\sylvops.exe tui
+
+In the TUI, Tab switches between Explorer and Main; arrow keys or j/k move
+through the hierarchy; Left/Right or h/l collapse and expand; 1/2/3 select
+Terminal/Changes/Details; Enter performs the explicit primary action; and
+Ctrl+] detaches without stopping a session. Press ? for the complete current
+shortcut list. Press q to close the TUI while sessions continue.
+
+Closing either client leaves daemon-owned sessions running. Reopen the
+desktop with the launcher command or reopen the TUI with the command above.
 
 To stop the daemon, open PowerShell in this directory and run:
 
   .\sylvops.exe daemon stop
 
-This is an unsigned development build, not a production release.
+This is an unsigned beta build. Windows may show an unrecognized-app warning;
+verify the archive checksum before choosing More info -> Run anyway.

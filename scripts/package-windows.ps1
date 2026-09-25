@@ -24,4 +24,6 @@ Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") -Destination $pac
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $packageDirectory -Force
 Compress-Archive -Path (Join-Path $packageDirectory "*") -DestinationPath $archivePath -Force
 
+& (Join-Path $PSScriptRoot "validate-release.ps1") -ArchivePath $archivePath
+
 Write-Host "Created $archivePath"

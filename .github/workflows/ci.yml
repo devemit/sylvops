@@ -19,6 +19,9 @@ jobs:
           components: rustfmt, clippy
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Validate release-proof sources
+        shell: pwsh
+        run: ./scripts/validate-release.ps1
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run workspace tests
