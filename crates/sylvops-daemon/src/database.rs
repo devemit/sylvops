@@ -2008,7 +2008,9 @@ fn database_error(error: rusqlite::Error) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sylvops_core::ui::{DesktopDensity, DesktopState, DesktopTheme, MainTab};
+    use sylvops_core::ui::{
+        DesktopDensity, DesktopState, DesktopTerminalFont, DesktopTheme, MainTab,
+    };
 
     #[tokio::test]
     async fn migrates_and_returns_empty_snapshot() {
@@ -2095,6 +2097,31 @@ mod tests {
         drop(connection);
         let database = DatabaseHandle::open(&path).unwrap();
         assert_eq!(database.desktop_state().await.unwrap(), None);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn older_desktop_state_defaults_new_appearance_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let database = DatabaseHandle::open(&path).unwrap();
+        database.shutdown().await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO ui_state(client_scope, key, value_json, updated_at) \
+                 VALUES ('desktop', 'navigation.v1', \
+                 '{\"theme\":\"nord\",\"terminal_font_size\":15}', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = DatabaseHandle::open(&path).unwrap();
+        let state = database.desktop_state().await.unwrap().unwrap();
+        assert_eq!(state.theme, DesktopTheme::Nord);
+        assert_eq!(state.terminal_font_size, 15);
+        assert_eq!(state.terminal_font, DesktopTerminalFont::System);
         database.shutdown().await.unwrap();
     }
 

@@ -70,9 +70,9 @@ The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoco
 
 - `sylvops` or `sylvops up [PATH]` opens the native window; closing it leaves daemon-owned sessions running.
 - The top bar switches workspaces. Projects, worktrees, and sessions stay visible beside the large Terminal/Changes/Details area.
-- Select a session, click **Attach**, and interact normally. The wheel or Shift+PageUp/Shift+PageDown reads terminal history without a scrollbar; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. `Ctrl+]` detaches without stopping it.
+- Select a session, click **Open terminal**, and interact normally. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
 - The footer always shows the version, workspace, branch, current view, daemon connectivity, and key hints.
-- Settings provide System, Light, Dark, Nord, Tokyo Night, and Catppuccin themes plus comfortable/compact density, terminal font sizing, and layout reset. The terminal TUI remains available as a keyboard-first alternative.
+- Settings provide ten built-in themes, comfortable/compact density, four terminal typeface choices, terminal text sizing, and layout reset. The terminal TUI remains available as a keyboard-first alternative.
 
 ## Current commands
 

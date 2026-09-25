@@ -43,6 +43,22 @@ pub enum DesktopTheme {
     Nord,
     TokyoNight,
     Catppuccin,
+    Dracula,
+    GruvboxDark,
+    SolarizedLight,
+    SolarizedDark,
+}
+
+/// Terminal typeface preference. Named fonts intentionally fall back through
+/// the renderer when they are not installed on the current machine.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopTerminalFont {
+    #[default]
+    System,
+    JetBrainsMono,
+    CascadiaCode,
+    FiraCode,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -64,6 +80,7 @@ pub enum DesktopPanel {
 
 /// Bounded, non-sensitive state restored by the native desktop client.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DesktopState {
     pub selected_project_id: Option<ProjectId>,
     pub selected_worktree_id: Option<WorktreeId>,
@@ -72,6 +89,7 @@ pub struct DesktopState {
     pub open_session_ids: Vec<SessionId>,
     pub theme: DesktopTheme,
     pub density: DesktopDensity,
+    pub terminal_font: DesktopTerminalFont,
     pub terminal_font_size: u8,
     pub window_width: u16,
     pub window_height: u16,
@@ -90,6 +108,7 @@ impl Default for DesktopState {
             open_session_ids: Vec::new(),
             theme: DesktopTheme::System,
             density: DesktopDensity::Comfortable,
+            terminal_font: DesktopTerminalFont::System,
             terminal_font_size: 13,
             window_width: 1440,
             window_height: 900,
