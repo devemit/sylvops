@@ -10,4 +10,6 @@ These terms describe desktop interaction patterns rather than daemon domain type
 | Selected state | A persistent soft tint, accent outline, and stronger label indicating the current workspace, entity, tab, density, theme, or font choice. |
 | Hover feedback | A temporary neutral tint showing that a control is interactive; it never carries information unavailable elsewhere. |
 | Inline rename | A session-name text field entered by double-click or keyboard shortcut. Enter saves; Escape or click-away cancels. |
+| Interactive session form | The desktop/TUI provider picker and optional display name. Advanced Codex startup arguments are CLI-only. |
+| Terminal cursor | The current input cell marker, persisted as either Block or Line. |
 | Terminal typeface | The monospace family used for terminal and diff content. It is independent from the platform-native application UI font. |

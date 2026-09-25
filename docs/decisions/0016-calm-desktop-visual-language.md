@@ -19,7 +19,8 @@ Comparable tools consistently separate subjective appearance preferences from wo
 - Place terminal attachment and session termination controls in the active session-tab header. Keep Terminal/Changes/Details exclusively for switching views.
 - Do not use hover tooltips. Labels, status copy, confirmation dialogs, and the shortcuts panel must carry the interaction contract without transient overlays.
 - Inline session rename is a direct-manipulation interaction: double-click to edit, Enter to save, Escape or click-away to cancel. Validation and daemon failures keep the editor and input intact.
-- Preserve a useful zero-configuration default while offering ten curated themes and four terminal typeface choices. Preferences remain bounded, local desktop state and do not change daemon authority.
+- Preserve a useful zero-configuration default while offering dropdowns for ten curated themes, density, four terminal typefaces, bounded text size, and Block/Line cursor shape. Preferences remain bounded, local desktop state and do not change daemon authority.
+- Keep interactive session creation intentionally small: provider plus optional display name. Advanced Codex model, effort, and initial-prompt controls remain CLI-only while their protocol fields stay compatible.
 
 ## Consequences
 
@@ -27,4 +28,6 @@ Comparable tools consistently separate subjective appearance preferences from wo
 - Session lifecycle actions remain visible but are visually and spatially associated with the session they affect.
 - Removing tooltips means clipped labels do not reveal hidden text on hover; future search or detail surfaces should solve discovery explicitly if this becomes a problem.
 - Named terminal fonts may not be installed on every machine, so the renderer falls back rather than making font availability a startup requirement.
+- The Block cursor remains the compatibility default. The Line cursor uses accent foreground only and never paints the complete cell background.
+- Desktop and TUI users configure advanced Codex options after launch or use the CLI when they need explicit startup arguments.
 - Older persisted desktop state remains readable through serde defaults; the protocol version does not change because named MessagePack fields remain backward compatible.

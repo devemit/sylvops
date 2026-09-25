@@ -1,5 +1,7 @@
 //! Bounded, non-sensitive state shared by replaceable user interfaces.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ProjectId, SessionId, WorktreeId};
@@ -61,6 +63,15 @@ pub enum DesktopTerminalFont {
     FiraCode,
 }
 
+/// Cursor shape rendered by the native desktop terminal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopTerminalCursor {
+    #[default]
+    Block,
+    Line,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DesktopDensity {
@@ -78,6 +89,52 @@ pub enum DesktopPanel {
     Sessions,
 }
 
+impl fmt::Display for DesktopTheme {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+            Self::Nord => "Nord",
+            Self::TokyoNight => "Tokyo Night",
+            Self::Catppuccin => "Catppuccin",
+            Self::Dracula => "Dracula",
+            Self::GruvboxDark => "Gruvbox Dark",
+            Self::SolarizedLight => "Solarized Light",
+            Self::SolarizedDark => "Solarized Dark",
+        })
+    }
+}
+
+impl fmt::Display for DesktopTerminalFont {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::System => "System mono",
+            Self::JetBrainsMono => "JetBrains Mono",
+            Self::CascadiaCode => "Cascadia Code",
+            Self::FiraCode => "Fira Code",
+        })
+    }
+}
+
+impl fmt::Display for DesktopTerminalCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Block => "Block",
+            Self::Line => "Line",
+        })
+    }
+}
+
+impl fmt::Display for DesktopDensity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Comfortable => "Comfortable",
+            Self::Compact => "Compact",
+        })
+    }
+}
+
 /// Bounded, non-sensitive state restored by the native desktop client.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -90,6 +147,7 @@ pub struct DesktopState {
     pub theme: DesktopTheme,
     pub density: DesktopDensity,
     pub terminal_font: DesktopTerminalFont,
+    pub terminal_cursor: DesktopTerminalCursor,
     pub terminal_font_size: u8,
     pub window_width: u16,
     pub window_height: u16,
@@ -109,6 +167,7 @@ impl Default for DesktopState {
             theme: DesktopTheme::System,
             density: DesktopDensity::Comfortable,
             terminal_font: DesktopTerminalFont::System,
+            terminal_cursor: DesktopTerminalCursor::Block,
             terminal_font_size: 13,
             window_width: 1440,
             window_height: 900,
@@ -167,8 +226,20 @@ mod tests {
         let state = state.normalized();
         assert_eq!(state.open_session_ids, vec![repeated]);
         assert_eq!(state.terminal_font_size, MAX_TERMINAL_FONT_SIZE);
+        assert_eq!(state.terminal_cursor, DesktopTerminalCursor::Block);
         assert_eq!(state.window_width, MIN_DESKTOP_WIDTH);
         assert_eq!(state.window_height, MAX_DESKTOP_HEIGHT);
         assert_eq!(state.panel_ratios, [100, 100, 350]);
+    }
+
+    #[test]
+    fn appearance_choices_have_stable_user_facing_labels() {
+        assert_eq!(DesktopTheme::TokyoNight.to_string(), "Tokyo Night");
+        assert_eq!(
+            DesktopTerminalFont::JetBrainsMono.to_string(),
+            "JetBrains Mono"
+        );
+        assert_eq!(DesktopTerminalCursor::Line.to_string(), "Line");
+        assert_eq!(DesktopDensity::Compact.to_string(), "Compact");
     }
 }

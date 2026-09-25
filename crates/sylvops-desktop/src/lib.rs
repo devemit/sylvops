@@ -21,8 +21,9 @@ use iced::{
     keyboard::{Key, key::Named},
     mouse, system, time,
     widget::{
-        self, button, column, container, mouse_area, opaque, pane_grid, responsive, rich_text, row,
-        rule, scrollable, sensor, slider, space, span, stack, text, text_input, vertical_slider,
+        self, button, column, container, mouse_area, opaque, pane_grid, pick_list, responsive,
+        rich_text, row, rule, scrollable, sensor, space, span, stack, text, text_input,
+        vertical_slider,
     },
     window,
 };
@@ -36,9 +37,9 @@ use sylvops_core::{
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     provider::ProviderHealth,
     ui::{
-        DesktopDensity, DesktopPanel, DesktopState, DesktopTerminalFont, DesktopTheme,
-        MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT, MIN_DESKTOP_WIDTH,
-        MIN_TERMINAL_FONT_SIZE, MainTab,
+        DesktopDensity, DesktopPanel, DesktopState, DesktopTerminalCursor, DesktopTerminalFont,
+        DesktopTheme, MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT,
+        MIN_DESKTOP_WIDTH, MIN_TERMINAL_FONT_SIZE, MainTab,
     },
     ui_forms::{Form, FormKind},
 };
@@ -68,6 +69,28 @@ const TERMINAL_HEADER_SPACING: f32 = 4.0;
 const TERMINAL_SCROLLBAR_WIDTH: f32 = 14.0;
 const TERMINAL_CELL_WIDTH_RATIO: f32 = 0.6;
 const TERMINAL_LINE_HEIGHT_RATIO: f32 = 1.3;
+const THEME_CHOICES: [DesktopTheme; 10] = [
+    DesktopTheme::System,
+    DesktopTheme::Light,
+    DesktopTheme::Dark,
+    DesktopTheme::Nord,
+    DesktopTheme::TokyoNight,
+    DesktopTheme::Catppuccin,
+    DesktopTheme::Dracula,
+    DesktopTheme::GruvboxDark,
+    DesktopTheme::SolarizedLight,
+    DesktopTheme::SolarizedDark,
+];
+const DENSITY_CHOICES: [DesktopDensity; 2] = [DesktopDensity::Comfortable, DesktopDensity::Compact];
+const TERMINAL_FONT_CHOICES: [DesktopTerminalFont; 4] = [
+    DesktopTerminalFont::System,
+    DesktopTerminalFont::JetBrainsMono,
+    DesktopTerminalFont::CascadiaCode,
+    DesktopTerminalFont::FiraCode,
+];
+const TERMINAL_CURSOR_CHOICES: [DesktopTerminalCursor; 2] =
+    [DesktopTerminalCursor::Block, DesktopTerminalCursor::Line];
+const TERMINAL_FONT_SIZE_CHOICES: [u8; 13] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
 #[cfg(windows)]
 const UI_FONT: Font = Font::with_name("Segoe UI");
 #[cfg(target_os = "macos")]
@@ -293,6 +316,7 @@ enum Message {
     SelectTheme(DesktopTheme),
     SelectDensity(DesktopDensity),
     SelectTerminalFont(DesktopTerminalFont),
+    SelectTerminalCursor(DesktopTerminalCursor),
     SetTerminalFontSize(u8),
     ResetLayout,
     SelectCompactPanel(DesktopPanel),
@@ -560,6 +584,10 @@ impl DesktopApp {
                 self.desktop_state.terminal_font = font;
                 self.mark_state_dirty();
                 self.queue_terminal_resize();
+            }
+            Message::SelectTerminalCursor(cursor) => {
+                self.desktop_state.terminal_cursor = cursor;
+                self.mark_state_dirty();
             }
             Message::SetTerminalFontSize(size) => {
                 self.desktop_state.terminal_font_size =
@@ -1241,9 +1269,14 @@ impl DesktopApp {
         };
         let terminal_font = terminal_font(self.desktop_state.terminal_font);
         let spans = terminal_spans(
-            terminal_display_runs(terminal, self.terminal_focus.is_focused()),
+            terminal_display_runs(
+                terminal,
+                self.terminal_focus.is_focused(),
+                self.desktop_state.terminal_cursor,
+            ),
             &self.theme(),
             terminal_font,
+            self.desktop_state.terminal_cursor,
         );
         let mut terminal_header = row![
             text(role)
@@ -1480,45 +1513,55 @@ impl DesktopApp {
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
-        let theme_choices = [
-            DesktopTheme::System,
-            DesktopTheme::Light,
-            DesktopTheme::Dark,
-            DesktopTheme::Nord,
-            DesktopTheme::TokyoNight,
-            DesktopTheme::Catppuccin,
-            DesktopTheme::Dracula,
-            DesktopTheme::GruvboxDark,
-            DesktopTheme::SolarizedLight,
-            DesktopTheme::SolarizedDark,
-        ];
-        let mut theme_rows = column![].spacing(8);
-        for choices in theme_choices.chunks(5) {
-            let mut themes = row![].spacing(8);
-            for &choice in choices {
-                let selected = self.desktop_state.theme == choice;
-                themes = themes.push(
-                    button(theme::label(choice))
-                        .on_press(Message::SelectTheme(choice))
-                        .style(move |theme, status| content_tab_style(theme, status, selected)),
-                );
-            }
-            theme_rows = theme_rows.push(themes);
-        }
-        let mut terminal_fonts = row![].spacing(8);
-        for choice in [
-            DesktopTerminalFont::System,
-            DesktopTerminalFont::JetBrainsMono,
-            DesktopTerminalFont::CascadiaCode,
-            DesktopTerminalFont::FiraCode,
-        ] {
-            let selected = self.desktop_state.terminal_font == choice;
-            terminal_fonts = terminal_fonts.push(
-                button(terminal_font_label(choice))
-                    .on_press(Message::SelectTerminalFont(choice))
-                    .style(move |theme, status| content_tab_style(theme, status, selected)),
-            );
-        }
+        let control_width = Length::Fixed(260.0);
+        let appearance = column![
+            setting_row(
+                "Theme",
+                pick_list(
+                    THEME_CHOICES,
+                    Some(self.desktop_state.theme),
+                    Message::SelectTheme,
+                )
+                .width(control_width),
+            ),
+            setting_row(
+                "Density",
+                pick_list(
+                    DENSITY_CHOICES,
+                    Some(self.desktop_state.density),
+                    Message::SelectDensity,
+                )
+                .width(control_width),
+            ),
+            setting_row(
+                "Terminal font",
+                pick_list(
+                    TERMINAL_FONT_CHOICES,
+                    Some(self.desktop_state.terminal_font),
+                    Message::SelectTerminalFont,
+                )
+                .width(control_width),
+            ),
+            setting_row(
+                "Font size (px)",
+                pick_list(
+                    TERMINAL_FONT_SIZE_CHOICES,
+                    Some(self.desktop_state.terminal_font_size),
+                    Message::SetTerminalFontSize,
+                )
+                .width(control_width),
+            ),
+            setting_row(
+                "Cursor",
+                pick_list(
+                    TERMINAL_CURSOR_CHOICES,
+                    Some(self.desktop_state.terminal_cursor),
+                    Message::SelectTerminalCursor,
+                )
+                .width(control_width),
+            ),
+        ]
+        .spacing(10);
         container(
             column![
                 row![
@@ -1534,29 +1577,10 @@ impl DesktopApp {
                 text("Appearance").font(UI_SEMIBOLD).size(16),
                 text("Appearance changes apply immediately and persist locally for this desktop.")
                     .style(text::secondary),
-                theme_rows,
-                row![
-                    text("Density").width(Length::Fixed(120.0)),
-                    button("Comfortable")
-                        .on_press(Message::SelectDensity(DesktopDensity::Comfortable))
-                        .style(move |theme, status| content_tab_style(theme, status, self.desktop_state.density == DesktopDensity::Comfortable)),
-                    button("Compact")
-                        .on_press(Message::SelectDensity(DesktopDensity::Compact))
-                        .style(move |theme, status| content_tab_style(theme, status, self.desktop_state.density == DesktopDensity::Compact)),
-                ].spacing(8).align_y(Center),
-                row![
-                    text("Terminal font").width(Length::Fixed(120.0)),
-                    terminal_fonts,
-                ].spacing(8).align_y(Center),
-                row![
-                    text(format!("Text size: {} px", self.desktop_state.terminal_font_size)).width(Length::Fixed(180.0)),
-                    slider(
-                        MIN_TERMINAL_FONT_SIZE..=MAX_TERMINAL_FONT_SIZE,
-                        self.desktop_state.terminal_font_size,
-                        Message::SetTerminalFontSize,
-                    ).width(Length::Fixed(260.0)),
-                ].spacing(8).align_y(Center),
-                button("Reset layout").on_press(Message::ResetLayout),
+                appearance,
+                button("Reset layout")
+                    .on_press(Message::ResetLayout)
+                    .style(chrome_action_style),
                 rule::horizontal(1),
                 text("Safety").font(UI_SEMIBOLD).size(16),
                 text("The desktop remains an IPC client. The daemon still owns PTYs, Git mutations, process cleanup, and audit events.")
@@ -1565,7 +1589,7 @@ impl DesktopApp {
             .spacing(16),
         )
         .padding(22)
-        .width(Length::Fixed(640.0))
+        .width(Length::Fixed(560.0))
         .style(modal_card)
         .into()
     }
@@ -2719,9 +2743,9 @@ impl DesktopApp {
                         worktree_id,
                         provider: provider.kind,
                         display_name: trimmed_option(&form.fields[0].value),
-                        model: trimmed_option(&form.fields[1].value),
-                        effort: trimmed_option(&form.fields[2].value),
-                        initial_prompt: trimmed_option(&form.fields[3].value),
+                        model: None,
+                        effort: None,
+                        initial_prompt: None,
                         columns,
                         rows,
                     },
@@ -3449,15 +3473,6 @@ const fn terminal_clipboard_shortcut() -> &'static str {
     }
 }
 
-const fn terminal_font_label(choice: DesktopTerminalFont) -> &'static str {
-    match choice {
-        DesktopTerminalFont::System => "System mono",
-        DesktopTerminalFont::JetBrainsMono => "JetBrains Mono",
-        DesktopTerminalFont::CascadiaCode => "Cascadia Code",
-        DesktopTerminalFont::FiraCode => "Fira Code",
-    }
-}
-
 const fn terminal_font(choice: DesktopTerminalFont) -> Font {
     match choice {
         DesktopTerminalFont::System => SYSTEM_TERMINAL_FONT,
@@ -3701,6 +3716,7 @@ fn terminal_spans(
     runs: Vec<DisplayRun>,
     theme: &Theme,
     terminal_font: Font,
+    cursor_style: DesktopTerminalCursor,
 ) -> Vec<text::Span<'static, (), Font>> {
     let palette = theme.extended_palette();
     let default_foreground = palette.background.base.text;
@@ -3721,8 +3737,12 @@ fn terminal_spans(
                 background = palette.primary.weak.color;
             }
             if run.style.cursor {
-                foreground = palette.primary.strong.text;
-                background = palette.primary.strong.color;
+                let (cursor_foreground, cursor_background) =
+                    terminal_cursor_colors(theme, cursor_style);
+                foreground = cursor_foreground;
+                if let Some(cursor_background) = cursor_background {
+                    background = cursor_background;
+                }
             }
             let mut font = terminal_font;
             if run.style.bold {
@@ -3741,6 +3761,20 @@ fn terminal_spans(
             span
         })
         .collect()
+}
+
+fn terminal_cursor_colors(
+    theme: &Theme,
+    cursor_style: DesktopTerminalCursor,
+) -> (Color, Option<Color>) {
+    let palette = theme.extended_palette();
+    match cursor_style {
+        DesktopTerminalCursor::Block => (
+            palette.primary.strong.text,
+            Some(palette.primary.strong.color),
+        ),
+        DesktopTerminalCursor::Line => (palette.primary.strong.color, None),
+    }
 }
 
 fn terminal_color(color: vt100::Color, default: Color) -> Color {
@@ -4277,6 +4311,19 @@ fn tab_close_style(theme: &Theme, status: Status) -> button::Style {
     }
 }
 
+fn setting_row<'a>(
+    label: &'a str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![
+        text(label).font(UI_MEDIUM).width(Length::Fixed(150.0)),
+        control.into(),
+    ]
+    .spacing(12)
+    .align_y(Center)
+    .into()
+}
+
 fn detail(label: &str, value: String) -> Element<'_, Message> {
     row![
         text(label)
@@ -4529,6 +4576,49 @@ mod tests {
         assert!(f32::from(columns + 1) * cell_width > screen_width);
         assert!(f32::from(rows) * line_height <= screen_height);
         assert!(f32::from(rows + 1) * line_height > screen_height);
+    }
+
+    #[test]
+    fn cursor_style_controls_cell_fill() {
+        let theme = theme::resolve(DesktopTheme::Dark, iced::theme::Mode::Dark);
+        let (_, block_background) = terminal_cursor_colors(&theme, DesktopTerminalCursor::Block);
+        let (_, line_background) = terminal_cursor_colors(&theme, DesktopTerminalCursor::Line);
+
+        assert!(block_background.is_some());
+        assert!(line_background.is_none());
+    }
+
+    #[test]
+    fn appearance_settings_use_bounded_dropdown_choices() {
+        let source = include_str!("lib.rs");
+        let settings = source
+            .split_once("    fn settings_view(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn form_view("))
+            .map(|(body, _)| body)
+            .expect("settings source");
+
+        assert_eq!(settings.matches("pick_list(").count(), 5);
+        assert!(!settings.contains("slider("));
+        assert_eq!(TERMINAL_FONT_SIZE_CHOICES[0], MIN_TERMINAL_FONT_SIZE);
+        assert_eq!(
+            TERMINAL_FONT_SIZE_CHOICES[TERMINAL_FONT_SIZE_CHOICES.len() - 1],
+            MAX_TERMINAL_FONT_SIZE
+        );
+    }
+
+    #[test]
+    fn desktop_session_form_keeps_advanced_codex_options_cli_only() {
+        let source = include_str!("lib.rs");
+        let create_session = source
+            .split_once("            FormKind::CreateSession(worktree_id) => {")
+            .and_then(|(_, tail)| tail.split_once("            FormKind::RenameProject"))
+            .map(|(body, _)| body)
+            .expect("desktop session submission source");
+
+        assert!(create_session.contains("display_name: trimmed_option(&form.fields[0].value)"));
+        assert!(create_session.contains("model: None"));
+        assert!(create_session.contains("effort: None"));
+        assert!(create_session.contains("initial_prompt: None"));
     }
 
     #[test]

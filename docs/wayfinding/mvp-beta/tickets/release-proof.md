@@ -156,7 +156,7 @@ Each scenario produces its own evidence row. A UI check records the observed lab
 This is opt-in, never part of the default automated suite, and runs only with pre-existing authentication. Record Codex version/path health without recording credentials.
 
 1. `provider probe codex` must report available and authenticated using a canonical native binary.
-2. Start Codex through SylvOps in the disposable repository with a harmless prompt. Confirm structured launch in the selected checkout and interactive input/output.
+2. Start Codex through SylvOps in the disposable repository, open its terminal, and enter a harmless instruction interactively. Confirm structured launch in the selected checkout and interactive input/output.
 3. Observe an authenticated hook-driven attention transition and a verified external session ID in the SylvOps snapshot. Do not copy raw provider configuration or environment values.
 4. Put the session into a resume-eligible inactive state, resume it, and confirm a new SylvOps session record refers to the verified external ID while the prior record remains intact.
 5. Stop the resumed session and confirm complete process-tree cleanup.

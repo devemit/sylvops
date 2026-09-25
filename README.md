@@ -72,7 +72,7 @@ The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoco
 - The top bar switches workspaces. Projects, worktrees, and sessions stay visible beside the large Terminal/Changes/Details area.
 - Select a session, click **Open terminal**, and interact normally. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
 - The footer always shows the version, workspace, branch, current view, daemon connectivity, and key hints.
-- Settings provide ten built-in themes, comfortable/compact density, four terminal typeface choices, terminal text sizing, and layout reset. The terminal TUI remains available as a keyboard-first alternative.
+- Settings use compact dropdowns for ten built-in themes, comfortable/compact density, four terminal typefaces, 10–22 px text sizing, and Block/Line terminal cursors. New interactive sessions ask only for a provider and optional display name; advanced Codex model, effort, and initial-prompt options remain available from the CLI. The terminal TUI remains available as a keyboard-first alternative.
 
 ## Current commands
 

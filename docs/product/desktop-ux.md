@@ -30,7 +30,8 @@ First-run guidance names both the user-facing and domain terms where that distin
 - Desktop copy says `Open terminal` and `Leave terminal`; the protocol continues to model the operation as explicit attachment and detachment.
 - `Open terminal` / `Leave terminal` and `Stop` are session-lifecycle actions, so they live at the trailing edge of the active session-tab header rather than beside Terminal/Changes/Details view navigation.
 - The native platform UI family remains the default for cross-platform availability. Body text is 14 px, secondary labels are 12 px, and the footer uses a dedicated 12 px status scale.
-- Appearance preferences include System, Light, Dark, Nord, Tokyo Night, Catppuccin, Dracula, Gruvbox Dark, Solarized Light, and Solarized Dark themes; terminal typeface choices include the platform monospace default, JetBrains Mono, Cascadia Code, and Fira Code. Missing named fonts fall back through the renderer.
+- Appearance uses aligned dropdown rows for theme, density, terminal typeface, text size, and cursor. Preferences include System, Light, Dark, Nord, Tokyo Night, Catppuccin, Dracula, Gruvbox Dark, Solarized Light, and Solarized Dark themes; terminal typeface choices include the platform monospace default, JetBrains Mono, Cascadia Code, and Fira Code. Missing named fonts fall back through the renderer. Text size is bounded to 10–22 px, and the cursor can be Block or Line.
+- The desktop and TUI new-session forms expose the provider picker and optional display name only. Model, effort, and initial prompt remain supported by the CLI and protocol but are not interactive-form settings.
 - The footer contains version, current workspace/checkout context, connection health, and essential shortcuts. Internal enum names and keyboard-panel debug state are not user-facing status.
 
 ## Embedded terminal baseline
@@ -39,7 +40,7 @@ The desktop terminal renders the daemon-owned VT screen; it does not print raw p
 
 - indexed, 256-color, and RGB ANSI foreground/background colors;
 - bold, dim, italic, underline, and inverse cell attributes;
-- a visible focused/unfocused cursor;
+- a visible focused/unfocused Block or Line cursor selected in Settings;
 - terminal-owned bounded scrollback with wheel, keyboard, and a visible vertical history control;
 - alternate-screen wheel forwarding when the running TUI explicitly requests a supported terminal mouse encoding;
 - mouse drag selection and platform terminal copy/paste shortcuts;

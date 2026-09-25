@@ -1,6 +1,7 @@
 use iced::keyboard::{self, Key, key::Named};
 use sylvops_core::domain::AttachmentRole;
 use sylvops_core::protocol::MAX_PTY_CHUNK_SIZE;
+use sylvops_core::ui::DesktopTerminalCursor;
 
 pub(crate) const MAX_WHEEL_EVENTS_PER_INPUT: usize = 12;
 const MAX_WHEEL_EVENTS_PER_INPUT_F32: f32 = 12.0;
@@ -388,7 +389,11 @@ pub(crate) fn encode_paste(contents: &str, bracketed: bool) -> Vec<u8> {
     bytes
 }
 
-pub(crate) fn display_runs(terminal: &TerminalState, focused: bool) -> Vec<DisplayRun> {
+pub(crate) fn display_runs(
+    terminal: &TerminalState,
+    focused: bool,
+    cursor_style: DesktopTerminalCursor,
+) -> Vec<DisplayRun> {
     let screen = terminal.parser.screen();
     let (cursor_row, cursor_column) = screen.cursor_position();
     let show_cursor = terminal.attached
@@ -425,10 +430,13 @@ pub(crate) fn display_runs(terminal: &TerminalState, focused: bool) -> Vec<Displ
                 continue;
             }
             let cursor = show_cursor && row == cursor_row && column == cursor_column;
-            let text = if cursor && focused {
-                "█"
-            } else if cursor {
-                "▯"
+            let text = if cursor {
+                match (cursor_style, focused) {
+                    (DesktopTerminalCursor::Block, true) => "█",
+                    (DesktopTerminalCursor::Block, false) => "▯",
+                    (DesktopTerminalCursor::Line, true) => "│",
+                    (DesktopTerminalCursor::Line, false) => "┆",
+                }
             } else if let Some(cell) = cell.filter(|cell| cell.has_contents()) {
                 cell.contents()
             } else {
@@ -470,8 +478,12 @@ fn push_run(runs: &mut Vec<DisplayRun>, text: &str, style: TerminalStyle) {
 /// Produces a plain-text view of the maintained terminal screen and adds a
 /// visible cursor marker. Provider escape sequences stay inside the VT parser.
 #[cfg(test)]
-fn display_contents(terminal: &TerminalState, focused: bool) -> String {
-    display_runs(terminal, focused)
+fn display_contents(
+    terminal: &TerminalState,
+    focused: bool,
+    cursor_style: DesktopTerminalCursor,
+) -> String {
+    display_runs(terminal, focused, cursor_style)
         .into_iter()
         .map(|run| run.text)
         .collect()
@@ -510,8 +522,22 @@ mod tests {
         let mut terminal = TerminalState::new(AttachmentRole::Controller, 4, 12, 100);
         terminal.process(b"ready");
 
-        assert_eq!(display_contents(&terminal, true), "ready█");
-        assert_eq!(display_contents(&terminal, false), "ready▯");
+        assert_eq!(
+            display_contents(&terminal, true, DesktopTerminalCursor::Block),
+            "ready█"
+        );
+        assert_eq!(
+            display_contents(&terminal, false, DesktopTerminalCursor::Block),
+            "ready▯"
+        );
+        assert_eq!(
+            display_contents(&terminal, true, DesktopTerminalCursor::Line),
+            "ready│"
+        );
+        assert_eq!(
+            display_contents(&terminal, false, DesktopTerminalCursor::Line),
+            "ready┆"
+        );
     }
 
     #[test]
@@ -519,15 +545,15 @@ mod tests {
         let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 12, 100);
         terminal.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
 
-        assert!(display_contents(&terminal, true).contains("five"));
+        assert!(display_contents(&terminal, true, DesktopTerminalCursor::Block).contains("five"));
         terminal.scroll_lines(2.0);
         assert!(terminal.is_scrolled_back());
-        assert!(display_contents(&terminal, true).contains("two"));
-        assert!(!display_contents(&terminal, true).contains('█'));
+        assert!(display_contents(&terminal, true, DesktopTerminalCursor::Block).contains("two"));
+        assert!(!display_contents(&terminal, true, DesktopTerminalCursor::Block).contains('█'));
 
         terminal.prepare_for_input();
         assert!(!terminal.is_scrolled_back());
-        let latest = display_contents(&terminal, true);
+        let latest = display_contents(&terminal, true, DesktopTerminalCursor::Block);
         assert!(latest.contains("five"));
         assert!(latest.contains('█'));
     }
@@ -537,14 +563,17 @@ mod tests {
         let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 12, 100);
         terminal.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         terminal.scroll_lines(2.0);
-        let before = display_contents(&terminal, true);
+        let before = display_contents(&terminal, true, DesktopTerminalCursor::Block);
 
         terminal.process(b"\r\nsix");
 
-        assert_eq!(display_contents(&terminal, true), before);
+        assert_eq!(
+            display_contents(&terminal, true, DesktopTerminalCursor::Block),
+            before
+        );
         assert!(terminal.is_scrolled_back());
         terminal.prepare_for_input();
-        assert!(display_contents(&terminal, true).contains("six"));
+        assert!(display_contents(&terminal, true, DesktopTerminalCursor::Block).contains("six"));
     }
 
     #[test]
@@ -552,7 +581,7 @@ mod tests {
         let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 20, 100);
         terminal.process(b"\x1b[1;31merror\x1b[0m plain");
 
-        let runs = display_runs(&terminal, true);
+        let runs = display_runs(&terminal, true, DesktopTerminalCursor::Block);
 
         assert!(runs.iter().any(|run| {
             run.text == "error" && run.style.bold && run.style.foreground == vt100::Color::Idx(1)
@@ -592,14 +621,14 @@ mod tests {
 
         terminal.set_scrollback_position(oldest);
         assert_eq!(terminal.scrollback_rows(), oldest);
-        assert!(display_contents(&terminal, true).contains("one"));
+        assert!(display_contents(&terminal, true, DesktopTerminalCursor::Block).contains("one"));
 
         terminal.scroll_lines(-1.0);
         assert_eq!(terminal.scrollback_rows(), oldest - 1);
 
         terminal.prepare_for_input();
         assert_eq!(terminal.scrollback_rows(), 0);
-        assert!(display_contents(&terminal, true).contains("five"));
+        assert!(display_contents(&terminal, true, DesktopTerminalCursor::Block).contains("five"));
     }
 
     #[test]

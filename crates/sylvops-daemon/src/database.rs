@@ -2009,7 +2009,8 @@ fn database_error(error: rusqlite::Error) -> DaemonError {
 mod tests {
     use super::*;
     use sylvops_core::ui::{
-        DesktopDensity, DesktopState, DesktopTerminalFont, DesktopTheme, MainTab,
+        DesktopDensity, DesktopState, DesktopTerminalCursor, DesktopTerminalFont, DesktopTheme,
+        MainTab,
     };
 
     #[tokio::test]
@@ -2071,6 +2072,7 @@ mod tests {
             selected_main_tab: MainTab::Details,
             theme: DesktopTheme::Nord,
             density: DesktopDensity::Compact,
+            terminal_cursor: DesktopTerminalCursor::Line,
             terminal_font_size: 17,
             ..DesktopState::default()
         };
@@ -2122,6 +2124,7 @@ mod tests {
         assert_eq!(state.theme, DesktopTheme::Nord);
         assert_eq!(state.terminal_font_size, 15);
         assert_eq!(state.terminal_font, DesktopTerminalFont::System);
+        assert_eq!(state.terminal_cursor, DesktopTerminalCursor::Block);
         database.shutdown().await.unwrap();
     }
 
