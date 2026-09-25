@@ -6,7 +6,7 @@ use std::{
     fmt::{self, Write as _},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -99,7 +99,7 @@ impl ProviderRegistry {
     ///
     /// Returns an error when the requested provider kind is not registered.
     pub async fn probe(&self, kind: ProviderKind) -> Result<ProviderHealth> {
-        Ok(self.adapter(kind)?.probe().await)
+        Ok(self.adapter(kind)?.refresh().await)
     }
 
     pub async fn probe_all(&self) -> Vec<ProviderHealth> {
@@ -234,31 +234,60 @@ impl ProviderAdapter for ShellAdapter {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CodexDiscovery {
+    executable: Option<PathBuf>,
+    error: Option<String>,
+}
+
 #[derive(Debug)]
 struct CodexAdapter {
-    executable: Option<PathBuf>,
-    discovery_error: Option<String>,
+    discovery: RwLock<CodexDiscovery>,
 }
 
 impl CodexAdapter {
     fn discover() -> Self {
+        Self {
+            discovery: RwLock::new(Self::discover_now()),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_executable(executable: PathBuf) -> Self {
+        Self {
+            discovery: RwLock::new(CodexDiscovery {
+                executable: Some(executable),
+                error: None,
+            }),
+        }
+    }
+
+    fn discover_now() -> CodexDiscovery {
         match discover_codex_executable() {
-            Ok(path) => Self {
+            Ok(path) => CodexDiscovery {
                 executable: Some(path),
-                discovery_error: None,
+                error: None,
             },
-            Err(error) => Self {
+            Err(error) => CodexDiscovery {
                 executable: None,
-                discovery_error: Some(error.to_string()),
+                error: Some(error.to_string()),
             },
         }
     }
 
-    fn executable(&self) -> sylvops_core::Result<&Path> {
-        self.executable.as_deref().ok_or_else(|| {
+    fn discovery(&self) -> std::result::Result<CodexDiscovery, String> {
+        self.discovery
+            .read()
+            .map(|discovery| discovery.clone())
+            .map_err(|_| "Codex discovery state is unavailable".into())
+    }
+
+    fn executable(&self) -> sylvops_core::Result<PathBuf> {
+        let discovery = self.discovery().map_err(provider_error)?;
+        discovery.executable.ok_or_else(|| {
             provider_error(
-                self.discovery_error
-                    .clone()
+                discovery
+                    .error
                     .unwrap_or_else(|| "Codex executable is unavailable".into()),
             )
         })
@@ -279,32 +308,73 @@ impl ProviderAdapter for CodexAdapter {
             model_selection: true,
             effort_selection: true,
         };
-        let Some(executable) = self.executable.as_deref() else {
+        let discovery = match self.discovery() {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                return ProviderHealth {
+                    kind: self.kind(),
+                    available: false,
+                    authenticated: false,
+                    executable_path: None,
+                    version: None,
+                    diagnostic: Some(error),
+                    capabilities,
+                    checked_at: now_millis(),
+                };
+            }
+        };
+        let Some(executable) = discovery.executable else {
             return ProviderHealth {
                 kind: self.kind(),
                 available: false,
                 authenticated: false,
                 executable_path: None,
                 version: None,
-                diagnostic: self.discovery_error.clone(),
+                diagnostic: discovery.error,
                 capabilities,
                 checked_at: now_millis(),
             };
         };
-        let version = run_probe(executable, &["--version"]).await;
-        let authentication = run_probe(executable, &["login", "status"]).await;
+        let version = run_probe(&executable, &["--version"]).await;
+        let authentication = run_probe(&executable, &["login", "status"]).await;
         let version_error = version.as_ref().err().cloned();
         let authentication_error = authentication.as_ref().err().cloned();
         ProviderHealth {
             kind: self.kind(),
             available: version.is_ok(),
             authenticated: authentication.is_ok(),
-            executable_path: path_text(executable).ok(),
+            executable_path: path_text(&executable).ok(),
             version: version.ok(),
             diagnostic: authentication_error.or(version_error),
             capabilities,
             checked_at: now_millis(),
         }
+    }
+
+    async fn refresh(&self) -> ProviderHealth {
+        let discovery = Self::discover_now();
+        match self.discovery.write() {
+            Ok(mut current) => *current = discovery,
+            Err(_) => {
+                return ProviderHealth {
+                    kind: self.kind(),
+                    available: false,
+                    authenticated: false,
+                    executable_path: None,
+                    version: None,
+                    diagnostic: Some("Codex discovery state is unavailable".into()),
+                    capabilities: ProviderCapabilities {
+                        interactive: true,
+                        resume: true,
+                        status_hooks: true,
+                        model_selection: true,
+                        effort_selection: true,
+                    },
+                    checked_at: now_millis(),
+                };
+            }
+        }
+        self.probe().await
     }
 
     fn build_launch(&self, context: LaunchContext) -> sylvops_core::Result<LaunchSpec> {
@@ -325,7 +395,7 @@ impl ProviderAdapter for CodexAdapter {
             arguments.push(OsString::from(prompt));
         }
         Ok(LaunchSpec {
-            executable: self.executable()?.to_path_buf(),
+            executable: self.executable()?,
             arguments,
             environment: safe_environment(context.session_id, context.worktree_id, true),
         })
@@ -351,7 +421,7 @@ impl ProviderAdapter for CodexAdapter {
             ]);
         }
         Ok(Some(LaunchSpec {
-            executable: self.executable()?.to_path_buf(),
+            executable: self.executable()?,
             arguments,
             environment: safe_environment(context.session_id, context.worktree_id, true),
         }))
@@ -362,12 +432,6 @@ impl ProviderAdapter for CodexAdapter {
         _worktree: &Path,
         endpoint: &HookEndpoint,
     ) -> sylvops_core::Result<HookInstallation> {
-        if self.executable.is_none() {
-            return Ok(HookInstallation {
-                profile_name: endpoint.profile_name.clone(),
-                owned_paths: Vec::new(),
-            });
-        }
         let directory = codex_home()?;
         std::fs::create_dir_all(&directory).map_err(|error| {
             provider_error(format!(
@@ -673,6 +737,87 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct RefreshTrackingAdapter {
+        refreshes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for RefreshTrackingAdapter {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+
+        async fn probe(&self) -> ProviderHealth {
+            ProviderHealth {
+                kind: ProviderKind::Codex,
+                available: false,
+                authenticated: false,
+                executable_path: None,
+                version: None,
+                diagnostic: Some("cached discovery miss".into()),
+                capabilities: ProviderCapabilities::default(),
+                checked_at: 0,
+            }
+        }
+
+        async fn refresh(&self) -> ProviderHealth {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            ProviderHealth {
+                kind: ProviderKind::Codex,
+                available: true,
+                authenticated: true,
+                executable_path: Some("native-codex".into()),
+                version: Some("codex-cli test".into()),
+                diagnostic: None,
+                capabilities: ProviderCapabilities::default(),
+                checked_at: 1,
+            }
+        }
+
+        fn build_launch(&self, _context: LaunchContext) -> sylvops_core::Result<LaunchSpec> {
+            unreachable!("not used by refresh test")
+        }
+
+        fn build_resume(
+            &self,
+            _context: ResumeContext,
+        ) -> sylvops_core::Result<Option<LaunchSpec>> {
+            unreachable!("not used by refresh test")
+        }
+
+        fn install_status_hooks(
+            &self,
+            _worktree: &Path,
+            _endpoint: &HookEndpoint,
+        ) -> sylvops_core::Result<HookInstallation> {
+            unreachable!("not used by refresh test")
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_probe_refreshes_discovery() {
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let adapter = Arc::new(RefreshTrackingAdapter {
+            refreshes: Arc::clone(&refreshes),
+        });
+        let registry = ProviderRegistry {
+            adapters: HashMap::from([(ProviderKind::Codex, adapter as Arc<dyn ProviderAdapter>)]),
+            codex_profile: None,
+            hook_environment: None,
+            owned_hook_paths: Vec::new(),
+        };
+
+        let health = registry
+            .probe(ProviderKind::Codex)
+            .await
+            .expect("refresh known provider");
+
+        assert!(health.available);
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn environment_excludes_credentials() {
@@ -715,14 +860,11 @@ mod tests {
 
     #[test]
     fn codex_launch_uses_structured_arguments() {
-        let adapter = CodexAdapter {
-            executable: Some(PathBuf::from(if cfg!(windows) {
-                r"C:\Program Files\Codex\codex.exe"
-            } else {
-                "/usr/local/bin/codex"
-            })),
-            discovery_error: None,
-        };
+        let adapter = CodexAdapter::from_executable(PathBuf::from(if cfg!(windows) {
+            r"C:\Program Files\Codex\codex.exe"
+        } else {
+            "/usr/local/bin/codex"
+        }));
         let worktree = PathBuf::from(if cfg!(windows) {
             r"C:\work trees\feature"
         } else {
@@ -750,14 +892,11 @@ mod tests {
 
     #[test]
     fn codex_resume_validates_external_id() {
-        let adapter = CodexAdapter {
-            executable: Some(PathBuf::from(if cfg!(windows) {
-                r"C:\Codex\codex.exe"
-            } else {
-                "/usr/bin/codex"
-            })),
-            discovery_error: None,
-        };
+        let adapter = CodexAdapter::from_executable(PathBuf::from(if cfg!(windows) {
+            r"C:\Codex\codex.exe"
+        } else {
+            "/usr/bin/codex"
+        }));
         let result = adapter.build_resume(ResumeContext {
             session_id: sylvops_core::ids::SessionId::new(),
             worktree_id: sylvops_core::ids::WorktreeId::new(),

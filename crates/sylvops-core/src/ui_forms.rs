@@ -71,7 +71,7 @@ impl Form {
             .position(|provider| provider.kind == ProviderKind::Shell)
             .unwrap_or(0);
         let mut form = Self::new(
-            "Create terminal session",
+            "New session",
             FormKind::CreateSession(worktree_id),
             vec![
                 field("Display name (optional)", ""),
@@ -120,6 +120,19 @@ impl Form {
             (self.provider_index + delta.unsigned_abs()).min(self.providers.len() - 1)
         };
         self.update_conditional_fields();
+    }
+
+    pub fn select_provider(&mut self, kind: ProviderKind) -> bool {
+        let Some(index) = self
+            .providers
+            .iter()
+            .position(|provider| provider.kind == kind)
+        else {
+            return false;
+        };
+        self.provider_index = index;
+        self.update_conditional_fields();
+        true
     }
 
     pub fn update_conditional_fields(&mut self) {
@@ -258,5 +271,23 @@ mod tests {
         let mut form = Form::session(WorktreeId::new(), vec![health(ProviderKind::Shell, false)]);
         assert!(!form.validate());
         assert_eq!(form.submission_error.as_deref(), Some("not found"));
+    }
+
+    #[test]
+    fn provider_can_be_selected_directly() {
+        let mut form = Form::session(
+            WorktreeId::new(),
+            vec![
+                health(ProviderKind::Codex, true),
+                health(ProviderKind::Shell, true),
+            ],
+        );
+
+        assert!(form.select_provider(ProviderKind::Codex));
+        assert_eq!(
+            form.provider().map(|provider| provider.kind),
+            Some(ProviderKind::Codex)
+        );
+        assert_eq!(form.visible_field_indices(), vec![0, 1, 2, 3]);
     }
 }

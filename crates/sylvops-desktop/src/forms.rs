@@ -1,9 +1,13 @@
-use sylvops_core::{domain::GitWorktreeState, ui_forms::Form};
+use sylvops_core::{
+    domain::{GitWorktreeState, ProviderKind},
+    ui_forms::Form,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct FormModal {
     pub form: Form,
     pub pending: bool,
+    pub provider_probe: Option<ProviderKind>,
     pub first_run: bool,
 }
 
@@ -12,6 +16,7 @@ impl FormModal {
         Self {
             form,
             pending: false,
+            provider_probe: None,
             first_run: false,
         }
     }
@@ -20,6 +25,7 @@ impl FormModal {
         Self {
             form,
             pending: false,
+            provider_probe: None,
             first_run: true,
         }
     }
