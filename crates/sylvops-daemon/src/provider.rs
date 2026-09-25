@@ -19,9 +19,9 @@ use sylvops_core::{
         ProviderCapabilities, ProviderHealth, ResumeContext, provider_error,
     },
 };
-use tokio::{io::AsyncReadExt, process::Command, time::timeout};
+use tokio::{io::AsyncReadExt, time::timeout};
 
-use crate::{DaemonError, Result, codex_discovery::discover_codex_executable};
+use crate::{DaemonError, Result, background_process, codex_discovery::discover_codex_executable};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
@@ -551,7 +551,7 @@ fn codex_home() -> sylvops_core::Result<PathBuf> {
 }
 
 async fn run_probe(executable: &Path, arguments: &[&str]) -> std::result::Result<String, String> {
-    let mut child = Command::new(executable);
+    let mut child = background_process::command(executable);
     child
         .args(arguments)
         .env_clear()

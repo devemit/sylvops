@@ -13,10 +13,10 @@ use sylvops_core::{
     domain::{GitDiff, GitWorktreeState, Project, Worktree, WorktreeStatus},
     ids::{WorkspaceId, WorktreeId},
 };
-use tokio::{io::AsyncReadExt, process::Command, time::timeout};
+use tokio::{io::AsyncReadExt, time::timeout};
 
 use crate::{
-    DaemonError, Result,
+    DaemonError, Result, background_process,
     database::{NewManagedWorktree, RepositoryRegistration},
 };
 
@@ -370,7 +370,7 @@ pub async fn worktree_diff(worktree: &Worktree) -> Result<GitDiff> {
     }
     let path = canonical_registered_path(&worktree.canonical_path).await?;
     verify_repository_root(&path).await?;
-    let mut child = Command::new("git");
+    let mut child = background_process::command("git");
     child
         .arg("-C")
         .arg(&path)
@@ -740,7 +740,7 @@ fn git_path_argument(path: &Path) -> OsString {
 }
 
 async fn run_git_os(cwd: &Path, arguments: &[OsString]) -> Result<GitOutput> {
-    let mut child = Command::new("git");
+    let mut child = background_process::command("git");
     child
         .arg("-C")
         .arg(cwd)

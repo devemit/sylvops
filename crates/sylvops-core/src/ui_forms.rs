@@ -55,7 +55,7 @@ impl Form {
 
     pub fn worktree(project_id: ProjectId) -> Self {
         Self::new(
-            "Create managed worktree",
+            "Create isolated checkout",
             FormKind::CreateWorktree(project_id),
             vec![
                 field("Branch", ""),
@@ -71,7 +71,7 @@ impl Form {
             .position(|provider| provider.kind == ProviderKind::Shell)
             .unwrap_or(0);
         let mut form = Self::new(
-            "New session",
+            "Start a session",
             FormKind::CreateSession(worktree_id),
             vec![
                 field("Display name (optional)", ""),
