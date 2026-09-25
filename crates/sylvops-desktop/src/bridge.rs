@@ -9,7 +9,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use sylvops_core::{
-    domain::DaemonSnapshot,
+    domain::{DaemonSnapshot, ProviderKind},
     ids::{SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     provider::ProviderHealth,
@@ -24,6 +24,7 @@ const CRITICAL_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Operation {
     RefreshSnapshot,
+    ProbeProvider(ProviderKind),
     CreateWorkspace,
     OpenWorkspace(WorkspaceId),
     RegisterProject,

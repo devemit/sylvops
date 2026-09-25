@@ -4,6 +4,7 @@ use sylvops_core::{domain::GitWorktreeState, ui_forms::Form};
 pub(crate) struct FormModal {
     pub form: Form,
     pub pending: bool,
+    pub first_run: bool,
 }
 
 impl FormModal {
@@ -11,6 +12,15 @@ impl FormModal {
         Self {
             form,
             pending: false,
+            first_run: false,
+        }
+    }
+
+    pub(crate) fn first_run(form: Form) -> Self {
+        Self {
+            form,
+            pending: false,
+            first_run: true,
         }
     }
 }
