@@ -8,6 +8,82 @@ pub(crate) struct TerminalState {
     pub attached: bool,
     pub columns: u16,
     pub rows: u16,
+    scroll_fraction: f32,
+}
+
+impl TerminalState {
+    pub(crate) fn new(
+        role: AttachmentRole,
+        rows: u16,
+        columns: u16,
+        scrollback_rows: usize,
+    ) -> Self {
+        Self {
+            role,
+            parser: vt100::Parser::new(rows, columns, scrollback_rows),
+            last_sequence: 0,
+            attached: true,
+            columns,
+            rows,
+            scroll_fraction: 0.0,
+        }
+    }
+
+    pub(crate) fn scroll_lines(&mut self, lines: f32) {
+        if !lines.is_finite() || lines == 0.0 {
+            return;
+        }
+        let total = self.scroll_fraction + lines;
+        let scroll_up = total.is_sign_positive();
+        let mut remainder = total.abs().min(1_000.0);
+        let mut whole_lines = 0_usize;
+        while remainder >= 1.0 {
+            remainder -= 1.0;
+            whole_lines += 1;
+        }
+        self.scroll_fraction = remainder.copysign(total);
+        if whole_lines == 0 {
+            return;
+        }
+
+        let current = self.parser.screen().scrollback();
+        let next = if scroll_up {
+            current.saturating_add(whole_lines)
+        } else {
+            current.saturating_sub(whole_lines)
+        };
+        self.parser.screen_mut().set_scrollback(next);
+    }
+
+    pub(crate) fn scroll_page(&mut self, pages: isize) {
+        let page_rows = usize::from(self.rows.saturating_sub(1).max(1));
+        let current = self.parser.screen().scrollback();
+        let next = if pages.is_positive() {
+            current.saturating_add(page_rows.saturating_mul(pages.unsigned_abs()))
+        } else {
+            current.saturating_sub(page_rows.saturating_mul(pages.unsigned_abs()))
+        };
+        self.parser.screen_mut().set_scrollback(next);
+        self.scroll_fraction = 0.0;
+    }
+
+    pub(crate) fn scroll_to_oldest(&mut self) {
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        self.scroll_fraction = 0.0;
+    }
+
+    pub(crate) fn prepare_for_input(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+        self.scroll_fraction = 0.0;
+    }
+
+    pub(crate) fn is_scrolled_back(&self) -> bool {
+        self.scrollback_rows() > 0
+    }
+
+    pub(crate) fn scrollback_rows(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
 }
 
 pub(crate) fn encode_key(
@@ -54,8 +130,10 @@ pub(crate) fn encode_key(
 pub(crate) fn display_contents(terminal: &TerminalState, focused: bool) -> String {
     let screen = terminal.parser.screen();
     let (cursor_row, cursor_column) = screen.cursor_position();
-    let show_cursor =
-        terminal.attached && terminal.role == AttachmentRole::Controller && !screen.hide_cursor();
+    let show_cursor = terminal.attached
+        && terminal.role == AttachmentRole::Controller
+        && !terminal.is_scrolled_back()
+        && !screen.hide_cursor();
     let cursor_marker = if focused { '█' } else { '▯' };
 
     let mut last_row = cursor_row;
@@ -131,17 +209,47 @@ mod tests {
 
     #[test]
     fn display_adds_a_visible_focus_cursor_without_raw_escape_sequences() {
-        let mut terminal = TerminalState {
-            role: AttachmentRole::Controller,
-            parser: vt100::Parser::new(4, 12, 100),
-            last_sequence: 0,
-            attached: true,
-            columns: 12,
-            rows: 4,
-        };
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 4, 12, 100);
         terminal.parser.process(b"ready");
 
         assert_eq!(display_contents(&terminal, true), "ready█");
         assert_eq!(display_contents(&terminal, false), "ready▯");
+    }
+
+    #[test]
+    fn history_scrolls_without_losing_the_live_input_row() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 12, 100);
+        terminal
+            .parser
+            .process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+
+        assert!(display_contents(&terminal, true).contains("five"));
+        terminal.scroll_lines(2.0);
+        assert!(terminal.is_scrolled_back());
+        assert!(display_contents(&terminal, true).contains("two"));
+        assert!(!display_contents(&terminal, true).contains('█'));
+
+        terminal.prepare_for_input();
+        assert!(!terminal.is_scrolled_back());
+        let latest = display_contents(&terminal, true);
+        assert!(latest.contains("five"));
+        assert!(latest.contains('█'));
+    }
+
+    #[test]
+    fn incoming_output_preserves_the_history_view_until_input_resumes() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 12, 100);
+        terminal
+            .parser
+            .process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        terminal.scroll_lines(2.0);
+        let before = display_contents(&terminal, true);
+
+        terminal.parser.process(b"\r\nsix");
+
+        assert_eq!(display_contents(&terminal, true), before);
+        assert!(terminal.is_scrolled_back());
+        terminal.prepare_for_input();
+        assert!(display_contents(&terminal, true).contains("six"));
     }
 }

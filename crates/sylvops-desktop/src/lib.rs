@@ -18,7 +18,7 @@ use iced::{
     alignment::Vertical,
     keyboard,
     keyboard::{Key, key::Named},
-    system, time,
+    mouse, system, time,
     widget::{
         button, column, container, mouse_area, opaque, pane_grid, row, rule, scrollable, slider,
         space, stack, text, text_input,
@@ -206,6 +206,8 @@ enum Message {
     Attach,
     Detach,
     FocusTerminal,
+    ScrollTerminal(mouse::ScrollDelta),
+    LatestTerminal,
     Stop,
     Refresh,
     ToggleSettings,
@@ -361,6 +363,8 @@ impl DesktopApp {
             Message::Attach => self.attach_active(),
             Message::Detach => self.detach_active(),
             Message::FocusTerminal => self.focus_terminal(),
+            Message::ScrollTerminal(delta) => self.scroll_terminal(delta),
+            Message::LatestTerminal => self.show_latest_terminal(),
             Message::Stop => self.open_stop_confirmation(),
             Message::Refresh => self.request_snapshot(),
             Message::ToggleSettings => {
@@ -473,8 +477,7 @@ impl DesktopApp {
         } else {
             mission_control
         };
-        let footer = self.footer();
-        let mut content = column![top, rule::horizontal(1), body, rule::horizontal(1), footer]
+        let mut content = column![top, rule::horizontal(1), body]
             .width(Fill)
             .height(Fill);
         if let Some(error) = &self.error {
@@ -489,14 +492,14 @@ impl DesktopApp {
                 )
                 .padding([8, 12]),
             );
-        }
-        if let Some((message, _)) = &self.success {
+        } else if let Some((message, _)) = &self.success {
             content = content.push(
                 container(text(message).style(text::success))
                     .padding([6, 12])
                     .width(Fill),
             );
         }
+        content = content.push(rule::horizontal(1)).push(self.footer());
         container(content).width(Fill).height(Fill).into()
     }
 
@@ -554,11 +557,15 @@ impl DesktopApp {
         }
         workspaces = workspaces
             .push(
-                button(text("+").font(UI_MEDIUM).size(16))
-                    .on_press(Message::NewWorkspace)
-                    .height(ACTION_HEIGHT)
-                    .padding([5, 10])
-                    .style(chrome_action_style),
+                button(
+                    text(if compact { "+" } else { "+ Workspace" })
+                        .font(UI_MEDIUM)
+                        .size(if compact { 16 } else { 12 }),
+                )
+                .on_press(Message::NewWorkspace)
+                .height(ACTION_HEIGHT)
+                .padding([5, 10])
+                .style(chrome_action_style),
             )
             .push(space::horizontal())
             .push(
@@ -568,13 +575,7 @@ impl DesktopApp {
                     .align_y(Vertical::Center)
                     .style(selected_context_style),
             )
-            .push(
-                button(text("↻").size(17))
-                    .on_press(Message::Refresh)
-                    .height(ACTION_HEIGHT)
-                    .padding([5, 10])
-                    .style(chrome_action_style),
-            )
+            .push(self.refresh_button(compact))
             .push(
                 button(text(fullscreen_label).font(UI_MEDIUM).size(12))
                     .on_press(Message::ToggleFullscreen)
@@ -598,7 +599,28 @@ impl DesktopApp {
             .into()
     }
 
+    fn refresh_button(&self, compact: bool) -> Element<'static, Message> {
+        let can_refresh =
+            matches!(self.connection, ConnectionState::Connected) && !self.snapshot_pending;
+        let label = if self.snapshot_pending {
+            if compact { "…" } else { "Refreshing…" }
+        } else if compact {
+            "↻"
+        } else {
+            "Refresh"
+        };
+        button(text(label).size(if compact { 17 } else { 12 }))
+            .on_press_maybe(can_refresh.then_some(Message::Refresh))
+            .height(ACTION_HEIGHT)
+            .padding([5, 10])
+            .style(chrome_action_style)
+            .into()
+    }
+
     fn mission_control(&self) -> Element<'_, Message> {
+        if matches!(self.connection, ConnectionState::Connecting) {
+            return centered_message("Connecting to the SylvOps daemon…");
+        }
         match state::layout_mode(self.desktop_state.window_width) {
             state::LayoutMode::Wide => pane_grid(&self.panes, |_pane, kind, _maximized| {
                 let content = match kind {
@@ -654,7 +676,8 @@ impl DesktopApp {
 
     fn projects_column(&self) -> Element<'_, Message> {
         let mut items = column![column_heading("Projects", Some(Message::NewProject))].spacing(4);
-        for project in self.visible_projects() {
+        let projects = self.visible_projects();
+        for project in &projects {
             items = items.push(select_button(
                 &project.name,
                 self.selected_project_id == Some(project.id),
@@ -662,8 +685,20 @@ impl DesktopApp {
                 self.desktop_state.density,
             ));
         }
-        if self.visible_projects().is_empty() {
-            items = items.push(empty_hint("No repositories in this workspace."));
+        if projects.is_empty() {
+            items = items.push(if self.active_workspace().is_some() {
+                empty_action(
+                    "No repositories in this workspace yet.",
+                    "Register repository",
+                    Message::NewProject,
+                )
+            } else {
+                empty_action(
+                    "Create a workspace to begin.",
+                    "Create workspace",
+                    Message::NewWorkspace,
+                )
+            });
         }
         panel(scrollable(items), 190.0)
     }
@@ -672,7 +707,8 @@ impl DesktopApp {
         let create = self.selected_project_id.map(|_| Message::NewWorktree);
         let mut items = column![column_heading("Worktrees", create)].spacing(4);
         if let Some(project_id) = self.selected_project_id {
-            for worktree in self.worktrees_for(project_id) {
+            let worktrees = self.worktrees_for(project_id);
+            for worktree in &worktrees {
                 let branch = worktree.branch.as_deref().unwrap_or("detached");
                 let label = if worktree.is_root_checkout {
                     format!("{}  ·  {branch}  ·  root", worktree.name)
@@ -686,8 +722,14 @@ impl DesktopApp {
                     self.desktop_state.density,
                 ));
             }
-        }
-        if self.selected_project_id.is_none() {
+            if worktrees.is_empty() {
+                items = items.push(empty_action(
+                    "No worktrees are available for this project.",
+                    "Create worktree",
+                    Message::NewWorktree,
+                ));
+            }
+        } else {
             items = items.push(empty_hint("Select a project."));
         }
         panel(scrollable(items), 225.0)
@@ -697,7 +739,8 @@ impl DesktopApp {
         let create = self.selected_worktree_id.map(|_| Message::NewSession);
         let mut items = column![column_heading("Sessions", create)].spacing(4);
         if let Some(worktree_id) = self.selected_worktree_id {
-            for session in self.sessions_for(worktree_id) {
+            let sessions = self.sessions_for(worktree_id);
+            for session in &sessions {
                 let label = format!(
                     "{}  ·  {} {}",
                     status_symbol(session.state),
@@ -711,8 +754,14 @@ impl DesktopApp {
                     self.desktop_state.density,
                 ));
             }
-        }
-        if self.selected_worktree_id.is_none() {
+            if sessions.is_empty() {
+                items = items.push(empty_action(
+                    "No sessions in this worktree yet.",
+                    "New session",
+                    Message::NewSession,
+                ));
+            }
+        } else {
             items = items.push(empty_hint("Select a worktree."));
         }
         panel(scrollable(items), 255.0)
@@ -907,7 +956,10 @@ impl DesktopApp {
                 Message::Attach,
             );
         };
-        let role = if !terminal.attached {
+        let scrollback_rows = terminal.scrollback_rows();
+        let role = if scrollback_rows > 0 {
+            format!("History  ·  {scrollback_rows} lines back")
+        } else if !terminal.attached {
             "Detached  ·  click Attach to reconnect".to_owned()
         } else if terminal.role == AttachmentRole::Observer {
             "Read-only observer  ·  another client controls input".to_owned()
@@ -917,16 +969,29 @@ impl DesktopApp {
             "Controller  ·  click anywhere in the terminal to type".to_owned()
         };
         let contents = terminal_display_contents(terminal, self.terminal_focus.is_focused());
+        let mut terminal_header = row![
+            text(role)
+                .font(UI_MEDIUM)
+                .size(UI_META_SIZE)
+                .style(text::secondary),
+            space::horizontal(),
+        ]
+        .align_y(Center);
+        if scrollback_rows > 0 {
+            terminal_header = terminal_header.push(
+                button(text("Latest").font(UI_MEDIUM).size(UI_META_SIZE))
+                    .on_press(Message::LatestTerminal)
+                    .height(24)
+                    .padding([3, 8])
+                    .style(button::primary),
+            );
+        }
         let surface = container(
             column![
-                container(
-                    text(role)
-                        .font(UI_MEDIUM)
-                        .size(UI_META_SIZE)
-                        .style(text::secondary)
-                )
-                .height(26)
-                .align_y(Vertical::Center),
+                container(terminal_header)
+                    .height(26)
+                    .width(Fill)
+                    .align_y(Vertical::Center),
                 container(
                     text(contents)
                         .font(TERMINAL_FONT)
@@ -942,7 +1007,10 @@ impl DesktopApp {
         .width(Fill)
         .height(Fill)
         .style(move |theme| terminal_surface(theme, self.terminal_focus.is_focused()));
-        mouse_area(surface).on_press(Message::FocusTerminal).into()
+        mouse_area(surface)
+            .on_press(Message::FocusTerminal)
+            .on_scroll(Message::ScrollTerminal)
+            .into()
     }
 
     fn changes_view(&self) -> Element<'_, Message> {
@@ -1095,6 +1163,10 @@ impl DesktopApp {
                 detail("1 / 2 / 3", "Terminal / Changes / Details".into()),
                 detail("N / R / D", "New / rename / stop or remove".into()),
                 detail("A / G", "Attach terminal / show Git changes".into()),
+                detail(
+                    "Wheel / Shift+PageUp",
+                    "Read terminal history; Shift+End returns to latest".into(),
+                ),
                 detail("Ctrl+]", "Detach the focused terminal".into()),
                 text("Shortcuts are paused while a form is open. When the terminal says “keyboard active”, ordinary keys go to the running process.")
                     .style(text::secondary),
@@ -1183,7 +1255,11 @@ impl DesktopApp {
             fields = fields.push(text(guidance).style(text::secondary));
         }
         if form.is_session() {
-            fields = fields.push(Self::provider_picker(form, modal.provider_probe));
+            fields = fields.push(Self::provider_picker(
+                form,
+                modal.provider_probe,
+                modal.pending,
+            ));
         }
         for (index, field) in form
             .fields
@@ -1203,7 +1279,10 @@ impl DesktopApp {
                 group = group.push(text(error).style(text::danger));
             }
             if matches!(form.kind, FormKind::RegisterProject(_)) && index == 0 {
-                group = group.push(button("Choose folder…").on_press(Message::BrowseRepository));
+                group = group.push(
+                    button("Choose folder…")
+                        .on_press_maybe((!modal.pending).then_some(Message::BrowseRepository)),
+                );
             }
             fields = fields.push(group);
         }
@@ -1214,26 +1293,15 @@ impl DesktopApp {
             form.provider()
                 .is_some_and(|provider| provider.kind == kind)
         });
-        let submit = if modal.pending {
-            "Working…"
-        } else if selected_provider_checking {
-            "Checking Codex…"
-        } else if form.is_session() {
-            match form.provider().map(|provider| provider.kind) {
-                Some(ProviderKind::Codex) => "Start Codex",
-                Some(ProviderKind::Shell) => "Open Shell",
-                Some(_) | None => "Start session",
-            }
-        } else {
-            "Continue"
-        };
+        let submit = form_submit_label(form, modal.pending, selected_provider_checking);
         container(
             column![
                 text(&form.title).font(UI_SEMIBOLD).size(22),
                 fields,
                 row![
                     space::horizontal(),
-                    button("Cancel").on_press(Message::CancelModal),
+                    button("Cancel")
+                        .on_press_maybe((!modal.pending).then_some(Message::CancelModal)),
                     button(submit)
                         .on_press_maybe(
                             (!modal.pending && !selected_provider_checking)
@@ -1251,7 +1319,11 @@ impl DesktopApp {
         .into()
     }
 
-    fn provider_picker(form: &Form, probing: Option<ProviderKind>) -> Element<'_, Message> {
+    fn provider_picker(
+        form: &Form,
+        probing: Option<ProviderKind>,
+        form_pending: bool,
+    ) -> Element<'_, Message> {
         let provider = form.provider();
         let provider_text = provider.map_or_else(
             || "No providers".into(),
@@ -1259,7 +1331,7 @@ impl DesktopApp {
                 let status = if !item.available {
                     "unavailable"
                 } else if item.kind == ProviderKind::Codex && !item.authenticated {
-                    "available, login required"
+                    "available, sign-in required"
                 } else {
                     "ready"
                 };
@@ -1276,7 +1348,7 @@ impl DesktopApp {
             if form.providers.iter().any(|provider| provider.kind == kind) {
                 choices = choices.push(
                     button(text(kind.to_string()).font(UI_MEDIUM))
-                        .on_press(Message::SelectProvider(kind))
+                        .on_press_maybe((!form_pending).then_some(Message::SelectProvider(kind)))
                         .style(if selected == Some(kind) {
                             button::primary
                         } else {
@@ -1297,7 +1369,9 @@ impl DesktopApp {
                 } else {
                     "Retry discovery"
                 })
-                .on_press_maybe((!checking_selected).then_some(Message::ProbeProvider)),
+                .on_press_maybe(
+                    (!checking_selected && !form_pending).then_some(Message::ProbeProvider),
+                ),
             ]
             .spacing(8)
             .align_y(Center)
@@ -1513,6 +1587,7 @@ impl DesktopApp {
                     terminal.last_sequence = snapshot_sequence;
                     terminal.columns = columns;
                     terminal.rows = rows;
+                    terminal.prepare_for_input();
                 }
             }
             DaemonEvent::SessionExited { session_id, .. } => {
@@ -1603,14 +1678,7 @@ impl DesktopApp {
                 let terminal = self
                     .terminals
                     .entry(session_id)
-                    .or_insert_with(|| TerminalState {
-                        role,
-                        parser: vt100::Parser::new(rows, columns, 10_000),
-                        last_sequence: 0,
-                        attached: true,
-                        columns,
-                        rows,
-                    });
+                    .or_insert_with(|| TerminalState::new(role, rows, columns, 10_000));
                 terminal.role = role;
                 terminal.attached = true;
                 terminal.columns = columns;
@@ -1620,6 +1688,7 @@ impl DesktopApp {
                     terminal.parser.process(&snapshot);
                     terminal.last_sequence = replay_through_sequence;
                 }
+                terminal.prepare_for_input();
                 self.main_tab = MainTab::Terminal;
                 self.terminal_focus = if role == AttachmentRole::Controller {
                     TerminalFocus::Focused
@@ -1809,7 +1878,7 @@ impl DesktopApp {
                 self.terminal_focus = TerminalFocus::Unfocused;
                 return;
             };
-            let Some(terminal) = self.terminals.get(&session_id) else {
+            let Some(terminal) = self.terminals.get_mut(&session_id) else {
                 self.terminal_focus = TerminalFocus::Unfocused;
                 return;
             };
@@ -1821,9 +1890,31 @@ impl DesktopApp {
                 self.detach_active();
                 return;
             }
+            if modifiers.shift() {
+                match key.as_ref() {
+                    Key::Named(Named::PageUp) => {
+                        terminal.scroll_page(1);
+                        return;
+                    }
+                    Key::Named(Named::PageDown) => {
+                        terminal.scroll_page(-1);
+                        return;
+                    }
+                    Key::Named(Named::Home) => {
+                        terminal.scroll_to_oldest();
+                        return;
+                    }
+                    Key::Named(Named::End) => {
+                        terminal.prepare_for_input();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             let Some(bytes) = encode_terminal_key(&key, modifiers, text.as_deref()) else {
                 return;
             };
+            terminal.prepare_for_input();
             self.send_request(
                 Operation::Input(session_id),
                 ClientRequest::SessionInput { session_id, bytes },
@@ -2364,7 +2455,7 @@ impl DesktopApp {
         let Some(session_id) = self.active_session_id else {
             return;
         };
-        let Some(terminal) = self.terminals.get(&session_id) else {
+        let Some(terminal) = self.terminals.get_mut(&session_id) else {
             self.error = Some("Click Attach before typing in this terminal.".into());
             return;
         };
@@ -2378,8 +2469,32 @@ impl DesktopApp {
             );
             return;
         }
+        terminal.prepare_for_input();
         self.terminal_focus = TerminalFocus::Focused;
         self.error = None;
+    }
+
+    fn scroll_terminal(&mut self, delta: mouse::ScrollDelta) {
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        let font_size = f32::from(self.desktop_state.terminal_font_size);
+        let lines = match delta {
+            mouse::ScrollDelta::Lines { y, .. } => y * 3.0,
+            mouse::ScrollDelta::Pixels { y, .. } => y / (font_size + 3.0),
+        };
+        if let Some(terminal) = self.terminals.get_mut(&session_id) {
+            terminal.scroll_lines(lines);
+        }
+    }
+
+    fn show_latest_terminal(&mut self) {
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        if let Some(terminal) = self.terminals.get_mut(&session_id) {
+            terminal.prepare_for_input();
+        }
     }
 
     fn load_diff(&mut self) {
@@ -2512,6 +2627,7 @@ impl DesktopApp {
             terminal.parser.screen_mut().set_size(rows, columns);
             terminal.columns = columns;
             terminal.rows = rows;
+            terminal.prepare_for_input();
         }
         self.pending_resize = Some((session_id, columns, rows, Instant::now()));
     }
@@ -2849,6 +2965,28 @@ fn trimmed_option(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+fn form_submit_label(form: &Form, pending: bool, selected_provider_checking: bool) -> &'static str {
+    if pending {
+        return "Working…";
+    }
+    if selected_provider_checking {
+        return "Checking Codex…";
+    }
+    match form.kind {
+        FormKind::CreateWorkspace => "Create workspace",
+        FormKind::RegisterProject(_) => "Register repository",
+        FormKind::CreateWorktree(_) => "Create worktree",
+        FormKind::CreateSession(_) => match form.provider().map(|provider| provider.kind) {
+            Some(ProviderKind::Codex) => "Start Codex",
+            Some(ProviderKind::Shell) => "Open Shell",
+            Some(_) | None => "Start session",
+        },
+        FormKind::RenameProject(_) | FormKind::RenameWorktree(_) | FormKind::RenameSession(_) => {
+            "Save name"
+        }
+    }
+}
+
 fn first_run_guidance(kind: FormKind) -> Option<&'static str> {
     match kind {
         FormKind::CreateWorkspace => Some(
@@ -2940,6 +3078,23 @@ fn empty_hint(message: &str) -> Element<'_, Message> {
         .padding(8)
         .width(Fill)
         .into()
+}
+
+fn empty_action(
+    message: &'static str,
+    label: &'static str,
+    action: Message,
+) -> Element<'static, Message> {
+    container(
+        column![
+            text(message).size(UI_META_SIZE).style(text::secondary),
+            button(label).on_press(action).style(button::secondary),
+        ]
+        .spacing(8),
+    )
+    .padding(8)
+    .width(Fill)
+    .into()
 }
 
 fn footer_item(label: &str) -> Element<'static, Message> {
@@ -3232,6 +3387,10 @@ mod tests {
             !terminal_view.contains("scrollable("),
             "the VT screen owns its viewport; a nested desktop scroll area breaks terminal input and resizing"
         );
+        assert!(
+            terminal_view.contains(".on_scroll("),
+            "the fixed VT viewport must still route wheel input to terminal-owned scrollback"
+        );
     }
 
     #[test]
@@ -3279,5 +3438,32 @@ mod tests {
             provider_recovery_message(&provider_health(ProviderKind::Codex, true, false));
         assert!(unauthenticated.contains("Sign in to Codex"));
         assert!(unauthenticated.contains("retry discovery"));
+    }
+
+    #[test]
+    fn forms_use_specific_primary_action_labels() {
+        assert_eq!(
+            form_submit_label(&Form::workspace(), false, false),
+            "Create workspace"
+        );
+        assert_eq!(
+            form_submit_label(&Form::repository(WorkspaceId::new()), false, false),
+            "Register repository"
+        );
+        assert_eq!(
+            form_submit_label(&Form::worktree(ProjectId::new()), false, false),
+            "Create worktree"
+        );
+        assert_eq!(
+            form_submit_label(
+                &Form::session(
+                    WorktreeId::new(),
+                    vec![provider_health(ProviderKind::Shell, true, true)],
+                ),
+                false,
+                false,
+            ),
+            "Open Shell"
+        );
     }
 }

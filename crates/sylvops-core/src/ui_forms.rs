@@ -214,8 +214,10 @@ impl Form {
                 return false;
             }
             if provider.kind == ProviderKind::Codex && !provider.authenticated {
-                self.submission_error =
-                    Some("Codex is not authenticated. Run `codex login` explicitly.".into());
+                self.submission_error = Some(
+                    "Codex is not authenticated. Sign in to Codex on this computer, then retry discovery."
+                        .into(),
+                );
                 return false;
             }
         }
@@ -289,5 +291,19 @@ mod tests {
             Some(ProviderKind::Codex)
         );
         assert_eq!(form.visible_field_indices(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn unauthenticated_codex_validation_uses_in_app_recovery_language() {
+        let mut codex = health(ProviderKind::Codex, true);
+        codex.authenticated = false;
+        let mut form = Form::session(WorktreeId::new(), vec![codex]);
+
+        assert!(!form.validate());
+        assert!(
+            form.submission_error
+                .as_deref()
+                .is_some_and(|message| message.contains("Sign in to Codex on this computer"))
+        );
     }
 }
