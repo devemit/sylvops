@@ -41,6 +41,16 @@ cargo test --workspace --all-targets
 
 Process-tree and local-transport behavior is platform-specific; changes there require Windows and Unix coverage.
 
+## Git delivery
+
+After completing a user-authorized implementation task and its required verification, automatically:
+
+- Inspect `git status` and the diff, then stage only files related to the task. Preserve unrelated user changes and never use a broad staging command when the task files can be named explicitly.
+- Create one concise conventional commit describing the completed task.
+- Push the current feature branch to its configured upstream. If it has no upstream, push it with `git push -u origin HEAD`.
+
+Never push directly to `main` or `master`, force-push, rewrite published history, bypass hooks, commit secrets, or commit failing changes. If the current branch is protected, verification fails, the remote or task scope is ambiguous, or task-related changes cannot be separated safely, stop and ask the user instead.
+
 ## Feature status
 
 Cross-platform beta implementation candidate: protocol 1.7, authenticated local IPC, SQLite state, repository/worktree lifecycle and reconciliation, daemon-owned plain-shell and Codex PTYs, provider probing, bounded scrollback and VT snapshots, authenticated observational Codex hooks, deterministic attention states, resume, read-only bounded diff, hierarchical TUI, and a native desktop mission-control client. The desktop supports workspace switching/creation, native repository selection, guided worktree and provider-aware session forms, metadata renames, safe confirmed removal/stop, resizable responsive panels, embedded attachment, dynamic PTY resize, and bounded persisted desktop preferences. Worktree removal is non-forced, refuses tracked/untracked/ignored content, and preserves branches.
