@@ -63,7 +63,7 @@ These are non-blocking only when the behavior is explicit in the shipped UI or d
 
 - Distribution is by portable, unsigned archives. Windows signing and macOS signing/notarization are not beta requirements; any platform warning and the safe user action needed to continue must be documented and demonstrated on the clean host. Installers do not edit `PATH` automatically.
 - Terminal scrollback is bounded and memory-only. It survives client detach, not daemon restart. A daemon crash/restart disconnects the old process record rather than attempting unsafe PTY or PID adoption.
-- Only one client controls a session at a time; other attachments are read-only. Terminal mouse-protocol forwarding is unavailable.
+- Only one client controls a session at a time; other attachments are read-only. The desktop forwards bounded wheel events when an alternate-screen TUI requests mouse reporting, but terminal click and drag forwarding remain unavailable so native text selection is preserved.
 - Shell and Codex are the only enabled providers. SylvOps does not install Codex, perform `codex login`, or manage provider credentials. The TUI retains individual management forms; the desktop is the supported guided first-run path.
 - External worktrees are discovered read-only but cannot be imported. Root/external checkouts cannot be removed by SylvOps, managed removal is never forced, and branches are not deleted.
 - Raw provider transcripts, prompts, terminal bytes, searches, form contents, and credentials are not persisted. Inactive records have no deletion or automatic-retention UI.
@@ -73,7 +73,7 @@ These are non-blocking only when the behavior is explicit in the shipped UI or d
 
 ### Explicitly post-beta
 
-The beta must not add or advertise Claude, GitHub issue/pull-request views, commit/push/merge/PR actions, branch deletion, remote execution, notifications, file finding, Git grep, history/pruning tools, external-worktree import, persisted terminal scrollback, terminal mouse forwarding, auto-update, signed/native installers, signing, or notarization. Stable-release migration compatibility, soak/resource, diagnostics, and security reviews also remain later gates.
+The beta must not add or advertise Claude, GitHub issue/pull-request views, commit/push/merge/PR actions, branch deletion, remote execution, notifications, file finding, Git grep, history/pruning tools, external-worktree import, persisted terminal scrollback, terminal click/drag forwarding, auto-update, signed/native installers, signing, or notarization. Stable-release migration compatibility, soak/resource, diagnostics, and security reviews also remain later gates.
 
 ### Audit result at the decision point
 
