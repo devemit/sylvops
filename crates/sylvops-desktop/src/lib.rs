@@ -21,8 +21,9 @@ use iced::{
     keyboard::{Key, key::Named},
     mouse, system, time,
     widget::{
-        self, button, column, container, mouse_area, opaque, pane_grid, rich_text, row, rule,
-        scrollable, sensor, slider, space, span, stack, text, text_input, vertical_slider,
+        self, button, column, container, mouse_area, opaque, pane_grid, responsive, rich_text, row,
+        rule, scrollable, sensor, slider, space, span, stack, text, text_input, tooltip,
+        vertical_slider,
     },
     window,
 };
@@ -44,7 +45,7 @@ use sylvops_core::{
 };
 use sylvops_daemon::runtime::RuntimePaths;
 use terminal::{
-    DisplayRun, TerminalState, display_runs as terminal_display_runs,
+    DisplayRun, TerminalState, WheelAction, display_runs as terminal_display_runs,
     encode_key as encode_terminal_key, encode_paste as encode_terminal_paste,
 };
 
@@ -159,6 +160,7 @@ struct DesktopApp {
     terminal_pointer: Option<Point>,
     terminal_selection_state: TerminalSelectionState,
     inline_session_rename: Option<InlineSessionRename>,
+    hovered_session_id: Option<SessionId>,
     window_mode: window::Mode,
 }
 
@@ -265,6 +267,7 @@ enum Message {
     SessionRenameInput(String),
     SubmitSessionRename,
     CancelSessionRename,
+    HoverSession(Option<SessionId>),
     RemoveSelectedWorktree,
     FormInput(usize, String),
     SelectProvider(ProviderKind),
@@ -353,6 +356,7 @@ impl DesktopApp {
             terminal_pointer: None,
             terminal_selection_state: TerminalSelectionState::Idle,
             inline_session_rename: None,
+            hovered_session_id: None,
             window_mode: window::Mode::Windowed,
         }
     }
@@ -414,6 +418,7 @@ impl DesktopApp {
                 self.handle_keyboard(event);
             }
             Message::SelectWorkspace(workspace_id) => {
+                self.unfocus_terminal();
                 if self
                     .active_workspace()
                     .is_some_and(|workspace| workspace.id == workspace_id && workspace.is_open)
@@ -421,7 +426,6 @@ impl DesktopApp {
                     return Task::none();
                 }
                 self.inline_session_rename = None;
-                self.terminal_focus = TerminalFocus::Unfocused;
                 self.send_request(
                     Operation::OpenWorkspace(workspace_id),
                     ClientRequest::OpenWorkspace { workspace_id },
@@ -431,6 +435,7 @@ impl DesktopApp {
             Message::SelectWorktree(worktree_id) => self.select_worktree(worktree_id),
             Message::SelectSession(session_id) => self.select_session(session_id),
             Message::SelectOpenSession(session_id) => {
+                self.unfocus_terminal();
                 if self.active_session_id == Some(session_id) {
                     return Task::none();
                 }
@@ -442,7 +447,6 @@ impl DesktopApp {
                     self.inline_session_rename = None;
                 }
                 self.keyboard_panel = DesktopPanel::Sessions;
-                self.terminal_focus = TerminalFocus::Unfocused;
                 self.select_session_context(session_id);
                 self.active_session_id = Some(session_id);
                 self.mark_state_dirty();
@@ -492,6 +496,7 @@ impl DesktopApp {
             Message::CancelSessionRename => {
                 cancel_inline_session_rename(&mut self.inline_session_rename);
             }
+            Message::HoverSession(session_id) => self.hovered_session_id = session_id,
             Message::RemoveSelectedWorktree => self.inspect_worktree_removal(),
             Message::FormInput(index, value) => self.update_form_field(index, value),
             Message::SelectProvider(kind) => self.select_provider(kind),
@@ -686,19 +691,27 @@ impl DesktopApp {
         )
         .width(Length::Fixed(if compact { 106.0 } else { 132.0 }))
         .padding([0, 8]);
-        let mut workspace_tabs = row![].spacing(6).align_y(Center);
-        for workspace in &self.snapshot.workspaces {
+        let mut workspace_tabs = row![].spacing(0).align_y(Center);
+        for (index, workspace) in self.snapshot.workspaces.iter().enumerate() {
+            if index > 0 {
+                workspace_tabs = workspace_tabs.push(rule::vertical(1));
+            }
             let active = workspace.is_open;
+            let label = workspace.name.clone();
             let action = button(
-                text(workspace.name.clone())
+                text(label.clone())
                     .font(if active { UI_SEMIBOLD } else { UI_FONT })
-                    .size(UI_TEXT_SIZE),
+                    .size(UI_TEXT_SIZE)
+                    .wrapping(text::Wrapping::None),
             )
             .on_press(Message::SelectWorkspace(workspace.id))
             .height(ACTION_HEIGHT)
             .padding([6, 14])
             .style(move |theme, status| workspace_tab_style(theme, status, active));
-            workspace_tabs = workspace_tabs.push(action);
+            workspace_tabs = workspace_tabs.push(navigation_tooltip(action, label));
+        }
+        if !self.snapshot.workspaces.is_empty() {
+            workspace_tabs = workspace_tabs.push(rule::vertical(1));
         }
         workspace_tabs = workspace_tabs.push(
             button(
@@ -803,17 +816,13 @@ impl DesktopApp {
                 let toggle = row![
                     button("Navigator")
                         .on_press(Message::ShowNarrowNavigator)
-                        .style(if self.narrow_main {
-                            button::secondary
-                        } else {
-                            button::primary
+                        .style(move |theme, status| {
+                            content_tab_style(theme, status, !self.narrow_main)
                         }),
                     button("Main")
                         .on_press(Message::ShowNarrowMain)
-                        .style(if self.narrow_main {
-                            button::primary
-                        } else {
-                            button::secondary
+                        .style(move |theme, status| {
+                            content_tab_style(theme, status, self.narrow_main)
                         }),
                 ]
                 .spacing(4);
@@ -872,12 +881,32 @@ impl DesktopApp {
                 } else {
                     format!("{}  ·  {branch}", worktree.name)
                 };
-                items = items.push(select_button(
+                let selected = self.selected_worktree_id == Some(worktree.id);
+                let select = select_button(
                     &label,
-                    self.selected_worktree_id == Some(worktree.id),
+                    selected,
                     Message::SelectWorktree(worktree.id),
                     self.desktop_state.density,
-                ));
+                );
+                if selected && worktree_can_delete(worktree) {
+                    items = items.push(
+                        row![
+                            select,
+                            button(text("Delete").font(UI_MEDIUM).size(UI_META_SIZE))
+                                .on_press(Message::RemoveSelectedWorktree)
+                                .height(match self.desktop_state.density {
+                                    DesktopDensity::Comfortable => 36,
+                                    DesktopDensity::Compact => 30,
+                                })
+                                .padding([4, 7])
+                                .style(flat_danger_style),
+                        ]
+                        .spacing(3)
+                        .align_y(Center),
+                    );
+                } else {
+                    items = items.push(select);
+                }
             }
             if worktrees.is_empty() {
                 items = items.push(empty_action(
@@ -907,31 +936,31 @@ impl DesktopApp {
                     items = items.push(self.session_rename_row());
                 } else {
                     let label = session_navigation_label(&session.display_name, session.state);
-                    let select = select_button(
-                        &label,
-                        selected,
-                        Message::SelectSession(session.id),
-                        self.desktop_state.density,
-                    );
-                    if selected {
-                        items = items.push(
-                            row![
-                                select,
-                                button(text("✎").font(UI_MEDIUM).size(15))
-                                    .on_press(Message::BeginSessionRename(session.id))
-                                    .height(match self.desktop_state.density {
-                                        DesktopDensity::Comfortable => 36,
-                                        DesktopDensity::Compact => 30,
-                                    })
-                                    .padding([4, 9])
-                                    .style(chrome_action_style),
-                            ]
-                            .spacing(4)
-                            .align_y(Center),
-                        );
-                    } else {
-                        items = items.push(select);
-                    }
+                    let hovered = self.hovered_session_id == Some(session.id);
+                    let height = match self.desktop_state.density {
+                        DesktopDensity::Comfortable => 36,
+                        DesktopDensity::Compact => 30,
+                    };
+                    let row = container(
+                        text(label.clone())
+                            .font(if selected { UI_MEDIUM } else { UI_FONT })
+                            .size(UI_TEXT_SIZE)
+                            .wrapping(text::Wrapping::None)
+                            .width(Fill),
+                    )
+                    .width(Fill)
+                    .height(height)
+                    .padding([5, 9])
+                    .align_y(Vertical::Center)
+                    .clip(true)
+                    .style(move |theme| list_item_container_style(theme, selected, hovered));
+                    let interaction = mouse_area(row)
+                        .on_enter(Message::HoverSession(Some(session.id)))
+                        .on_exit(Message::HoverSession(None))
+                        .on_press(Message::SelectSession(session.id))
+                        .on_double_click(Message::BeginSessionRename(session.id))
+                        .interaction(mouse::Interaction::Pointer);
+                    items = items.push(navigation_tooltip(interaction, label));
                 }
             }
             if sessions.is_empty() {
@@ -962,7 +991,7 @@ impl DesktopApp {
                 .on_press_maybe((!rename.pending).then_some(Message::SubmitSessionRename))
                 .height(32)
                 .padding([5, 8])
-                .style(button::primary),
+                .style(primary_action_style),
             button("Cancel")
                 .on_press_maybe((!rename.pending).then_some(Message::CancelSessionRename))
                 .height(32)
@@ -1062,16 +1091,20 @@ impl DesktopApp {
                                 text(label)
                                     .font(if active { UI_SEMIBOLD } else { UI_FONT })
                                     .size(UI_TEXT_SIZE)
+                                    .wrapping(text::Wrapping::None)
                             )
                             .on_press(Message::SelectOpenSession(session.id))
                             .height(30)
                             .padding([5, 9])
                             .style(move |theme, status| { tab_label_style(theme, status, active) }),
-                            button(text("×").size(15))
-                                .on_press(Message::CloseSessionTab(session.id))
-                                .height(30)
-                                .padding([4, 8])
-                                .style(tab_close_style),
+                            navigation_tooltip(
+                                button(text("×").size(15))
+                                    .on_press(Message::CloseSessionTab(session.id))
+                                    .height(30)
+                                    .padding([4, 8])
+                                    .style(tab_close_style),
+                                "Close tab — session keeps running".into(),
+                            ),
                         ]
                         .spacing(0)
                         .align_y(Center),
@@ -1114,58 +1147,66 @@ impl DesktopApp {
             .terminals
             .get(&session_id)
             .is_some_and(|terminal| terminal.attached);
-        let mut actions = row![].spacing(6);
-        if attached {
-            actions = actions.push(
-                button(text("Detach").font(UI_MEDIUM).size(12))
-                    .on_press(Message::Detach)
+        let can_stop = session_can_stop(session.state);
+        let session_state = session.state;
+        let state_label = session_state_label(session.state);
+        responsive(move |size| {
+            let compact = size.width < 260.0;
+            let mut actions = row![].spacing(4);
+            if let Some(label) = session_terminal_action_label(attached, session_state, compact) {
+                let message = if attached {
+                    Message::Detach
+                } else {
+                    Message::Attach
+                };
+                let style = if attached {
+                    chrome_action_style
+                } else {
+                    primary_action_style
+                };
+                actions = actions.push(
+                    button(
+                        text(label)
+                            .font(UI_MEDIUM)
+                            .size(UI_META_SIZE)
+                            .wrapping(text::Wrapping::None),
+                    )
+                    .on_press(message)
                     .height(ACTION_HEIGHT)
-                    .padding([6, 10])
-                    .style(chrome_action_style),
-            );
-        } else if session_can_stop(session.state) || session_can_replay(session.state) {
-            let label = if session_can_stop(session.state) {
-                "Attach"
-            } else {
-                "View output"
-            };
-            actions = actions.push(
-                button(text(label).font(UI_MEDIUM).size(12))
-                    .on_press(Message::Attach)
+                    .padding([6, 9])
+                    .style(style),
+                );
+            }
+            if can_stop {
+                actions = actions.push(
+                    button(text("Stop").font(UI_MEDIUM).size(UI_META_SIZE))
+                        .on_press(Message::Stop)
+                        .height(ACTION_HEIGHT)
+                        .padding([6, 9])
+                        .style(danger_action_style),
+                );
+            } else if !compact {
+                actions = actions.push(
+                    container(
+                        text(format!("History retained · {state_label}"))
+                            .size(UI_META_SIZE)
+                            .wrapping(text::Wrapping::None)
+                            .style(text::secondary),
+                    )
                     .height(ACTION_HEIGHT)
-                    .padding([6, 10])
-                    .style(button::primary),
-            );
-        }
-        if session_can_stop(session.state) {
-            actions = actions.push(
-                button(text("Stop").font(UI_MEDIUM).size(12))
-                    .on_press(Message::Stop)
-                    .height(ACTION_HEIGHT)
-                    .padding([6, 10])
-                    .style(button::danger),
-            );
-        } else {
-            actions = actions.push(
-                container(
-                    text(format!(
-                        "History retained · {}",
-                        session_state_label(session.state)
-                    ))
-                    .size(UI_META_SIZE)
-                    .style(text::secondary),
-                )
-                .height(ACTION_HEIGHT)
-                .align_y(Vertical::Center),
-            );
-        }
-        actions.into()
+                    .align_y(Vertical::Center)
+                    .clip(true),
+                );
+            }
+            actions.into()
+        })
+        .into()
     }
 
     fn terminal_view(&self) -> Element<'_, Message> {
         let Some(session_id) = self.active_session_id else {
             return observed_terminal_viewport(centered_message(
-                "Choose a session, then select Attach.",
+                "Choose a session, then open its terminal.",
             ));
         };
         let Some(terminal) = self.terminals.get(&session_id) else {
@@ -1180,8 +1221,8 @@ impl DesktopApp {
                 ));
             }
             return observed_terminal_viewport(centered_action(
-                "Session ready. Attach to connect its terminal.",
-                "Attach terminal",
+                "Session ready. Open its terminal to begin.",
+                "Open terminal",
                 Message::Attach,
             ));
         };
@@ -1189,11 +1230,11 @@ impl DesktopApp {
         let role = if scrollback_rows > 0 {
             format!("Viewing history  ·  {scrollback_rows} lines above latest")
         } else if !terminal.attached {
-            "Not attached  ·  select Attach to reconnect".to_owned()
+            "Terminal closed  ·  select Open terminal to reconnect".to_owned()
         } else if terminal.role == AttachmentRole::Observer {
             "Read only  ·  this session is controlled in another window".to_owned()
         } else if self.terminal_focus.is_focused() {
-            "Input active  ·  drag to select  ·  Ctrl+] detaches".to_owned()
+            "Input active  ·  drag to select  ·  Ctrl+] leaves terminal".to_owned()
         } else {
             "Click to type  ·  drag to select terminal text".to_owned()
         };
@@ -1215,7 +1256,7 @@ impl DesktopApp {
                     .on_press(Message::LatestTerminal)
                     .height(24)
                     .padding([3, 8])
-                    .style(button::primary),
+                    .style(primary_action_style),
             );
         }
         let surface = container(
@@ -1354,18 +1395,15 @@ impl DesktopApp {
                 actions = actions.push(
                     button("Stop session")
                         .on_press(Message::Stop)
-                        .style(button::danger),
+                        .style(flat_danger_style),
                 );
             }
         }
-        if self
-            .selected_worktree()
-            .is_some_and(|worktree| !worktree.is_root_checkout)
-        {
+        if self.selected_worktree().is_some_and(worktree_can_delete) {
             actions = actions.push(
-                button("Remove checkout")
+                button("Delete checkout")
                     .on_press(Message::RemoveSelectedWorktree)
-                    .style(button::danger),
+                    .style(flat_danger_style),
             );
         }
         content = content.push(rule::horizontal(1)).push(actions);
@@ -1417,12 +1455,12 @@ impl DesktopApp {
                 detail("Enter", "Open the selected session".into()),
                 detail("1 / 2 / 3", "Terminal / Changes / Details".into()),
                 detail("N / R / D", "New / rename / stop or remove".into()),
-                detail("A / G", "Attach terminal / show Git changes".into()),
+                detail("O / G", "Open terminal / show Git changes".into()),
                 detail(
                     "Wheel / Shift+PageUp",
                     "Read terminal history; Shift+End returns to latest".into(),
                 ),
-                detail("Ctrl+]", "Detach the focused terminal".into()),
+                detail("Ctrl+]", "Leave the focused terminal".into()),
                 detail(
                     terminal_clipboard_shortcut(),
                     "Copy selected terminal text / paste from the clipboard".into(),
@@ -1448,14 +1486,11 @@ impl DesktopApp {
             DesktopTheme::TokyoNight,
             DesktopTheme::Catppuccin,
         ] {
+            let selected = self.desktop_state.theme == choice;
             themes = themes.push(
                 button(theme::label(choice))
                     .on_press(Message::SelectTheme(choice))
-                    .style(if self.desktop_state.theme == choice {
-                        button::primary
-                    } else {
-                        button::secondary
-                    }),
+                    .style(move |theme, status| content_tab_style(theme, status, selected)),
             );
         }
         container(
@@ -1478,10 +1513,10 @@ impl DesktopApp {
                     text("Density").width(Length::Fixed(120.0)),
                     button("Comfortable")
                         .on_press(Message::SelectDensity(DesktopDensity::Comfortable))
-                        .style(if self.desktop_state.density == DesktopDensity::Comfortable { button::primary } else { button::secondary }),
+                        .style(move |theme, status| content_tab_style(theme, status, self.desktop_state.density == DesktopDensity::Comfortable)),
                     button("Compact")
                         .on_press(Message::SelectDensity(DesktopDensity::Compact))
-                        .style(if self.desktop_state.density == DesktopDensity::Compact { button::primary } else { button::secondary }),
+                        .style(move |theme, status| content_tab_style(theme, status, self.desktop_state.density == DesktopDensity::Compact)),
                 ].spacing(8).align_y(Center),
                 row![
                     text(format!("Terminal font: {} px", self.desktop_state.terminal_font_size)).width(Length::Fixed(180.0)),
@@ -1566,7 +1601,7 @@ impl DesktopApp {
                             (!modal.pending && !selected_provider_checking)
                                 .then_some(Message::SubmitForm),
                         )
-                        .style(button::primary),
+                        .style(primary_action_style),
                 ]
                 .spacing(8),
             ]
@@ -1605,14 +1640,11 @@ impl DesktopApp {
         let mut choices = row![].spacing(8);
         for kind in [ProviderKind::Shell, ProviderKind::Codex] {
             if form.providers.iter().any(|provider| provider.kind == kind) {
+                let is_selected = selected == Some(kind);
                 choices = choices.push(
                     button(text(kind.to_string()).font(UI_MEDIUM))
                         .on_press_maybe((!form_pending).then_some(Message::SelectProvider(kind)))
-                        .style(if selected == Some(kind) {
-                            button::primary
-                        } else {
-                            button::secondary
-                        }),
+                        .style(move |theme, status| content_tab_style(theme, status, is_selected)),
                 );
             }
         }
@@ -1662,9 +1694,9 @@ impl DesktopApp {
                 canonical_path,
                 ..
             } => (
-                "Remove clean checkout",
+                "Delete clean checkout",
                 format!(
-                    "Remove checkout “{name}” at {canonical_path}? The Git branch is preserved."
+                    "Delete checkout “{name}” at {canonical_path}? The checkout directory is removed without force; the Git branch is preserved."
                 ),
             ),
         };
@@ -1677,7 +1709,7 @@ impl DesktopApp {
                     button("Cancel").on_press(Message::CancelModal),
                     button("Confirm")
                         .on_press(Message::ConfirmAction)
-                        .style(button::danger),
+                        .style(danger_action_style),
                 ]
                 .spacing(8),
             ]
@@ -1734,7 +1766,7 @@ impl DesktopApp {
         if !compact {
             status = status
                 .push(footer_separator())
-                .push(footer_item("Ctrl+K shortcuts  ·  Ctrl+] detach"));
+                .push(footer_item("Ctrl+K shortcuts  ·  Ctrl+] leave terminal"));
         }
         container(status)
             .height(FOOTER_HEIGHT)
@@ -1934,7 +1966,7 @@ impl DesktopApp {
                 }
                 self.modal = None;
                 self.show_success(if first_run {
-                    "Session launched. Click Attach to open its terminal."
+                    "Session launched. Select Open terminal to begin."
                 } else {
                     "Session created."
                 });
@@ -2103,7 +2135,7 @@ impl DesktopApp {
             }
             (Operation::RemoveWorktree, DaemonResponse::WorktreeRemoved { .. }) => {
                 self.modal = None;
-                self.show_success("Checkout removed; its branch was preserved.");
+                self.show_success("Checkout deleted; its branch was preserved.");
                 self.request_snapshot();
             }
             (operation, DaemonResponse::Error(failure)) => {
@@ -2267,7 +2299,7 @@ impl DesktopApp {
             Key::Character(value) if value.eq_ignore_ascii_case("n") => self.shortcut_new(),
             Key::Character(value) if value.eq_ignore_ascii_case("r") => self.shortcut_rename(),
             Key::Character(value) if value.eq_ignore_ascii_case("d") => self.shortcut_delete(),
-            Key::Character(value) if value.eq_ignore_ascii_case("a") => self.attach_active(),
+            Key::Character(value) if is_open_terminal_shortcut(value) => self.attach_active(),
             Key::Character(value) if value.eq_ignore_ascii_case("g") => {
                 self.select_main_tab(MainTab::Changes);
             }
@@ -2278,11 +2310,11 @@ impl DesktopApp {
     }
 
     fn select_main_tab(&mut self, tab: MainTab) {
+        self.unfocus_terminal();
         if self.main_tab == tab {
             return;
         }
         self.main_tab = tab;
-        self.terminal_focus = TerminalFocus::Unfocused;
         if tab == MainTab::Changes {
             self.load_diff();
         }
@@ -2462,6 +2494,7 @@ impl DesktopApp {
             return Task::none();
         };
         let rename = InlineSessionRename::new(session.id, &session.display_name);
+        self.hovered_session_id = None;
         let input_id = rename.input_id.clone();
         self.inline_session_rename = Some(rename);
         self.selected_session_id = Some(session_id);
@@ -2712,11 +2745,11 @@ impl DesktopApp {
             return;
         };
         if worktree.is_root_checkout {
-            self.error = Some("The root checkout cannot be removed by SylvOps.".into());
+            self.error = Some("The root checkout cannot be deleted by SylvOps.".into());
             return;
         }
         if worktree.status != WorktreeStatus::Active {
-            self.error = Some("Only an active managed checkout can be removed.".into());
+            self.error = Some("Only an active managed checkout can be deleted.".into());
             return;
         }
         self.send_request(
@@ -2761,7 +2794,7 @@ impl DesktopApp {
 
     fn attach_active(&mut self) {
         let Some(session_id) = self.active_session_id else {
-            self.error = Some("Select a session before attaching.".into());
+            self.error = Some("Select a session before opening its terminal.".into());
             return;
         };
         let Some(session) = self.session(session_id) else {
@@ -2807,21 +2840,26 @@ impl DesktopApp {
             return;
         };
         let Some(terminal) = self.terminals.get_mut(&session_id) else {
-            self.error = Some("Click Attach before typing in this terminal.".into());
+            self.error = Some("Select Open terminal before typing here.".into());
             return;
         };
         if !terminal.attached {
-            self.error = Some("This terminal is detached. Click Attach to reconnect.".into());
+            self.error = Some("This terminal is closed. Select Open terminal to reconnect.".into());
             return;
         }
         if terminal.role != AttachmentRole::Controller {
             self.error = Some(
-                "This attachment is read-only because another client controls the session.".into(),
+                "This terminal is read-only because another client controls the session.".into(),
             );
             return;
         }
         self.terminal_focus = TerminalFocus::Focused;
         self.error = None;
+    }
+
+    fn unfocus_terminal(&mut self) {
+        self.terminal_focus = TerminalFocus::Unfocused;
+        self.terminal_selection_state = TerminalSelectionState::Idle;
     }
 
     fn move_terminal_pointer(&mut self, point: Point) {
@@ -2909,9 +2947,31 @@ impl DesktopApp {
             mouse::ScrollDelta::Lines { y, .. } => y * 3.0,
             mouse::ScrollDelta::Pixels { y, .. } => y / (font_size + 3.0),
         };
-        if let Some(terminal) = self.terminals.get_mut(&session_id) {
-            terminal.clear_selection();
-            terminal.scroll_lines(lines);
+        let pointer = self.terminal_pointer;
+        let action = self.terminals.get_mut(&session_id).map(|terminal| {
+            let (row, column) = pointer
+                .and_then(|point| {
+                    terminal_point_to_cell(
+                        point,
+                        self.desktop_state.terminal_font_size,
+                        (terminal.rows, terminal.columns),
+                    )
+                })
+                .unwrap_or_else(|| terminal.parser.screen().cursor_position());
+            terminal.wheel_action(lines, row, column)
+        });
+        match action {
+            Some(WheelAction::Application(bytes)) if !bytes.is_empty() => self.send_request(
+                Operation::Input(session_id),
+                ClientRequest::SessionInput { session_id, bytes },
+            ),
+            Some(WheelAction::Local) => {
+                if let Some(terminal) = self.terminals.get_mut(&session_id) {
+                    terminal.clear_selection();
+                    terminal.scroll_lines(lines);
+                }
+            }
+            Some(WheelAction::Application(_)) | None => {}
         }
     }
 
@@ -3126,13 +3186,13 @@ impl DesktopApp {
     }
 
     fn select_project(&mut self, project_id: ProjectId) {
+        self.unfocus_terminal();
         if self.selected_project_id == Some(project_id) {
             return;
         }
         self.inline_session_rename = None;
         self.keyboard_panel = DesktopPanel::Projects;
         self.desktop_state.compact_panel = DesktopPanel::Projects;
-        self.terminal_focus = TerminalFocus::Unfocused;
         self.selected_project_id = Some(project_id);
         self.selected_worktree_id = self
             .worktrees_for(project_id)
@@ -3147,13 +3207,13 @@ impl DesktopApp {
     }
 
     fn select_worktree(&mut self, worktree_id: WorktreeId) {
+        self.unfocus_terminal();
         if self.selected_worktree_id == Some(worktree_id) {
             return;
         }
         self.inline_session_rename = None;
         self.keyboard_panel = DesktopPanel::Worktrees;
         self.desktop_state.compact_panel = DesktopPanel::Worktrees;
-        self.terminal_focus = TerminalFocus::Unfocused;
         self.selected_worktree_id = Some(worktree_id);
         self.selected_session_id = self
             .sessions_for(worktree_id)
@@ -3165,6 +3225,7 @@ impl DesktopApp {
     }
 
     fn select_session(&mut self, session_id: SessionId) {
+        self.unfocus_terminal();
         if self.selected_session_id == Some(session_id)
             && self.active_session_id == Some(session_id)
         {
@@ -3179,7 +3240,6 @@ impl DesktopApp {
         }
         self.keyboard_panel = DesktopPanel::Sessions;
         self.desktop_state.compact_panel = DesktopPanel::Sessions;
-        self.terminal_focus = TerminalFocus::Unfocused;
         self.selected_session_id = Some(session_id);
         self.active_session_id = Some(session_id);
         if !self.open_sessions.contains(&session_id) {
@@ -3390,18 +3450,46 @@ fn select_button(
         DesktopDensity::Comfortable => (36, [8, 9]),
         DesktopDensity::Compact => (30, [5, 8]),
     };
-    button(
-        text(label.to_owned())
+    let label = label.to_owned();
+    let content = container(
+        text(label.clone())
             .font(if selected { UI_MEDIUM } else { UI_FONT })
             .size(UI_TEXT_SIZE)
+            .wrapping(text::Wrapping::None)
             .width(Fill),
     )
-    .on_press(message)
-    .style(move |theme, status| list_item_style(theme, status, selected))
     .width(Fill)
-    .height(height)
-    .padding(padding)
+    .clip(true);
+    let action = button(content)
+        .on_press(message)
+        .style(move |theme, status| list_item_style(theme, status, selected))
+        .width(Fill)
+        .height(height)
+        .padding(padding);
+    navigation_tooltip(action, label)
+}
+
+fn navigation_tooltip(
+    content: impl Into<Element<'static, Message>>,
+    label: String,
+) -> Element<'static, Message> {
+    tooltip(
+        content,
+        container(text(label).font(UI_FONT).size(UI_META_SIZE))
+            .padding([5, 8])
+            .style(tooltip_surface),
+        tooltip::Position::FollowCursor,
+    )
+    .gap(6)
     .into()
+}
+
+const fn worktree_can_delete(worktree: &Worktree) -> bool {
+    checkout_delete_available(worktree.is_root_checkout, worktree.status)
+}
+
+const fn checkout_delete_available(is_root_checkout: bool, status: WorktreeStatus) -> bool {
+    !is_root_checkout && matches!(status, WorktreeStatus::Active)
 }
 
 fn tab_button(label: &str, tab: MainTab, active: MainTab) -> Element<'_, Message> {
@@ -3409,7 +3497,8 @@ fn tab_button(label: &str, tab: MainTab, active: MainTab) -> Element<'_, Message
     button(
         text(label)
             .font(if selected { UI_SEMIBOLD } else { UI_FONT })
-            .size(UI_TEXT_SIZE),
+            .size(UI_TEXT_SIZE)
+            .wrapping(text::Wrapping::None),
     )
     .on_press(Message::SelectMainTab(tab))
     .height(ACTION_HEIGHT)
@@ -3427,7 +3516,8 @@ fn compact_panel_button(
     button(
         text(label)
             .font(if selected { UI_SEMIBOLD } else { UI_FONT })
-            .size(UI_META_SIZE),
+            .size(UI_META_SIZE)
+            .wrapping(text::Wrapping::None),
     )
     .on_press(Message::SelectCompactPanel(panel))
     .height(32)
@@ -3694,7 +3784,7 @@ fn centered_action(
     container(
         column![
             text(message).style(text::secondary),
-            button(label).on_press(action).style(button::primary),
+            button(label).on_press(action).style(primary_action_style),
         ]
         .spacing(12)
         .align_x(Center),
@@ -3720,7 +3810,7 @@ fn empty_action(
     container(
         column![
             text(message).size(UI_META_SIZE).style(text::secondary),
-            button(label).on_press(action).style(button::secondary),
+            button(label).on_press(action).style(chrome_action_style),
         ]
         .spacing(8),
     )
@@ -3780,7 +3870,7 @@ fn selected_context_style(theme: &Theme) -> container::Style {
         text_color: Some(palette.primary.base.text),
         border: Border {
             width: 1.0,
-            radius: 6.0.into(),
+            radius: 4.0.into(),
             color: palette.primary.strong.color,
         },
         ..container::Style::default()
@@ -3832,6 +3922,20 @@ fn modal_card(theme: &Theme) -> container::Style {
     }
 }
 
+fn tooltip_surface(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.strong.color)),
+        text_color: Some(palette.background.strong.text),
+        border: Border {
+            width: 1.0,
+            radius: 4.0.into(),
+            color: palette.background.strong.color,
+        },
+        ..container::Style::default()
+    }
+}
+
 fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
     let palette = theme.extended_palette();
     let pair = match status {
@@ -3840,7 +3944,7 @@ fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
         Status::Active | Status::Disabled => palette.background.base,
     };
     button::Style {
-        background: (!matches!(status, Status::Active | Status::Disabled))
+        background: matches!(status, Status::Hovered | Status::Pressed)
             .then_some(Background::Color(pair.color)),
         text_color: pair.text.scale_alpha(if status == Status::Disabled {
             0.45
@@ -3848,10 +3952,96 @@ fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
             1.0
         }),
         border: Border {
-            radius: 6.0.into(),
+            radius: 4.0.into(),
             ..Border::default()
         },
         ..button::Style::default()
+    }
+}
+
+fn primary_action_style(theme: &Theme, status: Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let pair = palette.primary.base;
+    button::Style {
+        background: Some(Background::Color(pair.color)),
+        text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
+            if status == Status::Disabled {
+                0.45
+            } else {
+                1.0
+            },
+        ),
+        border: Border {
+            radius: 4.0.into(),
+            color: palette.primary.strong.color,
+            width: if matches!(status, Status::Hovered | Status::Pressed) {
+                1.0
+            } else {
+                0.0
+            },
+        },
+        ..button::Style::default()
+    }
+}
+
+fn danger_action_style(theme: &Theme, status: Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let pair = palette.danger.base;
+    button::Style {
+        background: Some(Background::Color(pair.color)),
+        text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
+            if status == Status::Disabled {
+                0.45
+            } else {
+                1.0
+            },
+        ),
+        border: Border {
+            radius: 4.0.into(),
+            color: palette.danger.strong.color,
+            width: if matches!(status, Status::Hovered | Status::Pressed) {
+                1.0
+            } else {
+                0.0
+            },
+        },
+        ..button::Style::default()
+    }
+}
+
+fn flat_danger_style(theme: &Theme, status: Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let pair = match status {
+        Status::Hovered | Status::Pressed => palette.danger.weak,
+        Status::Active | Status::Disabled => palette.background.base,
+    };
+    button::Style {
+        background: matches!(status, Status::Hovered | Status::Pressed)
+            .then_some(Background::Color(pair.color)),
+        text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
+            if status == Status::Disabled {
+                0.45
+            } else {
+                1.0
+            },
+        ),
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+fn contrast_safe_text(background: Color, preferred: Color) -> Color {
+    if background.relative_contrast(preferred) >= 4.5 {
+        preferred
+    } else if background.relative_contrast(Color::WHITE)
+        >= background.relative_contrast(Color::BLACK)
+    {
+        Color::WHITE
+    } else {
+        Color::BLACK
     }
 }
 
@@ -3863,7 +4053,7 @@ fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::S
         match status {
             Status::Hovered => palette.background.weak,
             Status::Pressed => palette.background.neutral,
-            Status::Active | Status::Disabled => palette.background.weakest,
+            Status::Active | Status::Disabled => palette.background.base,
         }
     };
     button::Style {
@@ -3874,13 +4064,8 @@ fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::S
             1.0
         }),
         border: Border {
-            radius: 8.0.into(),
-            color: if active {
-                palette.primary.strong.color
-            } else {
-                pair.color
-            },
-            width: if active { 2.0 } else { 0.0 },
+            radius: 0.0.into(),
+            ..Border::default()
         },
         ..button::Style::default()
     }
@@ -3905,10 +4090,30 @@ fn list_item_style(theme: &Theme, status: Status, selected: bool) -> button::Sty
             1.0
         }),
         border: Border {
-            radius: 5.0.into(),
-            ..Border::default()
+            radius: 4.0.into(),
+            color: if selected {
+                palette.primary.strong.color
+            } else {
+                pair.color
+            },
+            width: if selected { 2.0 } else { 0.0 },
         },
         ..button::Style::default()
+    }
+}
+
+fn list_item_container_style(theme: &Theme, selected: bool, hovered: bool) -> container::Style {
+    let status = if hovered {
+        Status::Hovered
+    } else {
+        Status::Active
+    };
+    let style = list_item_style(theme, status, selected);
+    container::Style {
+        background: style.background,
+        text_color: Some(style.text_color),
+        border: style.border,
+        ..container::Style::default()
     }
 }
 
@@ -3927,13 +4132,13 @@ fn content_tab_style(theme: &Theme, status: Status, selected: bool) -> button::S
         background: Some(Background::Color(pair.color)),
         text_color: pair.text.scale_alpha(if selected { 1.0 } else { 0.82 }),
         border: Border {
-            radius: 7.0.into(),
+            radius: 4.0.into(),
             color: if selected {
                 palette.primary.strong.color
             } else {
                 pair.color
             },
-            width: if selected { 2.0 } else { 0.0 },
+            width: if selected { 1.0 } else { 0.0 },
         },
         ..button::Style::default()
     }
@@ -3950,13 +4155,13 @@ fn session_tab_group_style(theme: &Theme, selected: bool) -> container::Style {
         background: Some(Background::Color(pair.color)),
         text_color: Some(pair.text),
         border: Border {
-            radius: 7.0.into(),
+            radius: 4.0.into(),
             color: if selected {
                 palette.primary.strong.color
             } else {
                 palette.background.weak.color
             },
-            width: if selected { 2.0 } else { 1.0 },
+            width: 1.0,
         },
         ..container::Style::default()
     }
@@ -3978,7 +4183,7 @@ fn tab_label_style(theme: &Theme, status: Status, selected: bool) -> button::Sty
             .then_some(Background::Color(pair.color)),
         text_color: pair.text,
         border: Border {
-            radius: 5.0.into(),
+            radius: 4.0.into(),
             ..Border::default()
         },
         ..button::Style::default()
@@ -4003,7 +4208,7 @@ fn tab_close_style(theme: &Theme, status: Status) -> button::Style {
             pair.text
         },
         border: Border {
-            radius: 5.0.into(),
+            radius: 4.0.into(),
             color: if matches!(status, Status::Hovered | Status::Pressed) {
                 palette.danger.strong.color
             } else {
@@ -4086,6 +4291,26 @@ const fn session_can_replay(state: SessionState) -> bool {
     )
 }
 
+const fn session_terminal_action_label(
+    attached: bool,
+    state: SessionState,
+    compact: bool,
+) -> Option<&'static str> {
+    if attached {
+        Some(if compact { "Leave" } else { "Leave terminal" })
+    } else if session_can_stop(state) {
+        Some(if compact { "Open" } else { "Open terminal" })
+    } else if session_can_replay(state) {
+        Some("View output")
+    } else {
+        None
+    }
+}
+
+fn is_open_terminal_shortcut(value: &str) -> bool {
+    value.eq_ignore_ascii_case("o") || value.eq_ignore_ascii_case("a")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4142,6 +4367,53 @@ mod tests {
     }
 
     #[test]
+    fn navigator_reselection_clears_terminal_focus_before_returning() {
+        let source = include_str!("lib.rs");
+        for function in ["select_project", "select_worktree", "select_session"] {
+            let body = source
+                .split_once(&format!("    fn {function}"))
+                .and_then(|(_, tail)| tail.split_once("\n    fn "))
+                .map(|(body, _)| body)
+                .expect("navigator selection function");
+            let focus = body
+                .find("self.unfocus_terminal()")
+                .expect("navigator selection clears terminal focus");
+            let early_return = body.find("return;").unwrap_or(usize::MAX);
+            assert!(
+                focus < early_return,
+                "{function} must clear focus even when the selection is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn session_rename_uses_double_click_without_a_pencil_control() {
+        let source = include_str!("lib.rs");
+        let sessions = source
+            .split_once("    fn sessions_column(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn session_rename_row(&self)"))
+            .map(|(body, _)| body)
+            .expect("sessions column source");
+
+        assert!(sessions.contains("on_double_click"));
+        assert!(!sessions.contains('✎'));
+    }
+
+    #[test]
+    fn navigator_labels_are_single_line_and_clipped() {
+        let source = include_str!("lib.rs");
+        let select_button = source
+            .split_once("fn select_button(")
+            .and_then(|(_, tail)| tail.split_once("\nfn tab_button"))
+            .map(|(body, _)| body)
+            .expect("select button source");
+
+        assert!(select_button.contains("Wrapping::None"));
+        assert!(select_button.contains(".clip(true)"));
+        assert!(select_button.contains("tooltip("));
+    }
+
+    #[test]
     fn measured_terminal_viewport_keeps_the_grid_inside_the_visible_screen() {
         let viewport = iced::Size::new(600.0, 400.0);
         let font_size = 14;
@@ -4166,7 +4438,7 @@ mod tests {
         let active = content_tab_style(&theme, Status::Active, true);
         let inactive = content_tab_style(&theme, Status::Active, false);
 
-        assert!(active.border.width >= 2.0);
+        assert!(active.border.width >= 1.0);
         assert!(active.border.width > inactive.border.width);
         assert_ne!(active.text_color, inactive.text_color);
         let Some(Background::Color(background)) = active.background else {
@@ -4211,6 +4483,17 @@ mod tests {
                     "chrome pressed",
                     chrome_action_style(&theme, Status::Pressed),
                 ),
+                (
+                    "primary active",
+                    primary_action_style(&theme, Status::Active),
+                ),
+                (
+                    "primary hover",
+                    primary_action_style(&theme, Status::Hovered),
+                ),
+                ("danger active", danger_action_style(&theme, Status::Active)),
+                ("danger hover", danger_action_style(&theme, Status::Hovered)),
+                ("flat danger", flat_danger_style(&theme, Status::Hovered)),
                 (
                     "workspace selected",
                     workspace_tab_style(&theme, Status::Active, true),
@@ -4330,6 +4613,41 @@ mod tests {
         assert!(session_can_replay(SessionState::Failed));
         assert!(!session_can_replay(SessionState::Disconnected));
         assert!(!session_can_replay(SessionState::Terminated));
+    }
+
+    #[test]
+    fn terminal_actions_use_short_single_line_labels_when_space_is_tight() {
+        assert_eq!(
+            session_terminal_action_label(false, SessionState::Running, false),
+            Some("Open terminal")
+        );
+        assert_eq!(
+            session_terminal_action_label(false, SessionState::Running, true),
+            Some("Open")
+        );
+        assert_eq!(
+            session_terminal_action_label(true, SessionState::Running, false),
+            Some("Leave terminal")
+        );
+        assert_eq!(
+            session_terminal_action_label(true, SessionState::Running, true),
+            Some("Leave")
+        );
+    }
+
+    #[test]
+    fn checkout_delete_is_only_available_for_active_managed_checkouts() {
+        assert!(checkout_delete_available(false, WorktreeStatus::Active));
+        assert!(!checkout_delete_available(true, WorktreeStatus::Active));
+        for status in [
+            WorktreeStatus::Creating,
+            WorktreeStatus::Removing,
+            WorktreeStatus::Removed,
+            WorktreeStatus::Missing,
+            WorktreeStatus::Invalid,
+        ] {
+            assert!(!checkout_delete_available(false, status));
+        }
     }
 
     #[test]

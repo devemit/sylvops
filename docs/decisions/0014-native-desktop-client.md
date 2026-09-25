@@ -21,4 +21,4 @@ The desktop layout uses workspace tabs across the top, separate project, worktre
 - Desktop, TUI, and scripting clients can coexist without duplicating lifecycle authority.
 - Native renderer dependencies increase binary and build size.
 - Platform packaging must include native-window smoke coverage in addition to PTY and IPC tests.
-- Desktop entity forms and bounded preferences were completed in protocol 1.7. Notifications and terminal mouse-protocol forwarding remain incremental work that does not change daemon authority.
+- Desktop entity forms and bounded preferences were completed in protocol 1.7. The desktop may forward bounded wheel events through existing session input when an alternate-screen TUI requests mouse reporting; click and drag forwarding and notifications remain incremental work that does not change daemon authority.

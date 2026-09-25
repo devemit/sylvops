@@ -2,6 +2,15 @@ use iced::keyboard::{self, Key, key::Named};
 use sylvops_core::domain::AttachmentRole;
 use sylvops_core::protocol::MAX_PTY_CHUNK_SIZE;
 
+pub(crate) const MAX_WHEEL_EVENTS_PER_INPUT: usize = 12;
+const MAX_WHEEL_EVENTS_PER_INPUT_F32: f32 = 12.0;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WheelAction {
+    Local,
+    Application(Vec<u8>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CellPosition {
     row: u16,
@@ -98,6 +107,41 @@ impl TerminalState {
             current.saturating_sub(whole_lines)
         };
         self.parser.screen_mut().set_scrollback(next);
+    }
+
+    pub(crate) fn wheel_action(&mut self, lines: f32, row: u16, column: u16) -> WheelAction {
+        if !self.attached || self.role != AttachmentRole::Controller {
+            return WheelAction::Local;
+        }
+        let screen = self.parser.screen();
+        let mode = screen.mouse_protocol_mode();
+        if !screen.alternate_screen() || mode == vt100::MouseProtocolMode::None {
+            return WheelAction::Local;
+        }
+        if !lines.is_finite() || lines == 0.0 {
+            return WheelAction::Application(Vec::new());
+        }
+
+        let total = self.scroll_fraction + lines;
+        let scroll_up = total.is_sign_positive();
+        let mut remainder = total.abs().min(MAX_WHEEL_EVENTS_PER_INPUT_F32);
+        let mut events = 0_usize;
+        while remainder >= 1.0 && events < MAX_WHEEL_EVENTS_PER_INPUT {
+            remainder -= 1.0;
+            events += 1;
+        }
+        self.scroll_fraction = remainder.copysign(total);
+
+        let encoding = screen.mouse_protocol_encoding();
+        let row = row.min(self.rows.saturating_sub(1));
+        let column = column.min(self.columns.saturating_sub(1));
+        let mut bytes = Vec::new();
+        for _ in 0..events {
+            bytes.extend_from_slice(&encode_mouse_wheel_event(encoding, scroll_up, row, column));
+        }
+        bytes.truncate(MAX_PTY_CHUNK_SIZE);
+        self.clear_selection();
+        WheelAction::Application(bytes)
     }
 
     pub(crate) fn scroll_page(&mut self, pages: isize) {
@@ -237,6 +281,41 @@ impl TerminalState {
             let position = CellPosition { row, column };
             position >= start && position <= end
         })
+    }
+}
+
+fn encode_mouse_wheel_event(
+    encoding: vt100::MouseProtocolEncoding,
+    scroll_up: bool,
+    row: u16,
+    column: u16,
+) -> Vec<u8> {
+    let button = if scroll_up { 64_u16 } else { 65_u16 };
+    let x = column.saturating_add(1);
+    let y = row.saturating_add(1);
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{x};{y}M").into_bytes(),
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let mut bytes = b"\x1b[M".to_vec();
+            for value in [
+                button.saturating_add(32),
+                x.saturating_add(32),
+                y.saturating_add(32),
+            ] {
+                let character = char::from_u32(u32::from(value)).unwrap_or('\u{fffd}');
+                let mut encoded = [0_u8; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            }
+            bytes
+        }
+        vt100::MouseProtocolEncoding::Default => vec![
+            0x1b,
+            b'[',
+            b'M',
+            u8::try_from(button.saturating_add(32)).unwrap_or(u8::MAX),
+            u8::try_from(x.min(223).saturating_add(32)).unwrap_or(u8::MAX),
+            u8::try_from(y.min(223).saturating_add(32)).unwrap_or(u8::MAX),
+        ],
     }
 }
 
@@ -521,5 +600,61 @@ mod tests {
         terminal.prepare_for_input();
         assert_eq!(terminal.scrollback_rows(), 0);
         assert!(display_contents(&terminal, true).contains("five"));
+    }
+
+    #[test]
+    fn alternate_screen_wheel_uses_the_requested_mouse_encoding() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 20, 80, 100);
+        terminal.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+
+        assert_eq!(
+            terminal.wheel_action(1.0, 2, 3),
+            WheelAction::Application(b"\x1b[<64;4;3M".to_vec())
+        );
+
+        terminal.process(b"\x1b[?1006l\x1b[?1005h");
+        assert_eq!(
+            terminal.wheel_action(-1.0, 2, 3),
+            WheelAction::Application(vec![0x1b, b'[', b'M', 97, 36, 35])
+        );
+
+        terminal.process(b"\x1b[?1005l");
+        assert_eq!(
+            terminal.wheel_action(1.0, 2, 3),
+            WheelAction::Application(vec![0x1b, b'[', b'M', 96, 36, 35])
+        );
+    }
+
+    #[test]
+    fn wheel_input_is_bounded_and_normal_screen_scroll_stays_local() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 12, 100);
+        terminal.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+
+        assert_eq!(terminal.wheel_action(2.0, 0, 0), WheelAction::Local);
+        terminal.scroll_lines(2.0);
+        assert!(terminal.is_scrolled_back());
+
+        terminal.prepare_for_input();
+        terminal.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        let WheelAction::Application(bytes) = terminal.wheel_action(10_000.0, 0, 0) else {
+            panic!("alternate-screen mouse mode must receive wheel input");
+        };
+        assert_eq!(
+            bytes.len(),
+            b"\x1b[<64;1;1M".len() * MAX_WHEEL_EVENTS_PER_INPUT
+        );
+        assert!(bytes.len() <= MAX_PTY_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn alternate_screen_wheel_is_never_forwarded_for_observers_or_detached_clients() {
+        let mut observer = TerminalState::new(AttachmentRole::Observer, 20, 80, 100);
+        observer.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        assert_eq!(observer.wheel_action(1.0, 0, 0), WheelAction::Local);
+
+        let mut detached = TerminalState::new(AttachmentRole::Controller, 20, 80, 100);
+        detached.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        detached.attached = false;
+        assert_eq!(detached.wheel_action(1.0, 0, 0), WheelAction::Local);
     }
 }
