@@ -36,6 +36,7 @@ pub(crate) struct TerminalState {
     pub columns: u16,
     pub rows: u16,
     scroll_fraction: f32,
+    scrollback_extent: usize,
     selection_anchor: Option<CellPosition>,
     selection_focus: Option<CellPosition>,
 }
@@ -55,9 +56,22 @@ impl TerminalState {
             columns,
             rows,
             scroll_fraction: 0.0,
+            scrollback_extent: 0,
             selection_anchor: None,
             selection_focus: None,
         }
+    }
+
+    pub(crate) fn process(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+        self.refresh_scrollback_extent();
+    }
+
+    pub(crate) fn resize(&mut self, rows: u16, columns: u16) {
+        self.parser.screen_mut().set_size(rows, columns);
+        self.rows = rows;
+        self.columns = columns;
+        self.refresh_scrollback_extent();
     }
 
     pub(crate) fn scroll_lines(&mut self, lines: f32) {
@@ -99,8 +113,18 @@ impl TerminalState {
     }
 
     pub(crate) fn scroll_to_oldest(&mut self) {
-        self.parser.screen_mut().set_scrollback(usize::MAX);
+        self.parser
+            .screen_mut()
+            .set_scrollback(self.scrollback_extent);
         self.scroll_fraction = 0.0;
+    }
+
+    pub(crate) fn set_scrollback_position(&mut self, rows: usize) {
+        self.parser
+            .screen_mut()
+            .set_scrollback(rows.min(self.scrollback_extent));
+        self.scroll_fraction = 0.0;
+        self.clear_selection();
     }
 
     pub(crate) fn prepare_for_input(&mut self) {
@@ -115,6 +139,19 @@ impl TerminalState {
 
     pub(crate) fn scrollback_rows(&self) -> usize {
         self.parser.screen().scrollback()
+    }
+
+    pub(crate) const fn scrollback_extent(&self) -> usize {
+        self.scrollback_extent
+    }
+
+    fn refresh_scrollback_extent(&mut self) {
+        let current = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        self.scrollback_extent = self.parser.screen().scrollback();
+        self.parser
+            .screen_mut()
+            .set_scrollback(current.min(self.scrollback_extent));
     }
 
     pub(crate) fn begin_selection(&mut self, row: u16, column: u16) {
@@ -392,7 +429,7 @@ mod tests {
     #[test]
     fn display_adds_a_visible_focus_cursor_without_raw_escape_sequences() {
         let mut terminal = TerminalState::new(AttachmentRole::Controller, 4, 12, 100);
-        terminal.parser.process(b"ready");
+        terminal.process(b"ready");
 
         assert_eq!(display_contents(&terminal, true), "ready█");
         assert_eq!(display_contents(&terminal, false), "ready▯");
@@ -401,9 +438,7 @@ mod tests {
     #[test]
     fn history_scrolls_without_losing_the_live_input_row() {
         let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 12, 100);
-        terminal
-            .parser
-            .process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        terminal.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
 
         assert!(display_contents(&terminal, true).contains("five"));
         terminal.scroll_lines(2.0);
@@ -421,13 +456,11 @@ mod tests {
     #[test]
     fn incoming_output_preserves_the_history_view_until_input_resumes() {
         let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 12, 100);
-        terminal
-            .parser
-            .process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        terminal.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         terminal.scroll_lines(2.0);
         let before = display_contents(&terminal, true);
 
-        terminal.parser.process(b"\r\nsix");
+        terminal.process(b"\r\nsix");
 
         assert_eq!(display_contents(&terminal, true), before);
         assert!(terminal.is_scrolled_back());
@@ -438,7 +471,7 @@ mod tests {
     #[test]
     fn ansi_styles_survive_terminal_rendering() {
         let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 20, 100);
-        terminal.parser.process(b"\x1b[1;31merror\x1b[0m plain");
+        terminal.process(b"\x1b[1;31merror\x1b[0m plain");
 
         let runs = display_runs(&terminal, true);
 
@@ -451,7 +484,7 @@ mod tests {
     #[test]
     fn selected_terminal_text_can_be_copied() {
         let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 20, 100);
-        terminal.parser.process(b"alpha beta");
+        terminal.process(b"alpha beta");
         terminal.begin_selection(0, 0);
         terminal.update_selection(0, 4);
         terminal.finish_selection();
@@ -467,5 +500,26 @@ mod tests {
         assert!(pasted.ends_with(b"\x1b[201~"));
         assert!(pasted.windows(7).any(|window| window == b"one\ntwo"));
         assert!(pasted.len() <= sylvops_core::protocol::MAX_PTY_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn scrollbar_tracks_the_complete_vt_history_range() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 3, 12, 100);
+        terminal.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+
+        let oldest = terminal.scrollback_extent();
+        assert!(oldest >= 2);
+        assert_eq!(terminal.scrollback_rows(), 0);
+
+        terminal.set_scrollback_position(oldest);
+        assert_eq!(terminal.scrollback_rows(), oldest);
+        assert!(display_contents(&terminal, true).contains("one"));
+
+        terminal.scroll_lines(-1.0);
+        assert_eq!(terminal.scrollback_rows(), oldest - 1);
+
+        terminal.prepare_for_input();
+        assert_eq!(terminal.scrollback_rows(), 0);
+        assert!(display_contents(&terminal, true).contains("five"));
     }
 }
