@@ -19,21 +19,6 @@ pub(crate) fn resolve(choice: DesktopTheme, system: iced::theme::Mode) -> Theme 
     }
 }
 
-pub(crate) const fn label(theme: DesktopTheme) -> &'static str {
-    match theme {
-        DesktopTheme::System => "System",
-        DesktopTheme::Light => "Light",
-        DesktopTheme::Dark => "Dark",
-        DesktopTheme::Nord => "Nord",
-        DesktopTheme::TokyoNight => "Tokyo Night",
-        DesktopTheme::Catppuccin => "Catppuccin",
-        DesktopTheme::Dracula => "Dracula",
-        DesktopTheme::GruvboxDark => "Gruvbox Dark",
-        DesktopTheme::SolarizedLight => "Solarized Light",
-        DesktopTheme::SolarizedDark => "Solarized Dark",
-    }
-}
-
 fn dark() -> Theme {
     Theme::custom(
         "SylvOps Dark",

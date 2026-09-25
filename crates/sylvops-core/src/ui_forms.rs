@@ -73,16 +73,10 @@ impl Form {
         let mut form = Self::new(
             "Start a session",
             FormKind::CreateSession(worktree_id),
-            vec![
-                field("Display name (optional)", ""),
-                field("Model (optional)", ""),
-                field("Effort (optional)", ""),
-                field("Initial prompt (optional)", ""),
-            ],
+            vec![field("Display name (optional)", "")],
         );
         form.providers = providers;
         form.provider_index = provider_index;
-        form.update_conditional_fields();
         form
     }
 
@@ -119,7 +113,6 @@ impl Form {
         } else {
             (self.provider_index + delta.unsigned_abs()).min(self.providers.len() - 1)
         };
-        self.update_conditional_fields();
     }
 
     pub fn select_provider(&mut self, kind: ProviderKind) -> bool {
@@ -131,23 +124,7 @@ impl Form {
             return false;
         };
         self.provider_index = index;
-        self.update_conditional_fields();
         true
-    }
-
-    pub fn update_conditional_fields(&mut self) {
-        if !self.is_session() {
-            return;
-        }
-        let codex = self
-            .provider()
-            .is_some_and(|provider| provider.kind == ProviderKind::Codex);
-        for index in 1..self.fields.len() {
-            self.fields[index].visible = codex;
-        }
-        self.active = self
-            .active
-            .min(self.visible_field_indices().len().saturating_sub(1));
     }
 
     pub fn visible_field_indices(&self) -> Vec<usize> {
@@ -253,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_is_the_session_default_and_hides_codex_fields() {
+    fn shell_is_the_session_default_and_session_name_is_the_only_field() {
         let form = Form::session(
             WorktreeId::new(),
             vec![
@@ -276,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_can_be_selected_directly() {
+    fn provider_can_be_selected_without_revealing_advanced_fields() {
         let mut form = Form::session(
             WorktreeId::new(),
             vec![
@@ -290,7 +267,8 @@ mod tests {
             form.provider().map(|provider| provider.kind),
             Some(ProviderKind::Codex)
         );
-        assert_eq!(form.visible_field_indices(), vec![0, 1, 2, 3]);
+        assert_eq!(form.visible_field_indices(), vec![0]);
+        assert_eq!(form.fields.len(), 1);
     }
 
     #[test]

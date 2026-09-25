@@ -418,7 +418,6 @@ async fn handle_form(
             } else {
                 (form.provider_index + 1) % form.providers.len()
             };
-            form.update_conditional_fields();
         }
         return Ok(());
     }
@@ -584,9 +583,9 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
                         worktree_id,
                         provider,
                         display_name: optional(0),
-                        model: optional(1),
-                        effort: optional(2),
-                        initial_prompt: optional(3),
+                        model: None,
+                        effort: None,
+                        initial_prompt: None,
                         columns: 80,
                         rows: 24,
                     })
@@ -1397,5 +1396,20 @@ mod tests {
         push_bounded(&mut value, "éx");
         assert!(value.ends_with('é'));
         assert_eq!(value.len(), MAX_FORM_VALUE_BYTES);
+    }
+
+    #[test]
+    fn tui_session_form_keeps_advanced_codex_options_cli_only() {
+        let source = include_str!("lib.rs");
+        let create_session = source
+            .split_once("        FormKind::CreateSession(worktree_id) => {")
+            .and_then(|(_, tail)| tail.split_once("        FormKind::RenameProject"))
+            .map(|(body, _)| body)
+            .expect("TUI session submission source");
+
+        assert!(create_session.contains("display_name: optional(0)"));
+        assert!(create_session.contains("model: None"));
+        assert!(create_session.contains("effort: None"));
+        assert!(create_session.contains("initial_prompt: None"));
     }
 }
