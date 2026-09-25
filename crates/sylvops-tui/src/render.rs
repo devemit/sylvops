@@ -5,7 +5,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
-use sylvops_core::{domain::SessionState, ui::MainTab};
+use sylvops_core::{
+    domain::{Session, SessionState, state_allows_resume},
+    ui::MainTab,
+};
 
 use crate::{
     app::{App, ExplorerNode, FocusZone, HitMap, HitTarget, Mode},
@@ -374,61 +377,7 @@ fn draw_changes(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let content = if let Some(session) = app.selected_session() {
-        vec![
-            Line::from(vec![
-                Span::styled("Session      ", theme.muted),
-                Span::raw(&session.display_name),
-            ]),
-            Line::from(vec![
-                Span::styled("Provider     ", theme.muted),
-                Span::raw(session.provider_kind.to_string()),
-            ]),
-            Line::from(vec![
-                Span::styled("State        ", theme.muted),
-                Span::raw(format!(
-                    "{} {}",
-                    status_symbol(session.state),
-                    status_label(session.state)
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled("Worktree     ", theme.muted),
-                Span::raw(
-                    app.selected_worktree()
-                        .map_or("Unknown", |item| item.name.as_str()),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Started      ", theme.muted),
-                Span::raw(
-                    session
-                        .started_at
-                        .map_or_else(|| "Not started".into(), |value| value.to_string()),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Attachment   ", theme.muted),
-                Span::raw(app.attached.as_ref().map_or("Detached", |item| {
-                    if item.role == sylvops_core::domain::AttachmentRole::Controller {
-                        "Controller"
-                    } else {
-                        "Read-only observer"
-                    }
-                })),
-            ]),
-            Line::from(vec![
-                Span::styled("Resume       ", theme.muted),
-                Span::raw(if session.external_session_id.is_some() {
-                    "Available"
-                } else {
-                    "Unavailable"
-                }),
-            ]),
-            Line::from(""),
-            Line::from(
-                "Safe actions: Attach, Rename, Stop. Commit, push, merge, and PR actions are not available.",
-            ),
-        ]
+        session_details(app, session, theme)
     } else if let Some(worktree) = app.selected_worktree() {
         vec![
             Line::from(format!("Worktree: {}", worktree.name)),
@@ -454,6 +403,94 @@ fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<Line<'a>> {
+    vec![
+        Line::from(vec![
+            Span::styled("Session      ", theme.muted),
+            Span::raw(&session.display_name),
+        ]),
+        Line::from(vec![
+            Span::styled("Provider     ", theme.muted),
+            Span::raw(session.provider_kind.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("State        ", theme.muted),
+            Span::raw(format!(
+                "{} {}",
+                status_symbol(session.state),
+                status_label(session.state)
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Worktree     ", theme.muted),
+            Span::raw(
+                app.selected_worktree()
+                    .map_or("Unknown", |item| item.name.as_str()),
+            ),
+        ]),
+        owned_detail_line(
+            "Started      ",
+            optional_number(session.started_at, "Not started"),
+            theme,
+        ),
+        owned_detail_line(
+            "Ended        ",
+            optional_number(session.ended_at, "Not ended"),
+            theme,
+        ),
+        owned_detail_line(
+            "Exit code    ",
+            optional_number(session.exit_code, "Not recorded"),
+            theme,
+        ),
+        owned_detail_line(
+            "Reason       ",
+            session
+                .failure_reason
+                .clone()
+                .unwrap_or_else(|| "None".into()),
+            theme,
+        ),
+        owned_detail_line(
+            "Output       ",
+            "Memory-only; lost when the daemon restarts".into(),
+            theme,
+        ),
+        Line::from(vec![
+            Span::styled("Attachment   ", theme.muted),
+            Span::raw(app.attached.as_ref().map_or("Detached", |item| {
+                if item.role == sylvops_core::domain::AttachmentRole::Controller {
+                    "Controller"
+                } else {
+                    "Read-only observer"
+                }
+            })),
+        ]),
+        Line::from(vec![
+            Span::styled("Resume       ", theme.muted),
+            Span::raw(
+                if session.external_session_id.is_some() && state_allows_resume(session.state) {
+                    "Available from the CLI"
+                } else {
+                    "Unavailable"
+                },
+            ),
+        ]),
+        Line::from(""),
+        Line::from(
+            "Safe actions: Attach, Rename, Stop. Commit, push, merge, and PR actions are not available.",
+        ),
+    ]
+}
+
+fn owned_detail_line(label: &'static str, value: String, theme: Theme) -> Line<'static> {
+    Line::from(vec![Span::styled(label, theme.muted), Span::raw(value)])
+}
+
+fn optional_number<T: ToString>(value: Option<T>, fallback: &str) -> String {
+    value.map_or_else(|| fallback.to_owned(), |value| value.to_string())
 }
 
 fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
