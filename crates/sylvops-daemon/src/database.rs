@@ -1801,7 +1801,7 @@ fn load_snapshot(connection: &Connection, revision: u64) -> Result<DaemonSnapsho
         workspaces: query_all(
             connection,
             "SELECT id, name, created_at, updated_at, last_opened_at, is_open \
-             FROM workspaces ORDER BY updated_at DESC",
+             FROM workspaces ORDER BY created_at ASC, id ASC",
             workspace_from_row,
         )?,
         projects: query_all(
@@ -2114,10 +2114,27 @@ mod tests {
         let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
         let (_, first) = database.add_workspace("First".into()).await.unwrap();
         let (second_revision, second) = database.add_workspace("Second".into()).await.unwrap();
+        let initial_order: Vec<_> = database
+            .snapshot()
+            .await
+            .unwrap()
+            .workspaces
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect();
         let (opened_revision, opened) = database.open_workspace(first.id).await.unwrap();
         assert!(opened_revision > second_revision);
         assert_eq!(opened.id, first.id);
         let snapshot = database.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id)
+                .collect::<Vec<_>>(),
+            initial_order,
+            "opening a workspace must not move its desktop tab"
+        );
         assert_eq!(
             snapshot
                 .workspaces

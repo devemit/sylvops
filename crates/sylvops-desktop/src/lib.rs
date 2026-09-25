@@ -21,8 +21,8 @@ use iced::{
     keyboard::{Key, key::Named},
     mouse, system, time,
     widget::{
-        button, column, container, mouse_area, opaque, pane_grid, rich_text, row, rule, scrollable,
-        sensor, slider, space, span, stack, text, text_input,
+        self, button, column, container, mouse_area, opaque, pane_grid, rich_text, row, rule,
+        scrollable, sensor, slider, space, span, stack, text, text_input, vertical_slider,
     },
     window,
 };
@@ -65,6 +65,7 @@ const TERMINAL_HORIZONTAL_PADDING: f32 = 24.0;
 const TERMINAL_VERTICAL_PADDING: f32 = 16.0;
 const TERMINAL_HEADER_HEIGHT: f32 = 26.0;
 const TERMINAL_HEADER_SPACING: f32 = 4.0;
+const TERMINAL_SCROLLBAR_WIDTH: f32 = 14.0;
 const TERMINAL_CELL_WIDTH_RATIO: f32 = 0.6;
 const TERMINAL_LINE_HEIGHT_RATIO: f32 = 1.3;
 #[cfg(windows)]
@@ -157,6 +158,7 @@ struct DesktopApp {
     terminal_viewport: Option<iced::Size>,
     terminal_pointer: Option<Point>,
     terminal_selection_state: TerminalSelectionState,
+    inline_session_rename: Option<InlineSessionRename>,
     window_mode: window::Mode,
 }
 
@@ -189,6 +191,53 @@ enum TerminalSelectionState {
     Selecting,
 }
 
+#[derive(Clone, Debug)]
+struct InlineSessionRename {
+    session_id: SessionId,
+    value: String,
+    pending: bool,
+    error: Option<String>,
+    input_id: widget::Id,
+}
+
+impl InlineSessionRename {
+    fn new(session_id: SessionId, value: &str) -> Self {
+        Self {
+            session_id,
+            value: value.to_owned(),
+            pending: false,
+            error: None,
+            input_id: widget::Id::unique(),
+        }
+    }
+
+    fn update(&mut self, value: String) {
+        if !self.pending && value.len() <= 8 * 1024 {
+            self.value = value;
+            self.error = None;
+        }
+    }
+
+    fn begin_submission(&mut self) -> Option<String> {
+        if self.pending {
+            return None;
+        }
+        let name = self.value.trim();
+        if name.is_empty() || name.chars().count() > 200 {
+            self.error = Some("Session name must contain between 1 and 200 characters.".into());
+            return None;
+        }
+        self.pending = true;
+        self.error = None;
+        Some(name.to_owned())
+    }
+
+    fn fail(&mut self, message: String) {
+        self.pending = false;
+        self.error = Some(message);
+    }
+}
+
 impl TerminalFocus {
     const fn is_focused(self) -> bool {
         matches!(self, Self::Focused)
@@ -212,7 +261,10 @@ enum Message {
     NewSession,
     RenameProject,
     RenameWorktree,
-    RenameSession,
+    BeginSessionRename(SessionId),
+    SessionRenameInput(String),
+    SubmitSessionRename,
+    CancelSessionRename,
     RemoveSelectedWorktree,
     FormInput(usize, String),
     SelectProvider(ProviderKind),
@@ -229,6 +281,7 @@ enum Message {
     TerminalSelectionEnded,
     TerminalPaste(Option<String>),
     ScrollTerminal(mouse::ScrollDelta),
+    SetTerminalScrollback(u32),
     LatestTerminal,
     TerminalViewportResized(iced::Size),
     Stop,
@@ -299,6 +352,7 @@ impl DesktopApp {
             terminal_viewport: None,
             terminal_pointer: None,
             terminal_selection_state: TerminalSelectionState::Idle,
+            inline_session_rename: None,
             window_mode: window::Mode::Windowed,
         }
     }
@@ -328,6 +382,35 @@ impl DesktopApp {
                 if let Some(task) = self.handle_terminal_clipboard(&event) {
                     return task;
                 }
+                if self.modal.is_none()
+                    && self.inline_session_rename.is_some()
+                    && let keyboard::Event::KeyPressed { key, .. } = &event
+                {
+                    match key {
+                        Key::Named(Named::Escape)
+                            if self
+                                .inline_session_rename
+                                .as_ref()
+                                .is_some_and(|rename| !rename.pending) =>
+                        {
+                            cancel_inline_session_rename(&mut self.inline_session_rename);
+                        }
+                        Key::Named(Named::Enter) => self.submit_session_rename(),
+                        _ => {}
+                    }
+                    return Task::none();
+                }
+                if self.modal.is_none()
+                    && !self.terminal_focus.is_focused()
+                    && self.keyboard_panel == DesktopPanel::Sessions
+                    && let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
+                    && !modifiers.control()
+                    && !modifiers.alt()
+                    && matches!(key.as_ref(), Key::Character(value) if value.eq_ignore_ascii_case("r"))
+                    && let Some(session_id) = self.selected_session_id
+                {
+                    return self.begin_session_rename(session_id);
+                }
                 self.handle_keyboard(event);
             }
             Message::SelectWorkspace(workspace_id) => {
@@ -337,6 +420,7 @@ impl DesktopApp {
                 {
                     return Task::none();
                 }
+                self.inline_session_rename = None;
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.send_request(
                     Operation::OpenWorkspace(workspace_id),
@@ -349,6 +433,13 @@ impl DesktopApp {
             Message::SelectOpenSession(session_id) => {
                 if self.active_session_id == Some(session_id) {
                     return Task::none();
+                }
+                if self
+                    .inline_session_rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.session_id != session_id)
+                {
+                    self.inline_session_rename = None;
                 }
                 self.keyboard_panel = DesktopPanel::Sessions;
                 self.terminal_focus = TerminalFocus::Unfocused;
@@ -380,6 +471,7 @@ impl DesktopApp {
             }
             Message::SelectMainTab(tab) => self.select_main_tab(tab),
             Message::NewWorkspace => {
+                self.inline_session_rename = None;
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.modal = Some(Modal::Form(FormModal::new(Form::workspace())));
             }
@@ -388,7 +480,18 @@ impl DesktopApp {
             Message::NewSession => self.open_session_form(),
             Message::RenameProject => self.open_project_rename_form(),
             Message::RenameWorktree => self.open_worktree_rename_form(),
-            Message::RenameSession => self.open_session_rename_form(),
+            Message::BeginSessionRename(session_id) => {
+                return self.begin_session_rename(session_id);
+            }
+            Message::SessionRenameInput(value) => {
+                if let Some(rename) = &mut self.inline_session_rename {
+                    rename.update(value);
+                }
+            }
+            Message::SubmitSessionRename => self.submit_session_rename(),
+            Message::CancelSessionRename => {
+                cancel_inline_session_rename(&mut self.inline_session_rename);
+            }
             Message::RemoveSelectedWorktree => self.inspect_worktree_removal(),
             Message::FormInput(index, value) => self.update_form_field(index, value),
             Message::SelectProvider(kind) => self.select_provider(kind),
@@ -407,6 +510,9 @@ impl DesktopApp {
             Message::TerminalSelectionEnded => self.finish_terminal_selection(),
             Message::TerminalPaste(contents) => self.paste_terminal(contents),
             Message::ScrollTerminal(delta) => self.scroll_terminal(delta),
+            Message::SetTerminalScrollback(position) => {
+                self.set_terminal_scrollback(position);
+            }
             Message::LatestTerminal => self.show_latest_terminal(),
             Message::TerminalViewportResized(size) => {
                 if self.terminal_viewport != Some(size) {
@@ -417,6 +523,7 @@ impl DesktopApp {
             Message::Stop => self.open_stop_confirmation(),
             Message::Refresh => self.request_snapshot(),
             Message::ToggleSettings => {
+                self.inline_session_rename = None;
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.modal = if matches!(self.modal, Some(Modal::Settings)) {
                     None
@@ -462,6 +569,9 @@ impl DesktopApp {
                 self.queue_terminal_resize();
             }
             Message::SelectCompactPanel(panel) => {
+                if panel != DesktopPanel::Sessions {
+                    self.inline_session_rename = None;
+                }
                 self.keyboard_panel = panel;
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.desktop_state.compact_panel = panel;
@@ -495,6 +605,7 @@ impl DesktopApp {
                 self.narrow_main = false;
             }
             Message::ShowNarrowMain => {
+                self.inline_session_rename = None;
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.narrow_main = true;
             }
@@ -787,18 +898,41 @@ impl DesktopApp {
         if let Some(worktree_id) = self.selected_worktree_id {
             let sessions = self.sessions_for(worktree_id);
             for session in &sessions {
-                let label = format!(
-                    "{}  ·  {} {}",
-                    status_symbol(session.state),
-                    session.display_name,
-                    session.state
-                );
-                items = items.push(select_button(
-                    &label,
-                    self.selected_session_id == Some(session.id),
-                    Message::SelectSession(session.id),
-                    self.desktop_state.density,
-                ));
+                let selected = self.selected_session_id == Some(session.id);
+                if self
+                    .inline_session_rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.session_id == session.id)
+                {
+                    items = items.push(self.session_rename_row());
+                } else {
+                    let label = session_navigation_label(&session.display_name, session.state);
+                    let select = select_button(
+                        &label,
+                        selected,
+                        Message::SelectSession(session.id),
+                        self.desktop_state.density,
+                    );
+                    if selected {
+                        items = items.push(
+                            row![
+                                select,
+                                button(text("✎").font(UI_MEDIUM).size(15))
+                                    .on_press(Message::BeginSessionRename(session.id))
+                                    .height(match self.desktop_state.density {
+                                        DesktopDensity::Comfortable => 36,
+                                        DesktopDensity::Compact => 30,
+                                    })
+                                    .padding([4, 9])
+                                    .style(chrome_action_style),
+                            ]
+                            .spacing(4)
+                            .align_y(Center),
+                        );
+                    } else {
+                        items = items.push(select);
+                    }
+                }
             }
             if sessions.is_empty() {
                 items = items.push(empty_action(
@@ -811,6 +945,37 @@ impl DesktopApp {
             items = items.push(empty_hint("Select a checkout."));
         }
         panel(scrollable(items), 255.0)
+    }
+
+    fn session_rename_row(&self) -> Element<'_, Message> {
+        let Some(rename) = &self.inline_session_rename else {
+            return space::vertical().height(0).into();
+        };
+        let controls = row![
+            text_input("Session name", &rename.value)
+                .id(rename.input_id.clone())
+                .on_input_maybe((!rename.pending).then_some(Message::SessionRenameInput))
+                .on_submit_maybe((!rename.pending).then_some(Message::SubmitSessionRename))
+                .padding([6, 8])
+                .size(UI_TEXT_SIZE),
+            button(if rename.pending { "…" } else { "Save" })
+                .on_press_maybe((!rename.pending).then_some(Message::SubmitSessionRename))
+                .height(32)
+                .padding([5, 8])
+                .style(button::primary),
+            button("Cancel")
+                .on_press_maybe((!rename.pending).then_some(Message::CancelSessionRename))
+                .height(32)
+                .padding([5, 8])
+                .style(chrome_action_style),
+        ]
+        .spacing(4)
+        .align_y(Center);
+        let mut content = column![controls].spacing(4);
+        if let Some(error) = &rename.error {
+            content = content.push(text(error).size(UI_META_SIZE).style(text::danger));
+        }
+        container(content).padding([3, 0]).width(Fill).into()
     }
 
     fn compact_navigator(&self) -> Element<'_, Message> {
@@ -888,7 +1053,7 @@ impl DesktopApp {
         let mut tabs = row![].spacing(6).align_y(Center);
         for session_id in &self.open_sessions {
             if let Some(session) = self.session(*session_id) {
-                let label = format!("{} {}", status_symbol(session.state), session.display_name);
+                let label = session_tab_label(&session.display_name);
                 let active = self.active_session_id == Some(session.id);
                 tabs = tabs.push(
                     container(
@@ -901,7 +1066,7 @@ impl DesktopApp {
                             .on_press(Message::SelectOpenSession(session.id))
                             .height(30)
                             .padding([5, 9])
-                            .style(tab_label_style),
+                            .style(move |theme, status| { tab_label_style(theme, status, active) }),
                             button(text("×").size(15))
                                 .on_press(Message::CloseSessionTab(session.id))
                                 .height(30)
@@ -983,9 +1148,12 @@ impl DesktopApp {
         } else {
             actions = actions.push(
                 container(
-                    text(format!("History retained · {}", session.state))
-                        .size(UI_META_SIZE)
-                        .style(text::secondary),
+                    text(format!(
+                        "History retained · {}",
+                        session_state_label(session.state)
+                    ))
+                    .size(UI_META_SIZE)
+                    .style(text::secondary),
                 )
                 .height(ACTION_HEIGHT)
                 .align_y(Vertical::Center),
@@ -1074,14 +1242,16 @@ impl DesktopApp {
         .width(Fill)
         .height(Fill)
         .style(move |theme| terminal_surface(theme, self.terminal_focus.is_focused()));
-        observed_terminal_viewport(
+        let viewport = observed_terminal_viewport(
             mouse_area(surface)
                 .on_move(Message::TerminalPointerMoved)
                 .on_press(Message::TerminalSelectionStarted)
                 .on_release(Message::TerminalSelectionEnded)
                 .on_scroll(Message::ScrollTerminal)
                 .into(),
-        )
+        );
+        let scrollbar = terminal_scrollbar(terminal);
+        row![viewport, scrollbar].width(Fill).height(Fill).into()
     }
 
     fn changes_view(&self) -> Element<'_, Message> {
@@ -1138,7 +1308,7 @@ impl DesktopApp {
                 .push(rule::horizontal(1))
                 .push(text(&session.display_name).font(UI_SEMIBOLD).size(18))
                 .push(detail("Provider", session.provider_kind.to_string()))
-                .push(detail("State", session.state.to_string()))
+                .push(detail("State", session_state_label(session.state).into()))
                 .push(detail("Working directory", session.cwd.clone()))
                 .push(detail(
                     "Started (Unix ms)",
@@ -1179,7 +1349,7 @@ impl DesktopApp {
             actions = actions.push(button("Rename checkout").on_press(Message::RenameWorktree));
         }
         if let Some(session) = self.active_session_id.and_then(|id| self.session(id)) {
-            actions = actions.push(button("Rename session").on_press(Message::RenameSession));
+            actions = actions.push(self.session_rename_action(session.id));
             if session_can_stop(session.state) {
                 actions = actions.push(
                     button("Stop session")
@@ -1205,6 +1375,20 @@ impl DesktopApp {
             .height(Fill)
             .style(workspace_surface)
             .into()
+    }
+
+    fn session_rename_action(&self, session_id: SessionId) -> Element<'_, Message> {
+        button(if self.inline_session_rename.is_some() {
+            "Renaming…"
+        } else {
+            "Rename session"
+        })
+        .on_press_maybe(
+            self.inline_session_rename
+                .is_none()
+                .then_some(Message::BeginSessionRename(session_id)),
+        )
+        .into()
     }
 
     fn modal_view<'a>(&'a self, modal: &'a Modal) -> Element<'a, Message> {
@@ -1626,6 +1810,12 @@ impl DesktopApp {
                     }
                     return;
                 }
+                if matches!(&operation, Some(Operation::RenameSession))
+                    && let Some(rename) = &mut self.inline_session_rename
+                {
+                    rename.fail(message);
+                    return;
+                }
                 let form_operation = matches!(
                     operation,
                     Some(
@@ -1666,7 +1856,7 @@ impl DesktopApp {
                 if let Some(terminal) = self.terminals.get_mut(&session_id)
                     && sequence > terminal.last_sequence
                 {
-                    terminal.parser.process(&bytes);
+                    terminal.process(&bytes);
                     terminal.last_sequence = sequence;
                 }
             }
@@ -1679,7 +1869,7 @@ impl DesktopApp {
             } => {
                 if let Some(terminal) = self.terminals.get_mut(&session_id) {
                     terminal.parser = vt100::Parser::new(rows, columns, 10_000);
-                    terminal.parser.process(&terminal_snapshot);
+                    terminal.process(&terminal_snapshot);
                     terminal.last_sequence = snapshot_sequence;
                     terminal.columns = columns;
                     terminal.rows = rows;
@@ -1781,7 +1971,7 @@ impl DesktopApp {
                 terminal.rows = rows;
                 if let Some(snapshot) = terminal_snapshot {
                     terminal.parser = vt100::Parser::new(rows, columns, 10_000);
-                    terminal.parser.process(&snapshot);
+                    terminal.process(&snapshot);
                     terminal.last_sequence = replay_through_sequence;
                 }
                 terminal.prepare_for_input();
@@ -1879,10 +2069,14 @@ impl DesktopApp {
                 self.request_snapshot();
             }
             (Operation::RenameProject, DaemonResponse::ProjectUpdated { .. })
-            | (Operation::RenameWorktree, DaemonResponse::WorktreeUpdated { .. })
-            | (Operation::RenameSession, DaemonResponse::SessionUpdated { .. }) => {
+            | (Operation::RenameWorktree, DaemonResponse::WorktreeUpdated { .. }) => {
                 self.modal = None;
                 self.show_success("Display name updated.");
+                self.request_snapshot();
+            }
+            (Operation::RenameSession, DaemonResponse::SessionUpdated { .. }) => {
+                self.inline_session_rename = None;
+                self.show_success("Session name updated.");
                 self.request_snapshot();
             }
             (Operation::InspectRemoval(worktree_id), DaemonResponse::WorktreeStatus(state)) => {
@@ -2110,6 +2304,9 @@ impl DesktopApp {
         } else {
             (current + 1) % panels.len()
         };
+        if panels[next] != DesktopPanel::Sessions {
+            self.inline_session_rename = None;
+        }
         self.keyboard_panel = panels[next];
         self.desktop_state.compact_panel = panels[next];
         self.narrow_main = false;
@@ -2176,7 +2373,7 @@ impl DesktopApp {
         match self.keyboard_panel {
             DesktopPanel::Projects => self.open_project_rename_form(),
             DesktopPanel::Worktrees => self.open_worktree_rename_form(),
-            DesktopPanel::Sessions => self.open_session_rename_form(),
+            DesktopPanel::Sessions => {}
         }
     }
 
@@ -2201,6 +2398,7 @@ impl DesktopApp {
     }
 
     fn open_project_form(&mut self) {
+        self.inline_session_rename = None;
         let Some(workspace_id) = self.active_workspace().map(|workspace| workspace.id) else {
             self.error = Some("Create a workspace before registering a repository.".into());
             self.modal = Some(Modal::Form(FormModal::new(Form::workspace())));
@@ -2210,6 +2408,7 @@ impl DesktopApp {
     }
 
     fn open_worktree_form(&mut self) {
+        self.inline_session_rename = None;
         let Some(project_id) = self.selected_project_id else {
             self.error = Some("Select a repository before creating a checkout.".into());
             return;
@@ -2218,6 +2417,7 @@ impl DesktopApp {
     }
 
     fn open_session_form(&mut self) {
+        self.inline_session_rename = None;
         let Some(worktree_id) = self.selected_worktree_id else {
             self.error = Some("Select a checkout before starting a session.".into());
             return;
@@ -2256,16 +2456,40 @@ impl DesktopApp {
         ))));
     }
 
-    fn open_session_rename_form(&mut self) {
-        let Some(session) = self.selected_session_id.and_then(|id| self.session(id)) else {
+    fn begin_session_rename(&mut self, session_id: SessionId) -> Task<Message> {
+        let Some(session) = self.session(session_id) else {
             self.error = Some("Select a session to rename.".into());
+            return Task::none();
+        };
+        let rename = InlineSessionRename::new(session.id, &session.display_name);
+        let input_id = rename.input_id.clone();
+        self.inline_session_rename = Some(rename);
+        self.selected_session_id = Some(session_id);
+        self.keyboard_panel = DesktopPanel::Sessions;
+        self.desktop_state.compact_panel = DesktopPanel::Sessions;
+        self.narrow_main = false;
+        self.terminal_focus = TerminalFocus::Unfocused;
+        Task::batch([
+            widget::operation::focus(input_id.clone()),
+            widget::operation::select_all(input_id),
+        ])
+    }
+
+    fn submit_session_rename(&mut self) {
+        let Some((session_id, name)) = self.inline_session_rename.as_mut().and_then(|rename| {
+            rename
+                .begin_submission()
+                .map(|name| (rename.session_id, name))
+        }) else {
             return;
         };
-        self.modal = Some(Modal::Form(FormModal::new(Form::rename(
-            "Rename session",
-            &session.display_name,
-            FormKind::RenameSession(session.id),
-        ))));
+        if !self.bridge.request(
+            Operation::RenameSession,
+            ClientRequest::RenameSession { session_id, name },
+        ) && let Some(rename) = &mut self.inline_session_rename
+        {
+            rename.fail("The desktop IPC command queue is busy. Try again.".into());
+        }
     }
 
     fn update_form_field(&mut self, index: usize, value: String) {
@@ -2471,7 +2695,8 @@ impl DesktopApp {
         if !session_can_stop(session.state) {
             self.error = Some(format!(
                 "Session “{}” is already {}; its history remains available.",
-                session.display_name, session.state
+                session.display_name,
+                session_state_label(session.state)
             ));
             return;
         }
@@ -2546,7 +2771,8 @@ impl DesktopApp {
         if !session_can_stop(session.state) && !session_can_replay(session.state) {
             self.error = Some(format!(
                 "Session “{}” is {}; only its metadata is retained.",
-                session.display_name, session.state
+                session.display_name,
+                session_state_label(session.state)
             ));
             return;
         }
@@ -2689,6 +2915,15 @@ impl DesktopApp {
         }
     }
 
+    fn set_terminal_scrollback(&mut self, position: u32) {
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        if let Some(terminal) = self.terminals.get_mut(&session_id) {
+            terminal.set_scrollback_position(position as usize);
+        }
+    }
+
     fn show_latest_terminal(&mut self) {
         let Some(session_id) = self.active_session_id else {
             return;
@@ -2825,9 +3060,7 @@ impl DesktopApp {
             if terminal.columns == columns && terminal.rows == rows {
                 return;
             }
-            terminal.parser.screen_mut().set_size(rows, columns);
-            terminal.columns = columns;
-            terminal.rows = rows;
+            terminal.resize(rows, columns);
             terminal.prepare_for_input();
         }
         self.pending_resize = Some((session_id, columns, rows, Instant::now()));
@@ -2857,6 +3090,10 @@ impl DesktopApp {
     }
 
     fn restore_selection(&mut self) {
+        retain_inline_session_rename(
+            &mut self.inline_session_rename,
+            self.snapshot.sessions.iter().map(|session| session.id),
+        );
         let projects = self.visible_projects();
         self.selected_project_id = self
             .selected_project_id
@@ -2892,6 +3129,7 @@ impl DesktopApp {
         if self.selected_project_id == Some(project_id) {
             return;
         }
+        self.inline_session_rename = None;
         self.keyboard_panel = DesktopPanel::Projects;
         self.desktop_state.compact_panel = DesktopPanel::Projects;
         self.terminal_focus = TerminalFocus::Unfocused;
@@ -2912,6 +3150,7 @@ impl DesktopApp {
         if self.selected_worktree_id == Some(worktree_id) {
             return;
         }
+        self.inline_session_rename = None;
         self.keyboard_panel = DesktopPanel::Worktrees;
         self.desktop_state.compact_panel = DesktopPanel::Worktrees;
         self.terminal_focus = TerminalFocus::Unfocused;
@@ -2930,6 +3169,13 @@ impl DesktopApp {
             && self.active_session_id == Some(session_id)
         {
             return;
+        }
+        if self
+            .inline_session_rename
+            .as_ref()
+            .is_some_and(|rename| rename.session_id != session_id)
+        {
+            self.inline_session_rename = None;
         }
         self.keyboard_panel = DesktopPanel::Sessions;
         self.desktop_state.compact_panel = DesktopPanel::Sessions;
@@ -3409,6 +3655,29 @@ fn observed_terminal_viewport(content: Element<'_, Message>) -> Element<'_, Mess
         .into()
 }
 
+fn terminal_scrollbar(terminal: &TerminalState) -> Element<'_, Message> {
+    let extent = terminal.scrollback_extent();
+    if extent == 0 {
+        return container(space::vertical())
+            .width(TERMINAL_SCROLLBAR_WIDTH)
+            .height(Fill)
+            .into();
+    }
+    let maximum = u32::try_from(extent).unwrap_or(u32::MAX);
+    let position = u32::try_from(terminal.scrollback_rows())
+        .unwrap_or(u32::MAX)
+        .min(maximum);
+    container(
+        vertical_slider(0..=maximum, position, Message::SetTerminalScrollback)
+            .default(0_u32)
+            .width(TERMINAL_SCROLLBAR_WIDTH)
+            .height(Fill),
+    )
+    .width(TERMINAL_SCROLLBAR_WIDTH)
+    .height(Fill)
+    .into()
+}
+
 fn centered_message(message: &str) -> Element<'_, Message> {
     container(text(message).style(text::secondary))
         .width(Fill)
@@ -3507,8 +3776,8 @@ fn workspace_surface(theme: &Theme) -> container::Style {
 fn selected_context_style(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
-        background: Some(Background::Color(palette.primary.weak.color)),
-        text_color: Some(palette.primary.weak.text),
+        background: Some(Background::Color(palette.primary.base.color)),
+        text_color: Some(palette.primary.base.text),
         border: Border {
             width: 1.0,
             radius: 6.0.into(),
@@ -3565,22 +3834,19 @@ fn modal_card(theme: &Theme) -> container::Style {
 
 fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
     let palette = theme.extended_palette();
-    let background = match status {
-        Status::Hovered => Some(palette.background.weak.color),
-        Status::Pressed => Some(palette.background.neutral.color),
-        Status::Active | Status::Disabled => None,
+    let pair = match status {
+        Status::Hovered => palette.background.weak,
+        Status::Pressed => palette.background.neutral,
+        Status::Active | Status::Disabled => palette.background.base,
     };
     button::Style {
-        background: background.map(Background::Color),
-        text_color: palette
-            .background
-            .base
-            .text
-            .scale_alpha(if status == Status::Disabled {
-                0.45
-            } else {
-                1.0
-            }),
+        background: (!matches!(status, Status::Active | Status::Disabled))
+            .then_some(Background::Color(pair.color)),
+        text_color: pair.text.scale_alpha(if status == Status::Disabled {
+            0.45
+        } else {
+            1.0
+        }),
         border: Border {
             radius: 6.0.into(),
             ..Border::default()
@@ -3592,11 +3858,13 @@ fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
 fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::Style {
     let palette = theme.extended_palette();
     let pair = if active {
-        palette.primary.weak
-    } else if status == Status::Hovered {
-        palette.background.weak
+        palette.primary.base
     } else {
-        palette.background.weakest
+        match status {
+            Status::Hovered => palette.background.weak,
+            Status::Pressed => palette.background.neutral,
+            Status::Active | Status::Disabled => palette.background.weakest,
+        }
     };
     button::Style {
         background: Some(Background::Color(pair.color)),
@@ -3621,11 +3889,13 @@ fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::S
 fn list_item_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
-        palette.primary.weak
-    } else if status == Status::Hovered {
-        palette.background.weak
+        palette.primary.base
     } else {
-        palette.background.weakest
+        match status {
+            Status::Hovered => palette.background.weak,
+            Status::Pressed => palette.background.neutral,
+            Status::Active | Status::Disabled => palette.background.weakest,
+        }
     };
     button::Style {
         background: Some(Background::Color(pair.color)),
@@ -3645,19 +3915,17 @@ fn list_item_style(theme: &Theme, status: Status, selected: bool) -> button::Sty
 fn content_tab_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
-        palette.primary.weak
-    } else if status == Status::Hovered {
-        palette.background.weak
+        palette.primary.base
     } else {
-        palette.background.base
+        match status {
+            Status::Hovered => palette.background.weak,
+            Status::Pressed => palette.background.neutral,
+            Status::Active | Status::Disabled => palette.background.base,
+        }
     };
     button::Style {
         background: Some(Background::Color(pair.color)),
-        text_color: if selected {
-            palette.primary.strong.color
-        } else {
-            pair.text.scale_alpha(0.78)
-        },
+        text_color: pair.text.scale_alpha(if selected { 1.0 } else { 0.82 }),
         border: Border {
             radius: 7.0.into(),
             color: if selected {
@@ -3674,7 +3942,7 @@ fn content_tab_style(theme: &Theme, status: Status, selected: bool) -> button::S
 fn session_tab_group_style(theme: &Theme, selected: bool) -> container::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
-        palette.primary.weak
+        palette.primary.base
     } else {
         palette.background.weakest
     };
@@ -3694,12 +3962,21 @@ fn session_tab_group_style(theme: &Theme, selected: bool) -> container::Style {
     }
 }
 
-fn tab_label_style(theme: &Theme, status: Status) -> button::Style {
+fn tab_label_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
     let palette = theme.extended_palette();
+    let pair = if selected {
+        palette.primary.base
+    } else {
+        match status {
+            Status::Hovered => palette.background.weak,
+            Status::Pressed => palette.background.neutral,
+            Status::Active | Status::Disabled => palette.background.base,
+        }
+    };
     button::Style {
-        background: (status == Status::Hovered)
-            .then_some(Background::Color(palette.background.weak.color)),
-        text_color: palette.background.base.text,
+        background: (!selected && !matches!(status, Status::Active | Status::Disabled))
+            .then_some(Background::Color(pair.color)),
+        text_color: pair.text,
         border: Border {
             radius: 5.0.into(),
             ..Border::default()
@@ -3710,19 +3987,33 @@ fn tab_label_style(theme: &Theme, status: Status) -> button::Style {
 
 fn tab_close_style(theme: &Theme, status: Status) -> button::Style {
     let palette = theme.extended_palette();
+    let pair = match status {
+        Status::Hovered => palette.background.weak,
+        Status::Pressed => palette.background.neutral,
+        Status::Active | Status::Disabled => palette.background.base,
+    };
     button::Style {
         background: match status {
-            Status::Hovered | Status::Pressed => Some(Background::Color(palette.danger.weak.color)),
+            Status::Hovered | Status::Pressed => Some(Background::Color(pair.color)),
             Status::Active | Status::Disabled => None,
         },
-        text_color: if status == Status::Hovered {
-            palette.danger.weak.text
+        text_color: if status == Status::Active {
+            pair.text.scale_alpha(0.68)
         } else {
-            palette.background.base.text.scale_alpha(0.68)
+            pair.text
         },
         border: Border {
             radius: 5.0.into(),
-            ..Border::default()
+            color: if matches!(status, Status::Hovered | Status::Pressed) {
+                palette.danger.strong.color
+            } else {
+                pair.color
+            },
+            width: if matches!(status, Status::Hovered | Status::Pressed) {
+                1.0
+            } else {
+                0.0
+            },
         },
         ..button::Style::default()
     }
@@ -3739,15 +4030,42 @@ fn detail(label: &str, value: String) -> Element<'_, Message> {
     .into()
 }
 
-const fn status_symbol(state: SessionState) -> &'static str {
+fn session_navigation_label(name: &str, state: SessionState) -> String {
+    format!("{name} · {}", session_state_label(state))
+}
+
+fn session_tab_label(name: &str) -> String {
+    name.to_owned()
+}
+
+fn cancel_inline_session_rename(rename: &mut Option<InlineSessionRename>) {
+    if rename.as_ref().is_some_and(|rename| !rename.pending) {
+        *rename = None;
+    }
+}
+
+fn retain_inline_session_rename(
+    rename: &mut Option<InlineSessionRename>,
+    session_ids: impl IntoIterator<Item = SessionId>,
+) {
+    let Some(session_id) = rename.as_ref().map(|rename| rename.session_id) else {
+        return;
+    };
+    if !session_ids.into_iter().any(|id| id == session_id) {
+        *rename = None;
+    }
+}
+
+const fn session_state_label(state: SessionState) -> &'static str {
     match state {
-        SessionState::Fresh => "○",
-        SessionState::Starting | SessionState::Running => "◐",
-        SessionState::NeedsFeedback => "!",
-        SessionState::FinishedUnseen => "◆",
-        SessionState::FinishedSeen => "✓",
-        SessionState::Failed => "×",
-        SessionState::Terminated | SessionState::Disconnected => "—",
+        SessionState::Fresh => "Ready",
+        SessionState::Starting => "Starting",
+        SessionState::Running => "Running",
+        SessionState::NeedsFeedback => "Needs feedback",
+        SessionState::FinishedUnseen | SessionState::FinishedSeen => "Finished",
+        SessionState::Failed => "Failed",
+        SessionState::Terminated => "Stopped",
+        SessionState::Disconnected => "Disconnected",
     }
 }
 
@@ -3784,6 +4102,24 @@ mod tests {
             capabilities: ProviderCapabilities::default(),
             checked_at: 0,
         }
+    }
+
+    fn assert_button_contrast(
+        theme_name: &str,
+        style_name: &str,
+        theme: &Theme,
+        style: &button::Style,
+    ) {
+        let background = match style.background {
+            Some(Background::Color(color)) => color,
+            Some(Background::Gradient(_)) => panic!("button gradients are not expected"),
+            None => theme.extended_palette().background.base.color,
+        };
+        let contrast = background.relative_contrast(style.text_color);
+        assert!(
+            contrast >= 4.5,
+            "{theme_name} {style_name} contrast was {contrast:.2}"
+        );
     }
 
     #[test]
@@ -3826,12 +4162,157 @@ mod tests {
 
     #[test]
     fn active_navigation_tabs_have_a_clear_persistent_accent() {
-        let active = content_tab_style(&Theme::Dark, Status::Active, true);
-        let inactive = content_tab_style(&Theme::Dark, Status::Active, false);
+        let theme = theme::resolve(DesktopTheme::Dark, iced::theme::Mode::Dark);
+        let active = content_tab_style(&theme, Status::Active, true);
+        let inactive = content_tab_style(&theme, Status::Active, false);
 
         assert!(active.border.width >= 2.0);
         assert!(active.border.width > inactive.border.width);
         assert_ne!(active.text_color, inactive.text_color);
+        let Some(Background::Color(background)) = active.background else {
+            panic!("active tabs need a solid background");
+        };
+        assert!(
+            background.relative_contrast(active.text_color) >= 4.5,
+            "selected tab text must remain readable against its fill"
+        );
+    }
+
+    #[test]
+    fn custom_button_styles_remain_readable_and_have_distinct_hover_states() {
+        let themes = [
+            (
+                "light",
+                theme::resolve(DesktopTheme::Light, iced::theme::Mode::Light),
+            ),
+            (
+                "dark",
+                theme::resolve(DesktopTheme::Dark, iced::theme::Mode::Dark),
+            ),
+            (
+                "nord",
+                theme::resolve(DesktopTheme::Nord, iced::theme::Mode::Dark),
+            ),
+            (
+                "tokyo night",
+                theme::resolve(DesktopTheme::TokyoNight, iced::theme::Mode::Dark),
+            ),
+            (
+                "catppuccin",
+                theme::resolve(DesktopTheme::Catppuccin, iced::theme::Mode::Dark),
+            ),
+        ];
+
+        for (theme_name, theme) in themes {
+            let styles = [
+                ("chrome active", chrome_action_style(&theme, Status::Active)),
+                ("chrome hover", chrome_action_style(&theme, Status::Hovered)),
+                (
+                    "chrome pressed",
+                    chrome_action_style(&theme, Status::Pressed),
+                ),
+                (
+                    "workspace selected",
+                    workspace_tab_style(&theme, Status::Active, true),
+                ),
+                (
+                    "workspace hover",
+                    workspace_tab_style(&theme, Status::Hovered, false),
+                ),
+                (
+                    "list selected",
+                    list_item_style(&theme, Status::Active, true),
+                ),
+                (
+                    "list hover",
+                    list_item_style(&theme, Status::Hovered, false),
+                ),
+                (
+                    "content selected",
+                    content_tab_style(&theme, Status::Active, true),
+                ),
+                (
+                    "content hover",
+                    content_tab_style(&theme, Status::Hovered, false),
+                ),
+                ("tab active", tab_label_style(&theme, Status::Active, false)),
+                ("tab hover", tab_label_style(&theme, Status::Hovered, false)),
+                ("close active", tab_close_style(&theme, Status::Active)),
+                ("close hover", tab_close_style(&theme, Status::Hovered)),
+            ];
+            for (name, style) in styles {
+                assert_button_contrast(theme_name, name, &theme, &style);
+            }
+            assert_ne!(
+                chrome_action_style(&theme, Status::Active).background,
+                chrome_action_style(&theme, Status::Hovered).background,
+                "hover must be visible without changing text contrast"
+            );
+            let session_group = session_tab_group_style(&theme, true);
+            let Some(Background::Color(group_background)) = session_group.background else {
+                panic!("selected session tabs need a solid background");
+            };
+            for status in [Status::Active, Status::Hovered, Status::Pressed] {
+                let session_label = tab_label_style(&theme, status, true);
+                assert!(session_label.background.is_none());
+                assert!(
+                    group_background.relative_contrast(session_label.text_color) >= 4.5,
+                    "{theme_name} selected session-tab text must remain readable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_labels_put_state_after_the_name_without_a_prefix() {
+        assert_eq!(
+            session_navigation_label("Build API", SessionState::Disconnected),
+            "Build API · Disconnected"
+        );
+        assert_eq!(session_tab_label("Build API"), "Build API");
+    }
+
+    #[test]
+    fn inline_session_rename_retains_input_and_errors_until_resolved() {
+        let session_id = SessionId::new();
+        let mut rename = InlineSessionRename::new(session_id, "Old name");
+        rename.update("  New name  ".into());
+
+        assert_eq!(rename.begin_submission().as_deref(), Some("New name"));
+        assert!(rename.pending);
+
+        rename.fail("name already exists".into());
+        assert!(!rename.pending);
+        assert_eq!(rename.value, "  New name  ");
+        assert_eq!(rename.error.as_deref(), Some("name already exists"));
+    }
+
+    #[test]
+    fn inline_session_rename_cancels_only_before_submission() {
+        let session_id = SessionId::new();
+        let mut rename = Some(InlineSessionRename::new(session_id, "Name"));
+        cancel_inline_session_rename(&mut rename);
+        assert!(rename.is_none());
+
+        let mut pending = InlineSessionRename::new(session_id, "Name");
+        assert_eq!(pending.begin_submission().as_deref(), Some("Name"));
+        let mut rename = Some(pending);
+        cancel_inline_session_rename(&mut rename);
+        assert!(
+            rename.is_some(),
+            "an in-flight rename cannot be cancelled locally"
+        );
+    }
+
+    #[test]
+    fn stale_inline_session_rename_is_discarded_after_refresh() {
+        let session_id = SessionId::new();
+        let mut rename = Some(InlineSessionRename::new(session_id, "Name"));
+        retain_inline_session_rename(&mut rename, [session_id]);
+        assert!(rename.is_some());
+
+        retain_inline_session_rename(&mut rename, [SessionId::new()]);
+        assert!(rename.is_none());
     }
 
     #[test]
