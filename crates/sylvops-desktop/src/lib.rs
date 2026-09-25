@@ -196,8 +196,7 @@ enum Message {
     RenameSession,
     RemoveSelectedWorktree,
     FormInput(usize, String),
-    PreviousProvider,
-    NextProvider,
+    SelectProvider(ProviderKind),
     ProbeProvider,
     SubmitForm,
     CancelModal,
@@ -350,8 +349,7 @@ impl DesktopApp {
             Message::RenameSession => self.open_session_rename_form(),
             Message::RemoveSelectedWorktree => self.inspect_worktree_removal(),
             Message::FormInput(index, value) => self.update_form_field(index, value),
-            Message::PreviousProvider => self.change_provider(-1),
-            Message::NextProvider => self.change_provider(1),
+            Message::SelectProvider(kind) => self.select_provider(kind),
             Message::ProbeProvider => self.probe_selected_provider(),
             Message::SubmitForm => self.submit_form(),
             Message::CancelModal => self.modal = None,
@@ -903,7 +901,11 @@ impl DesktopApp {
                     "This session is no longer running. Its metadata remains in Details; terminal output was not persisted.",
                 );
             }
-            return centered_message("Session selected. Click Attach to load its terminal.");
+            return centered_action(
+                "Session is ready. Attach to open its terminal.",
+                "Attach terminal",
+                Message::Attach,
+            );
         };
         let role = if !terminal.attached {
             "Detached  ·  click Attach to reconnect".to_owned()
@@ -925,13 +927,14 @@ impl DesktopApp {
                 )
                 .height(26)
                 .align_y(Vertical::Center),
-                scrollable(
+                container(
                     text(contents)
                         .font(TERMINAL_FONT)
                         .size(u32::from(self.desktop_state.terminal_font_size))
-                        .width(Fill)
+                        .width(Fill),
                 )
-                .height(Fill),
+                .height(Fill)
+                .width(Fill),
             ]
             .spacing(4),
         )
@@ -1180,7 +1183,7 @@ impl DesktopApp {
             fields = fields.push(text(guidance).style(text::secondary));
         }
         if form.is_session() {
-            fields = fields.push(Self::provider_picker(form, modal.pending));
+            fields = fields.push(Self::provider_picker(form, modal.provider_probe));
         }
         for (index, field) in form
             .fields
@@ -1207,10 +1210,20 @@ impl DesktopApp {
         if let Some(error) = &form.submission_error {
             fields = fields.push(text(error).style(text::danger));
         }
+        let selected_provider_checking = modal.provider_probe.is_some_and(|kind| {
+            form.provider()
+                .is_some_and(|provider| provider.kind == kind)
+        });
         let submit = if modal.pending {
             "Working…"
-        } else if modal.first_run && matches!(form.kind, FormKind::CreateSession(_)) {
-            "Launch session"
+        } else if selected_provider_checking {
+            "Checking Codex…"
+        } else if form.is_session() {
+            match form.provider().map(|provider| provider.kind) {
+                Some(ProviderKind::Codex) => "Start Codex",
+                Some(ProviderKind::Shell) => "Open Shell",
+                Some(_) | None => "Start session",
+            }
         } else {
             "Continue"
         };
@@ -1222,7 +1235,10 @@ impl DesktopApp {
                     space::horizontal(),
                     button("Cancel").on_press(Message::CancelModal),
                     button(submit)
-                        .on_press_maybe((!modal.pending).then_some(Message::SubmitForm))
+                        .on_press_maybe(
+                            (!modal.pending && !selected_provider_checking)
+                                .then_some(Message::SubmitForm),
+                        )
                         .style(button::primary),
                 ]
                 .spacing(8),
@@ -1235,7 +1251,7 @@ impl DesktopApp {
         .into()
     }
 
-    fn provider_picker(form: &Form, pending: bool) -> Element<'_, Message> {
+    fn provider_picker(form: &Form, probing: Option<ProviderKind>) -> Element<'_, Message> {
         let provider = form.provider();
         let provider_text = provider.map_or_else(
             || "No providers".into(),
@@ -1254,25 +1270,47 @@ impl DesktopApp {
             || "The daemon returned no providers. Check again to retry discovery.".into(),
             provider_recovery_message,
         );
-        column![
-            row![
-                button("‹").on_press_maybe((!pending).then_some(Message::PreviousProvider)),
-                text(provider_text).width(Fill),
-                button("›").on_press_maybe((!pending).then_some(Message::NextProvider)),
-            ]
-            .spacing(8)
-            .align_y(Center),
+        let selected = provider.map(|provider| provider.kind);
+        let mut choices = row![].spacing(8);
+        for kind in [ProviderKind::Shell, ProviderKind::Codex] {
+            if form.providers.iter().any(|provider| provider.kind == kind) {
+                choices = choices.push(
+                    button(text(kind.to_string()).font(UI_MEDIUM))
+                        .on_press(Message::SelectProvider(kind))
+                        .style(if selected == Some(kind) {
+                            button::primary
+                        } else {
+                            button::secondary
+                        }),
+                );
+            }
+        }
+        let checking_selected = probing.is_some() && probing == selected;
+        let retry_needed = provider.is_none_or(|provider| {
+            !provider.available || (provider.kind == ProviderKind::Codex && !provider.authenticated)
+        });
+        let recovery_row = if retry_needed {
             row![
                 text(recovery).width(Fill).style(text::secondary),
-                button(if pending {
+                button(if checking_selected {
                     "Checking…"
                 } else {
-                    "Check again"
+                    "Retry discovery"
                 })
-                .on_press_maybe((!pending).then_some(Message::ProbeProvider)),
+                .on_press_maybe((!checking_selected).then_some(Message::ProbeProvider)),
             ]
             .spacing(8)
-            .align_y(Center),
+            .align_y(Center)
+        } else {
+            row![text(recovery).width(Fill).style(text::secondary)]
+        };
+        column![
+            text("Session type").font(UI_MEDIUM).size(UI_META_SIZE),
+            choices,
+            row![text(provider_text).width(Fill),]
+                .spacing(8)
+                .align_y(Center),
+            recovery_row,
         ]
         .spacing(10)
         .into()
@@ -1409,11 +1447,19 @@ impl DesktopApp {
                 if matches!(operation, Some(Operation::SaveDesktopState)) {
                     self.state_save_pending = false;
                 }
+                if matches!(&operation, Some(Operation::ProbeProvider(_))) {
+                    if let Some(Modal::Form(modal)) = &mut self.modal {
+                        modal.provider_probe = None;
+                        modal.form.submission_error = Some(message);
+                    } else {
+                        self.error = Some(message);
+                    }
+                    return;
+                }
                 let form_operation = matches!(
                     operation,
                     Some(
                         Operation::CreateWorkspace
-                            | Operation::ProbeProvider(_)
                             | Operation::RegisterProject
                             | Operation::CreateWorktree
                             | Operation::CreateSession(_)
@@ -1621,7 +1667,7 @@ impl DesktopApp {
             {
                 self.update_provider_health(health);
                 if let Some(Modal::Form(modal)) = &mut self.modal {
-                    modal.pending = false;
+                    modal.provider_probe = None;
                     modal.form.submission_error = None;
                 }
             }
@@ -1702,10 +1748,18 @@ impl DesktopApp {
                 self.request_snapshot();
             }
             (operation, DaemonResponse::Error(failure)) => {
+                if matches!(operation, Operation::ProbeProvider(_)) {
+                    if let Some(Modal::Form(modal)) = &mut self.modal {
+                        modal.provider_probe = None;
+                        modal.form.submission_error = Some(failure.message);
+                    } else {
+                        self.error = Some(format!("{operation:?}: {}", failure.message));
+                    }
+                    return;
+                }
                 let form_operation = matches!(
                     operation,
                     Operation::CreateWorkspace
-                        | Operation::ProbeProvider(_)
                         | Operation::RegisterProject
                         | Operation::CreateWorktree
                         | Operation::CreateSession(_)
@@ -1956,6 +2010,7 @@ impl DesktopApp {
             worktree_id,
             self.providers.clone(),
         ))));
+        self.probe_provider(ProviderKind::Codex);
     }
 
     fn open_project_rename_form(&mut self) {
@@ -2025,38 +2080,57 @@ impl DesktopApp {
         }
     }
 
-    fn change_provider(&mut self, delta: isize) {
+    fn select_provider(&mut self, kind: ProviderKind) {
         if let Some(Modal::Form(modal)) = &mut self.modal
             && !modal.pending
         {
-            modal.form.select_next_provider(delta);
+            modal.form.select_provider(kind);
             modal.form.submission_error = None;
         }
     }
 
     fn probe_selected_provider(&mut self) {
-        let kind = {
-            let Some(Modal::Form(modal)) = &mut self.modal else {
-                return;
-            };
-            if modal.pending {
-                return;
-            }
-            let Some(kind) = modal.form.provider().map(|provider| provider.kind) else {
+        let Some(kind) = self.modal.as_ref().and_then(|modal| match modal {
+            Modal::Form(modal) => modal.form.provider().map(|provider| provider.kind),
+            _ => None,
+        }) else {
+            if let Some(Modal::Form(modal)) = &mut self.modal {
                 modal.form.submission_error =
                     Some("The daemon returned no providers to check.".into());
-                return;
-            };
-            modal.pending = true;
-            modal.form.submission_error = None;
-            kind
+            }
+            return;
         };
+        self.probe_provider(kind);
+    }
+
+    fn probe_provider(&mut self, kind: ProviderKind) {
+        let Some(Modal::Form(modal)) = &mut self.modal else {
+            return;
+        };
+        if modal.pending
+            || modal.provider_probe.is_some()
+            || !modal
+                .form
+                .providers
+                .iter()
+                .any(|provider| provider.kind == kind)
+        {
+            return;
+        }
+        modal.provider_probe = Some(kind);
+        if modal
+            .form
+            .provider()
+            .is_some_and(|provider| provider.kind == kind)
+        {
+            modal.form.submission_error = None;
+        }
         if !self.bridge.request(
             Operation::ProbeProvider(kind),
             ClientRequest::ProbeProvider { kind },
         ) && let Some(Modal::Form(modal)) = &mut self.modal
         {
-            modal.pending = false;
+            modal.provider_probe = None;
             modal.form.submission_error =
                 Some("The desktop IPC command queue is busy. Try again.".into());
         }
@@ -2801,7 +2875,7 @@ fn provider_recovery_message(provider: &ProviderHealth) -> String {
             .map_or_else(String::new, |message| format!(" ({message})"));
         return match provider.kind {
             ProviderKind::Codex => format!(
-                "Codex is unavailable{diagnostic}. Install the Codex CLI, then check again, or select Shell to continue now."
+                "Codex is unavailable{diagnostic}. Install Codex, then retry discovery. Shell remains available now."
             ),
             _ => format!(
                 "{} is unavailable{diagnostic}. Fix its local configuration, then check again.",
@@ -2810,7 +2884,7 @@ fn provider_recovery_message(provider: &ProviderHealth) -> String {
         };
     }
     if provider.kind == ProviderKind::Codex && !provider.authenticated {
-        return "Run `codex login` in a terminal, finish sign-in, then check again, or select Shell to continue now.".into();
+        return "Sign in to Codex on this computer, then retry discovery. Shell remains available now.".into();
     }
     format!("{} is ready.", provider.kind)
 }
@@ -2840,6 +2914,25 @@ fn centered_message(message: &str) -> Element<'_, Message> {
         .height(Fill)
         .center(Fill)
         .into()
+}
+
+fn centered_action(
+    message: &'static str,
+    label: &'static str,
+    action: Message,
+) -> Element<'static, Message> {
+    container(
+        column![
+            text(message).style(text::secondary),
+            button(label).on_press(action).style(button::primary),
+        ]
+        .spacing(12)
+        .align_x(Center),
+    )
+    .width(Fill)
+    .height(Fill)
+    .center(Fill)
+    .into()
 }
 
 fn empty_hint(message: &str) -> Element<'_, Message> {
@@ -3127,6 +3220,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_view_has_no_nested_scroll_viewport() {
+        let source = include_str!("lib.rs");
+        let terminal_view = source
+            .split_once("    fn terminal_view(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn changes_view(&self)"))
+            .map(|(body, _)| body)
+            .expect("terminal view source");
+
+        assert!(
+            !terminal_view.contains("scrollable("),
+            "the VT screen owns its viewport; a nested desktop scroll area breaks terminal input and resizing"
+        );
+    }
+
+    #[test]
     fn inactive_session_actions_are_safe_and_explicit() {
         assert!(session_can_stop(SessionState::Running));
         assert!(!session_can_stop(SessionState::Terminated));
@@ -3164,12 +3272,12 @@ mod tests {
     fn provider_recovery_copy_offers_retry_and_shell_fallback() {
         let unavailable =
             provider_recovery_message(&provider_health(ProviderKind::Codex, false, false));
-        assert!(unavailable.contains("Install the Codex CLI"));
-        assert!(unavailable.contains("select Shell"));
+        assert!(unavailable.contains("Install Codex"));
+        assert!(unavailable.contains("Shell remains available"));
 
         let unauthenticated =
             provider_recovery_message(&provider_health(ProviderKind::Codex, true, false));
-        assert!(unauthenticated.contains("codex login"));
-        assert!(unauthenticated.contains("check again"));
+        assert!(unauthenticated.contains("Sign in to Codex"));
+        assert!(unauthenticated.contains("retry discovery"));
     }
 }

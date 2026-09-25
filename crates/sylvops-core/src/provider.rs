@@ -101,6 +101,9 @@ pub struct HookInstallation {
 pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
     fn kind(&self) -> ProviderKind;
     async fn probe(&self) -> ProviderHealth;
+    async fn refresh(&self) -> ProviderHealth {
+        self.probe().await
+    }
     /// Builds a structured executable, argument vector, and reviewed environment.
     ///
     /// # Errors
