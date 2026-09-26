@@ -8,6 +8,7 @@ mod theme;
 
 use std::{
     collections::{HashMap, HashSet},
+    io::Cursor,
     time::{Duration, Instant},
 };
 
@@ -69,6 +70,7 @@ const TERMINAL_HEADER_SPACING: f32 = 4.0;
 const TERMINAL_SCROLLBAR_WIDTH: f32 = 14.0;
 const TERMINAL_CELL_WIDTH_RATIO: f32 = 0.6;
 const TERMINAL_LINE_HEIGHT_RATIO: f32 = 1.3;
+const MAX_WINDOW_ICON_SIDE: u32 = 256;
 const THEME_CHOICES: [DesktopTheme; 10] = [
     DesktopTheme::System,
     DesktopTheme::Light,
@@ -136,16 +138,44 @@ pub fn run(paths: RuntimePaths) -> iced::Result {
     .subscription(subscription)
     .default_font(UI_FONT)
     .antialiasing(true)
-    .window(iced::window::Settings {
+    .window(desktop_window_settings())
+    .run()
+}
+
+fn desktop_window_settings() -> window::Settings {
+    let icon_directory = ico::IconDir::read(Cursor::new(include_bytes!(
+        "../../../packaging/icons/sylvops.ico"
+    )))
+    .expect("the embedded SylvOps window icon must be a valid ICO file");
+    let icon_entry = icon_directory
+        .entries()
+        .iter()
+        .filter(|entry| {
+            (1..=MAX_WINDOW_ICON_SIDE).contains(&entry.width())
+                && (1..=MAX_WINDOW_ICON_SIDE).contains(&entry.height())
+        })
+        .max_by_key(|entry| u64::from(entry.width()) * u64::from(entry.height()))
+        .expect("the embedded SylvOps window icon must contain a bounded image");
+    let icon_image = icon_entry
+        .decode()
+        .expect("the embedded SylvOps window icon image must be valid");
+    let icon = window::icon::from_rgba(
+        icon_image.rgba_data().to_vec(),
+        icon_image.width(),
+        icon_image.height(),
+    )
+    .expect("the embedded SylvOps window icon must have valid RGBA dimensions");
+
+    window::Settings {
         size: iced::Size::new(1_440.0, 900.0),
         min_size: Some(iced::Size::new(
             f32::from(MIN_DESKTOP_WIDTH),
             f32::from(MIN_DESKTOP_HEIGHT),
         )),
         exit_on_close_request: false,
-        ..iced::window::Settings::default()
-    })
-    .run()
+        icon: Some(icon),
+        ..window::Settings::default()
+    }
 }
 
 struct DesktopApp {
@@ -3856,10 +3886,7 @@ fn terminal_cursor_colors(
 ) -> (Color, Option<Color>) {
     let palette = theme.extended_palette();
     match cursor_style {
-        DesktopTerminalCursor::Block => (
-            palette.primary.strong.text,
-            Some(palette.primary.strong.color),
-        ),
+        DesktopTerminalCursor::Block => (Color::WHITE, Some(Color::WHITE)),
         DesktopTerminalCursor::Line => (palette.primary.strong.color, None),
     }
 }
@@ -4691,11 +4718,25 @@ mod tests {
     #[test]
     fn cursor_style_controls_cell_fill() {
         let theme = theme::resolve(DesktopTheme::Dark, iced::theme::Mode::Dark);
-        let (_, block_background) = terminal_cursor_colors(&theme, DesktopTerminalCursor::Block);
+        let (block_foreground, block_background) =
+            terminal_cursor_colors(&theme, DesktopTerminalCursor::Block);
         let (_, line_background) = terminal_cursor_colors(&theme, DesktopTerminalCursor::Line);
 
-        assert!(block_background.is_some());
+        assert_eq!(block_foreground, Color::WHITE);
+        assert_eq!(block_background, Some(Color::WHITE));
         assert!(line_background.is_none());
+    }
+
+    #[test]
+    fn desktop_window_uses_the_embedded_sylvops_icon() {
+        let icon = desktop_window_settings().icon.expect("desktop window icon");
+        let (rgba, size) = icon.into_raw();
+
+        assert!(size.width > 0);
+        assert!(size.height > 0);
+        assert!(size.width <= MAX_WINDOW_ICON_SIDE);
+        assert!(size.height <= MAX_WINDOW_ICON_SIDE);
+        assert_eq!(rgba.len(), (size.width * size.height * 4) as usize);
     }
 
     #[test]
