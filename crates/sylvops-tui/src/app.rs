@@ -108,6 +108,7 @@ pub(crate) enum HitTarget {
     FocusMain,
     Attach,
     Detach,
+    Resume,
     New,
     Rename,
     Delete,
@@ -167,6 +168,7 @@ pub(crate) struct App {
     pub flash: Option<Flash>,
     pub help: bool,
     pub attached: Option<AttachedTerminal>,
+    pub resume_pending: Option<SessionId>,
     pub hit_map: HitMap,
     pub navigation_dirty_at: Option<Instant>,
 }
@@ -203,6 +205,7 @@ impl App {
             flash: None,
             help: false,
             attached: None,
+            resume_pending: None,
             hit_map: HitMap::default(),
             navigation_dirty_at: None,
         };

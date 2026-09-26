@@ -15,6 +15,16 @@ const PROMPT_SENTINEL: &str = "SYLVOPS_PRIVATE_PROMPT_25_7f8cbfea";
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn fake_codex_hooks_attention_and_resume() {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        fake_codex_hooks_attention_and_resume_inner(),
+    )
+    .await
+    .expect("fake Codex scenario timeout");
+}
+
+#[allow(clippy::too_many_lines)]
+async fn fake_codex_hooks_attention_and_resume_inner() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let repository = temporary.path().join("repository");
     initialize_repository(&repository);
@@ -60,6 +70,72 @@ async fn fake_codex_hooks_attention_and_resume() {
         DaemonResponse::ProjectAdded { root_worktree, .. } => root_worktree.id,
         response => panic!("unexpected project response: {response:?}"),
     };
+    let shell_session_id = create_shell_session(&client, worktree_id).await;
+    match client
+        .request(&ClientRequest::ResumeSession {
+            session_id: shell_session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("missing resume ID response")
+    {
+        DaemonResponse::Error(error) => assert!(
+            error
+                .message
+                .contains("no verified provider resume identifier"),
+            "missing resume ID error should be actionable: {}",
+            error.message
+        ),
+        response => panic!("session without resume ID unexpectedly resumed: {response:?}"),
+    }
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: shell_session_id,
+        })
+        .await
+        .expect("stop shell response");
+
+    let terminated_session_id = create_codex_session(&client, worktree_id).await;
+    attach(&client, terminated_session_id).await;
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id: terminated_session_id,
+            bytes: input_line("permission"),
+        })
+        .await
+        .expect("terminated-session permission input");
+    wait_for_session(&client, terminated_session_id, |session| {
+        session.state == SessionState::NeedsFeedback && session.external_session_id.is_some()
+    })
+    .await;
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: terminated_session_id,
+        })
+        .await
+        .expect("terminate response");
+    wait_for_session(&client, terminated_session_id, |session| {
+        session.state == SessionState::Terminated
+    })
+    .await;
+    match client
+        .request(&ClientRequest::ResumeSession {
+            session_id: terminated_session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("terminated resume response")
+    {
+        DaemonResponse::Error(error) => assert!(
+            error.message.contains("not eligible for resume"),
+            "terminated resume error should be actionable: {}",
+            error.message
+        ),
+        response => panic!("terminated session unexpectedly resumed: {response:?}"),
+    }
+
     let source_session_id = create_codex_session(&client, worktree_id).await;
     attach(&client, source_session_id).await;
     client
@@ -91,24 +167,83 @@ async fn fake_codex_hooks_attention_and_resume() {
     })
     .await;
 
-    let resumed_id = match client
+    let first_resume = ClientRequest::ResumeSession {
+        session_id: source_session_id,
+        columns: 80,
+        rows: 24,
+    };
+    let concurrent_resume = first_resume.clone();
+    let (first_response, concurrent_response) = tokio::join!(
+        client.request(&first_resume),
+        client.request(&concurrent_resume)
+    );
+    let mut resumed_id = None;
+    let mut refused = 0;
+    for response in [first_response, concurrent_response] {
+        match response.expect("concurrent resume response") {
+            DaemonResponse::SessionResumed { session, .. } => {
+                assert_eq!(
+                    session.external_session_id.as_deref(),
+                    Some(external_id.as_str())
+                );
+                assert!(resumed_id.replace(session.id).is_none());
+            }
+            DaemonResponse::Error(error) => {
+                assert!(
+                    error.message.contains("already been resumed"),
+                    "concurrent resume error should be actionable: {}",
+                    error.message
+                );
+                refused += 1;
+            }
+            response => panic!("unexpected concurrent resume response: {response:?}"),
+        }
+    }
+    assert_eq!(refused, 1);
+    let resumed_id = resumed_id.expect("one concurrent resume succeeds");
+    match client
         .request(&ClientRequest::ResumeSession {
             session_id: source_session_id,
             columns: 80,
             rows: 24,
         })
         .await
-        .expect("resume response")
+        .expect("stale resume response")
     {
-        DaemonResponse::SessionResumed { session, .. } => {
-            assert_eq!(
-                session.external_session_id.as_deref(),
-                Some(external_id.as_str())
-            );
-            session.id
-        }
-        response => panic!("unexpected resume response: {response:?}"),
+        DaemonResponse::Error(error) => assert!(
+            error.message.contains("already been resumed"),
+            "stale resume error should be actionable: {}",
+            error.message
+        ),
+        response => panic!("stale resume unexpectedly succeeded: {response:?}"),
+    }
+    let history = match client
+        .request(&ClientRequest::GetSnapshot)
+        .await
+        .expect("history snapshot response")
+    {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => panic!("unexpected history snapshot response: {response:?}"),
     };
+    let source_history = history
+        .sessions
+        .iter()
+        .find(|session| session.id == source_session_id)
+        .expect("historical source session");
+    assert!(matches!(
+        source_history.state,
+        SessionState::FinishedUnseen | SessionState::FinishedSeen
+    ));
+    assert_eq!(
+        source_history.external_session_id.as_deref(),
+        Some(external_id.as_str())
+    );
+    assert!(
+        history
+            .sessions
+            .iter()
+            .any(|session| session.id == resumed_id)
+    );
     attach(&client, resumed_id).await;
     client
         .request(&ClientRequest::SessionInput {
@@ -147,6 +282,18 @@ async fn fake_codex_hooks_attention_and_resume() {
         session.id == source_session_id
             && session.external_session_id.as_deref() == Some(external_id.as_str())
     }));
+    match restarted
+        .request(&ClientRequest::ResumeSession {
+            session_id: source_session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("restart stale resume response")
+    {
+        DaemonResponse::Error(error) => assert!(error.message.contains("already been resumed")),
+        response => panic!("restart stale resume unexpectedly succeeded: {response:?}"),
+    }
     restarted
         .request(&ClientRequest::ShutdownDaemon)
         .await
@@ -176,6 +323,26 @@ async fn create_codex_session(client: &DaemonClient, worktree_id: WorktreeId) ->
     {
         DaemonResponse::SessionCreated { session, .. } => session.id,
         response => panic!("unexpected session response: {response:?}"),
+    }
+}
+
+async fn create_shell_session(client: &DaemonClient, worktree_id: WorktreeId) -> SessionId {
+    match client
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Shell,
+            display_name: Some("plain shell".into()),
+            model: None,
+            effort: None,
+            initial_prompt: None,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("shell session response")
+    {
+        DaemonResponse::SessionCreated { session, .. } => session.id,
+        response => panic!("unexpected shell session response: {response:?}"),
     }
 }
 

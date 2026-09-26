@@ -7,7 +7,7 @@ mod terminal;
 mod theme;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -31,7 +31,7 @@ use iced::{font, font::Weight, widget::button::Status};
 use sylvops_core::{
     domain::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
-        Worktree, WorktreeStatus, state_allows_resume,
+        Worktree, WorktreeStatus, session_can_resume,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
@@ -183,6 +183,7 @@ struct DesktopApp {
     terminal_selection_state: TerminalSelectionState,
     inline_session_rename: Option<InlineSessionRename>,
     hovered_session_id: Option<SessionId>,
+    resume_pending: HashSet<SessionId>,
     window_mode: window::Mode,
 }
 
@@ -301,6 +302,7 @@ enum Message {
     ConfirmAction,
     Attach,
     Detach,
+    Resume(SessionId),
     TerminalPointerMoved(Point),
     TerminalSelectionStarted,
     TerminalSelectionEnded,
@@ -381,6 +383,7 @@ impl DesktopApp {
             terminal_selection_state: TerminalSelectionState::Idle,
             inline_session_rename: None,
             hovered_session_id: None,
+            resume_pending: HashSet::new(),
             window_mode: window::Mode::Windowed,
         }
     }
@@ -534,6 +537,7 @@ impl DesktopApp {
             Message::ConfirmAction => self.confirm_action(),
             Message::Attach => self.attach_active(),
             Message::Detach => self.detach_active(),
+            Message::Resume(session_id) => self.resume_session(session_id),
             Message::TerminalPointerMoved(point) => self.move_terminal_pointer(point),
             Message::TerminalSelectionStarted => self.start_terminal_selection(),
             Message::TerminalSelectionEnded => self.finish_terminal_selection(),
@@ -1175,6 +1179,8 @@ impl DesktopApp {
             .get(&session_id)
             .is_some_and(|terminal| terminal.attached);
         let can_stop = session_can_stop(session.state);
+        let can_resume = session_can_resume(session, &self.snapshot.sessions);
+        let resume_pending = self.resume_pending.contains(&session_id);
         let session_state = session.state;
         let state_label = session_state_label(session.state);
         responsive(move |size| {
@@ -1211,6 +1217,22 @@ impl DesktopApp {
                         .height(ACTION_HEIGHT)
                         .padding([6, 9])
                         .style(danger_action_style),
+                );
+            } else if can_resume {
+                actions = actions.push(
+                    button(
+                        text(if resume_pending {
+                            "Resuming…"
+                        } else {
+                            "Resume"
+                        })
+                        .font(UI_MEDIUM)
+                        .size(UI_META_SIZE),
+                    )
+                    .on_press_maybe((!resume_pending).then_some(Message::Resume(session_id)))
+                    .height(ACTION_HEIGHT)
+                    .padding([6, 9])
+                    .style(primary_action_style),
                 );
             } else if !compact {
                 actions = actions.push(
@@ -1416,7 +1438,10 @@ impl DesktopApp {
                         .get(&session.id)
                         .map_or_else(|| "Detached".into(), |terminal| terminal.role.to_string()),
                 ))
-                .push(detail("Resume", session_resume_label(session).into()));
+                .push(detail(
+                    "Resume",
+                    session_resume_label(session, &self.snapshot.sessions).into(),
+                ));
         }
         let mut actions = row![].spacing(8);
         if self.selected_project_id.is_some() {
@@ -1881,6 +1906,9 @@ impl DesktopApp {
                 self.handle_response(operation, response);
             }
             BridgeEvent::Error { operation, message } => {
+                if let Some(Operation::Resume(session_id)) = operation {
+                    self.resume_pending.remove(&session_id);
+                }
                 if matches!(operation, Some(Operation::RefreshSnapshot)) {
                     self.snapshot_pending = false;
                 }
@@ -2025,6 +2053,28 @@ impl DesktopApp {
                     "Session created."
                 });
                 self.mark_state_dirty();
+                self.request_snapshot();
+            }
+            (
+                Operation::Resume(source_session_id),
+                DaemonResponse::SessionResumed { session, .. },
+            ) => {
+                self.resume_pending.remove(&source_session_id);
+                let session_id = session.id;
+                if let Some(existing) = self
+                    .snapshot
+                    .sessions
+                    .iter_mut()
+                    .find(|existing| existing.id == session_id)
+                {
+                    *existing = session;
+                } else {
+                    self.snapshot.sessions.push(session);
+                }
+                self.select_session_context(session_id);
+                self.select_session(session_id);
+                self.main_tab = MainTab::Terminal;
+                self.show_success("Session resumed into a new history record.");
                 self.request_snapshot();
             }
             (Operation::Stop(session_id), DaemonResponse::Acknowledged) => {
@@ -2193,6 +2243,9 @@ impl DesktopApp {
                 self.request_snapshot();
             }
             (operation, DaemonResponse::Error(failure)) => {
+                if let Operation::Resume(session_id) = operation {
+                    self.resume_pending.remove(&session_id);
+                }
                 if matches!(operation, Operation::ProbeProvider(_)) {
                     if let Some(Modal::Form(modal)) = &mut self.modal {
                         modal.provider_probe = None;
@@ -2231,6 +2284,40 @@ impl DesktopApp {
         if !self.bridge.request(operation, request) {
             self.error = Some("The desktop IPC command queue is busy. Try again.".into());
         }
+    }
+
+    fn resume_session(&mut self, session_id: SessionId) {
+        let Some(request) = self.begin_resume_request(session_id) else {
+            return;
+        };
+        if !self.bridge.request(Operation::Resume(session_id), request) {
+            self.resume_pending.remove(&session_id);
+            self.error = Some("The desktop IPC command queue is busy. Try again.".into());
+        }
+    }
+
+    fn begin_resume_request(&mut self, session_id: SessionId) -> Option<ClientRequest> {
+        let Some(session) = self.session(session_id) else {
+            self.error =
+                Some("The selected session is no longer available. Refresh and try again.".into());
+            return None;
+        };
+        if !session_can_resume(session, &self.snapshot.sessions) {
+            self.error = Some(
+                "This session is not eligible for resume. Refresh to load its latest state.".into(),
+            );
+            return None;
+        }
+        if self.resume_pending.contains(&session_id) {
+            return None;
+        }
+        let (columns, rows) = self.terminal_dimensions();
+        self.resume_pending.insert(session_id);
+        Some(ClientRequest::ResumeSession {
+            session_id,
+            columns,
+            rows,
+        })
     }
 
     fn handle_terminal_clipboard(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
@@ -3448,9 +3535,9 @@ fn optional_number<T: ToString>(value: Option<T>, fallback: &str) -> String {
     value.map_or_else(|| fallback.to_owned(), |value| value.to_string())
 }
 
-const fn session_resume_label(session: &Session) -> &'static str {
-    if session.external_session_id.is_some() && state_allows_resume(session.state) {
-        "Available from the CLI"
+fn session_resume_label(session: &Session, sessions: &[Session]) -> &'static str {
+    if session_can_resume(session, sessions) {
+        "Available"
     } else {
         "Unavailable"
     }
@@ -4416,6 +4503,29 @@ mod tests {
     use super::*;
     use sylvops_core::provider::ProviderCapabilities;
 
+    fn session(state: SessionState, external_session_id: Option<&str>) -> Session {
+        Session {
+            id: SessionId::new(),
+            worktree_id: WorktreeId::new(),
+            provider_profile_id: None,
+            provider_kind: ProviderKind::Codex,
+            display_name: "Codex".into(),
+            state,
+            process_id: None,
+            external_session_id: external_session_id.map(str::to_owned),
+            command: "codex".into(),
+            arguments_json: "[]".into(),
+            cwd: "C:/repo".into(),
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: Some(2),
+            last_activity_at: 2,
+            last_seen_output_sequence: 0,
+            exit_code: Some(0),
+            failure_reason: None,
+        }
+    }
+
     fn provider_health(kind: ProviderKind, available: bool, authenticated: bool) -> ProviderHealth {
         ProviderHealth {
             kind,
@@ -4801,6 +4911,143 @@ mod tests {
         assert!(session_can_replay(SessionState::Failed));
         assert!(!session_can_replay(SessionState::Disconnected));
         assert!(!session_can_replay(SessionState::Terminated));
+    }
+
+    #[test]
+    fn resume_requires_daemon_eligible_state_and_verified_external_id() {
+        let available = session(SessionState::FinishedSeen, Some("verified-id"));
+        assert!(session_can_resume(
+            &available,
+            std::slice::from_ref(&available)
+        ));
+        let missing_id = session(SessionState::FinishedSeen, None);
+        assert!(!session_can_resume(
+            &missing_id,
+            std::slice::from_ref(&missing_id)
+        ));
+        let terminated = session(SessionState::Terminated, Some("verified-id"));
+        assert!(!session_can_resume(
+            &terminated,
+            std::slice::from_ref(&terminated)
+        ));
+        let mut unsupported_provider = available.clone();
+        unsupported_provider.provider_kind = ProviderKind::Shell;
+        assert!(!session_can_resume(
+            &unsupported_provider,
+            std::slice::from_ref(&unsupported_provider)
+        ));
+    }
+
+    #[test]
+    fn successful_resume_selects_successor_and_preserves_source_history() {
+        let runtime_root =
+            std::env::temp_dir().join(format!("sylvops-desktop-resume-test-{}", SessionId::new()));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        let source = session(SessionState::FinishedSeen, Some("verified-id"));
+        let mut successor = source.clone();
+        successor.id = SessionId::new();
+        successor.created_at = 2;
+        successor.display_name = "Codex (resumed)".into();
+        successor.state = SessionState::Running;
+        successor.process_id = Some(42);
+        successor.ended_at = None;
+        successor.exit_code = None;
+        app.snapshot.sessions.push(source.clone());
+        app.selected_session_id = Some(source.id);
+        app.active_session_id = Some(source.id);
+        app.open_sessions.push(source.id);
+        app.resume_pending.insert(source.id);
+
+        app.handle_response(
+            Operation::Resume(source.id),
+            DaemonResponse::SessionResumed {
+                revision: 2,
+                session: successor.clone(),
+            },
+        );
+
+        assert_eq!(app.selected_session_id, Some(successor.id));
+        assert_eq!(app.active_session_id, Some(successor.id));
+        assert_eq!(app.main_tab, MainTab::Terminal);
+        assert!(app.open_sessions.contains(&successor.id));
+        assert!(!app.resume_pending.contains(&source.id));
+        assert!(
+            app.snapshot
+                .sessions
+                .iter()
+                .any(|item| item.id == source.id)
+        );
+        assert!(
+            app.snapshot
+                .sessions
+                .iter()
+                .any(|item| item.id == successor.id)
+        );
+        let historical_source = app
+            .snapshot
+            .sessions
+            .iter()
+            .find(|item| item.id == source.id)
+            .expect("historical source");
+        assert!(!session_can_resume(
+            historical_source,
+            &app.snapshot.sessions
+        ));
+    }
+
+    #[test]
+    fn desktop_suppresses_duplicate_resume_requests_while_one_is_pending() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-resume-pending-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        let source = session(SessionState::FinishedSeen, Some("verified-id"));
+        app.snapshot.sessions.push(source.clone());
+
+        let request = app
+            .begin_resume_request(source.id)
+            .expect("first resume request");
+        assert_eq!(
+            request,
+            ClientRequest::ResumeSession {
+                session_id: source.id,
+                columns: app.terminal_dimensions().0,
+                rows: app.terminal_dimensions().1,
+            }
+        );
+        assert!(app.begin_resume_request(source.id).is_none());
+        assert_eq!(app.resume_pending.len(), 1);
+    }
+
+    #[test]
+    fn stale_resume_error_clears_pending_and_is_actionable() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-resume-stale-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        let source = session(SessionState::FinishedSeen, Some("verified-id"));
+        app.resume_pending.insert(source.id);
+
+        app.handle_response(
+            Operation::Resume(source.id),
+            DaemonResponse::Error(sylvops_core::protocol::ProtocolFailure {
+                code: "conflict".into(),
+                message: "This session has already been resumed.".into(),
+                retryable: false,
+            }),
+        );
+
+        assert!(!app.resume_pending.contains(&source.id));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|message| message.contains("already been resumed"))
+        );
     }
 
     #[test]
