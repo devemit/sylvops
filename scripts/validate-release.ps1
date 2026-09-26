@@ -4,6 +4,7 @@ param(
     [string]$ArchivePath,
     [string]$InstallerPath,
     [string[]]$MacosPackagePath,
+    [string[]]$LinuxPackagePath,
     [string]$DistDirectory,
     [string]$ExpectedTag
 )
@@ -49,7 +50,7 @@ function Assert-Quickstart {
 function Assert-BundledReadme {
     param([string]$Text)
 
-    foreach ($requiredText in @('sylvops up .', 'sylvops tui', 'SHA256SUMS', 'native desktop', 'sylvops-windows-x86_64-setup.exe', 'Start Menu')) {
+    foreach ($requiredText in @('sylvops up .', 'sylvops tui', 'SHA256SUMS', 'native desktop', 'sylvops-windows-x86_64-setup.exe', 'Start Menu', 'sylvops-linux-x86_64.AppImage', 'sylvops-linux-x86_64.deb')) {
         Assert-ReleaseCondition ($Text.Contains($requiredText)) "Bundled README is missing release guidance: $requiredText"
     }
 }
@@ -159,6 +160,21 @@ function Assert-MacosPackage {
     Write-Host "[ok] signed and notarized macOS package is present: $name"
 }
 
+function Assert-LinuxPackage {
+    param([string]$Path)
+
+    Assert-ReleaseCondition (Test-Path -LiteralPath $Path -PathType Leaf) "Linux package is missing: $Path"
+    Assert-ReleaseCondition ((Get-Item -LiteralPath $Path).Length -gt 0) "Linux package is empty: $Path"
+    $name = Split-Path -Leaf $Path
+    Assert-ReleaseCondition ($name -in @('sylvops-linux-x86_64.AppImage', 'sylvops-linux-x86_64.deb')) "Unexpected Linux package name: $name"
+    if ($name.EndsWith('.AppImage') -and -not $IsWindows) {
+        & test -x $Path
+        Assert-ReleaseCondition ($LASTEXITCODE -eq 0) "AppImage is not executable: $Path"
+    }
+
+    Write-Host "[ok] native Linux package is present: $name"
+}
+
 $root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 $cargo = Get-Content -Raw -LiteralPath (Join-Path $root 'Cargo.toml')
 $versionMatch = [regex]::Match($cargo, '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"([^"]+)"')
@@ -173,6 +189,7 @@ $applicationId = 'com.devemit.sylvops'
 $publisher = 'devemit'
 $coreLibrary = Get-Content -Raw -LiteralPath (Join-Path $root 'crates\sylvops-core\src\lib.rs')
 Assert-ReleaseCondition ($coreLibrary.Contains("APPLICATION_ID: &str = `"$applicationId`"")) "The runtime application ID does not match the package identity."
+Assert-ReleaseCondition ($coreLibrary.Contains('LINUX_DESKTOP_ID: &str = "sylvops"')) "The shared Linux desktop-file identity must match sylvops.desktop."
 Assert-ReleaseCondition ($coreLibrary.Contains("APPLICATION_PUBLISHER: &str = `"$publisher`"")) "The runtime publisher does not match the package identity."
 $packagerConfigPath = Join-Path $root 'Packager.toml'
 Assert-ReleaseCondition (Test-Path -LiteralPath $packagerConfigPath -PathType Leaf) "Packager.toml is missing."
@@ -255,6 +272,54 @@ foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'C
     Assert-ReleaseCondition ($macosSmokeScript.Contains($requiredText)) "The macOS package smoke test is missing an acceptance check: $requiredText"
 }
 
+$linuxPackagerConfigPath = Join-Path $root 'packaging\linux\Packager.toml'
+Assert-ReleaseCondition (Test-Path -LiteralPath $linuxPackagerConfigPath -PathType Leaf) "The Linux packager configuration is missing."
+$linuxPackagerConfig = Get-Content -Raw -LiteralPath $linuxPackagerConfigPath
+foreach ($requiredSetting in @(
+    'product-name = "SylvOps"',
+    "version = `"$version`"",
+    "identifier = `"$applicationId`"",
+    "publisher = `"$publisher`"",
+    "authors = [`"$publisher`"]",
+    'formats = ["appimage", "deb"]',
+    'packaging/icons/sylvops.png',
+    'generate-desktop-entry = true',
+    'desktop-template = "packaging/linux/sylvops.desktop.hbs"',
+    'usr/share/metainfo/com.devemit.sylvops.metainfo.xml'
+)) {
+    Assert-ReleaseCondition ($linuxPackagerConfig.Contains($requiredSetting)) "The Linux packager configuration is missing the locked setting: $requiredSetting"
+}
+
+$linuxDesktopEntryPath = Join-Path $root 'packaging\linux\sylvops.desktop.hbs'
+Assert-ReleaseCondition (Test-Path -LiteralPath $linuxDesktopEntryPath -PathType Leaf) "The Linux desktop entry template is missing."
+$linuxDesktopEntry = Get-Content -Raw -LiteralPath $linuxDesktopEntryPath
+foreach ($requiredText in @('Type=Application', 'Name={{name}}', 'Exec={{exec}}', 'Icon={{icon}}', 'Terminal=false', 'StartupWMClass=sylvops')) {
+    Assert-ReleaseCondition ($linuxDesktopEntry.Contains($requiredText)) "The Linux desktop entry is missing required metadata: $requiredText"
+}
+$desktopSource = Get-Content -Raw -LiteralPath (Join-Path $root 'crates\sylvops-desktop\src\lib.rs')
+Assert-ReleaseCondition ($desktopSource.Contains('settings.platform_specific.application_id = sylvops_core::LINUX_DESKTOP_ID.to_owned();')) "The Linux window identity must use the shared desktop-file identity."
+
+$linuxMetainfoPath = Join-Path $root 'packaging\linux\com.devemit.sylvops.metainfo.xml'
+Assert-ReleaseCondition (Test-Path -LiteralPath $linuxMetainfoPath -PathType Leaf) "The Linux AppStream metadata is missing."
+$linuxMetainfo = Get-Content -Raw -LiteralPath $linuxMetainfoPath
+foreach ($requiredText in @('<id>com.devemit.sylvops</id>', '<name>SylvOps</name>', '<project_license>MIT</project_license>', '<launchable type="desktop-id">sylvops.desktop</launchable>')) {
+    Assert-ReleaseCondition ($linuxMetainfo.Contains($requiredText)) "The Linux AppStream metadata is missing required content: $requiredText"
+}
+
+$linuxPackageScriptPath = Join-Path $root 'scripts\package-linux.sh'
+Assert-ReleaseCondition (Test-Path -LiteralPath $linuxPackageScriptPath -PathType Leaf) "The Linux package script is missing."
+$linuxPackageScript = Get-Content -Raw -LiteralPath $linuxPackageScriptPath
+foreach ($requiredText in @('run_with_timeout', 'x86_64-unknown-linux-gnu', 'cargo build --release --locked -p sylvops-cli', 'cargo packager', '--formats appimage,deb', 'sylvops-linux-x86_64.AppImage', 'sylvops-linux-x86_64.deb')) {
+    Assert-ReleaseCondition ($linuxPackageScript.Contains($requiredText)) "The Linux package script is missing a release control: $requiredText"
+}
+
+$linuxSmokeScriptPath = Join-Path $root 'scripts\test-linux-packages.sh'
+Assert-ReleaseCondition (Test-Path -LiteralPath $linuxSmokeScriptPath -PathType Leaf) "The Linux package smoke test is missing."
+$linuxSmokeScript = Get-Content -Raw -LiteralPath $linuxSmokeScriptPath
+foreach ($requiredText in @('run_with_timeout', 'run_with_timeout 10 realpath --', 'APPIMAGE_EXTRACT_AND_RUN=1', '--appimage-extract', 'run_with_timeout 30 dpkg-deb --info', 'run_with_timeout 30 dpkg-deb --contents', 'run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install', 'run_with_timeout 30 ldd /usr/bin/sylvops', 'run_with_timeout 30 dpkg-query -L sylvops', 'gtk-launch sylvops', 'desktop-file-validate', 'daemon status', 'pgrep -f', 'run_with_timeout 120 sudo --non-interactive dpkg --remove', 'package-preserve.txt', 'show-ref --verify', 'user_integration_path', 'usr/share/applications/sylvops.desktop', 'usr/share/metainfo/com.devemit.sylvops.metainfo.xml', 'apps/sylvops\.png')) {
+    Assert-ReleaseCondition ($linuxSmokeScript.Contains($requiredText)) "The Linux package smoke test is missing an acceptance check: $requiredText"
+}
+
 $quickstart = Get-Content -Raw -LiteralPath (Join-Path $root 'packaging\windows\QUICKSTART.txt')
 Assert-ReleaseCondition ($quickstart -match "(?m)^SYLVOPS $([regex]::Escape($version))$") "Windows QUICKSTART version does not match workspace version $version."
 
@@ -284,6 +349,10 @@ foreach ($requiredText in @('sylvops-macos-x86_64.dmg', 'sylvops-macos-aarch64.d
 $releasingGuide = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\development\releasing.md')
 foreach ($requiredText in @(
     'cargo-packager 0.11.8',
+    'scripts/package-linux.sh',
+    'scripts/test-linux-packages.sh',
+    'sylvops-linux-x86_64.AppImage',
+    'sylvops-linux-x86_64.deb',
     'WINDOWS_SIGNING_CERTIFICATE_BASE64',
     'WINDOWS_SIGNING_CERTIFICATE_PASSWORD',
     'WINDOWS_SIGNING_TIMESTAMP_URL',
@@ -316,6 +385,8 @@ $release = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\rel
 foreach ($asset in @(
     'sylvops-windows-x86_64.zip',
     'sylvops-linux-x86_64.tar.gz',
+    'sylvops-linux-x86_64.AppImage',
+    'sylvops-linux-x86_64.deb',
     'sylvops-macos-x86_64.tar.gz',
     'sylvops-macos-aarch64.tar.gz',
     'sylvops-macos-x86_64.dmg',
@@ -348,6 +419,10 @@ Assert-ReleaseCondition ($release.Contains('MACOS_NOTARY_KEY_ID')) "Release pack
 Assert-ReleaseCondition ($release.Contains('MACOS_NOTARY_ISSUER_ID')) "Release packaging does not load the notarization issuer ID."
 Assert-ReleaseCondition ($release.Contains('scripts/package-macos.sh')) "Release packaging does not build the signed and notarized macOS DMGs."
 Assert-ReleaseCondition ($release.Contains('scripts/test-macos-package.sh')) "Release packaging does not run the native macOS package smoke test."
+Assert-ReleaseCondition ($release.Contains('scripts/package-linux.sh')) "Release packaging does not build the AppImage and deb packages."
+Assert-ReleaseCondition ($release.Contains('scripts/test-linux-packages.sh')) "Release packaging does not run the native Linux package smoke test."
+Assert-ReleaseCondition ($release.Contains('needs: [package-windows, package-linux, package-macos]')) "Release staging is not gated on the native Linux package job."
+Assert-ReleaseCondition ([regex]::Matches($release, 'chmod 755 dist/sylvops-linux-x86_64\.AppImage').Count -eq 2) "Release staging and publication do not restore the AppImage executable permission after artifact transport."
 Assert-NoLegacyReleasePhaseWording -Path '.github\workflows\release.yml' -Text $release
 
 $ciInstallerJob = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\ci.yml')
@@ -359,6 +434,10 @@ Assert-ReleaseCondition ($ciInstallerJob.Contains('macos-package')) "CI is missi
 Assert-ReleaseCondition ($ciInstallerJob.Contains('macos-15-intel')) "CI is missing the native Intel macOS package job."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-macos.sh')) "CI does not exercise the production macOS packaging script."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-macos-package.sh')) "CI does not install, launch, verify, and remove the macOS package."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('linux-package')) "CI is missing the native Linux package job."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('xvfb')) "CI does not provide a virtual display for the Linux desktop launch test."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-linux.sh')) "CI does not exercise the production Linux packaging script."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-linux-packages.sh')) "CI does not install, launch, verify, and remove the Linux packages."
 
 $activeNonDocumentationSurfaces = @(
     'packaging\windows\QUICKSTART.txt',
@@ -418,6 +497,10 @@ foreach ($packagePath in @($MacosPackagePath | Where-Object { -not [string]::IsN
     Assert-MacosPackage -Path (Resolve-Path -LiteralPath $packagePath).Path
 }
 
+foreach ($packagePath in @($LinuxPackagePath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+    Assert-LinuxPackage -Path (Resolve-Path -LiteralPath $packagePath).Path
+}
+
 if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
     $dist = (Resolve-Path -LiteralPath $DistDirectory).Path
     $archives = @(
@@ -431,7 +514,11 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
         'sylvops-macos-x86_64.dmg',
         'sylvops-macos-aarch64.dmg'
     )
-    $releaseAssets = @($archives + $installer + $macosPackages)
+    $linuxPackages = @(
+        'sylvops-linux-x86_64.AppImage',
+        'sylvops-linux-x86_64.deb'
+    )
+    $releaseAssets = @($archives + $installer + $macosPackages + $linuxPackages)
     $expectedFiles = @($releaseAssets + 'SHA256SUMS')
     $actualFiles = @(Get-ChildItem -LiteralPath $dist -File | ForEach-Object { $_.Name })
     $directories = @(Get-ChildItem -LiteralPath $dist -Directory)
@@ -458,10 +545,13 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
         elseif ($asset -in $macosPackages) {
             Assert-MacosPackage -Path $path
         }
+        elseif ($asset -in $linuxPackages) {
+            Assert-LinuxPackage -Path $path
+        }
         else {
             Assert-Archive -Path $path
         }
         Write-Host "[ok] $asset sha256=$actualHash"
     }
-    Write-Host "[ok] release bundle has exactly seven validated assets and one checksum manifest"
+    Write-Host "[ok] release bundle has exactly nine validated assets and one checksum manifest"
 }

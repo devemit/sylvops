@@ -109,43 +109,65 @@ jobs:
             Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
           }
 
-  package-unix:
+  package-linux:
     needs: validate-release
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset: sylvops-linux-x86_64.tar.gz
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
+      - name: Install Linux packaging prerequisites
+        run: |
+          timeout --signal=TERM --kill-after=5 300 sudo --non-interactive apt-get update
+          timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes patchelf
+      - name: Install pinned cargo-packager
+        run: |
+          packager_version="$(cat packaging/cargo-packager.version)"
+          cargo install cargo-packager --version "$packager_version" --locked
       - name: Build release binary
-        run: cargo build --release --locked -p sylvops-cli --target "${{ matrix.target }}"
+        run: cargo build --release --locked -p sylvops-cli --target x86_64-unknown-linux-gnu
       - name: Verify application version
         run: |
           expected="sylvops ${GITHUB_REF_NAME#v}"
-          actual="$(target/${{ matrix.target }}/release/sylvops --version)"
+          actual="$(target/x86_64-unknown-linux-gnu/release/sylvops --version)"
           test "$actual" = "$expected"
-      - name: Package
+      - name: Package portable fallback
         run: |
-          test -x "target/${{ matrix.target }}/release/sylvops"
+          test -x "target/x86_64-unknown-linux-gnu/release/sylvops"
           mkdir package
-          cp "target/${{ matrix.target }}/release/sylvops" README.md LICENSE package/
-          tar -C package -czf "${{ matrix.asset }}" sylvops README.md LICENSE
+          cp target/x86_64-unknown-linux-gnu/release/sylvops README.md LICENSE package/
+          tar -C package -czf sylvops-linux-x86_64.tar.gz sylvops README.md LICENSE
+      - name: Build AppImage and deb application packages
+        run: ./scripts/package-linux.sh --skip-build
+      - name: Verify Debian dependency closure
+        run: |
+          timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$(realpath dist/sylvops-linux-x86_64.deb)"
+          timeout --signal=TERM --kill-after=5 30 ldd /usr/bin/sylvops | tee /tmp/sylvops-ldd.txt
+          ! grep -Fq 'not found' /tmp/sylvops-ldd.txt
+          test "$(sylvops --version)" = "sylvops ${GITHUB_REF_NAME#v}"
+          timeout --signal=TERM --kill-after=5 120 sudo --non-interactive dpkg --remove sylvops
+      - name: Install desktop smoke test dependencies
+        run: timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes xvfb x11-utils libgtk-3-bin desktop-file-utils
+      - name: Install, launch, verify, and remove
+        run: ./scripts/test-linux-packages.sh --appimage dist/sylvops-linux-x86_64.AppImage --deb dist/sylvops-linux-x86_64.deb --expected-version "${GITHUB_REF_NAME#v}"
       - name: Validate package contents
         shell: pwsh
-        run: ./scripts/validate-release.ps1 -ArchivePath "${{ matrix.asset }}" -ExpectedTag "$env:GITHUB_REF_NAME"
+        run: ./scripts/validate-release.ps1 -ArchivePath sylvops-linux-x86_64.tar.gz -LinuxPackagePath dist/sylvops-linux-x86_64.AppImage,dist/sylvops-linux-x86_64.deb -ExpectedTag "$env:GITHUB_REF_NAME"
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ${{ matrix.asset }}
+          subject-path: |
+            sylvops-linux-x86_64.tar.gz
+            dist/sylvops-linux-x86_64.AppImage
+            dist/sylvops-linux-x86_64.deb
       - uses: actions/upload-artifact@v4
         with:
-          name: package-${{ matrix.target }}
-          path: ${{ matrix.asset }}
+          name: package-x86_64-unknown-linux-gnu
+          path: |
+            sylvops-linux-x86_64.tar.gz
+            dist/sylvops-linux-x86_64.AppImage
+            dist/sylvops-linux-x86_64.deb
 
   package-macos:
     needs: validate-release
@@ -282,7 +304,7 @@ jobs:
           fi
 
   stage-release:
-    needs: [package-windows, package-unix, package-macos]
+    needs: [package-windows, package-linux, package-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -291,6 +313,8 @@ jobs:
           path: dist
           pattern: "*package*"
           merge-multiple: true
+      - name: Restore AppImage executable permission
+        run: chmod 755 dist/sylvops-linux-x86_64.AppImage
       - name: Create checksums
         working-directory: dist
         run: sha256sum sylvops-* > SHA256SUMS
@@ -313,6 +337,8 @@ jobs:
         with:
           name: release-bundle-${{ github.sha }}
           path: dist
+      - name: Restore AppImage executable permission
+        run: chmod 755 dist/sylvops-linux-x86_64.AppImage
       - name: Revalidate approved release bundle
         shell: pwsh
         run: ./scripts/validate-release.ps1 -DistDirectory dist -ExpectedTag "$env:GITHUB_REF_NAME"

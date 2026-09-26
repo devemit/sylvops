@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.devemit.sylvops</id>
+  <name>SylvOps</name>
+  <summary>Local-first mission control for coding-agent sessions</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>SylvOps supervises coding-agent sessions running in real Git worktrees.</p>
+  </description>
+  <launchable type="desktop-id">sylvops.desktop</launchable>
+  <url type="homepage">https://github.com/devemit/sylvops</url>
+  <developer id="devemit">
+    <name>devemit</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+</component>

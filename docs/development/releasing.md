@@ -32,8 +32,20 @@ The native smoke test verifies the DMG signature and stapled ticket, asks Gateke
 
 The protected `release` environment must define `MACOS_SIGNING_CERTIFICATE_BASE64` as a base64-encoded Developer ID Application P12 and `MACOS_SIGNING_CERTIFICATE_PASSWORD` as its password. It must also define the variables `MACOS_SIGNING_IDENTITY`, `MACOS_NOTARY_KEY_ID`, and `MACOS_NOTARY_ISSUER_ID`, plus `MACOS_NOTARY_KEY_BASE64` as the base64-encoded App Store Connect API private key. The workflow imports these only into an ephemeral keychain and runner files, validates the requested identity, and removes them after packaging. Secrets, private keys, passwords, and certificate bytes must never be committed or printed.
 
+Linux x86_64 releases contain `sylvops-linux-x86_64.AppImage`, `sylvops-linux-x86_64.deb`, and the portable archive. `packaging/linux/Packager.toml` carries the shared application identity, version, icon, desktop entry, and AppStream metadata into both native formats. The AppImage remains a portable executable and makes no installation changes; the Debian package installs the desktop integration and CLI through the platform package manager.
+
+For local package testing on native x86_64 Linux, install cargo-packager 0.11.8 plus Xvfb and the normal graphical runtime libraries, then run:
+
+```sh
+cargo install cargo-packager --version 0.11.8 --locked
+./scripts/package-linux.sh
+./scripts/test-linux-packages.sh --appimage dist/sylvops-linux-x86_64.AppImage --deb dist/sylvops-linux-x86_64.deb --expected-version 0.1.0
+```
+
+The native smoke test inspects both packages, launches the AppImage and installed Debian application under a virtual display, verifies the daemon, removes the Debian package, and proves that state, a repository, worktree content, and its branch survive. CI runs this same path on a clean native Ubuntu x86_64 host.
+
 For local portable testing, `scripts/package-windows.ps1` builds the unsigned native MSVC x64 ZIP. Its launcher delegates to `sylvops open` and never starts a provider implicitly. `scripts/install.ps1` and `scripts/install.sh` retain the portable, checksum-verified installation path without silently editing `PATH`.
 
-Tags must be ordinary semantic `0.x` versions and exactly match the workspace version. `.github/workflows/release.yml` first runs the complete CI workflow, builds and validates the Windows x86_64 installer and portable ZIP, Linux x86_64 archive, and macOS x86_64 and arm64 notarized DMGs plus portable archives, creates one `SHA256SUMS`, attaches build-provenance attestations, and stages the exact bytes as a workflow artifact. The `publish` job uses the protected `release` environment, revalidates the staged bytes, and publishes a normal GitHub Release. The next expected tag is `v0.1.0`.
+Tags must be ordinary semantic `0.x` versions and exactly match the workspace version. `.github/workflows/release.yml` first runs the complete CI workflow, builds and validates the Windows x86_64 installer and portable ZIP, Linux x86_64 AppImage, Debian package and portable archive, and macOS x86_64 and arm64 notarized DMGs plus portable archives, creates one `SHA256SUMS`, attaches build-provenance attestations, and stages the exact bytes as a workflow artifact. The `publish` job uses the protected `release` environment, revalidates the staged bytes, and publishes a normal GitHub Release. The next expected tag is `v0.1.0`.
 
-Portable builds remain a fallback. Signed OS-integrated Linux packages, migration compatibility tests, process/resource soak tests, redacted diagnostics review, and an explicit security review remain planned controls and must not be advertised as shipped.
+Portable builds remain a fallback. Linux package signing, migration compatibility tests, process/resource soak tests, redacted diagnostics review, and an explicit security review remain planned controls and must not be advertised as shipped.
