@@ -6,6 +6,8 @@ assignee: null
 blocked_by: []
 ---
 
+> **Historical release-planning record:** this ticket belongs to the retired beta-phase plan and is not an active roadmap item or release gate.
+
 ## Question
 
 Which native-executable discovery rules should SylvOps support for official Codex installations on each beta platform—especially Windows npm and Codex desktop installs—so that ordinary users are detected without ever executing `.cmd`, PowerShell, or other shell shims, and what bounded fixtures prove those rules safely?

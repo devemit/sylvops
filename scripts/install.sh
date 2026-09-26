@@ -1,13 +1,13 @@
 #!/bin/sh
 set -eu
 
-version="${SYLVOPS_VERSION:-0.1.0-beta.1}"
+version="${SYLVOPS_VERSION:-0.1.0}"
 install_dir="${SYLVOPS_INSTALL_DIR:-$HOME/.local/bin}"
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) asset="sylvops-linux-x86_64.tar.gz" ;;
   Darwin-x86_64) asset="sylvops-macos-x86_64.tar.gz" ;;
   Darwin-arm64) asset="sylvops-macos-aarch64.tar.gz" ;;
-  *) echo "Unsupported SylvOps beta platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+  *) echo "Unsupported SylvOps platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 
 temporary="$(mktemp -d)"

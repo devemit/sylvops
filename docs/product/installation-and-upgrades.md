@@ -4,13 +4,13 @@
 
 A new user can install SylvOps as a normal desktop application, open it from the operating system, upgrade from inside the app, and uninstall it without a Rust toolchain or manual `PATH` editing. Maintainers can explicitly promote any green `main` commit as a semantic `0.x` release through GitHub Releases.
 
-This replaces the one-time beta-cut plan. Its safety checks become repeatable release checks rather than a product phase.
+This supersedes the one-time release-cut plan. Its safety checks are repeatable release checks rather than a product phase.
 
 ## Settled product decisions
 
 - `main` remains continuously releasable; publishing an application release is an explicit promotion.
 - GitHub Releases is the source for installers, portable builds, release notes, and upgrade metadata.
-- Versions use ordinary `0.x` semantic versions. Beta and prerelease naming is removed.
+- Versions use ordinary `0.x` semantic versions without release-phase suffixes.
 - Windows x86_64, Linux x86_64, macOS x86_64, and macOS arm64 remain supported. Packaging work proceeds Windows, then macOS, then Linux when it cannot land together.
 - Installation is per-user and does not require administrator access.
 - Windows ships a signed installer with normal shortcuts and uninstall registration.
@@ -42,8 +42,8 @@ The runtime already creates user-local state and configuration directories, so i
 
 ### 1. Reconcile product truth and stored data
 
-- Replace beta, prerelease, and one-time cut language in current product, development, packaging, workflow, and agent documentation. Preserve historical decisions as historical records rather than active roadmap items.
-- Change the workspace version from `0.1.0-beta.1` to the first promoted ordinary `0.x` version.
+- Keep current product, development, packaging, workflow, and agent documentation centered on application releases. Preserve earlier phase decisions as clearly marked historical records rather than active roadmap items.
+- Keep workspace, application, installer-default, and tag versions aligned on the promoted ordinary `0.x` version, beginning with `0.1.0`.
 - Preserve the prompt-privacy invariant: initial prompts never enter `session_prompts` or persisted provider argument arrays.
 - Retain the additive migration that deletes legacy prompt rows and scrubs prompt-bearing launch metadata; never edit the applied initial migration.
 - Keep the persistence test that uses a unique prompt sentinel and asserts that it is absent from every SQLite text field after session creation.
@@ -87,7 +87,7 @@ The runtime already creates user-local state and configuration directories, so i
 
 ### 6. Make distribution continuously releasable
 
-- Convert the release workflow from prerelease publication to explicit ordinary GitHub Releases triggered by an exact semantic version tag.
+- Publish an ordinary GitHub Release only from an exact semantic version tag that agrees with the workspace and packaged application version.
 - Build installers, application bundles, Linux packages, portable archives, signed upgrade payloads, checksums, attestations, and the upgrade manifest from the same commit.
 - Test clean install, launch, upgrade from the previous release, daemon coordination, rollback, uninstall-with-data-preservation, and reinstall on native hosts.
 - Continue running formatting, Clippy with warnings denied, and the complete workspace test suite on Windows, Linux, and macOS before promotion.

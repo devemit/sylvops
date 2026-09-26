@@ -1,4 +1,4 @@
-SYLVOPS 0.1.0-beta.1
+SYLVOPS 0.1.0
 ================================
 
 Requirements:
@@ -41,5 +41,5 @@ To stop the daemon, open PowerShell in this directory and run:
 
   .\sylvops.exe daemon stop
 
-This is an unsigned beta build. Windows may show an unrecognized-app warning;
+This is an unsigned portable build. Windows may show an unrecognized-app warning;
 verify the archive checksum before choosing More info -> Run anyway.

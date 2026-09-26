@@ -6,7 +6,7 @@ SylvOps is a local application for supervising coding-agent sessions that run in
 
 **Application release**:
 A deliberately promoted, versioned SylvOps build that users can install or upgrade to.
-_Avoid_: Beta, release candidate, build artifact
+_Avoid_: Release-phase labels, release candidate, build artifact
 
 **Installation**:
 An OS-integrated, per-user copy of SylvOps with a normal launch entry and an uninstall path.

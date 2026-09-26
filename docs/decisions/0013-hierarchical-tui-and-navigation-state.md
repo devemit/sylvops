@@ -1,5 +1,7 @@
 # ADR 0013: Hierarchical TUI and bounded navigation state
 
+> **Historical context:** release-phase terminology below records when this decision was made. Current delivery uses ordinary semantic `0.x` application releases.
+
 ## Status
 
 Accepted for the pre-beta UX milestone.
