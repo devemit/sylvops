@@ -117,12 +117,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: sylvops-linux-x86_64.tar.gz
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            asset: sylvops-macos-x86_64.tar.gz
-          - os: macos-15
-            target: aarch64-apple-darwin
-            asset: sylvops-macos-aarch64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -153,8 +147,142 @@ jobs:
           name: package-${{ matrix.target }}
           path: ${{ matrix.asset }}
 
+  package-macos:
+    needs: validate-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            architecture: x86_64
+            archive: sylvops-macos-x86_64.tar.gz
+            dmg: sylvops-macos-x86_64.dmg
+          - os: macos-15
+            target: aarch64-apple-darwin
+            architecture: aarch64
+            archive: sylvops-macos-aarch64.tar.gz
+            dmg: sylvops-macos-aarch64.dmg
+    runs-on: ${{ matrix.os }}
+    environment: release
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install pinned cargo-packager
+        shell: pwsh
+        run: |
+          $packagerVersion = (Get-Content -Raw packaging/cargo-packager.version).Trim()
+          cargo install cargo-packager --version $packagerVersion --locked
+      - name: Import protected Developer ID identity
+        id: macos-signing
+        env:
+          MACOS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.MACOS_SIGNING_CERTIFICATE_BASE64 }}
+          MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: |
+          test -n "$MACOS_SIGNING_CERTIFICATE_BASE64"
+          test -n "$MACOS_SIGNING_CERTIFICATE_PASSWORD"
+          test -n "$MACOS_SIGNING_IDENTITY"
+          case "$MACOS_SIGNING_IDENTITY" in
+            "Developer ID Application:"*) ;;
+            *) echo "MACOS_SIGNING_IDENTITY must name a Developer ID Application certificate." >&2; exit 1 ;;
+          esac
+          certificate_path="$RUNNER_TEMP/sylvops-developer-id.p12"
+          keychain_path="$RUNNER_TEMP/sylvops-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$MACOS_SIGNING_CERTIFICATE_BASE64" | base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" -P "$MACOS_SIGNING_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path" > "$RUNNER_TEMP/sylvops-signing-identities.txt"
+          grep -Fq "$MACOS_SIGNING_IDENTITY" "$RUNNER_TEMP/sylvops-signing-identities.txt"
+          rm -f "$certificate_path" "$RUNNER_TEMP/sylvops-signing-identities.txt"
+          echo "keychain_path=$keychain_path" >> "$GITHUB_OUTPUT"
+      - name: Prepare protected notarization key
+        id: macos-notary
+        env:
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ vars.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ vars.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          test -n "$MACOS_NOTARY_KEY_BASE64"
+          test -n "$MACOS_NOTARY_KEY_ID"
+          test -n "$MACOS_NOTARY_ISSUER_ID"
+          [[ "$MACOS_NOTARY_KEY_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "MACOS_NOTARY_KEY_ID must be a 10-character Apple API key ID." >&2; exit 1; }
+          notary_key_path="$RUNNER_TEMP/AuthKey_${MACOS_NOTARY_KEY_ID}.p8"
+          printf '%s' "$MACOS_NOTARY_KEY_BASE64" | base64 -D > "$notary_key_path"
+          chmod 600 "$notary_key_path"
+          echo "key_path=$notary_key_path" >> "$GITHUB_OUTPUT"
+      - name: Build signed and notarized application package
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          MACOS_NOTARY_KEY_ID: ${{ vars.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ vars.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          ./scripts/package-macos.sh \
+            --target '${{ matrix.target }}' \
+            --architecture '${{ matrix.architecture }}' \
+            --signing-identity "$MACOS_SIGNING_IDENTITY" \
+            --keychain '${{ steps.macos-signing.outputs.keychain_path }}' \
+            --notary-key '${{ steps.macos-notary.outputs.key_path }}' \
+            --notary-key-id "$MACOS_NOTARY_KEY_ID" \
+            --notary-issuer-id "$MACOS_NOTARY_ISSUER_ID" \
+            --require-developer-id
+      - name: Verify application version
+        run: |
+          expected="sylvops ${GITHUB_REF_NAME#v}"
+          actual="$(target/${{ matrix.target }}/release/sylvops --version)"
+          test "$actual" = "$expected"
+      - name: Package portable fallback
+        run: |
+          test -x "target/${{ matrix.target }}/release/sylvops"
+          mkdir package
+          cp "target/${{ matrix.target }}/release/sylvops" README.md LICENSE package/
+          tar -C package -czf '${{ matrix.archive }}' sylvops README.md LICENSE
+      - name: Install, launch, verify, and remove
+        run: |
+          ./scripts/test-macos-package.sh \
+            --dmg 'dist/${{ matrix.dmg }}' \
+            --architecture '${{ matrix.architecture }}' \
+            --expected-version "${GITHUB_REF_NAME#v}" \
+            --require-developer-id \
+            --require-notarization
+      - name: Validate package contents
+        shell: pwsh
+        run: ./scripts/validate-release.ps1 -ArchivePath '${{ matrix.archive }}' -MacosPackagePath 'dist/${{ matrix.dmg }}' -ExpectedTag "$env:GITHUB_REF_NAME"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            ${{ matrix.archive }}
+            dist/${{ matrix.dmg }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: |
+            ${{ matrix.archive }}
+            dist/${{ matrix.dmg }}
+      - name: Remove protected macOS credentials
+        if: always()
+        env:
+          MACOS_NOTARY_KEY_ID: ${{ vars.MACOS_NOTARY_KEY_ID }}
+        run: |
+          keychain_path="$RUNNER_TEMP/sylvops-signing.keychain-db"
+          security delete-keychain "$keychain_path" 2>/dev/null || true
+          rm -f \
+            "$RUNNER_TEMP/sylvops-developer-id.p12" \
+            "$RUNNER_TEMP/sylvops-signing-identities.txt"
+          if [[ "$MACOS_NOTARY_KEY_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+            rm -f "$RUNNER_TEMP/AuthKey_${MACOS_NOTARY_KEY_ID}.p8"
+          fi
+
   stage-release:
-    needs: [package-windows, package-unix]
+    needs: [package-windows, package-unix, package-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
