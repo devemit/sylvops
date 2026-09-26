@@ -43,6 +43,10 @@ pub(crate) enum Operation {
     LoadDiff(WorktreeId),
     Input(SessionId),
     SaveDesktopState,
+    CheckForUpdate,
+    GetUpdateStatus,
+    DownloadUpdate,
+    InstallUpdate,
 }
 
 #[derive(Debug)]

@@ -14,13 +14,20 @@ path = "src/bin/fake-agent.rs"
 name = "fake-codex"
 path = "src/bin/fake-codex.rs"
 
+[[bin]]
+name = "release-manifest"
+path = "src/bin/release-manifest.rs"
+
 [dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+sylvops-core = { path = "../sylvops-core" }
 tokio.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
-sylvops-core = { path = "../sylvops-core" }
 sylvops-daemon = { path = "../sylvops-daemon" }
 tempfile = "3"
 uuid.workspace = true

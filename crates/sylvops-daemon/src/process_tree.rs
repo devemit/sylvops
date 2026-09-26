@@ -48,15 +48,23 @@ mod platform {
         ffi::c_void,
         mem::size_of,
         os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        process::Child,
         ptr,
     };
 
     use windows_sys::Win32::{
-        Foundation::HANDLE,
-        System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, TerminateJobObject,
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
+                Thread32Next,
+            },
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, TerminateJobObject,
+            },
+            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
         },
     };
 
@@ -107,6 +115,67 @@ mod platform {
 
         pub fn raw_handle(&self) -> HANDLE {
             self.job.as_raw_handle().cast::<c_void>()
+        }
+
+        pub fn assign(&self, child: &Child) -> Result<()> {
+            // SAFETY: both handles are live and owned by `self` and `child` for this call.
+            if unsafe {
+                AssignProcessToJobObject(
+                    self.job.as_raw_handle().cast::<c_void>(),
+                    child.as_raw_handle().cast::<c_void>(),
+                )
+            } == 0
+            {
+                return Err(last_os_error("assign native command to Windows Job Object"));
+            }
+            Ok(())
+        }
+
+        pub fn resume(process_id: u32) -> Result<()> {
+            // SAFETY: the snapshot is an owned kernel handle, checked before ownership transfer.
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(last_os_error("enumerate suspended Windows process threads"));
+            }
+            // SAFETY: `snapshot` is valid and transferred exactly once.
+            let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+            let mut entry = THREADENTRY32 {
+                dwSize: u32::try_from(size_of::<THREADENTRY32>())
+                    .expect("Windows thread entry fits u32"),
+                ..Default::default()
+            };
+            let mut found = false;
+            // SAFETY: the snapshot and correctly sized output structure are valid for this call.
+            let mut available =
+                unsafe { Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) };
+            while available != 0 {
+                if entry.th32OwnerProcessID == process_id {
+                    // SAFETY: the requested access is limited to resuming the enumerated thread.
+                    let thread =
+                        unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                    if thread.is_null() {
+                        return Err(last_os_error("open suspended Windows process thread"));
+                    }
+                    // SAFETY: `thread` is valid and transferred exactly once.
+                    let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+                    // SAFETY: the handle grants THREAD_SUSPEND_RESUME for a suspended thread.
+                    if unsafe { ResumeThread(thread.as_raw_handle().cast()) } == u32::MAX {
+                        return Err(last_os_error("resume Windows process thread"));
+                    }
+                    found = true;
+                }
+                entry.dwSize = u32::try_from(size_of::<THREADENTRY32>())
+                    .expect("Windows thread entry fits u32");
+                // SAFETY: the snapshot and correctly sized output structure remain valid.
+                available =
+                    unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) };
+            }
+            if !found {
+                return Err(DaemonError::ProcessTree(
+                    "suspended Windows process had no resumable thread".into(),
+                ));
+            }
+            Ok(())
         }
 
         pub fn terminate(&self) -> Result<()> {

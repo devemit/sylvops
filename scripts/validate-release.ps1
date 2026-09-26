@@ -4,6 +4,7 @@ param(
     [string]$ArchivePath,
     [string]$InstallerPath,
     [string[]]$MacosPackagePath,
+    [string[]]$LinuxPackagePath,
     [string]$DistDirectory,
     [string]$ExpectedTag
 )
@@ -159,6 +160,65 @@ function Assert-MacosPackage {
     Write-Host "[ok] signed and notarized macOS package is present: $name"
 }
 
+function Assert-LinuxPackage {
+    param([string]$Path)
+
+    Assert-ReleaseCondition (Test-Path -LiteralPath $Path -PathType Leaf) "Linux package is missing: $Path"
+    Assert-ReleaseCondition ((Get-Item -LiteralPath $Path).Length -gt 0) "Linux package is empty: $Path"
+    $name = Split-Path -Leaf $Path
+    Assert-ReleaseCondition ($name -in @('sylvops-linux-x86_64.AppImage', 'sylvops-linux-x86_64.deb')) "Unexpected Linux package name: $name"
+    if ($name.EndsWith('.AppImage')) {
+        Assert-ReleaseCondition (-not $IsWindows -or ((Get-Item -LiteralPath $Path).Length -gt 0)) "AppImage validation failed."
+    }
+    Write-Host "[ok] native Linux package is present: $name"
+}
+
+function Assert-UpdateManifest {
+    param(
+        [string]$Path,
+        [string]$AssetPath,
+        [string]$ExpectedVersion
+    )
+
+    Assert-ReleaseCondition (Test-Path -LiteralPath $Path -PathType Leaf) "Update manifest is missing: $Path"
+    $manifest = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    Assert-ReleaseCondition ($manifest.release.schema_version -eq 1) "Update manifest schema is not version 1: $Path"
+    Assert-ReleaseCondition ($manifest.release.target_version -eq $ExpectedVersion) "Update manifest version does not match the package version: $Path"
+    Assert-ReleaseCondition ($manifest.signature -match '^[A-Za-z0-9+/]{86}==$') "Update manifest signature is not a 64-byte base64 Ed25519 signature: $Path"
+    $asset = Get-Item -LiteralPath $AssetPath
+    Assert-ReleaseCondition ([uint64]$manifest.release.byte_length -eq [uint64]$asset.Length) "Update manifest length does not match its asset: $Path"
+    $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $AssetPath).Hash.ToLowerInvariant()
+    Assert-ReleaseCondition ($manifest.release.sha256 -eq $digest) "Update manifest digest does not match its asset: $Path"
+    Assert-ReleaseCondition ($manifest.release.installer_url.EndsWith('/' + $asset.Name)) "Update manifest URL does not name its asset: $Path"
+    Write-Host "[ok] signed update manifest matches $($asset.Name)"
+}
+
+function Assert-ReleaseEvidence {
+    param(
+        [string]$Path,
+        [string]$ExpectedVersion
+    )
+
+    $evidence = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    Assert-ReleaseCondition ($evidence.schema_version -eq 1) "Release evidence schema is invalid."
+    Assert-ReleaseCondition ($evidence.version -eq $ExpectedVersion) "Release evidence version does not match."
+    Assert-ReleaseCondition ($evidence.commit -match '^[0-9a-f]{40}$') "Release evidence commit is invalid."
+    foreach ($target in @('windows_x86_64', 'linux_x86_64', 'macos_x86_64', 'macos_aarch64')) {
+        Assert-ReleaseCondition ($evidence.native_package_jobs.$target -eq 'passed') "Release evidence is missing passed native validation for $target."
+    }
+    Assert-ReleaseCondition ($evidence.upgrade_contract.signed_metadata -eq 'verified') "Release evidence is missing signed-metadata validation."
+    Assert-ReleaseCondition ($evidence.upgrade_contract.staged_payloads -eq 'verified') "Release evidence is missing staged-payload validation."
+    Assert-ReleaseCondition ($evidence.upgrade_contract.coordinator_rollback_unit -eq 'passed') "Release evidence is missing coordinator rollback validation."
+    Assert-ReleaseCondition ($evidence.upgrade_contract.detached_helper_rollback_integration -eq 'passed') "Release evidence is missing detached-helper rollback integration validation."
+    if ($ExpectedVersion -eq '0.1.0') {
+        Assert-ReleaseCondition ($evidence.upgrade_contract.native_package_upgrade_and_rollback -in @('passed', 'not_applicable_initial_release')) "Initial release evidence has an invalid native-package upgrade result."
+    }
+    else {
+        Assert-ReleaseCondition ($evidence.upgrade_contract.native_package_upgrade_and_rollback -eq 'passed') "Release evidence is missing native N-1 package upgrade and rollback validation."
+    }
+    Write-Host "[ok] release evidence covers every supported native target"
+}
+
 $root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 $cargo = Get-Content -Raw -LiteralPath (Join-Path $root 'Cargo.toml')
 $versionMatch = [regex]::Match($cargo, '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"([^"]+)"')
@@ -167,6 +227,7 @@ $version = $versionMatch.Groups[1].Value
 Assert-ReleaseCondition ($version -match '^0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') "Workspace version must be an ordinary semantic 0.x version without prerelease or build metadata, found $version."
 if (-not [string]::IsNullOrWhiteSpace($ExpectedTag)) {
     Assert-ReleaseCondition ($ExpectedTag -eq "v$version") "Release tag $ExpectedTag does not match workspace version $version."
+    Assert-ReleaseCondition (-not [string]::IsNullOrWhiteSpace($env:SYLVOPS_UPDATE_PUBLIC_KEY_BASE64)) "Tagged releases require UPDATE_SIGNING_PUBLIC_KEY_BASE64 to be embedded in application binaries."
 }
 
 $applicationId = 'com.devemit.sylvops'
@@ -255,6 +316,33 @@ foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'C
     Assert-ReleaseCondition ($macosSmokeScript.Contains($requiredText)) "The macOS package smoke test is missing an acceptance check: $requiredText"
 }
 
+$linuxPackagerConfigPath = Join-Path $root 'packaging\linux\Packager.toml'
+Assert-ReleaseCondition (Test-Path -LiteralPath $linuxPackagerConfigPath -PathType Leaf) "The Linux packager configuration is missing."
+$linuxPackagerConfig = Get-Content -Raw -LiteralPath $linuxPackagerConfigPath
+foreach ($requiredSetting in @(
+    'product-name = "SylvOps"',
+    "version = `"$version`"",
+    "identifier = `"$applicationId`"",
+    'formats = ["appimage", "deb"]',
+    'packaging/icons/sylvops.png',
+    'com.devemit.sylvops.metainfo.xml',
+    'generate-desktop-entry = true'
+)) {
+    Assert-ReleaseCondition ($linuxPackagerConfig.Contains($requiredSetting)) "The Linux packager configuration is missing the locked setting: $requiredSetting"
+}
+foreach ($linuxPath in @(
+    'packaging\linux\sylvops.desktop.hbs',
+    'packaging\linux\com.devemit.sylvops.metainfo.xml',
+    'scripts\package-linux.sh',
+    'scripts\test-linux-packages.sh'
+)) {
+    Assert-ReleaseCondition (Test-Path -LiteralPath (Join-Path $root $linuxPath) -PathType Leaf) "The Linux package workflow file is missing: $linuxPath"
+}
+$linuxSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-linux-packages.sh')
+foreach ($requiredText in @('run_with_timeout', '--appimage-extract', 'dpkg --install', 'dpkg --remove', 'package-preserve.txt', 'show-ref --verify')) {
+    Assert-ReleaseCondition ($linuxSmokeScript.Contains($requiredText)) "The Linux package smoke test is missing an acceptance check: $requiredText"
+}
+
 $quickstart = Get-Content -Raw -LiteralPath (Join-Path $root 'packaging\windows\QUICKSTART.txt')
 Assert-ReleaseCondition ($quickstart -match "(?m)^SYLVOPS $([regex]::Escape($version))$") "Windows QUICKSTART version does not match workspace version $version."
 
@@ -279,6 +367,9 @@ Assert-ReleaseCondition ($readme.Contains('Start-Process sylvops')) "README does
 Assert-ReleaseCondition ($readme.Contains('preserves configuration, session data, repositories, worktrees, and branches')) "README does not state the Windows uninstall preservation contract."
 foreach ($requiredText in @('sylvops-macos-x86_64.dmg', 'sylvops-macos-aarch64.dmg', '/Applications', 'Gatekeeper')) {
     Assert-ReleaseCondition ($readme.Contains($requiredText)) "README is missing normal macOS installation guidance: $requiredText"
+}
+foreach ($requiredText in @('sylvops-linux-x86_64.AppImage', 'sylvops-linux-x86_64.deb', 'AppImage', 'Debian')) {
+    Assert-ReleaseCondition ($readme.Contains($requiredText)) "README is missing normal Linux installation guidance: $requiredText"
 }
 
 $releasingGuide = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\development\releasing.md')
@@ -319,7 +410,15 @@ foreach ($asset in @(
     'sylvops-macos-x86_64.tar.gz',
     'sylvops-macos-aarch64.tar.gz',
     'sylvops-macos-x86_64.dmg',
-    'sylvops-macos-aarch64.dmg'
+    'sylvops-macos-aarch64.dmg',
+    'sylvops-linux-x86_64.AppImage',
+    'sylvops-linux-x86_64.deb',
+    'sylvops-update-windows-x86_64-nsis.json',
+    'sylvops-update-macos-x86_64-dmg.json',
+    'sylvops-update-macos-aarch64-dmg.json',
+    'sylvops-update-linux-x86_64-appimage.json',
+    'sylvops-update-linux-x86_64-deb.json',
+    'RELEASE-EVIDENCE.json'
 )) {
     Assert-ReleaseCondition ($release.Contains($asset)) "Release workflow is missing required archive: $asset"
 }
@@ -348,6 +447,12 @@ Assert-ReleaseCondition ($release.Contains('MACOS_NOTARY_KEY_ID')) "Release pack
 Assert-ReleaseCondition ($release.Contains('MACOS_NOTARY_ISSUER_ID')) "Release packaging does not load the notarization issuer ID."
 Assert-ReleaseCondition ($release.Contains('scripts/package-macos.sh')) "Release packaging does not build the signed and notarized macOS DMGs."
 Assert-ReleaseCondition ($release.Contains('scripts/test-macos-package.sh')) "Release packaging does not run the native macOS package smoke test."
+Assert-ReleaseCondition ($release.Contains('scripts/package-linux.sh')) "Release packaging does not build the AppImage and deb packages."
+Assert-ReleaseCondition ($release.Contains('scripts/test-linux-packages.sh')) "Release packaging does not run the native Linux package smoke test."
+Assert-ReleaseCondition ($release.Contains('UPDATE_SIGNING_PRIVATE_KEY_BASE64')) "Release staging does not load the protected application-update signing key."
+Assert-ReleaseCondition ($release.Contains('UPDATE_SIGNING_PUBLIC_KEY_BASE64')) "Release builds do not embed the application-update verification key."
+Assert-ReleaseCondition ($release.Contains('--bin release-manifest -- generate')) "Release staging does not create signed update manifests."
+Assert-ReleaseCondition ($release.Contains('--bin release-manifest -- verify')) "Release staging does not verify signed update manifests."
 Assert-NoLegacyReleasePhaseWording -Path '.github\workflows\release.yml' -Text $release
 
 $ciInstallerJob = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\ci.yml')
@@ -359,6 +464,9 @@ Assert-ReleaseCondition ($ciInstallerJob.Contains('macos-package')) "CI is missi
 Assert-ReleaseCondition ($ciInstallerJob.Contains('macos-15-intel')) "CI is missing the native Intel macOS package job."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-macos.sh')) "CI does not exercise the production macOS packaging script."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-macos-package.sh')) "CI does not install, launch, verify, and remove the macOS package."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('linux-package')) "CI is missing the native Linux package job."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-linux.sh')) "CI does not exercise the production Linux packaging script."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-linux-packages.sh')) "CI does not install, launch, verify, and remove the Linux packages."
 
 $activeNonDocumentationSurfaces = @(
     'packaging\windows\QUICKSTART.txt',
@@ -418,6 +526,10 @@ foreach ($packagePath in @($MacosPackagePath | Where-Object { -not [string]::IsN
     Assert-MacosPackage -Path (Resolve-Path -LiteralPath $packagePath).Path
 }
 
+foreach ($packagePath in @($LinuxPackagePath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+    Assert-LinuxPackage -Path (Resolve-Path -LiteralPath $packagePath).Path
+}
+
 if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
     $dist = (Resolve-Path -LiteralPath $DistDirectory).Path
     $archives = @(
@@ -431,7 +543,19 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
         'sylvops-macos-x86_64.dmg',
         'sylvops-macos-aarch64.dmg'
     )
-    $releaseAssets = @($archives + $installer + $macosPackages)
+    $linuxPackages = @(
+        'sylvops-linux-x86_64.AppImage',
+        'sylvops-linux-x86_64.deb'
+    )
+    $updateManifests = @{
+        'sylvops-update-windows-x86_64-nsis.json' = 'sylvops-windows-x86_64-setup.exe'
+        'sylvops-update-macos-x86_64-dmg.json' = 'sylvops-macos-x86_64.dmg'
+        'sylvops-update-macos-aarch64-dmg.json' = 'sylvops-macos-aarch64.dmg'
+        'sylvops-update-linux-x86_64-appimage.json' = 'sylvops-linux-x86_64.AppImage'
+        'sylvops-update-linux-x86_64-deb.json' = 'sylvops-linux-x86_64.deb'
+    }
+    $evidence = 'RELEASE-EVIDENCE.json'
+    $releaseAssets = @($archives + $installer + $macosPackages + $linuxPackages + @($updateManifests.Keys) + $evidence)
     $expectedFiles = @($releaseAssets + 'SHA256SUMS')
     $actualFiles = @(Get-ChildItem -LiteralPath $dist -File | ForEach-Object { $_.Name })
     $directories = @(Get-ChildItem -LiteralPath $dist -Directory)
@@ -458,10 +582,19 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
         elseif ($asset -in $macosPackages) {
             Assert-MacosPackage -Path $path
         }
+        elseif ($asset -in $linuxPackages) {
+            Assert-LinuxPackage -Path $path
+        }
+        elseif ($updateManifests.ContainsKey($asset)) {
+            Assert-UpdateManifest -Path $path -AssetPath (Join-Path $dist $updateManifests[$asset]) -ExpectedVersion $version
+        }
+        elseif ($asset -eq $evidence) {
+            Assert-ReleaseEvidence -Path $path -ExpectedVersion $version
+        }
         else {
             Assert-Archive -Path $path
         }
         Write-Host "[ok] $asset sha256=$actualHash"
     }
-    Write-Host "[ok] release bundle has exactly seven validated assets and one checksum manifest"
+    Write-Host "[ok] release bundle has exactly fifteen validated assets and one checksum manifest"
 }

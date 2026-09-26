@@ -8,6 +8,10 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
 sylvops-core = { path = "../sylvops-core" }
 serde.workspace = true
 serde_json.workspace = true
@@ -31,9 +35,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }

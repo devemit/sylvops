@@ -15,5 +15,6 @@ pub mod provider;
 pub mod status;
 pub mod ui;
 pub mod ui_forms;
+pub mod upgrade;
 
 pub use error::{CoreError, Result};

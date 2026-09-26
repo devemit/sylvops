@@ -63,6 +63,28 @@ jobs:
             Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
           }
 
+  linux-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native package prerequisites
+        run: sudo apt-get update && sudo apt-get install --yes dpkg-repack libfuse2 libgtk-3-0 libxdo3 patchelf policykit-1
+      - name: Install pinned cargo-packager
+        run: |
+          packager_version="$(cat packaging/cargo-packager.version)"
+          cargo install cargo-packager --version "$packager_version" --locked
+      - name: Build AppImage and deb packages
+        run: ./scripts/package-linux.sh
+      - name: Install, launch, verify, and remove
+        run: |
+          expected_version="$(awk '/^\[workspace.package\]/{workspace_package=1; next} workspace_package && /^version = /{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"
+          ./scripts/test-linux-packages.sh \
+            --appimage dist/sylvops-linux-x86_64.AppImage \
+            --deb dist/sylvops-linux-x86_64.deb \
+            --expected-version "$expected_version"
+
   macos-package:
     strategy:
       fail-fast: false

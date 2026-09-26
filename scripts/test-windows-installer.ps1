@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)]
     [ValidatePattern('^[0-9A-Fa-f]{40}$')]
     [string]$CertificateThumbprint,
+    [string]$PreviousInstallerPath,
     [switch]$RequireTrustedSignature,
     [switch]$RequireTimestamp
 )
@@ -27,6 +28,13 @@ function Assert-SignedByExpectedCertificate {
     Assert-InstallerCondition ($signature.Status -notin @('HashMismatch', 'NotSigned')) "Invalid Authenticode signature for ${Path}: $($signature.Status)"
     Assert-InstallerCondition (-not $RequireTrustedSignature -or $signature.Status -eq 'Valid') "The Authenticode signature for $Path is not trusted: $($signature.Status)."
     Assert-InstallerCondition (-not $RequireTimestamp -or $null -ne $signature.TimeStamperCertificate) "The Authenticode signature for $Path is missing its required RFC 3161 timestamp."
+}
+
+function Assert-TrustedSignature {
+    param([string]$Path)
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    Assert-InstallerCondition ($null -ne $signature.SignerCertificate) "No Authenticode signer was found for $Path."
+    Assert-InstallerCondition ($signature.Status -eq 'Valid') "The previous installer signature is not trusted: $($signature.Status)."
 }
 
 function Wait-ForDesktopProcess {
@@ -131,6 +139,15 @@ Assert-InstallerCondition $versionMatch.Success 'Could not read the expected Syl
 $expectedVersion = $versionMatch.Groups[1].Value
 $resolvedInstaller = (Resolve-Path -LiteralPath $InstallerPath).Path
 Assert-SignedByExpectedCertificate $resolvedInstaller
+$resolvedPreviousInstaller = if ([string]::IsNullOrWhiteSpace($PreviousInstallerPath)) {
+    $null
+}
+else {
+    (Resolve-Path -LiteralPath $PreviousInstallerPath).Path
+}
+if ($null -ne $resolvedPreviousInstaller) {
+    Assert-TrustedSignature $resolvedPreviousInstaller
+}
 
 $testId = [Guid]::NewGuid().ToString('N')
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "sylvops-installer-$testId"
@@ -163,6 +180,18 @@ try {
     Assert-InstallerCondition ($gitCommit.ExitCode -eq 0) 'Could not commit the smoke-test repository content.'
     $gitWorktree = Invoke-BoundedProcess -FilePath 'git' -ArgumentList @('-C', $repositoryDirectory, 'worktree', 'add', '--quiet', '-b', 'installer-smoke-branch', $worktreeDirectory) -TimeoutSeconds 30 -Operation 'Git worktree creation'
     Assert-InstallerCondition ($gitWorktree.ExitCode -eq 0) 'Could not create the smoke-test worktree and branch.'
+
+    if ($null -ne $resolvedPreviousInstaller) {
+        $installed = $true
+        $previousInstall = Start-Process -FilePath $resolvedPreviousInstaller -ArgumentList '/S' -PassThru
+        $previousInstallExitCode = Wait-ForProcessExit -Process $previousInstall -TimeoutSeconds 120 -Operation 'Previous installer'
+        Assert-InstallerCondition ($previousInstallExitCode -eq 0) "Previous installer exited with code $previousInstallExitCode."
+        Assert-InstallerCondition (Test-Path -LiteralPath $installedExecutable -PathType Leaf) 'The previous installed executable is missing.'
+        $previousVersion = Invoke-BoundedProcess -FilePath $installedExecutable -ArgumentList @('--version') -TimeoutSeconds 30 -Operation 'Previous installed CLI version check' -CaptureOutput
+        $previousVersionOutput = $previousVersion.StdOut.Trim()
+        Assert-InstallerCondition ($previousVersion.ExitCode -eq 0 -and $previousVersionOutput.StartsWith('sylvops ') -and $previousVersionOutput -ne "sylvops $expectedVersion") "Previous installed version is '$previousVersionOutput'."
+        $previousVersionNumber = $previousVersionOutput.Substring('sylvops '.Length)
+    }
 
     $installed = $true
     $install = Start-Process -FilePath $resolvedInstaller -ArgumentList '/S' -PassThru
@@ -203,6 +232,35 @@ try {
     Stop-Process -Id $desktopProcess.ProcessId -Force -ErrorAction SilentlyContinue
     $desktopProcess = $null
 
+    if ($null -ne $resolvedPreviousInstaller) {
+        $rollback = Start-Process -FilePath $resolvedPreviousInstaller -ArgumentList '/S' -PassThru
+        $rollbackExitCode = Wait-ForProcessExit -Process $rollback -TimeoutSeconds 120 -Operation 'Previous installer rollback'
+        Assert-InstallerCondition ($rollbackExitCode -eq 0) "Previous installer rollback exited with code $rollbackExitCode."
+        $rolledBackVersion = Invoke-BoundedProcess -FilePath $installedExecutable -ArgumentList @('--version') -TimeoutSeconds 30 -Operation 'Rolled-back CLI version check' -CaptureOutput
+        Assert-InstallerCondition ($rolledBackVersion.ExitCode -eq 0 -and $rolledBackVersion.StdOut.Trim() -eq $previousVersionOutput) 'Reapplying the previous package did not restore the previous version.'
+        $rolledBackUninstallKey = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\SylvOps'
+        Assert-InstallerCondition ($rolledBackUninstallKey.DisplayVersion -eq $previousVersionNumber) 'Rollback did not restore the previous uninstall registration.'
+        Assert-InstallerCondition (Test-Path -LiteralPath $uninstallerPath -PathType Leaf) 'Rollback did not restore the previous uninstaller.'
+        Assert-SignedByExpectedCertificate $uninstallerPath
+        $rolledBackAppPath = Get-Item -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\sylvops.exe'
+        Assert-InstallerCondition ($rolledBackAppPath.GetValue('') -eq $installedExecutable) 'Rollback did not restore CLI App Paths registration.'
+        Assert-InstallerCondition (Test-Path -LiteralPath $startMenuShortcut.FullName -PathType Leaf) 'Rollback did not restore the Start Menu shortcut.'
+        $rollbackLaunch = Invoke-BoundedProcess -FilePath $installedExecutable -ArgumentList @('--state-dir', $stateRoot, 'up', $repositoryDirectory) -TimeoutSeconds 30 -Operation 'Rolled-back desktop launch'
+        Assert-InstallerCondition ($rollbackLaunch.ExitCode -eq 0) 'The rolled-back launch surface failed.'
+        $desktopProcess = Wait-ForDesktopProcess -ExecutablePath $installedExecutable
+        $rollbackStatus = Invoke-BoundedProcess -FilePath $installedExecutable -ArgumentList @('--state-dir', $stateRoot, 'daemon', 'status') -TimeoutSeconds 30 -Operation 'Rolled-back daemon status check' -CaptureOutput
+        Assert-InstallerCondition ($rollbackStatus.ExitCode -eq 0 -and ($rollbackStatus.StdOut + $rollbackStatus.StdErr).Contains('SylvOps daemon is healthy')) 'The rolled-back daemon did not become healthy.'
+        $rollbackStop = Invoke-BoundedProcess -FilePath $installedExecutable -ArgumentList @('--state-dir', $stateRoot, 'daemon', 'stop') -TimeoutSeconds 30 -Operation 'Rolled-back daemon stop'
+        Assert-InstallerCondition ($rollbackStop.ExitCode -eq 0) 'The rolled-back daemon did not stop cleanly.'
+        Stop-Process -Id $desktopProcess.ProcessId -Force -ErrorAction SilentlyContinue
+        $desktopProcess = $null
+        $reupgrade = Start-Process -FilePath $resolvedInstaller -ArgumentList '/S' -PassThru
+        $reupgradeExitCode = Wait-ForProcessExit -Process $reupgrade -TimeoutSeconds 120 -Operation 'Re-upgrade installer'
+        Assert-InstallerCondition ($reupgradeExitCode -eq 0) "Re-upgrade installer exited with code $reupgradeExitCode."
+        $reupgradedVersion = Invoke-BoundedProcess -FilePath $installedExecutable -ArgumentList @('--version') -TimeoutSeconds 30 -Operation 'Re-upgraded CLI version check' -CaptureOutput
+        Assert-InstallerCondition ($reupgradedVersion.ExitCode -eq 0 -and $reupgradedVersion.StdOut.Trim() -eq "sylvops $expectedVersion") 'Re-upgrade did not restore the current version.'
+    }
+
     $uninstall = Start-Process -FilePath $uninstallerPath -ArgumentList '/S' -PassThru
     $uninstallExitCode = Wait-ForProcessExit -Process $uninstall -TimeoutSeconds 120 -Operation 'Uninstaller'
     Assert-InstallerCondition ($uninstallExitCode -eq 0) "Uninstaller exited with code $uninstallExitCode."
@@ -225,7 +283,7 @@ try {
     $gitShowRef = Invoke-BoundedProcess -FilePath 'git' -ArgumentList @('-C', $repositoryDirectory, 'show-ref', '--verify', '--quiet', 'refs/heads/installer-smoke-branch') -TimeoutSeconds 30 -Operation 'Git branch preservation check'
     Assert-InstallerCondition ($gitShowRef.ExitCode -eq 0) 'Uninstall removed the user branch.'
 
-    Write-Host '[ok] signed per-user installer installed, launched, verified, and uninstalled without removing user content'
+    Write-Host '[ok] signed per-user installer installed, upgraded, rolled back when applicable, launched, and uninstalled without removing user content'
 }
 finally {
     if ($null -ne $desktopProcess) {

@@ -42,6 +42,10 @@ pub(crate) enum Confirmation {
         name: String,
         canonical_path: String,
     },
+    InstallUpdate {
+        version: String,
+        active_session_names: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]

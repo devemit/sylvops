@@ -43,6 +43,7 @@ use sylvops_core::{
         MIN_DESKTOP_WIDTH, MIN_TERMINAL_FONT_SIZE, MainTab,
     },
     ui_forms::{Form, FormKind},
+    upgrade::{InstallDisposition, UpgradeStatus},
 };
 use sylvops_daemon::runtime::RuntimePaths;
 use terminal::{
@@ -215,6 +216,15 @@ struct DesktopApp {
     hovered_session_id: Option<SessionId>,
     resume_pending: HashSet<SessionId>,
     window_mode: window::Mode,
+    update_status: UpgradeStatus,
+    install_request: InstallRequestState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum InstallRequestState {
+    #[default]
+    Idle,
+    Pending,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,6 +370,10 @@ enum Message {
     ShowNarrowNavigator,
     ShowNarrowMain,
     ClearError,
+    CheckForUpdate,
+    DownloadUpdate,
+    InstallUpdate,
+    TogglePeriodicUpdateChecks,
 }
 
 impl DesktopApp {
@@ -415,6 +429,8 @@ impl DesktopApp {
             hovered_session_id: None,
             resume_pending: HashSet::new(),
             window_mode: window::Mode::Windowed,
+            update_status: UpgradeStatus::Idle,
+            install_request: InstallRequestState::Idle,
         }
     }
 
@@ -593,6 +609,20 @@ impl DesktopApp {
                 } else {
                     Some(Modal::Settings)
                 };
+            }
+            Message::CheckForUpdate => {
+                self.send_request(Operation::CheckForUpdate, ClientRequest::CheckForUpdate);
+            }
+            Message::DownloadUpdate => {
+                self.send_request(Operation::DownloadUpdate, ClientRequest::DownloadUpdate);
+            }
+            Message::InstallUpdate => {
+                self.send_install_request(false);
+            }
+            Message::TogglePeriodicUpdateChecks => {
+                self.desktop_state.periodic_update_checks =
+                    !self.desktop_state.periodic_update_checks;
+                self.mark_state_dirty();
             }
             Message::ToggleFullscreen => {
                 let Some(window_id) = self.window_id else {
@@ -1617,6 +1647,7 @@ impl DesktopApp {
             ),
         ]
         .spacing(10);
+        let update_settings = self.update_settings_view();
         container(
             column![
                 row![
@@ -1637,6 +1668,8 @@ impl DesktopApp {
                     .on_press(Message::ResetLayout)
                     .style(chrome_action_style),
                 rule::horizontal(1),
+                update_settings,
+                rule::horizontal(1),
                 text("Safety").font(UI_SEMIBOLD).size(16),
                 text("The desktop remains an IPC client. The daemon still owns PTYs, Git mutations, process cleanup, and audit events.")
                     .style(text::secondary),
@@ -1646,6 +1679,81 @@ impl DesktopApp {
         .padding(22)
         .width(Length::Fixed(560.0))
         .style(modal_card)
+        .into()
+    }
+
+    fn update_settings_view(&self) -> Element<'_, Message> {
+        let update_details: Element<'_, Message> = match &self.update_status {
+            UpgradeStatus::UpToDate { version } => {
+                text(format!("SylvOps {version} is up to date."))
+                    .style(text::secondary)
+                    .into()
+            }
+            UpgradeStatus::Available { release } => column![
+                text(format!(
+                    "SylvOps {} is available ({} bytes).",
+                    release.target_version, release.byte_length
+                )),
+                text(&release.release_notes).style(text::secondary),
+                button("Download verified upgrade")
+                    .on_press(Message::DownloadUpdate)
+                    .style(chrome_action_style),
+            ]
+            .spacing(8)
+            .into(),
+            UpgradeStatus::Downloading { release } => text(format!(
+                "Downloading and verifying SylvOps {}…",
+                release.target_version
+            ))
+            .into(),
+            UpgradeStatus::Staged { release } => column![
+                text(format!(
+                    "SylvOps {} is verified and ready.",
+                    release.target_version
+                )),
+                button("Install update")
+                    .on_press(Message::InstallUpdate)
+                    .style(chrome_action_style),
+            ]
+            .spacing(8)
+            .into(),
+            UpgradeStatus::Installing { release } => {
+                text(format!("Installing SylvOps {}…", release.target_version)).into()
+            }
+            UpgradeStatus::Installed { version } => {
+                text(format!("SylvOps {version} installed successfully.")).into()
+            }
+            UpgradeStatus::RolledBack { version } => text(format!(
+                "SylvOps {version} did not pass health checks; the previous version was restored."
+            ))
+            .style(text::danger)
+            .into(),
+            UpgradeStatus::Failed { message } => text(message).style(text::danger).into(),
+            UpgradeStatus::Idle => text("No update check has run in this desktop session.")
+                .style(text::secondary)
+                .into(),
+        };
+        let periodic_label = if self.desktop_state.periodic_update_checks {
+            "Periodic checks: On"
+        } else {
+            "Periodic checks: Off"
+        };
+        column![
+            text("Application updates").font(UI_SEMIBOLD).size(16),
+            text("Checks read bounded signed GitHub release metadata. Downloads and installation always require visible actions.")
+                .style(text::secondary),
+            row![
+                button("Check now")
+                    .on_press(Message::CheckForUpdate)
+                    .style(chrome_action_style),
+                button(periodic_label)
+                    .on_press(Message::TogglePeriodicUpdateChecks)
+                    .style(chrome_action_style),
+            ]
+            .spacing(8),
+            update_details,
+        ]
+        .spacing(8)
         .into()
     }
 
@@ -1808,6 +1916,16 @@ impl DesktopApp {
                     "Delete checkout “{name}” at {canonical_path}? The checkout directory is removed without force; the Git branch is preserved."
                 ),
             ),
+            Confirmation::InstallUpdate {
+                version,
+                active_session_names,
+            } => (
+                "Stop sessions and install update",
+                format!(
+                    "Install SylvOps {version}? The following active sessions and their complete process trees will stop: {}.",
+                    active_session_names.join(", ")
+                ),
+            ),
         };
         container(
             column![
@@ -1923,6 +2041,7 @@ impl DesktopApp {
                 if let Some(state) = desktop_state {
                     self.apply_desktop_state(state);
                 }
+                self.send_request(Operation::GetUpdateStatus, ClientRequest::GetUpdateStatus);
                 self.restore_selection();
                 if self.snapshot.workspaces.is_empty() {
                     self.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
@@ -2029,12 +2148,26 @@ impl DesktopApp {
                 }
                 self.request_snapshot();
             }
+            DaemonEvent::UpgradeProgress { status } => {
+                if matches!(status, UpgradeStatus::Installing { .. })
+                    && self.install_request == InstallRequestState::Idle
+                {
+                    self.closing_since = Some(Instant::now());
+                }
+                self.update_status = status;
+            }
             _ => self.request_snapshot(),
         }
     }
 
     #[allow(clippy::too_many_lines)]
     fn handle_response(&mut self, operation: Operation, response: DaemonResponse) {
+        if matches!(operation, Operation::InstallUpdate) {
+            self.install_request = InstallRequestState::Idle;
+            if matches!(self.update_status, UpgradeStatus::Installing { .. }) {
+                self.closing_since = Some(Instant::now());
+            }
+        }
         let first_run = matches!(
             &self.modal,
             Some(Modal::Form(FormModal {
@@ -2272,6 +2405,73 @@ impl DesktopApp {
                 self.show_success("Checkout deleted; its branch was preserved.");
                 self.request_snapshot();
             }
+            (Operation::CheckForUpdate, DaemonResponse::UpdateAvailable(release)) => {
+                self.update_status = UpgradeStatus::Available {
+                    release: release.clone(),
+                };
+                self.show_success(format!("SylvOps {} is available.", release.target_version));
+            }
+            (Operation::CheckForUpdate, DaemonResponse::UpdateNotAvailable { version }) => {
+                self.update_status = UpgradeStatus::UpToDate {
+                    version: version.clone(),
+                };
+                self.show_success(format!("SylvOps {version} is up to date."));
+            }
+            (Operation::GetUpdateStatus, DaemonResponse::UpdateStatus(status)) => {
+                self.update_status = status;
+            }
+            (Operation::DownloadUpdate, DaemonResponse::UpdateStaged(release)) => {
+                self.update_status = UpgradeStatus::Staged {
+                    release: release.clone(),
+                };
+                self.show_success(format!(
+                    "SylvOps {} downloaded and verified.",
+                    release.target_version
+                ));
+            }
+            (
+                Operation::InstallUpdate,
+                DaemonResponse::UpdateInstall(InstallDisposition::Blocked { active_sessions }),
+            ) => {
+                let version = match &self.update_status {
+                    UpgradeStatus::Staged { release } => release.target_version.clone(),
+                    _ => "the staged version".into(),
+                };
+                self.modal = Some(Modal::Confirmation(Confirmation::InstallUpdate {
+                    version,
+                    active_session_names: active_sessions
+                        .into_iter()
+                        .map(|session| session.name)
+                        .collect(),
+                }));
+            }
+            (
+                Operation::InstallUpdate,
+                DaemonResponse::UpdateInstall(InstallDisposition::Prepared { version }),
+            ) => {
+                let release = match &self.update_status {
+                    UpgradeStatus::Staged { release } => release.clone(),
+                    _ => return,
+                };
+                self.update_status = UpgradeStatus::Installing { release };
+                self.show_success(format!(
+                    "SylvOps {version} is installing; the desktop will relaunch after health checks."
+                ));
+                self.closing_since = Some(Instant::now());
+            }
+            (
+                Operation::InstallUpdate,
+                DaemonResponse::UpdateInstall(InstallDisposition::Installed),
+            ) => self.show_success("Application update installed and health-checked."),
+            (
+                Operation::InstallUpdate,
+                DaemonResponse::UpdateInstall(InstallDisposition::RolledBack),
+            ) => {
+                self.error = Some(
+                    "The updated application failed its health check; the previous version was restored."
+                        .into(),
+                );
+            }
             (operation, DaemonResponse::Error(failure)) => {
                 if let Operation::Resume(session_id) = operation {
                     self.resume_pending.remove(&session_id);
@@ -2312,6 +2512,23 @@ impl DesktopApp {
 
     fn send_request(&mut self, operation: Operation, request: ClientRequest) {
         if !self.bridge.request(operation, request) {
+            self.error = Some("The desktop IPC command queue is busy. Try again.".into());
+        }
+    }
+
+    fn send_install_request(&mut self, override_active_sessions: bool) {
+        self.install_request = if self.bridge.request(
+            Operation::InstallUpdate,
+            ClientRequest::InstallUpdate {
+                override_active_sessions,
+                requesting_process_id: std::process::id(),
+            },
+        ) {
+            InstallRequestState::Pending
+        } else {
+            InstallRequestState::Idle
+        };
+        if self.install_request == InstallRequestState::Idle {
             self.error = Some("The desktop IPC command queue is busy. Try again.".into());
         }
     }
@@ -2972,6 +3189,10 @@ impl DesktopApp {
                         confirmation_token: token,
                     },
                 );
+            }
+            Confirmation::InstallUpdate { .. } => {
+                self.send_install_request(true);
+                self.modal = None;
             }
         }
     }

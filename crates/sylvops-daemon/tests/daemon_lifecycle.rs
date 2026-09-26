@@ -39,6 +39,7 @@ async fn daemon_authenticates_concurrent_clients_and_shuts_down_cleanly() {
         .expect("raw local connection");
     let invalid_hello = ClientRequest::Hello(HelloRequest {
         client_name: "untrusted-test-client".into(),
+        client_process_id: std::process::id(),
         client_version: "0".into(),
         protocol_major: PROTOCOL_MAJOR,
         protocol_minor: PROTOCOL_MINOR,
