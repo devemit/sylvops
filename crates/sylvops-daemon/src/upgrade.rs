@@ -887,21 +887,25 @@ pub enum UpgradeError {
 #[cfg(test)]
 mod tests {
     use std::{
+        net::Ipv4Addr,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use async_trait::async_trait;
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
     use sylvops_core::upgrade::{
-        InstallerKind, ReleaseArchitecture, ReleaseMetadata, ReleasePlatform, ReleaseTarget,
-        ReleaseValidationContext, SignedReleaseMetadata, UpgradeStatus,
+        InstallerKind, MAX_RELEASE_METADATA_BYTES, ReleaseArchitecture, ReleaseMetadata,
+        ReleasePlatform, ReleaseTarget, ReleaseValidationContext, ReleaseValidationError,
+        SignedReleaseMetadata, UpgradeStatus,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        ActiveUpgradeSession, HealthCheck, HealthReport, InstallDisposition, PlatformInstaller,
-        ReleaseSource, UpgradeCoordinator, UpgradeError, is_allowed_release_url,
+        ActiveUpgradeSession, HealthCheck, HealthReport, HttpReleaseSource, InstallDisposition,
+        PlatformInstaller, ReleaseSource, UpgradeCoordinator, UpgradeError, is_allowed_release_url,
     };
 
     #[test]
@@ -942,6 +946,149 @@ mod tests {
         ) -> Result<(), UpgradeError> {
             tokio::fs::write(destination, &self.payload).await?;
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct MetadataOnlySource {
+        metadata: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl ReleaseSource for MetadataOnlySource {
+        async fn metadata(&self) -> Result<Vec<u8>, UpgradeError> {
+            Ok(self.metadata.clone())
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+            _destination: &Path,
+            _maximum_bytes: u64,
+            _cancelled: &std::sync::atomic::AtomicBool,
+        ) -> Result<(), UpgradeError> {
+            panic!("release discovery must not download an upgrade payload");
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeReleaseEndpoint {
+        url: String,
+        server: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl FakeReleaseEndpoint {
+        async fn finish(mut self) {
+            let mut server = self.server.take().expect("fake release endpoint task");
+            if let Ok(joined) = tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+                joined.unwrap();
+            } else {
+                server.abort();
+                let _ = server.await;
+                panic!("fake release endpoint shutdown timed out");
+            }
+        }
+    }
+
+    impl Drop for FakeReleaseEndpoint {
+        fn drop(&mut self) {
+            if let Some(server) = &self.server {
+                server.abort();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum FakeResponseFraming {
+        ContentLength,
+        ConnectionClose,
+    }
+
+    async fn fake_release_endpoint(
+        body: Vec<u8>,
+        framing: FakeResponseFraming,
+    ) -> FakeReleaseEndpoint {
+        let listener = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .await
+        .expect("fake release endpoint bind timed out")
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("fake release endpoint accept timed out")
+                .unwrap();
+            let mut request = [0_u8; 2_048];
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut request))
+                .await
+                .expect("fake release endpoint read timed out")
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..read]).starts_with("GET /release.json HTTP/1.1")
+            );
+            let headers = match framing {
+                FakeResponseFraming::ContentLength => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ),
+                FakeResponseFraming::ConnectionClose => {
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".into()
+                }
+            };
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), stream.write_all(headers.as_bytes()))
+                    .await
+                    .expect("fake release endpoint header write timed out");
+            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(&body))
+                .await
+                .expect("fake release endpoint body write timed out");
+            let _ = tokio::time::timeout(Duration::from_secs(5), stream.shutdown())
+                .await
+                .expect("fake release endpoint shutdown timed out");
+        });
+        FakeReleaseEndpoint {
+            url: format!("http://{address}/release.json"),
+            server: Some(server),
+        }
+    }
+
+    fn test_http_source(metadata_url: String) -> HttpReleaseSource {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        HttpReleaseSource {
+            client,
+            metadata_url,
+        }
+    }
+
+    async fn assert_endpoint_validation_error(
+        body: Vec<u8>,
+        key: &SigningKey,
+        validation: ReleaseValidationContext,
+        expected: ReleaseValidationError,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let endpoint = fake_release_endpoint(body, FakeResponseFraming::ContentLength).await;
+        let coordinator = UpgradeCoordinator::new(
+            temporary.path().join("endpoint-rejection"),
+            Box::new(test_http_source(endpoint.url.clone())),
+            key.verifying_key(),
+            validation,
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(5), coordinator.check()).await;
+        endpoint.finish().await;
+        let result = result.expect("release check timed out");
+        match result {
+            Err(UpgradeError::Validation(actual)) => assert_eq!(actual, expected),
+            other => panic!("expected {expected:?}, got {other:?}"),
         }
     }
 
@@ -999,17 +1146,8 @@ mod tests {
         }
     }
 
-    fn fixture_for_current_version(
-        healthy: bool,
-        current_version: &str,
-    ) -> (
-        UpgradeCoordinator,
-        tempfile::TempDir,
-        Arc<Mutex<Vec<&'static str>>>,
-    ) {
-        let temporary = tempfile::tempdir().unwrap();
+    fn release_fixture() -> (Vec<u8>, ReleaseMetadata, SigningKey) {
         let payload = b"verified application payload".to_vec();
-        let key = SigningKey::from_bytes(&[9; 32]);
         let release = ReleaseMetadata {
             schema_version: 1,
             minimum_source_version: "0.1.0".into(),
@@ -1022,8 +1160,35 @@ mod tests {
             release_notes: "Upgrade test.".into(),
             published_at_unix_seconds: 1_800_000_000,
         };
+        (payload, release, SigningKey::from_bytes(&[9; 32]))
+    }
+
+    fn signed_metadata(release: ReleaseMetadata, key: &SigningKey) -> Vec<u8> {
         let signature = key.sign(&release.signed_bytes().unwrap()).to_bytes();
-        let metadata = serde_json::to_vec(&SignedReleaseMetadata::new(release, signature)).unwrap();
+        serde_json::to_vec(&SignedReleaseMetadata::new(release, signature)).unwrap()
+    }
+
+    fn validation_context(current_version: &str) -> ReleaseValidationContext {
+        ReleaseValidationContext {
+            current_version: current_version.into(),
+            expected_target: target(),
+            now_unix_seconds: 1_800_000_000,
+            oldest_allowed_publication: 1_799_000_000,
+            newest_seen_publication: None,
+        }
+    }
+
+    fn fixture_for_current_version(
+        healthy: bool,
+        current_version: &str,
+    ) -> (
+        UpgradeCoordinator,
+        tempfile::TempDir,
+        Arc<Mutex<Vec<&'static str>>>,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let (payload, release, key) = release_fixture();
+        let metadata = signed_metadata(release, &key);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let coordinator = UpgradeCoordinator::new_for_test(
             temporary.path().join("staging"),
@@ -1033,13 +1198,7 @@ mod tests {
                 calls: calls.clone(),
             }),
             key.verifying_key(),
-            ReleaseValidationContext {
-                current_version: current_version.into(),
-                expected_target: target(),
-                now_unix_seconds: 1_800_000_000,
-                oldest_allowed_publication: 1_799_000_000,
-                newest_seen_publication: None,
-            },
+            validation_context(current_version),
         );
         (coordinator, temporary, calls)
     }
@@ -1068,6 +1227,136 @@ mod tests {
             b"verified application payload"
         );
         assert!(!staged.payload.to_string_lossy().ends_with(".partial"));
+    }
+
+    #[tokio::test]
+    async fn check_discovers_signed_metadata_without_downloading_the_payload() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (_payload, release, key) = release_fixture();
+        let metadata = signed_metadata(release, &key);
+        let coordinator = UpgradeCoordinator::new(
+            temporary.path().join("discovery-only"),
+            Box::new(MetadataOnlySource { metadata }),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+
+        let release = coordinator.check().await.unwrap().unwrap();
+
+        assert_eq!(release.target_version, "0.2.0");
+        assert!(matches!(
+            coordinator.status().await,
+            UpgradeStatus::Available { .. }
+        ));
+        assert!(
+            !temporary
+                .path()
+                .join("discovery-only/payload.partial")
+                .exists()
+        );
+        assert!(
+            !temporary
+                .path()
+                .join("discovery-only/payload.staged")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_release_endpoint_rejects_malformed_metadata() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+
+        assert_endpoint_validation_error(
+            b"not json".to_vec(),
+            &key,
+            validation_context("0.1.0"),
+            ReleaseValidationError::Malformed,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fake_release_endpoint_rejects_oversized_metadata() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let temporary = tempfile::tempdir().unwrap();
+        let endpoint = fake_release_endpoint(
+            vec![b'x'; MAX_RELEASE_METADATA_BYTES + 1],
+            FakeResponseFraming::ConnectionClose,
+        )
+        .await;
+        let coordinator = UpgradeCoordinator::new(
+            temporary.path().join("oversized-endpoint"),
+            Box::new(test_http_source(endpoint.url.clone())),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(5), coordinator.check()).await;
+        endpoint.finish().await;
+        let result = result.expect("release check timed out");
+        assert!(matches!(
+            result,
+            Err(UpgradeError::ReleaseService(message))
+                if message == "release response exceeds its byte limit"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fake_release_endpoint_rejects_stale_metadata() {
+        let (_payload, release, key) = release_fixture();
+        let body = signed_metadata(release, &key);
+        let mut validation = validation_context("0.1.0");
+        validation.oldest_allowed_publication = 1_800_000_001;
+
+        assert_endpoint_validation_error(
+            body,
+            &key,
+            validation,
+            ReleaseValidationError::StalePublication,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fake_release_endpoint_rejects_downgrade_metadata() {
+        let (_payload, release, key) = release_fixture();
+
+        assert_endpoint_validation_error(
+            signed_metadata(release, &key),
+            &key,
+            validation_context("0.3.0"),
+            ReleaseValidationError::Downgrade,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fake_release_endpoint_rejects_wrong_target_metadata() {
+        let (_payload, release, key) = release_fixture();
+        let mut validation = validation_context("0.1.0");
+        validation.expected_target.architecture = ReleaseArchitecture::Aarch64;
+
+        assert_endpoint_validation_error(
+            signed_metadata(release, &key),
+            &key,
+            validation,
+            ReleaseValidationError::WrongTarget,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fake_release_endpoint_rejects_invalid_signature_metadata() {
+        let (_payload, release, key) = release_fixture();
+        let untrusted_key = SigningKey::from_bytes(&[8; 32]);
+
+        assert_endpoint_validation_error(
+            signed_metadata(release, &untrusted_key),
+            &key,
+            validation_context("0.1.0"),
+            ReleaseValidationError::InvalidSignature,
+        )
+        .await;
     }
 
     #[tokio::test]
