@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use sylvops_core::{
     domain::ProviderKind,
     provider::{
-        HookEndpoint, HookInstallation, LaunchContext, LaunchSpec, ProviderAdapter,
-        ProviderCapabilities, ProviderHealth, ResumeContext, provider_error,
+        HookEndpoint, HookInstallation, LaunchArguments, LaunchContext, LaunchSpec,
+        ProviderAdapter, ProviderCapabilities, ProviderHealth, ResumeContext, provider_error,
     },
 };
 use tokio::{io::AsyncReadExt, time::timeout};
@@ -147,8 +147,8 @@ impl ProviderRegistry {
         if kind == ProviderKind::Codex
             && let Some(profile) = &self.codex_profile
         {
-            spec.arguments.insert(0, OsString::from(profile));
-            spec.arguments.insert(0, OsString::from("--profile"));
+            spec.arguments
+                .prepend_persisted([OsString::from("--profile"), OsString::from(profile)]);
         }
         if kind == ProviderKind::Codex
             && let Some((endpoint, token)) = &self.hook_environment
@@ -213,7 +213,7 @@ impl ProviderAdapter for ShellAdapter {
             executable: self.executable.clone(),
             // `/D` keeps cmd.exe interactive while disabling user AutoRun entries that can
             // silently replace the daemon-supplied worktree working directory.
-            arguments,
+            arguments: LaunchArguments::persisted(arguments),
             environment: safe_environment(context.session_id, context.worktree_id, false),
         })
     }
@@ -391,9 +391,12 @@ impl ProviderAdapter for CodexAdapter {
                 OsString::from(format!("model_reasoning_effort={effort}")),
             ]);
         }
-        if let Some(prompt) = context.initial_prompt {
-            arguments.push(OsString::from(prompt));
-        }
+        let arguments = match context.initial_prompt {
+            Some(prompt) => {
+                LaunchArguments::with_transient_tail(arguments, vec![OsString::from(prompt)])
+            }
+            None => LaunchArguments::persisted(arguments),
+        };
         Ok(LaunchSpec {
             executable: self.executable()?,
             arguments,
@@ -422,7 +425,7 @@ impl ProviderAdapter for CodexAdapter {
         }
         Ok(Some(LaunchSpec {
             executable: self.executable()?,
-            arguments,
+            arguments: LaunchArguments::persisted(arguments),
             environment: safe_environment(context.session_id, context.worktree_id, true),
         }))
     }
@@ -844,9 +847,9 @@ mod tests {
             })
             .expect("shell launch specification");
         #[cfg(windows)]
-        assert_eq!(spec.arguments, vec![OsString::from("/D")]);
+        assert_eq!(spec.arguments.all(), [OsString::from("/D")]);
         #[cfg(unix)]
-        assert!(spec.arguments.is_empty());
+        assert!(spec.arguments.all().is_empty());
     }
 
     #[test]
@@ -880,13 +883,19 @@ mod tests {
                 initial_prompt: Some("fix the parser; do not invoke a shell".into()),
             })
             .expect("launch specification");
-        assert_eq!(spec.arguments[0], OsString::from("--cd"));
-        assert_eq!(spec.arguments[1], worktree.into_os_string());
-        assert_eq!(spec.arguments[2], OsString::from("--model"));
-        assert_eq!(spec.arguments[3], OsString::from("gpt-test"));
+        assert_eq!(spec.arguments.all()[0], OsString::from("--cd"));
+        assert_eq!(spec.arguments.all()[1], worktree.into_os_string());
+        assert_eq!(spec.arguments.all()[2], OsString::from("--model"));
+        assert_eq!(spec.arguments.all()[3], OsString::from("gpt-test"));
         assert_eq!(
-            spec.arguments.last(),
+            spec.arguments.all().last(),
             Some(&OsString::from("fix the parser; do not invoke a shell"))
+        );
+        assert!(
+            !spec
+                .arguments
+                .persisted_values()
+                .contains(&OsString::from("fix the parser; do not invoke a shell"))
         );
     }
 

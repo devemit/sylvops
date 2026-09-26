@@ -2,12 +2,15 @@
 
 use std::{ffi::OsString, path::Path, process::Command, time::Duration};
 
+use rusqlite::OptionalExtension;
 use sylvops_core::{
     domain::{ProviderKind, Session, SessionState},
     ids::{SessionId, WorktreeId},
     protocol::{ClientRequest, DaemonResponse},
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
+
+const PROMPT_SENTINEL: &str = "SYLVOPS_PRIVATE_PROMPT_25_7f8cbfea";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
@@ -30,8 +33,11 @@ async fn fake_codex_hooks_attention_and_resume() {
 
     let paths = RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("paths");
     let daemon_paths = paths.clone();
-    let daemon_task = tokio::spawn(async move { daemon::run(daemon_paths).await });
-    let client = connect_eventually(&paths).await;
+    let mut daemon_task = tokio::spawn(async move { daemon::run(daemon_paths).await });
+    let client = tokio::select! {
+        result = &mut daemon_task => panic!("daemon exited before connection: {result:?}"),
+        client = connect_eventually(&paths) => client,
+    };
 
     let workspace_id = match client
         .request(&ClientRequest::AddWorkspace {
@@ -122,6 +128,35 @@ async fn fake_codex_hooks_attention_and_resume() {
         .expect("daemon shutdown timeout")
         .expect("daemon task")
         .expect("daemon result");
+
+    let restart_paths = paths.clone();
+    let mut restart_task = tokio::spawn(async move { daemon::run(restart_paths).await });
+    let restarted = tokio::select! {
+        result = &mut restart_task => panic!("restarted daemon exited before connection: {result:?}"),
+        client = connect_eventually(&paths) => client,
+    };
+    let snapshot = match restarted
+        .request(&ClientRequest::GetSnapshot)
+        .await
+        .expect("restart snapshot response")
+    {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => panic!("unexpected restart response: {response:?}"),
+    };
+    assert!(snapshot.sessions.iter().any(|session| {
+        session.id == source_session_id
+            && session.external_session_id.as_deref() == Some(external_id.as_str())
+    }));
+    restarted
+        .request(&ClientRequest::ShutdownDaemon)
+        .await
+        .expect("restart shutdown response");
+    tokio::time::timeout(Duration::from_secs(10), restart_task)
+        .await
+        .expect("restart daemon shutdown timeout")
+        .expect("restart daemon task")
+        .expect("restart daemon result");
+    assert_no_persisted_text_contains(&paths.database, PROMPT_SENTINEL);
 }
 
 async fn create_codex_session(client: &DaemonClient, worktree_id: WorktreeId) -> SessionId {
@@ -132,7 +167,7 @@ async fn create_codex_session(client: &DaemonClient, worktree_id: WorktreeId) ->
             display_name: Some("fake Codex".into()),
             model: Some("fake-model".into()),
             effort: Some("high".into()),
-            initial_prompt: Some("exercise hooks".into()),
+            initial_prompt: Some(PROMPT_SENTINEL.into()),
             columns: 80,
             rows: 24,
         })
@@ -142,6 +177,50 @@ async fn create_codex_session(client: &DaemonClient, worktree_id: WorktreeId) ->
         DaemonResponse::SessionCreated { session, .. } => session.id,
         response => panic!("unexpected session response: {response:?}"),
     }
+}
+
+fn assert_no_persisted_text_contains(path: &Path, sentinel: &str) {
+    let connection = rusqlite::Connection::open(path).expect("open persisted database");
+    let tables = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .expect("prepare table query")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query tables")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect tables");
+
+    for table in tables {
+        let quoted_table = quote_identifier(&table);
+        let columns = connection
+            .prepare(&format!("PRAGMA table_info({quoted_table})"))
+            .expect("prepare column query")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect columns");
+        for column in columns {
+            let quoted_column = quote_identifier(&column);
+            let query = format!(
+                "SELECT {quoted_column} FROM {quoted_table} \
+                 WHERE typeof({quoted_column}) = 'text' AND instr({quoted_column}, ?1) > 0"
+            );
+            let found = connection
+                .query_row(&query, [sentinel], |row| row.get::<_, String>(0))
+                .optional()
+                .expect("scan persisted text");
+            assert!(
+                found.is_none(),
+                "prompt sentinel persisted in {table}.{column}"
+            );
+        }
+    }
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 async fn attach(client: &DaemonClient, session_id: SessionId) {

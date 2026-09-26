@@ -3807,6 +3807,7 @@ dependencies = [
 name = "sylvops-test-support"
 version = "0.1.0-beta.1"
 dependencies = [
+ "rusqlite",
  "serde_json",
  "sylvops-core",
  "sylvops-daemon",
