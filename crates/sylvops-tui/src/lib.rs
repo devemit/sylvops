@@ -30,6 +30,7 @@ use sylvops_core::{
         MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS,
     },
     ui::{MainTab, TuiState},
+    upgrade::UpgradeStatus,
 };
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
 use terminal::{AttachedTerminal, encode_key, is_detach_key};
@@ -124,6 +125,9 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                         attached.rows = rows;
                     }
                 }
+                Ok(DaemonEvent::UpgradeProgress {
+                    status: UpgradeStatus::Installing { .. },
+                }) => return Ok(TuiExit::Quit),
                 Ok(_) => refresh = true,
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
                     refresh = true;

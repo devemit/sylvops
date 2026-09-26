@@ -25,12 +25,13 @@ run_with_timeout() {
 }
 
 usage() {
-  echo "usage: $0 --dmg <path> --architecture <x86_64|aarch64> --expected-version <version> [--require-developer-id] [--require-notarization]" >&2
+  echo "usage: $0 --dmg <path> --architecture <x86_64|aarch64> --expected-version <version> [--previous-dmg <path>] [--require-developer-id] [--require-notarization]" >&2
 }
 
 dmg_path=""
 architecture=""
 expected_version=""
+previous_dmg=""
 require_developer_id=false
 require_notarization=false
 
@@ -46,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --expected-version)
       expected_version="${2:-}"
+      shift 2
+      ;;
+    --previous-dmg)
+      previous_dmg="${2:-}"
       shift 2
       ;;
     --require-developer-id)
@@ -83,15 +88,22 @@ if [[ -z "$expected_version" ]]; then
   echo "An expected application version is required." >&2
   exit 1
 fi
+if [[ -n "$previous_dmg" && ( ! -f "$previous_dmg" || ! -s "$previous_dmg" ) ]]; then
+  echo "The previous DMG is missing or empty: $previous_dmg" >&2
+  exit 1
+fi
 
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/sylvops-macos-package.XXXXXX")"
 mount_dir="$test_root/mounted"
+previous_mount_dir="$test_root/previous-mounted"
 install_dir="$test_root/Applications"
 installed_app="$install_dir/SylvOps.app"
+rollback_app="$test_root/SylvOps.rollback.app"
 state_root="$test_root/state"
 repository_dir="$test_root/repository"
 worktree_dir="$test_root/worktree"
 mounted=false
+previous_mounted=false
 
 desktop_pattern=""
 cleanup() {
@@ -103,11 +115,14 @@ cleanup() {
   if $mounted; then
     run_with_timeout 120 hdiutil detach "$mount_dir" -force >/dev/null 2>&1 || true
   fi
+  if $previous_mounted; then
+    run_with_timeout 120 hdiutil detach "$previous_mount_dir" -force >/dev/null 2>&1 || true
+  fi
   rm -rf "$test_root"
 }
 trap cleanup EXIT
 
-mkdir -p "$mount_dir" "$install_dir" "$state_root"
+mkdir -p "$mount_dir" "$previous_mount_dir" "$install_dir" "$state_root"
 state_sentinel="$state_root/package-preserve.txt"
 printf '%s\n' "preserve SylvOps state" > "$state_sentinel"
 
@@ -124,6 +139,21 @@ run_with_timeout 120 codesign --verify --verbose=2 "$dmg_path"
 if $require_notarization; then
   run_with_timeout 120 xcrun stapler validate "$dmg_path"
   run_with_timeout 120 spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
+fi
+
+if [[ -n "$previous_dmg" ]]; then
+  run_with_timeout 120 codesign --verify --verbose=2 "$previous_dmg"
+  run_with_timeout 120 hdiutil attach "$previous_dmg" -nobrowse -readonly -mountpoint "$previous_mount_dir" >/dev/null
+  previous_mounted=true
+  [[ -d "$previous_mount_dir/SylvOps.app" ]] || { echo "The previous DMG has no SylvOps.app." >&2; exit 1; }
+  run_with_timeout 120 ditto "$previous_mount_dir/SylvOps.app" "$installed_app"
+  previous_binary="$installed_app/Contents/MacOS/sylvops"
+  previous_version="$(run_with_timeout 30 "$previous_binary" --version)"
+  [[ "$previous_version" == sylvops\ * && "$previous_version" != "sylvops $expected_version" ]] || { echo "Previous macOS version is invalid: $previous_version" >&2; exit 1; }
+  run_with_timeout 120 ditto "$installed_app" "$rollback_app"
+  run_with_timeout 120 hdiutil detach "$previous_mount_dir" >/dev/null
+  previous_mounted=false
+  rm -rf "$installed_app"
 fi
 
 run_with_timeout 120 hdiutil attach "$dmg_path" -nobrowse -readonly -mountpoint "$mount_dir" >/dev/null
@@ -192,6 +222,15 @@ while IFS= read -r desktop_pid; do
 done < <(run_with_timeout 10 pgrep -f -x "$desktop_pattern" 2>/dev/null || true)
 desktop_pattern=""
 
+if [[ -n "$previous_dmg" ]]; then
+  rm -rf "$installed_app"
+  run_with_timeout 120 ditto "$rollback_app" "$installed_app"
+  [[ "$(run_with_timeout 30 "$installed_binary" --version)" == "$previous_version" ]]
+  rm -rf "$installed_app"
+  run_with_timeout 120 ditto "$mount_dir/SylvOps.app" "$installed_app"
+  [[ "$(run_with_timeout 30 "$installed_binary" --version)" == "sylvops $expected_version" ]]
+fi
+
 rm -rf "$installed_app"
 [[ ! -e "$installed_app" ]] || { echo "Removing the application bundle failed." >&2; exit 1; }
 [[ -f "$state_sentinel" ]] || { echo "Removing the app deleted SylvOps state." >&2; exit 1; }
@@ -199,4 +238,4 @@ rm -rf "$installed_app"
 [[ -f "$worktree_dir/package-preserve.txt" ]] || { echo "Removing the app deleted worktree content." >&2; exit 1; }
 run_with_timeout 30 git -C "$repository_dir" show-ref --verify --quiet refs/heads/macos-package-smoke-branch
 
-echo "[ok] signed macOS $architecture app installed, launched, and was removed without deleting user content"
+echo "[ok] signed macOS $architecture app installed, upgraded, rolled back when applicable, and was removed without deleting user content"

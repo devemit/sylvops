@@ -18,6 +18,7 @@ use sylvops_core::{
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
 };
+use sylvops_daemon::data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan};
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
 use tracing_subscriber::EnvFilter;
 
@@ -96,9 +97,25 @@ enum Command {
     },
     /// Run redacted installation, daemon, Git, provider, and PTY checks.
     Doctor,
+    /// Check, download, and apply signed application upgrades.
+    Update {
+        #[command(subcommand)]
+        command: UpdateCommand,
+    },
+    /// Manage SylvOps-owned user data separately from application uninstall.
+    Data {
+        #[command(subcommand)]
+        command: DataCommand,
+    },
     /// Internal native desktop process entry point.
     #[command(hide = true)]
     Desktop,
+    /// Internal detached native package helper.
+    #[command(hide = true)]
+    UpdateHelper {
+        #[arg(long)]
+        handoff: PathBuf,
+    },
     #[command(hide = true)]
     Hook {
         #[command(subcommand)]
@@ -184,6 +201,33 @@ enum SessionCommand {
 enum ProviderCommand {
     List,
     Probe { provider: ProviderKind },
+}
+
+#[derive(Debug, Subcommand)]
+enum UpdateCommand {
+    /// Check signed release metadata without downloading anything.
+    Check,
+    /// Download and verify the currently available upgrade into staging.
+    Download,
+    /// Show daemon-owned upgrade state.
+    Status,
+    /// Cancel an in-progress download.
+    Cancel,
+    /// Apply the staged upgrade, optionally stopping the named active sessions.
+    Install {
+        #[arg(long)]
+        override_active_sessions: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DataCommand {
+    /// Permanently remove `SylvOps` configuration, preferences, logs, and session metadata.
+    Remove {
+        /// Must exactly equal "DELETE SYLVOPS USER DATA".
+        #[arg(long)]
+        confirm: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -327,6 +371,13 @@ async fn run_command(
             .await?;
         }
         Command::Doctor => doctor(&paths).await?,
+        Command::Update { command } => update_application(&paths, command).await?,
+        Command::Data {
+            command: DataCommand::Remove { confirm },
+        } => remove_user_data(&paths, &confirm).await?,
+        Command::UpdateHelper { handoff } => {
+            sylvops_daemon::native_upgrade::run(&handoff).await?;
+        }
         Command::Desktop => unreachable!("desktop mode is handled before starting Tokio"),
         Command::Hook {
             command: HookCommand::Emit,
@@ -929,6 +980,102 @@ async fn doctor(paths: &RuntimePaths) -> sylvops_daemon::Result<()> {
     Ok(())
 }
 
+async fn update_application(
+    paths: &RuntimePaths,
+    command: UpdateCommand,
+) -> sylvops_daemon::Result<()> {
+    let client = DaemonClient::connect(paths, "sylvops-update").await?;
+    let request = match command {
+        UpdateCommand::Check => ClientRequest::CheckForUpdate,
+        UpdateCommand::Download => ClientRequest::DownloadUpdate,
+        UpdateCommand::Status => ClientRequest::GetUpdateStatus,
+        UpdateCommand::Cancel => ClientRequest::CancelUpdateDownload,
+        UpdateCommand::Install {
+            override_active_sessions,
+        } => ClientRequest::InstallUpdate {
+            override_active_sessions,
+            requesting_process_id: std::process::id(),
+        },
+    };
+    match client.request(&request).await? {
+        DaemonResponse::UpdateNotAvailable { version } => {
+            println!("SylvOps {version} is up to date");
+            Ok(())
+        }
+        DaemonResponse::UpdateAvailable(release) | DaemonResponse::UpdateStaged(release) => {
+            println!(
+                "SylvOps {} for {:?} ({} bytes)\n{}\n{}",
+                release.target_version,
+                release.target,
+                release.byte_length,
+                release.release_notes,
+                release.release_notes_url
+            );
+            Ok(())
+        }
+        DaemonResponse::UpdateStatus(status) => {
+            println!("{status:#?}");
+            Ok(())
+        }
+        DaemonResponse::UpdateInstall(disposition) => {
+            println!("{disposition:#?}");
+            Ok(())
+        }
+        DaemonResponse::Acknowledged => {
+            println!("Upgrade download cancellation requested");
+            Ok(())
+        }
+        response => unexpected("application update", response),
+    }
+}
+
+async fn remove_user_data(paths: &RuntimePaths, confirmation: &str) -> sylvops_daemon::Result<()> {
+    if confirmation != DATA_REMOVAL_CONFIRMATION {
+        return Err(DaemonError::DataRemoval(
+            sylvops_daemon::data_removal::DataRemovalError::ConfirmationRequired,
+        ));
+    }
+    let client = DaemonClient::connect(paths, "sylvops-data-removal").await?;
+    let snapshot = match client.request(&ClientRequest::GetSnapshot).await? {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => return unexpected("data-removal snapshot", response),
+    };
+    let protected_paths = snapshot
+        .projects
+        .iter()
+        .map(|project| PathBuf::from(&project.canonical_repository_path))
+        .chain(
+            snapshot
+                .worktrees
+                .iter()
+                .map(|worktree| PathBuf::from(&worktree.canonical_path)),
+        )
+        .collect::<Vec<_>>();
+    match client
+        .request(&ClientRequest::PrepareDataRemoval {
+            confirmation: confirmation.into(),
+        })
+        .await?
+    {
+        DaemonResponse::DataRemovalPrepared => {}
+        response => return unexpected("data-removal preparation", response),
+    }
+    let plan = DataRemovalPlan::prepare(paths, confirmation, &protected_paths)?;
+    drop(client);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while paths.authentication_token.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if paths.authentication_token.exists() {
+        return Err(DaemonError::Lifecycle(
+            "daemon did not stop before user-data removal".into(),
+        ));
+    }
+    plan.execute().await?;
+    println!("Removed SylvOps user data. Repositories, worktrees, and branches were preserved.");
+    Ok(())
+}
+
 async fn run_tui(paths: &RuntimePaths, state_dir: Option<&Path>) -> sylvops_daemon::Result<()> {
     if DaemonClient::connect(paths, "sylvops-tui-probe")
         .await
@@ -1079,6 +1226,9 @@ async fn attach_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_
                     if initially_finished && last_sequence >= replay_through_sequence { break; }
                 }
                 Ok(DaemonEvent::SessionExited { session_id: id, .. }) if id == session_id => break,
+                Ok(DaemonEvent::UpgradeProgress {
+                    status: sylvops_core::upgrade::UpgradeStatus::Installing { .. },
+                }) => break,
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     let (columns, rows) = bounded_terminal_size();

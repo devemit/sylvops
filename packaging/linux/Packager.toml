@@ -19,7 +19,7 @@ icons = ["packaging/icons/sylvops.png"]
 generate-desktop-entry = true
 
 [deb]
-depends = ["libc6", "libgcc-s1", "libx11-6", "libxkbcommon0", "libxkbcommon-x11-0", "libwayland-client0", "libegl1", "libgl1", "libvulkan1"]
+depends = ["libc6", "libgcc-s1", "libx11-6", "libxkbcommon0", "libxkbcommon-x11-0", "libwayland-client0", "libegl1", "libgl1", "libvulkan1", "dpkg-repack", "policykit-1"]
 desktop-template = "packaging/linux/sylvops.desktop.hbs"
 section = "devel"
 priority = "optional"

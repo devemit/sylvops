@@ -89,7 +89,7 @@ jobs:
           test "$(sylvops --version)" = "sylvops $(awk '/^\[workspace.package\]/{workspace_package=1; next} workspace_package && /^version = /{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"
           timeout --signal=TERM --kill-after=5 120 sudo --non-interactive dpkg --remove sylvops
       - name: Install desktop smoke test dependencies
-        run: timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes xvfb x11-utils libgtk-3-bin desktop-file-utils
+        run: timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes xvfb x11-utils libgtk-3-bin desktop-file-utils libfuse2 libxdo3
       - name: Install, launch, verify, and remove
         run: |
           expected_version="$(awk '/^\[workspace.package\]/{workspace_package=1; next} workspace_package && /^version = /{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"

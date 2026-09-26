@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 7;
+pub const PROTOCOL_MINOR: u16 = 8;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -318,6 +318,7 @@ pub enum PhaseZeroResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HelloRequest {
     pub client_name: String,
+    pub client_process_id: u32,
     pub client_version: String,
     pub protocol_major: u16,
     pub protocol_minor: u16,
@@ -430,6 +431,21 @@ pub enum ClientRequest {
         session_id: SessionId,
         name: String,
     },
+    CheckForUpdate,
+    DownloadUpdate,
+    CancelUpdateDownload,
+    InstallUpdate {
+        override_active_sessions: bool,
+        requesting_process_id: u32,
+    },
+    FinalizeUpdate {
+        version: String,
+        outcome: crate::upgrade::NativeUpgradeOutcome,
+    },
+    GetUpdateStatus,
+    PrepareDataRemoval {
+        confirmation: String,
+    },
     GetDiff {
         worktree_id: WorktreeId,
     },
@@ -496,6 +512,14 @@ pub enum DaemonResponse {
         revision: u64,
         session: Session,
     },
+    UpdateNotAvailable {
+        version: String,
+    },
+    UpdateAvailable(crate::upgrade::ReleaseMetadata),
+    UpdateStaged(crate::upgrade::ReleaseMetadata),
+    UpdateStatus(crate::upgrade::UpgradeStatus),
+    UpdateInstall(crate::upgrade::InstallDisposition),
+    DataRemovalPrepared,
     Attached {
         session: Session,
         role: AttachmentRole,
@@ -549,6 +573,9 @@ pub enum DaemonEvent {
     SessionUpdated {
         revision: u64,
         session: Session,
+    },
+    UpgradeProgress {
+        status: crate::upgrade::UpgradeStatus,
     },
     ProviderHealthChanged {
         health: ProviderHealth,
@@ -683,7 +710,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 7);
+        assert_eq!(PROTOCOL_MINOR, 8);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),

@@ -18,6 +18,14 @@ On macOS, download `sylvops-macos-x86_64.dmg` for an Intel Mac or `sylvops-macos
 
 On Linux x86_64, download either `sylvops-linux-x86_64.deb` for normal Debian-family installation or `sylvops-linux-x86_64.AppImage` as a portable fallback, then verify it against `SHA256SUMS`. Install the Debian package with `sudo apt install ./sylvops-linux-x86_64.deb`; it provides the shared SylvOps name, icon, desktop entry, AppStream metadata, and `sylvops` CLI. Remove it with `sudo apt remove sylvops`. Package removal deletes application integration while preserving SylvOps state, repositories, worktrees, and branches. The AppImage requires `chmod +x sylvops-linux-x86_64.AppImage` before launch and does not install files or desktop integration.
 
+The desktop Settings panel can check signed release metadata, show the target version, size, and notes, download a verified package, and install only after a visible confirmation. Periodic checks default to a bounded 24-hour interval and can be disabled. Installation defers while agent sessions are active; the override confirmation names every session whose process tree will stop. The same controls are available as `sylvops update check`, `download`, `status`, `cancel`, and `install --override-active-sessions`.
+
+Git is a separate prerequisite and must already be installed and discoverable by the operating system. Codex is optional and separately discovered: install the Codex CLI and complete its login using OpenAI's own instructions before selecting the Codex provider. SylvOps does not install either tool, run login commands, copy credentials, or store provider secrets. Use `sylvops doctor` and `sylvops provider probe codex` to distinguish a missing executable from an authentication problem.
+
+If an installed upgrade fails its bounded version, protocol, database, executable, or platform-signature health check, SylvOps restores the previous package once and relaunches that version. Run `sylvops update status` to confirm the rollback, then `sylvops doctor` for redacted diagnostics before retrying. Persistent failures should be reported with the version, platform, status, and redacted daemon log; never attach credentials or unredacted environment output. A portable archive remains available as a recovery path if normal package repair is unavailable.
+
+Normal uninstall never removes user data. To deliberately remove configuration, preferences, logs, SQLite session metadata, and staged upgrades, first uninstall or stop SylvOps, then run `sylvops data remove --confirm "DELETE SYLVOPS USER DATA"`. The command revalidates application-owned paths immediately before deletion and refuses to remove registered repositories or worktrees. On Windows data lives below `%LOCALAPPDATA%\SylvOps` and `%APPDATA%\SylvOps`; on macOS and Linux it follows the platform data/config directories (`~/Library` or XDG defaults). Run `sylvops doctor` for redacted installation, daemon, Git, provider, and PTY diagnostics.
+
 Portable archives remain available on every platform as an advanced and recovery fallback. After extracting one and placing the binary on `PATH`, run this inside a Git repository:
 
 ```text
@@ -96,6 +104,13 @@ sylvops up .
 sylvops open .
 sylvops open . --provider codex --prompt "..."
 sylvops doctor
+sylvops update check
+sylvops update download
+sylvops update status
+sylvops update cancel
+sylvops update install
+sylvops update install --override-active-sessions
+sylvops data remove --confirm "DELETE SYLVOPS USER DATA"
 sylvops daemon start
 sylvops daemon status
 sylvops workspace add my-workspace

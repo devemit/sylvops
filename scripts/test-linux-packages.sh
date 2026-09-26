@@ -9,17 +9,21 @@ run_with_timeout() {
 }
 
 usage() {
-  echo "usage: $0 --appimage <path> --deb <path> --expected-version <version>" >&2
+  echo "usage: $0 --appimage <path> --deb <path> --expected-version <version> [--previous-appimage <path> --previous-deb <path>]" >&2
 }
 
 appimage=""
 deb=""
 expected_version=""
+previous_appimage=""
+previous_deb=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --appimage) appimage="${2:-}"; shift 2 ;;
     --deb) deb="${2:-}"; shift 2 ;;
     --expected-version) expected_version="${2:-}"; shift 2 ;;
+    --previous-appimage) previous_appimage="${2:-}"; shift 2 ;;
+    --previous-deb) previous_deb="${2:-}"; shift 2 ;;
     *) usage; exit 2 ;;
   esac
 done
@@ -30,6 +34,12 @@ appimage="$(run_with_timeout 10 realpath -- "$appimage")"
 deb="$(run_with_timeout 10 realpath -- "$deb")"
 [[ -f "$appimage" && -x "$appimage" ]] || { echo "Resolved AppImage is missing, not regular, or not executable: $appimage" >&2; exit 1; }
 [[ -f "$deb" && -s "$deb" ]] || { echo "Resolved deb package is missing, not regular, or empty: $deb" >&2; exit 1; }
+if [[ -n "$previous_appimage" || -n "$previous_deb" ]]; then
+  previous_appimage="$(run_with_timeout 10 realpath -- "$previous_appimage")"
+  previous_deb="$(run_with_timeout 10 realpath -- "$previous_deb")"
+  [[ -f "$previous_appimage" && -x "$previous_appimage" ]] || { echo "Resolved previous AppImage is missing, not regular, or not executable: $previous_appimage" >&2; exit 1; }
+  [[ -f "$previous_deb" && -s "$previous_deb" ]] || { echo "Resolved previous deb package is missing, not regular, or empty: $previous_deb" >&2; exit 1; }
+fi
 
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/sylvops-linux-package.XXXXXX")"
 state_root="$test_root/state"
@@ -176,8 +186,28 @@ until run_with_timeout 3 xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; do
   sleep 1
 done
 
-appimage_version="$(APPIMAGE_EXTRACT_AND_RUN=1 run_with_timeout 60 "$appimage" --version)"
+installed_appimage="$test_root/SylvOps.AppImage"
+if [[ -n "$previous_appimage" ]]; then
+  run_with_timeout 15 cp "$previous_appimage" "$installed_appimage"
+  chmod 755 "$installed_appimage"
+  previous_appimage_version="$(APPIMAGE_EXTRACT_AND_RUN=1 run_with_timeout 60 "$installed_appimage" --version)"
+  [[ "$previous_appimage_version" == sylvops\ * && "$previous_appimage_version" != "sylvops $expected_version" ]] || { echo "Previous AppImage version is invalid: $previous_appimage_version" >&2; exit 1; }
+  run_with_timeout 15 cp "$installed_appimage" "$test_root/SylvOps.AppImage.rollback"
+fi
+run_with_timeout 15 cp "$appimage" "$test_root/SylvOps.AppImage.new"
+chmod 755 "$test_root/SylvOps.AppImage.new"
+run_with_timeout 15 mv -f "$test_root/SylvOps.AppImage.new" "$installed_appimage"
+appimage_version="$(APPIMAGE_EXTRACT_AND_RUN=1 run_with_timeout 60 "$installed_appimage" --version)"
 [[ "$appimage_version" == "sylvops $expected_version" ]] || { echo "Unexpected AppImage version: $appimage_version" >&2; exit 1; }
+if [[ -n "$previous_appimage" ]]; then
+  run_with_timeout 15 cp "$test_root/SylvOps.AppImage.rollback" "$installed_appimage"
+  chmod 755 "$installed_appimage"
+  [[ "$(APPIMAGE_EXTRACT_AND_RUN=1 run_with_timeout 60 "$installed_appimage" --version)" == "$previous_appimage_version" ]]
+  run_with_timeout 15 cp "$appimage" "$test_root/SylvOps.AppImage.new"
+  chmod 755 "$test_root/SylvOps.AppImage.new"
+  run_with_timeout 15 mv -f "$test_root/SylvOps.AppImage.new" "$installed_appimage"
+  [[ "$(APPIMAGE_EXTRACT_AND_RUN=1 run_with_timeout 60 "$installed_appimage" --version)" == "sylvops $expected_version" ]]
+fi
 (
   cd "$test_root"
   run_with_timeout 120 "$appimage" --appimage-extract >/dev/null
@@ -213,6 +243,11 @@ deb_info="$(run_with_timeout 30 dpkg-deb --info "$deb")"
 deb_contents="$(run_with_timeout 30 dpkg-deb --contents "$deb")"
 [[ "$deb_contents" == *'usr/share/applications/sylvops.desktop'* ]]
 [[ "$deb_contents" == *'usr/share/metainfo/com.devemit.sylvops.metainfo.xml'* ]]
+if [[ -n "$previous_deb" ]]; then
+  run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$previous_deb"
+  previous_deb_version="$(run_with_timeout 30 sylvops --version)"
+  [[ "$previous_deb_version" == sylvops\ * && "$previous_deb_version" != "sylvops $expected_version" ]] || { echo "Previous deb version is invalid: $previous_deb_version" >&2; exit 1; }
+fi
 run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$deb"
 [[ "$(run_with_timeout 30 sylvops --version)" == "sylvops $expected_version" ]]
 ldd_output="$(run_with_timeout 30 ldd /usr/bin/sylvops)"
@@ -233,6 +268,12 @@ run_with_timeout 10 cmp --silent "$appimage_icon" "$installed_icon"
 run_with_timeout 15 desktop-file-validate /usr/share/applications/sylvops.desktop
 
 launch_and_verify installed "The installed Debian desktop entry"
+if [[ -n "$previous_deb" ]]; then
+  run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes --allow-downgrades "$previous_deb"
+  [[ "$(run_with_timeout 30 sylvops --version)" == "$previous_deb_version" ]]
+  run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$deb"
+  [[ "$(run_with_timeout 30 sylvops --version)" == "sylvops $expected_version" ]]
+fi
 run_with_timeout 120 sudo --non-interactive dpkg --remove sylvops
 
 while IFS= read -r installed_path; do
@@ -246,4 +287,4 @@ done < "$test_root/deb-installed-files.txt"
 [[ -d "$repository/.git" ]]
 [[ -f "$worktree/package-preserve.txt" ]]
 run_with_timeout 30 git -C "$repository" show-ref --verify --quiet refs/heads/linux-package-smoke-branch
-echo "[ok] AppImage and deb metadata, launch, daemon, and data-preserving removal verified"
+echo "[ok] AppImage and deb metadata, launch, upgrade rollback, and data-preserving removal verified"

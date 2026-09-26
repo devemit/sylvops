@@ -305,7 +305,7 @@ fn create_pipe_server(
     name: &str,
     first: bool,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-    use std::{ffi::c_void, mem::size_of, ptr};
+    use std::{ffi::c_void, fmt::Write as _, mem::size_of, ptr};
 
     use windows_sys::Win32::{
         Foundation::LocalFree,
@@ -330,10 +330,20 @@ fn create_pipe_server(
     // tokens Windows may otherwise select the deny-only Administrators group as the object's
     // default owner. Use the concrete duplex-pipe mask instead of generic rights: READ_CONTROL,
     // SYNCHRONIZE, and the data/attribute rights requested by Tokio's read/write client handle.
-    let sddl: Vec<u16> = format!("O:{user_sid}G:{user_sid}D:P(A;;0x0012019f;;;{user_sid})")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let mut restricted_aces = String::new();
+    for sid in current_process_restricted_sids()? {
+        write!(&mut restricted_aces, "(A;;0x0012019f;;;{sid})")
+            .expect("writing to a String cannot fail");
+    }
+    if let Some(sid) = current_process_app_container_sid()? {
+        write!(&mut restricted_aces, "(A;;0x0012019f;;;{sid})")
+            .expect("writing to a String cannot fail");
+    }
+    let sddl: Vec<u16> =
+        format!("O:{user_sid}G:{user_sid}D:P(A;;0x0012019f;;;{user_sid}){restricted_aces}")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated; `descriptor` is a valid output pointer. On success the
     // returned descriptor is owned by LocalAlloc and released with LocalFree below.
@@ -436,6 +446,158 @@ fn current_process_user_sid() -> Result<String> {
     })();
 
     // SAFETY: `token` is the valid handle returned by OpenProcessToken and is closed once.
+    let _ = unsafe { CloseHandle(token) };
+    result
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn current_process_app_container_sid() -> Result<Option<String>> {
+    use std::ptr;
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, LocalFree},
+        Security::{
+            Authorization::ConvertSidToStringSidW, GetTokenInformation,
+            TOKEN_APPCONTAINER_INFORMATION, TOKEN_QUERY, TokenAppContainerSid,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token = ptr::null_mut();
+    // SAFETY: the pseudo process handle is valid and `token` is a valid output pointer.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(DaemonError::Ipc(io::Error::last_os_error()));
+    }
+    let result = (|| {
+        let mut information = TOKEN_APPCONTAINER_INFORMATION::default();
+        let mut returned = 0_u32;
+        // SAFETY: `information` is a correctly sized writable output structure for this class.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenAppContainerSid,
+                (&raw mut information).cast(),
+                u32::try_from(std::mem::size_of::<TOKEN_APPCONTAINER_INFORMATION>())
+                    .expect("app container token structure size fits u32"),
+                &raw mut returned,
+            )
+        } == 0
+        {
+            return Err(DaemonError::Ipc(io::Error::last_os_error()));
+        }
+        if information.TokenAppContainer.is_null() {
+            return Ok(None);
+        }
+        let mut string_sid = ptr::null_mut();
+        // SAFETY: the token owns a valid AppContainer SID and Windows allocates the output.
+        if unsafe { ConvertSidToStringSidW(information.TokenAppContainer, &raw mut string_sid) }
+            == 0
+        {
+            return Err(DaemonError::Ipc(io::Error::last_os_error()));
+        }
+        let mut length = 0_usize;
+        // SAFETY: `string_sid` is a valid NUL-terminated UTF-16 allocation.
+        while unsafe { *string_sid.add(length) } != 0 {
+            length += 1;
+        }
+        // SAFETY: `length` was obtained by scanning within the NUL-terminated allocation.
+        let units = unsafe { std::slice::from_raw_parts(string_sid, length) };
+        let sid = String::from_utf16(units)
+            .map_err(|error| DaemonError::Ipc(io::Error::new(io::ErrorKind::InvalidData, error)));
+        // SAFETY: the string was allocated by `ConvertSidToStringSidW` and is released once.
+        let _ = unsafe { LocalFree(string_sid.cast()) };
+        sid.map(Some)
+    })();
+    // SAFETY: `token` is the valid handle returned by `OpenProcessToken` and is closed once.
+    let _ = unsafe { CloseHandle(token) };
+    result
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn current_process_restricted_sids() -> Result<Vec<String>> {
+    use std::{mem::size_of, ptr, slice};
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, LocalFree},
+        Security::{
+            Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_GROUPS, TOKEN_QUERY,
+            TokenRestrictedSids,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token = ptr::null_mut();
+    // SAFETY: the pseudo process handle is valid and `token` is a valid output pointer.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(DaemonError::Ipc(io::Error::last_os_error()));
+    }
+    let result = (|| {
+        let mut required = 0_u32;
+        // SAFETY: a null buffer with length zero is the documented size-query form.
+        let _ = unsafe {
+            GetTokenInformation(
+                token,
+                TokenRestrictedSids,
+                ptr::null_mut(),
+                0,
+                &raw mut required,
+            )
+        };
+        if required < u32::try_from(size_of::<TOKEN_GROUPS>()).expect("TOKEN_GROUPS size fits u32")
+        {
+            return Ok(Vec::new());
+        }
+        let words = usize::try_from(required)
+            .expect("restricted SID information length fits usize")
+            .div_ceil(size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        // SAFETY: the word-aligned buffer has at least `required` writable bytes.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenRestrictedSids,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &raw mut required,
+            )
+        } == 0
+        {
+            return Err(DaemonError::Ipc(io::Error::last_os_error()));
+        }
+        // SAFETY: successful information begins with TOKEN_GROUPS and contains GroupCount entries.
+        let groups = unsafe { &*buffer.as_ptr().cast::<TOKEN_GROUPS>() };
+        let entries = unsafe {
+            slice::from_raw_parts(
+                groups.Groups.as_ptr(),
+                usize::try_from(groups.GroupCount).expect("restricted SID count fits usize"),
+            )
+        };
+        let mut result = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut string_sid = ptr::null_mut();
+            // SAFETY: each entry returned by Windows owns a valid SID; Windows allocates output.
+            if unsafe { ConvertSidToStringSidW(entry.Sid, &raw mut string_sid) } == 0 {
+                return Err(DaemonError::Ipc(io::Error::last_os_error()));
+            }
+            let mut length = 0_usize;
+            // SAFETY: `string_sid` is a valid NUL-terminated UTF-16 allocation.
+            while unsafe { *string_sid.add(length) } != 0 {
+                length += 1;
+            }
+            // SAFETY: `length` was obtained by scanning within the allocation.
+            let units = unsafe { slice::from_raw_parts(string_sid, length) };
+            let sid = String::from_utf16(units).map_err(|error| {
+                DaemonError::Ipc(io::Error::new(io::ErrorKind::InvalidData, error))
+            });
+            // SAFETY: the string was allocated by Windows and is released once.
+            let _ = unsafe { LocalFree(string_sid.cast()) };
+            result.push(sid?);
+        }
+        Ok(result)
+    })();
+    // SAFETY: `token` is the valid handle returned by `OpenProcessToken` and is closed once.
     let _ = unsafe { CloseHandle(token) };
     result
 }
