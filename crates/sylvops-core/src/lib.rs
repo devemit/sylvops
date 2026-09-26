@@ -2,6 +2,8 @@
 
 /// Stable application identity shared by the desktop process, shortcuts, packages, and updater.
 pub const APPLICATION_ID: &str = "com.devemit.sylvops";
+/// Linux desktop-file basename and matching X11/Wayland shell identity.
+pub const LINUX_DESKTOP_ID: &str = "sylvops";
 
 /// Stable publisher recorded in native package and executable metadata.
 pub const APPLICATION_PUBLISHER: &str = "devemit";

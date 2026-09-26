@@ -28,13 +28,12 @@ target="x86_64-unknown-linux-gnu"
 skip_build=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --target) target="${2:-}"; shift 2 ;;
     --skip-build) skip_build=true; shift ;;
-    *) echo "usage: $0 [--target x86_64-unknown-linux-gnu] [--skip-build]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--skip-build]" >&2; exit 2 ;;
   esac
 done
 
-if [[ "$(uname -s)" != "Linux" || "$target" != "x86_64-unknown-linux-gnu" ]]; then
+if [[ "$(uname -s):$(uname -m)" != "Linux:x86_64" ]]; then
   echo "SylvOps Linux packages require a native x86_64 Linux host." >&2
   exit 1
 fi
@@ -59,7 +58,7 @@ install -m 755 "$binary_path" "$input_dir/sylvops"
 
 (
   cd "$repository_root"
-  run_with_timeout 900 cargo packager --config "$config_path" --formats appimage,deb
+  APPIMAGE_EXTRACT_AND_RUN=1 run_with_timeout 900 cargo packager --config "$config_path" --formats appimage,deb
 )
 
 mapfile -t appimages < <(find "$output_dir" -maxdepth 1 -type f -name '*.AppImage' -print)

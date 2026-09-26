@@ -12,7 +12,7 @@ This supersedes the one-time release-cut plan. Its safety checks are repeatable 
 - GitHub Releases is the source for installers, portable builds, release notes, and upgrade metadata.
 - Versions use ordinary `0.x` semantic versions without release-phase suffixes.
 - Windows x86_64, Linux x86_64, macOS x86_64, and macOS arm64 remain supported. Packaging work proceeds Windows, then macOS, then Linux when it cannot land together.
-- Installation is per-user and does not require administrator access.
+- Installation follows the platform's native scope: Windows is per-user, macOS uses the selected Applications location, and the Linux Debian package uses the system package manager; the Linux AppImage remains the no-administrator fallback.
 - Windows ships a signed installer with normal shortcuts and uninstall registration.
 - macOS ships a Developer ID-signed, notarized application bundle in a DMG.
 - Linux ships an AppImage and a Debian package with application metadata and a desktop entry.
@@ -38,7 +38,7 @@ Windows x86_64 now has a signed, timestamped, per-user NSIS installer produced b
 
 macOS x86_64 and arm64 now have architecture-specific Developer ID-signed application bundles inside signed, notarized, and stapled DMGs. They carry the shared application identity, version, and icon, enable the hardened runtime, launch from Finder, pass Gatekeeper assessment, and run native install/launch/daemon/removal/data-preservation smoke jobs. Portable macOS archives remain available as an advanced fallback.
 
-Linux x86_64 now produces an AppImage and Debian package in addition to the portable archive. Both native formats carry the shared identity, version, icon, desktop entry, and AppStream metadata. Native CI inspects both packages, launches the AppImage, installs and removes the Debian package, exercises the daemon, and verifies that application state, repositories, worktrees, and branches survive removal.
+Linux x86_64 now produces an AppImage and Debian package in addition to the portable archive. Both native formats carry the shared identity, version, icon, desktop entry, and AppStream metadata. Native CI inspects both packages, launches the desktop client and daemon from each format, removes the Debian package, and verifies that application state, repositories, worktrees, and branches survive removal. When a prior release exists, it also tests upgrade, rollback, and candidate reapplication for both formats.
 
 The daemon now owns a serialized signed-upgrade state machine. It validates bounded Ed25519 metadata against the public key embedded at build time, rejects target/version/time/replay/URL violations, checks payload length and SHA-256 while staging outside the installation, supports cancellation and restart recovery, and never downloads during discovery. Desktop and CLI clients expose manual and bounded periodic checks, release details, explicit download/install actions, and named active-session deferral. The platform installer contract performs a version/protocol/database/executable/signature health handshake and exactly one rollback when a newly applied version is unhealthy.
 
@@ -119,6 +119,6 @@ An application release is ready when all of the following are true:
 - Silent background installation without confirmation.
 - Microsoft Store, Mac App Store, Flathub, Snap Store, or other store distribution.
 - Windows arm64 and Linux arm64 packages.
-- System-wide or administrator-managed installation.
+- Additional system-wide or administrator-managed deployment channels beyond the Linux Debian package.
 - Automatic removal of user data, repositories, worktrees, or branches.
 - Feature expansion such as additional providers, GitHub workflows, remote execution, and notifications until installation and upgrades meet this plan's acceptance criteria.

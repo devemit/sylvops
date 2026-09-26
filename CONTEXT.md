@@ -9,7 +9,7 @@ A deliberately promoted, versioned SylvOps build that users can install or upgra
 _Avoid_: Release-phase labels, release candidate, build artifact
 
 **Installation**:
-An OS-integrated, per-user copy of SylvOps with a normal launch entry and an uninstall path.
+A copy of SylvOps integrated through the operating system's normal launch and removal surfaces. Privilege scope follows the platform's native package contract.
 _Avoid_: Extracted archive, copied binary, setup script
 
 **Upgrade**:

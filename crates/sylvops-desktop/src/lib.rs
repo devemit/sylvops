@@ -167,7 +167,7 @@ fn desktop_window_settings() -> window::Settings {
     )
     .expect("the embedded SylvOps window icon must have valid RGBA dimensions");
 
-    window::Settings {
+    let settings = window::Settings {
         size: iced::Size::new(1_440.0, 900.0),
         min_size: Some(iced::Size::new(
             f32::from(MIN_DESKTOP_WIDTH),
@@ -176,7 +176,14 @@ fn desktop_window_settings() -> window::Settings {
         exit_on_close_request: false,
         icon: Some(icon),
         ..window::Settings::default()
-    }
+    };
+    #[cfg(target_os = "linux")]
+    let settings = {
+        let mut settings = settings;
+        settings.platform_specific.application_id = sylvops_core::LINUX_DESKTOP_ID.to_owned();
+        settings
+    };
+    settings
 }
 
 struct DesktopApp {
@@ -4958,6 +4965,15 @@ mod tests {
         assert!(size.width <= MAX_WINDOW_ICON_SIDE);
         assert!(size.height <= MAX_WINDOW_ICON_SIDE);
         assert_eq!(rgba.len(), (size.width * size.height * 4) as usize);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_window_matches_the_linux_shell_identity() {
+        assert_eq!(
+            desktop_window_settings().platform_specific.application_id,
+            sylvops_core::LINUX_DESKTOP_ID
+        );
     }
 
     #[test]

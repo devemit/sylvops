@@ -32,12 +32,17 @@ The native smoke test verifies the DMG signature and stapled ticket, asks Gateke
 
 The protected `release` environment must define `MACOS_SIGNING_CERTIFICATE_BASE64` as a base64-encoded Developer ID Application P12 and `MACOS_SIGNING_CERTIFICATE_PASSWORD` as its password. It must also define the variables `MACOS_SIGNING_IDENTITY`, `MACOS_NOTARY_KEY_ID`, and `MACOS_NOTARY_ISSUER_ID`, plus `MACOS_NOTARY_KEY_BASE64` as the base64-encoded App Store Connect API private key. The workflow imports these only into an ephemeral keychain and runner files, validates the requested identity, and removes them after packaging. Secrets, private keys, passwords, and certificate bytes must never be committed or printed.
 
-Linux x86_64 releases contain `sylvops-linux-x86_64.AppImage` and `sylvops-linux-x86_64.deb` plus the portable archive. `packaging/linux/Packager.toml` defines their shared application identity, icon, desktop entry, AppStream metadata, Debian dependencies, and user-data-independent layout. Build and smoke-test them on a native Ubuntu runner with:
+Linux x86_64 releases contain `sylvops-linux-x86_64.AppImage`, `sylvops-linux-x86_64.deb`, and the portable archive. `packaging/linux/Packager.toml` carries the shared application identity, version, icon, desktop entry, and AppStream metadata into both native formats. The AppImage remains a portable executable and makes no installation changes; the Debian package installs the desktop integration and CLI through the platform package manager.
+
+For local package testing on native x86_64 Linux, install cargo-packager 0.11.8 plus Xvfb and the normal graphical runtime libraries, then run:
 
 ```sh
+cargo install cargo-packager --version 0.11.8 --locked
 ./scripts/package-linux.sh
 ./scripts/test-linux-packages.sh --appimage dist/sylvops-linux-x86_64.AppImage --deb dist/sylvops-linux-x86_64.deb --expected-version 0.1.0
 ```
+
+The native smoke test inspects both packages, launches the AppImage and installed Debian application under a virtual display, verifies the daemon and desktop integration, removes the Debian package, and proves that state, a repository, worktree content, and its branch survive. When a previous release exists it also verifies candidate installation, rollback to the previous package, and candidate reapplication. CI runs this same path on a clean native Ubuntu x86_64 host.
 
 Every platform also publishes a target-specific `sylvops-update-*.json` envelope. `UPDATE_SIGNING_PRIVATE_KEY_BASE64` is a protected 32-byte Ed25519 seed and `UPDATE_SIGNING_PUBLIC_KEY_BASE64` is its 32-byte public key; tagged binaries embed only the public key. The staging job writes the private seed to an ephemeral file, signs the exact version/target/URL/length/SHA-256/notes/timestamp metadata, verifies each envelope against the staged asset, deletes the seed, and only then builds `SHA256SUMS` and attestations. Rotate the key by generating a new offline pair, updating both protected secrets together, and promoting a bridge release signed by the old key with the new public key embedded. If the private key may be exposed, stop promotion, remove the secret, publish no unsigned workaround, and ship a manually verified recovery release through the existing platform-signing channels.
 

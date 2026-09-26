@@ -8,7 +8,7 @@
   <description>
     <p>SylvOps supervises coding-agent sessions running in real Git worktrees.</p>
   </description>
-  <launchable type="desktop-id">com.devemit.sylvops.desktop</launchable>
+  <launchable type="desktop-id">sylvops.desktop</launchable>
   <url type="homepage">https://github.com/devemit/sylvops</url>
   <developer id="devemit">
     <name>devemit</name>
