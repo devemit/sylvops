@@ -26,11 +26,44 @@ jobs:
   package-windows:
     needs: validate-release
     runs-on: windows-latest
+    environment: release
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned cargo-packager
+        shell: pwsh
+        run: |
+          $packagerVersion = (Get-Content -Raw packaging/cargo-packager.version).Trim()
+          cargo install cargo-packager --version $packagerVersion --locked
       - name: Build release binary
         run: cargo build --release --locked -p sylvops-cli
+      - name: Import protected Windows signing identity
+        id: windows-signing
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGNING_TIMESTAMP_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_BASE64)) { throw 'WINDOWS_SIGNING_CERTIFICATE_BASE64 is not configured.' }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD)) { throw 'WINDOWS_SIGNING_CERTIFICATE_PASSWORD is not configured.' }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_TIMESTAMP_URL)) { throw 'WINDOWS_SIGNING_TIMESTAMP_URL is not configured.' }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'sylvops-windows-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERTIFICATE_BASE64))
+            $password = ConvertTo-SecureString $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $password
+            if ($null -eq $certificate -or -not $certificate.HasPrivateKey) { throw 'The Windows signing certificate could not be imported with its private key.' }
+            "thumbprint=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "timestamp_url=$env:WINDOWS_SIGNING_TIMESTAMP_URL" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+          finally {
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+      - name: Sign release executable
+        shell: pwsh
+        run: ./scripts/sign-windows.ps1 -Path target/release/sylvops.exe -CertificateThumbprint '${{ steps.windows-signing.outputs.thumbprint }}' -TimestampUrl '${{ steps.windows-signing.outputs.timestamp_url }}' -RequireTrustedSignature
       - name: Verify application version
         shell: pwsh
         run: |
@@ -47,16 +80,34 @@ jobs:
           Copy-Item "packaging/windows/Start SylvOps.cmd" package/
           Copy-Item packaging/windows/QUICKSTART.txt package/
           Compress-Archive package/* sylvops-windows-x86_64.zip
+      - name: Build signed per-user installer
+        shell: pwsh
+        run: ./scripts/package-windows-installer.ps1 -CertificateThumbprint '${{ steps.windows-signing.outputs.thumbprint }}' -TimestampUrl '${{ steps.windows-signing.outputs.timestamp_url }}' -RequireTrustedSignature -SkipBuild
+      - name: Install, launch, verify, and uninstall
+        shell: pwsh
+        run: ./scripts/test-windows-installer.ps1 -InstallerPath dist/sylvops-windows-x86_64-setup.exe -CertificateThumbprint '${{ steps.windows-signing.outputs.thumbprint }}' -RequireTrustedSignature -RequireTimestamp
       - name: Validate package contents
         shell: pwsh
-        run: ./scripts/validate-release.ps1 -ArchivePath sylvops-windows-x86_64.zip -ExpectedTag "$env:GITHUB_REF_NAME"
+        run: ./scripts/validate-release.ps1 -ArchivePath sylvops-windows-x86_64.zip -InstallerPath dist/sylvops-windows-x86_64-setup.exe -ExpectedTag "$env:GITHUB_REF_NAME"
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: sylvops-windows-x86_64.zip
+          subject-path: |
+            sylvops-windows-x86_64.zip
+            dist/sylvops-windows-x86_64-setup.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows-package
-          path: sylvops-windows-x86_64.zip
+          path: |
+            sylvops-windows-x86_64.zip
+            dist/sylvops-windows-x86_64-setup.exe
+      - name: Remove protected Windows signing identity
+        if: always()
+        shell: pwsh
+        run: |
+          $thumbprint = '${{ steps.windows-signing.outputs.thumbprint }}'
+          if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
+            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
+          }
 
   package-unix:
     needs: validate-release

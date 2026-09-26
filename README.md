@@ -4,7 +4,17 @@ SylvOps is a local-first mission control for supervising interactive coding-agen
 
 ## Quick start
 
-SylvOps is distributed through explicitly promoted semantic `0.x` application releases on GitHub. Download the portable archive for your platform, extract it, put the binary on `PATH`, and run this inside a Git repository:
+SylvOps is distributed through explicitly promoted semantic `0.x` application releases on GitHub. On Windows x86_64, download `sylvops-windows-x86_64-setup.exe`, verify it against `SHA256SUMS`, and run the signed per-user installer. It installs under `%LOCALAPPDATA%\Programs\SylvOps` without administrator privileges and adds **SylvOps** to the Start Menu. Launching that entry starts the local daemon and native desktop client.
+
+The installer also registers `sylvops.exe` through the current user's Windows App Paths. PowerShell users can invoke an installed CLI command without editing `PATH`, for example:
+
+```powershell
+Start-Process sylvops -ArgumentList 'doctor'
+```
+
+The explicit path `%LOCALAPPDATA%\Programs\SylvOps\sylvops.exe` remains available for shells that do not resolve App Paths. Uninstalling SylvOps removes the application and its Windows integration but preserves configuration, session data, repositories, worktrees, and branches.
+
+Portable archives remain available on every platform as an advanced and recovery fallback. After extracting one and placing the binary on `PATH`, run this inside a Git repository:
 
 ```text
 sylvops up .
@@ -12,7 +22,7 @@ sylvops up .
 
 This starts the local daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the native desktop app. It does not launch an agent automatically. `sylvops open .` is a compatibility alias, while `sylvops tui` opens the terminal interface.
 
-Current releases provide unsigned portable archives and do not edit `PATH`. Verify the downloaded archive against the release's `SHA256SUMS` before extracting it. Windows may show an unrecognized-app warning; after verifying the checksum, choose **More info → Run anyway** for this build. macOS may block an unidentified, unnotarized binary; after verifying the checksum and attempting to run it, use **System Settings → Privacy & Security → Open Anyway**, confirm **Open**, and do not disable Gatekeeper globally. Linux desktop launch requires a graphical session and the system libraries normally provided by a supported desktop installation.
+Every release asset is covered by the release's `SHA256SUMS` and build-provenance attestations. The Windows installer and executable are Authenticode signed and timestamped; portable archives do not edit `PATH`. macOS portable builds remain unidentified and unnotarized, so after verifying the checksum and attempting to run one, use **System Settings → Privacy & Security → Open Anyway**, confirm **Open**, and do not disable Gatekeeper globally. Linux desktop launch requires a graphical session and the system libraries normally provided by a supported desktop installation.
 
 To build from source, install stable Rust 1.88 or newer, Git, and the platform C toolchain:
 
@@ -28,7 +38,7 @@ The executable is written to `target/release/sylvops` (`sylvops.exe` on Windows)
 ./target/release/sylvops up .
 ```
 
-On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the unsigned portable Windows ZIP with `powershell -File scripts/package-windows.ps1`; generated packages are intentionally excluded from Git.
+On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the unsigned portable Windows ZIP with `powershell -File scripts/package-windows.ps1`; the signed installer workflow is documented in [docs/development/releasing.md](docs/development/releasing.md). Generated packages are intentionally excluded from Git.
 
 The repository now contains a **cross-platform application-release baseline**. It includes:
 

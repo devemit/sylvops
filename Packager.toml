@@ -1,0 +1,24 @@
+name = "sylvops"
+product-name = "SylvOps"
+version = "0.1.0"
+identifier = "com.devemit.sylvops"
+publisher = "devemit"
+description = "Local-first mission control for coding-agent sessions"
+long-description = "A native desktop application for supervising coding-agent sessions in real Git worktrees."
+homepage = "https://github.com/devemit/sylvops"
+license-file = "LICENSE"
+formats = ["nsis"]
+out-dir = "dist/windows-installer"
+binaries-dir = "target/installer-input"
+binaries = [{ path = "sylvops", main = true }]
+icons = ["packaging/icons/sylvops.ico"]
+
+[nsis]
+installMode = "currentUser"
+installer-icon = "packaging/icons/sylvops.ico"
+compression = "lzma"
+template = "packaging/windows/installer.nsi"
+
+[windows]
+allow-downgrades = false
+digest-algorithm = "sha256"

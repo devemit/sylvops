@@ -34,9 +34,9 @@ The platform shape follows current vendor guidance and the capabilities of the R
 
 ## Current reality
 
-The repository currently produces portable archives containing one executable. The install scripts download an archive, compare its SHA-256 digest with the release manifest, copy the executable to a user-local directory, and ask the user to modify `PATH`. They do not create application shortcuts, register uninstall, coordinate with a running daemon, retain a rollback version, or provide upgrade discovery.
+Windows x86_64 now has a signed, timestamped, per-user NSIS installer produced by pinned cargo-packager 0.11.8. It installs separately from user data, assigns the same stable application ID and icon to the executable, package, and Start Menu shortcut, registers uninstall and CLI discovery, and passes a native install/launch/daemon/uninstall/data-preservation smoke job. The validated portable Windows ZIP remains available as a fallback.
 
-The runtime already creates user-local state and configuration directories, so installed application files can remain separate from user data. The existing release workflow already builds the four supported targets, validates archive contents, creates checksums and provenance attestations, and publishes through GitHub Releases. These are foundations to evolve, not parallel systems to replace blindly.
+Linux and macOS still produce portable archives containing one executable. Their install scripts download an archive, compare its SHA-256 digest with the release manifest, copy the executable to a user-local directory, and ask the user to modify `PATH`. Native macOS and Linux packages, upgrade discovery, staged replacement, health-checked rollback, and application-managed upgrades remain future delivery steps.
 
 ## Delivery plan
 
