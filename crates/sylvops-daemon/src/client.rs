@@ -45,6 +45,7 @@ impl DaemonClient {
         let mut stream = connect(&paths.endpoint).await?;
         let hello = ClientRequest::Hello(HelloRequest {
             client_name: client_name.into(),
+            client_process_id: std::process::id(),
             client_version: env!("CARGO_PKG_VERSION").into(),
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,

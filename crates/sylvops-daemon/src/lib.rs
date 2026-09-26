@@ -6,14 +6,17 @@ pub mod client;
 mod codex_discovery;
 pub mod config_store;
 pub mod daemon;
+pub mod data_removal;
 pub mod database;
 pub mod git;
 pub mod hook;
 pub mod ipc;
+pub mod native_upgrade;
 pub mod provider;
 mod pty;
 pub mod runtime;
 pub mod session;
+pub mod upgrade;
 
 mod process_tree;
 
@@ -47,6 +50,10 @@ pub enum DaemonError {
     Provider(String),
     #[error("daemon lifecycle failed: {0}")]
     Lifecycle(String),
+    #[error(transparent)]
+    Upgrade(#[from] upgrade::UpgradeError),
+    #[error(transparent)]
+    DataRemoval(#[from] data_removal::DataRemovalError),
 }
 
 pub type Result<T, E = DaemonError> = std::result::Result<T, E>;

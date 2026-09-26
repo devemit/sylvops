@@ -9,6 +9,14 @@ use crate::domain::ProviderKind;
 
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateCheckPolicy {
+    #[default]
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -27,6 +35,8 @@ pub struct AppConfig {
     pub prompt_retention_count: usize,
     pub hook_body_limit_bytes: usize,
     pub hook_requests_per_minute: u32,
+    pub update_check_policy: UpdateCheckPolicy,
+    pub update_check_interval_hours: u16,
     #[serde(flatten)]
     pub unknown: BTreeMap<String, Value>,
 }
@@ -49,6 +59,8 @@ impl Default for AppConfig {
             prompt_retention_count: 50,
             hook_body_limit_bytes: 64 * 1024,
             hook_requests_per_minute: 600,
+            update_check_policy: UpdateCheckPolicy::Enabled,
+            update_check_interval_hours: 24,
             unknown: BTreeMap::new(),
         }
     }
@@ -102,6 +114,9 @@ impl AppConfig {
         }
         if !(1..=10_000).contains(&self.hook_requests_per_minute) {
             return Err("hook request limit must be between 1 and 10000 per minute".into());
+        }
+        if !(1..=168).contains(&self.update_check_interval_hours) {
+            return Err("update check interval must be between 1 and 168 hours".into());
         }
         Ok(())
     }

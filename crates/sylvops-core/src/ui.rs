@@ -154,6 +154,7 @@ pub struct DesktopState {
     /// Navigator widths in thousandths of the usable desktop width.
     pub panel_ratios: [u16; 3],
     pub compact_panel: DesktopPanel,
+    pub periodic_update_checks: bool,
 }
 
 impl Default for DesktopState {
@@ -173,6 +174,7 @@ impl Default for DesktopState {
             window_height: 900,
             panel_ratios: [160, 190, 210],
             compact_panel: DesktopPanel::Projects,
+            periodic_update_checks: true,
         }
     }
 }

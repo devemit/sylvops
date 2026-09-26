@@ -38,7 +38,11 @@ Windows x86_64 now has a signed, timestamped, per-user NSIS installer produced b
 
 macOS x86_64 and arm64 now have architecture-specific Developer ID-signed application bundles inside signed, notarized, and stapled DMGs. They carry the shared application identity, version, and icon, enable the hardened runtime, launch from Finder, pass Gatekeeper assessment, and run native install/launch/daemon/removal/data-preservation smoke jobs. Portable macOS archives remain available as an advanced fallback.
 
-Linux still produces a portable archive containing one executable. Its install script downloads the archive, compares its SHA-256 digest with the release manifest, copies the executable to a user-local directory, and asks the user to modify `PATH`. Native Linux packages, upgrade discovery, staged replacement, health-checked rollback, and application-managed upgrades remain future delivery steps.
+Linux x86_64 now produces an AppImage and Debian package in addition to the portable archive. Both native formats carry the shared identity, version, icon, desktop entry, and AppStream metadata. Native CI inspects both packages, launches the AppImage, installs and removes the Debian package, exercises the daemon, and verifies that application state, repositories, worktrees, and branches survive removal.
+
+The daemon now owns a serialized signed-upgrade state machine. It validates bounded Ed25519 metadata against the public key embedded at build time, rejects target/version/time/replay/URL violations, checks payload length and SHA-256 while staging outside the installation, supports cancellation and restart recovery, and never downloads during discovery. Desktop and CLI clients expose manual and bounded periodic checks, release details, explicit download/install actions, and named active-session deferral. The platform installer contract performs a version/protocol/database/executable/signature health handshake and exactly one rollback when a newly applied version is unhealthy.
+
+Normal package removal continues to preserve application data. The separate strongly confirmed data-removal flow canonicalizes and revalidates only marker-owned SylvOps directories, refuses roots and links, refuses any overlap with registered repositories or worktrees, and is idempotent.
 
 ## Delivery plan
 

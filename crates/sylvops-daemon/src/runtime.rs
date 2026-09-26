@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{DaemonError, Result, atomic_file, ipc::LocalEndpoint};
 
 const MAX_TOKEN_BYTES: u64 = 256;
+pub(crate) const OWNERSHIP_MARKER: &str = ".sylvops-owned";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimePaths {
@@ -29,6 +30,35 @@ pub struct RuntimePaths {
 }
 
 impl RuntimePaths {
+    /// Reconstructs explicitly recorded runtime paths for the detached upgrade helper.
+    ///
+    /// # Errors
+    ///
+    /// Refuses relative paths, links, or directories without the `SylvOps` ownership marker.
+    pub fn from_explicit_directories(
+        data: PathBuf,
+        config: PathBuf,
+        runtime: PathBuf,
+    ) -> Result<Self> {
+        for directory in [&data, &config, &runtime] {
+            if !directory.is_absolute() {
+                return Err(DaemonError::Lifecycle(
+                    "upgrade runtime directory must be absolute".into(),
+                ));
+            }
+            reject_link(directory)?;
+            let marker = fs::read_to_string(directory.join(OWNERSHIP_MARKER)).map_err(|_| {
+                DaemonError::Lifecycle("upgrade runtime directory is not owned by SylvOps".into())
+            })?;
+            if marker != sylvops_core::APPLICATION_ID {
+                return Err(DaemonError::Lifecycle(
+                    "upgrade runtime directory ownership marker is invalid".into(),
+                ));
+            }
+        }
+        Ok(Self::from_directories(data, config, runtime))
+    }
+
     /// Resolves per-user paths, or places every artifact below an explicit test/development root.
     ///
     /// # Errors
@@ -85,6 +115,10 @@ impl RuntimePaths {
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
                     .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
             }
+            atomic_file::write(
+                &directory.join(OWNERSHIP_MARKER),
+                sylvops_core::APPLICATION_ID.as_bytes(),
+            )?;
         }
         Ok(())
     }

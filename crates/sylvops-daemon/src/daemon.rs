@@ -2,12 +2,14 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs::OpenOptions,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use subtle::ConstantTimeEq;
@@ -24,9 +26,13 @@ use sylvops_core::{
     },
     provider::{LaunchContext, LaunchSpec, ResumeContext},
     status::{NormalizedProviderEvent, SessionStatusMachine},
+    upgrade::{
+        ActiveUpgradeSession, InstallDisposition, MAX_UPGRADE_CLIENT_PROCESSES,
+        NativeUpgradeHandoff, ReleaseMetadata, UpgradeStatus,
+    },
 };
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, mpsc, watch},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, mpsc, watch},
     task::{AbortHandle, JoinSet},
     time::timeout,
 };
@@ -34,6 +40,7 @@ use uuid::Uuid;
 
 use crate::{
     DaemonError, Result, config_store,
+    data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan},
     database::{DatabaseHandle, NewSession},
     git,
     hook::{HookDelivery, HookReceiver},
@@ -41,6 +48,10 @@ use crate::{
     provider::ProviderRegistry,
     runtime::{AuthenticationToken, RuntimePaths},
     session::{Attachment, SessionHandle, SessionSpec},
+    upgrade::{
+        HttpReleaseSource, UpgradeCoordinator, current_release_target, embedded_verifying_key,
+        manifest_url,
+    },
 };
 
 pub const CONTROL_OPCODE: u16 = 10;
@@ -49,6 +60,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_QUEUE_CAPACITY: usize = 256;
 const CLIENT_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
+const LIFECYCLE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
+const CLIENT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct OutboundFrame {
@@ -121,22 +134,119 @@ struct ManagedSession {
     completed: watch::Receiver<bool>,
 }
 
+#[derive(Debug)]
+struct LifecycleCoordinator {
+    quiescing: AtomicBool,
+    activities: AtomicU32,
+    changed: Notify,
+}
+
+impl LifecycleCoordinator {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            quiescing: AtomicBool::new(false),
+            activities: AtomicU32::new(0),
+            changed: Notify::new(),
+        })
+    }
+
+    fn begin(self: &Arc<Self>) -> Result<LifecycleActivity> {
+        if self.quiescing.load(Ordering::Acquire) {
+            return Err(DaemonError::Lifecycle(
+                "application lifecycle is quiescing".into(),
+            ));
+        }
+        self.activities.fetch_add(1, Ordering::AcqRel);
+        if self.quiescing.load(Ordering::Acquire) {
+            if self.activities.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.changed.notify_waiters();
+            }
+            return Err(DaemonError::Lifecycle(
+                "application lifecycle is quiescing".into(),
+            ));
+        }
+        Ok(LifecycleActivity(self.clone()))
+    }
+
+    fn is_quiescing(&self) -> bool {
+        self.quiescing.load(Ordering::Acquire)
+    }
+
+    async fn quiesce(self: &Arc<Self>) -> Result<LifecycleQuiesce> {
+        self.quiescing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| DaemonError::Lifecycle("application lifecycle is busy".into()))?;
+        let deadline = tokio::time::Instant::now() + LIFECYCLE_QUIESCE_TIMEOUT;
+        loop {
+            let notified = self.changed.notified();
+            if self.activities.load(Ordering::Acquire) == 0 {
+                return Ok(LifecycleQuiesce {
+                    coordinator: self.clone(),
+                    committed: false,
+                });
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                self.quiescing.store(false, Ordering::Release);
+                self.changed.notify_waiters();
+                return Err(DaemonError::Lifecycle(
+                    "application lifecycle did not quiesce before its deadline".into(),
+                ));
+            }
+        }
+    }
+}
+
+struct LifecycleActivity(Arc<LifecycleCoordinator>);
+
+impl Drop for LifecycleActivity {
+    fn drop(&mut self) {
+        if self.0.activities.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+
+struct LifecycleQuiesce {
+    coordinator: Arc<LifecycleCoordinator>,
+    committed: bool,
+}
+
+impl LifecycleQuiesce {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for LifecycleQuiesce {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.coordinator.quiescing.store(false, Ordering::Release);
+            self.coordinator.changed.notify_waiters();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DaemonState {
     database: DatabaseHandle,
     authentication_token: AuthenticationToken,
     started: Instant,
     connected_clients: Arc<AtomicU32>,
+    client_processes: Arc<StdMutex<HashMap<u32, u32>>>,
     shutdown: watch::Sender<bool>,
     events: broadcast::Sender<DaemonEvent>,
     sessions: Arc<RwLock<HashMap<SessionId, ManagedSession>>>,
     project_locks: Arc<RwLock<HashMap<ProjectId, Arc<Mutex<()>>>>>,
     worktree_locks: Arc<RwLock<HashMap<WorktreeId, Arc<Mutex<()>>>>>,
+    lifecycle: Arc<LifecycleCoordinator>,
     scrollback_bytes: usize,
     managed_worktree_root: PathBuf,
     providers: Arc<ProviderRegistry>,
     status_machines: Arc<Mutex<HashMap<SessionId, SessionStatusMachine>>>,
     hook_tracking: Arc<Mutex<HashMap<SessionId, HookTracking>>>,
+    upgrade: Arc<UpgradeCoordinator>,
+    runtime_paths: RuntimePaths,
 }
 
 #[derive(Debug, Default)]
@@ -170,22 +280,12 @@ impl HookTracking {
 /// # Errors
 ///
 /// Returns an error when runtime setup, persistence, IPC, hook binding, or cleanup fails.
+#[allow(clippy::too_many_lines)]
 pub async fn run(paths: RuntimePaths) -> Result<()> {
     paths.prepare()?;
     let config = config_store::load(&paths.config, &paths.machine_config)?;
-    let managed_worktree_directory = config
-        .managed_worktree_directory
-        .clone()
-        .unwrap_or_else(|| paths.data_directory.join("worktrees"));
-    let managed_worktree_root = git::prepare_managed_root(&managed_worktree_directory).await?;
-    let relay_executable = std::fs::canonicalize(std::env::current_exe().map_err(|error| {
-        DaemonError::Lifecycle(format!("cannot resolve hook relay executable: {error}"))
-    })?)
-    .map_err(|error| {
-        DaemonError::Lifecycle(format!(
-            "cannot canonicalize hook relay executable: {error}"
-        ))
-    })?;
+    let managed_worktree_root = prepare_managed_worktree_root(&paths, &config).await?;
+    let relay_executable = canonical_current_executable()?;
     let mut hook_receiver = HookReceiver::bind(
         relay_executable,
         config.hook_body_limit_bytes,
@@ -196,6 +296,7 @@ pub async fn run(paths: RuntimePaths) -> Result<()> {
         Some(&hook_receiver.endpoint),
         &config.enabled_providers,
     )?);
+    let upgrade = prepare_upgrade(&paths).await?;
     let mut hook_deliveries = hook_receiver.take_deliveries();
     let mut listener = LocalListener::bind(&paths.endpoint)?;
     let database = DatabaseHandle::open(&paths.database)?;
@@ -221,20 +322,31 @@ pub async fn run(paths: RuntimePaths) -> Result<()> {
         authentication_token: token.clone(),
         started: Instant::now(),
         connected_clients: Arc::new(AtomicU32::new(0)),
+        client_processes: Arc::new(StdMutex::new(HashMap::new())),
         shutdown,
         events,
         sessions: Arc::new(RwLock::new(HashMap::new())),
         project_locks: Arc::new(RwLock::new(HashMap::new())),
         worktree_locks: Arc::new(RwLock::new(HashMap::new())),
+        lifecycle: LifecycleCoordinator::new(),
         scrollback_bytes: config.scrollback_capacity_bytes,
         managed_worktree_root,
         providers,
         status_machines: Arc::new(Mutex::new(HashMap::new())),
         hook_tracking: Arc::new(Mutex::new(HashMap::new())),
+        upgrade,
+        runtime_paths: paths.clone(),
     };
     tracing::info!(reconciled, "SylvOps daemon is ready");
 
     let mut clients = JoinSet::new();
+    if config.update_check_policy == sylvops_core::config::UpdateCheckPolicy::Enabled {
+        let periodic_state = state.clone();
+        clients.spawn(periodic_update_checks(
+            periodic_state,
+            Duration::from_secs(u64::from(config.update_check_interval_hours) * 60 * 60),
+        ));
+    }
     let serving_result = loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -271,6 +383,116 @@ pub async fn run(paths: RuntimePaths) -> Result<()> {
     database_result?;
     tracing::info!("SylvOps daemon stopped");
     serving_result
+}
+
+fn canonical_current_executable() -> Result<PathBuf> {
+    let executable = std::env::current_exe().map_err(|error| {
+        DaemonError::Lifecycle(format!("cannot resolve hook relay executable: {error}"))
+    })?;
+    std::fs::canonicalize(executable).map_err(|error| {
+        DaemonError::Lifecycle(format!(
+            "cannot canonicalize hook relay executable: {error}"
+        ))
+    })
+}
+
+async fn prepare_managed_worktree_root(
+    paths: &RuntimePaths,
+    config: &sylvops_core::config::AppConfig,
+) -> Result<PathBuf> {
+    let directory = config
+        .managed_worktree_directory
+        .clone()
+        .unwrap_or_else(|| paths.data_directory.join("worktrees"));
+    git::prepare_managed_root(&directory).await
+}
+
+async fn prepare_upgrade(paths: &RuntimePaths) -> Result<Arc<UpgradeCoordinator>> {
+    let release_target = current_release_target()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| DaemonError::Lifecycle("system clock is before the Unix epoch".into()))?
+        .as_secs()
+        .try_into()
+        .map_err(|_| {
+            DaemonError::Lifecycle("system clock is outside the supported range".into())
+        })?;
+    let update_source = HttpReleaseSource::github(&manifest_url(release_target))?;
+    let upgrade = Arc::new(UpgradeCoordinator::new(
+        paths.data_directory.join("upgrades"),
+        Box::new(update_source),
+        embedded_verifying_key()?,
+        sylvops_core::upgrade::ReleaseValidationContext {
+            current_version: env!("CARGO_PKG_VERSION").into(),
+            expected_target: release_target,
+            now_unix_seconds: now,
+            oldest_allowed_publication: now.saturating_sub(180 * 24 * 60 * 60),
+            newest_seen_publication: None,
+        },
+    ));
+    if let Err(error) = upgrade.recover_staged().await {
+        tracing::warn!(error = %error, "discarded invalid staged application upgrade");
+    }
+    Ok(upgrade)
+}
+
+async fn spawn_upgrade_helper(
+    paths: &RuntimePaths,
+    release: ReleaseMetadata,
+    client_process_ids: Vec<u32>,
+) -> Result<()> {
+    let staging_root = paths.data_directory.join("upgrades");
+    let installed_executable =
+        if release.target.installer == sylvops_core::upgrade::InstallerKind::LinuxAppImage {
+            std::env::var_os("APPIMAGE")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    DaemonError::Lifecycle("AppImage update lost its installed image path".into())
+                })?
+        } else {
+            canonical_current_executable()?
+        };
+    let helper = staging_root.join(if cfg!(windows) {
+        "sylvops-upgrade-helper.exe"
+    } else {
+        "sylvops-upgrade-helper"
+    });
+    tokio::fs::copy(&installed_executable, &helper).await?;
+    let permissions = tokio::fs::metadata(&installed_executable)
+        .await?
+        .permissions();
+    tokio::fs::set_permissions(&helper, permissions).await?;
+    let handoff = NativeUpgradeHandoff {
+        release,
+        staging_root: staging_root.clone(),
+        installed_executable,
+        data_directory: paths.data_directory.clone(),
+        config_directory: paths.config_directory.clone(),
+        runtime_directory: paths.runtime_directory.clone(),
+        client_process_ids,
+        relaunch_desktop: true,
+    };
+    let handoff_path = staging_root.join("handoff.json");
+    let encoded = serde_json::to_vec(&handoff)
+        .map_err(|_| DaemonError::Lifecycle("could not encode upgrade handoff".into()))?;
+    crate::atomic_file::write(&handoff_path, &encoded)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.daemon_log)?;
+    let error_log = log.try_clone()?;
+    crate::background_process::command(&helper)
+        .arg("update-helper")
+        .arg("--handoff")
+        .arg(&handoff_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(error_log))
+        .spawn()
+        .map_err(|error| {
+            DaemonError::Lifecycle(format!("could not start upgrade helper: {error}"))
+        })?;
+    Ok(())
 }
 
 async fn reconcile_worktrees(database: &DatabaseHandle) -> Result<serde_json::Value> {
@@ -322,12 +544,16 @@ async fn reconcile_worktrees(database: &DatabaseHandle) -> Result<serde_json::Va
 
 #[allow(clippy::too_many_lines)]
 async fn serve_client(mut stream: BoxStream, state: DaemonState) -> Result<()> {
-    if !complete_handshake(&mut stream, &state).await? {
+    let Some(client_process_id) = complete_handshake(&mut stream, &state).await? else {
         return Ok(());
-    }
+    };
     let client_id = Uuid::now_v7();
     state.connected_clients.fetch_add(1, Ordering::Relaxed);
-    let _client_guard = ClientGuard(state.connected_clients.clone());
+    let _client_guard = ClientGuard {
+        count: state.connected_clients.clone(),
+        processes: state.client_processes.clone(),
+        process_id: client_process_id,
+    };
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (incoming_tx, mut incoming) = mpsc::channel(64);
     let reader_task = tokio::spawn(async move {
@@ -366,7 +592,7 @@ async fn serve_client(mut stream: BoxStream, state: DaemonState) -> Result<()> {
                     .ok_or_else(|| DaemonError::Lifecycle("client reader stopped".into()))??;
                 let request = decode_request(&frame)?;
                 let request_id = frame.message_id;
-                if let Err(error) = handle_request(request, request_id, client_id, &state,
+                if let Err(error) = handle_request(request, request_id, client_id, client_process_id, &state,
                     &outgoing, &connection_failed, &mut attachments).await {
                     send_failure_queue(
                         &outgoing,
@@ -426,11 +652,73 @@ async fn serve_client(mut stream: BoxStream, state: DaemonState) -> Result<()> {
     result
 }
 
-#[allow(clippy::too_many_lines)]
+async fn periodic_update_checks(state: DaemonState, interval: Duration) {
+    let mut shutdown = state.shutdown.subscribe();
+    let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(60 * 60)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                match state.database.desktop_state().await {
+                    Ok(Some(desktop_state)) if !desktop_state.periodic_update_checks => continue,
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "periodic application upgrade preference could not be read");
+                        continue;
+                    }
+                }
+                match state.upgrade.check().await {
+                    Ok(Some(release)) => {
+                        let _ = state.events.send(DaemonEvent::UpgradeProgress {
+                            status: UpgradeStatus::Available { release },
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::debug!(error = %error, "periodic application upgrade check did not complete");
+                    }
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_other_client_processes(
+    state: &DaemonState,
+    requesting_process_id: u32,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + CLIENT_QUIESCE_TIMEOUT;
+    loop {
+        let has_other_process = state
+            .client_processes
+            .lock()
+            .map_err(|_| DaemonError::Lifecycle("client process registry is unavailable".into()))?
+            .keys()
+            .any(|process_id| *process_id != requesting_process_id);
+        if !has_other_process {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DaemonError::Lifecycle(
+                "connected applications did not quiesce for the upgrade".into(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_request(
     request: ClientRequest,
     request_id: Uuid,
     client_id: Uuid,
+    client_process_id: u32,
     state: &DaemonState,
     outgoing: &ClientSink,
     connection_failed: &mpsc::Sender<()>,
@@ -843,6 +1131,12 @@ async fn handle_request(
             columns,
             rows,
         } => {
+            let _lifecycle_activity = state.lifecycle.begin()?;
+            if *state.shutdown.borrow() {
+                return Err(DaemonError::Lifecycle(
+                    "daemon is quiescing for application replacement".into(),
+                ));
+            }
             validate_terminal_size(columns, rows).map_err(DaemonError::InvalidSession)?;
             let operation_lock = worktree_operation_lock(state, worktree_id).await;
             let _operation_guard = operation_lock.lock().await;
@@ -907,6 +1201,12 @@ async fn handle_request(
             columns,
             rows,
         } => {
+            let _lifecycle_activity = state.lifecycle.begin()?;
+            if *state.shutdown.borrow() {
+                return Err(DaemonError::Lifecycle(
+                    "daemon is quiescing for application replacement".into(),
+                ));
+            }
             validate_terminal_size(columns, rows).map_err(DaemonError::InvalidSession)?;
             let source = state.database.session(source_session_id).await?;
             let external_session_id = source.external_session_id.clone().ok_or_else(|| {
@@ -1078,6 +1378,215 @@ async fn handle_request(
             let _ = state
                 .events
                 .send(DaemonEvent::SessionUpdated { revision, session });
+            Ok(())
+        }
+        ClientRequest::CheckForUpdate => {
+            let _lifecycle_activity = state.lifecycle.begin()?;
+            if let Some(release) = state.upgrade.check().await? {
+                let status = UpgradeStatus::Available {
+                    release: release.clone(),
+                };
+                let _ = state.events.send(DaemonEvent::UpgradeProgress { status });
+                send_response_queue(
+                    outgoing,
+                    request_id,
+                    &DaemonResponse::UpdateAvailable(release),
+                )
+                .await
+            } else {
+                let version = env!("CARGO_PKG_VERSION").to_owned();
+                let status = UpgradeStatus::UpToDate {
+                    version: version.clone(),
+                };
+                let _ = state.events.send(DaemonEvent::UpgradeProgress { status });
+                send_response_queue(
+                    outgoing,
+                    request_id,
+                    &DaemonResponse::UpdateNotAvailable { version },
+                )
+                .await
+            }
+        }
+        ClientRequest::DownloadUpdate => {
+            let _lifecycle_activity = state.lifecycle.begin()?;
+            let staged = state.upgrade.download().await?;
+            let status = UpgradeStatus::Staged {
+                release: staged.release.clone(),
+            };
+            let _ = state.events.send(DaemonEvent::UpgradeProgress { status });
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::UpdateStaged(staged.release),
+            )
+            .await
+        }
+        ClientRequest::CancelUpdateDownload => {
+            state.upgrade.cancel_download();
+            send_response_queue(outgoing, request_id, &DaemonResponse::Acknowledged).await
+        }
+        ClientRequest::GetUpdateStatus => {
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::UpdateStatus(state.upgrade.status().await),
+            )
+            .await
+        }
+        ClientRequest::FinalizeUpdate { version, outcome } => {
+            let _lifecycle_activity = state.lifecycle.begin()?;
+            state.upgrade.record_outcome(&version, outcome).await?;
+            let status = state.upgrade.status().await;
+            let _ = state.events.send(DaemonEvent::UpgradeProgress {
+                status: status.clone(),
+            });
+            state
+                .database
+                .audit(
+                    "application_upgrade",
+                    match outcome {
+                        sylvops_core::upgrade::NativeUpgradeOutcome::Installed => "installed",
+                        sylvops_core::upgrade::NativeUpgradeOutcome::RolledBack => "rolled_back",
+                    },
+                    &serde_json::json!({ "version": version }).to_string(),
+                )
+                .await?;
+            send_response_queue(outgoing, request_id, &DaemonResponse::Acknowledged).await
+        }
+        ClientRequest::InstallUpdate {
+            override_active_sessions,
+            requesting_process_id,
+        } => {
+            if requesting_process_id != client_process_id {
+                return Err(DaemonError::Lifecycle(
+                    "upgrade request process ID does not match its authenticated client".into(),
+                ));
+            }
+            let mut lifecycle_quiesce = state.lifecycle.quiesce().await?;
+            let managed_sessions: Vec<_> = state.sessions.read().await.values().cloned().collect();
+            let mut active = Vec::new();
+            let mut active_handles = Vec::new();
+            for managed in managed_sessions {
+                let record = managed.record.read().await.clone();
+                if matches!(
+                    record.state,
+                    SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
+                ) {
+                    active.push(ActiveUpgradeSession {
+                        id: record.id.to_string(),
+                        name: record.display_name,
+                    });
+                    active_handles.push(managed);
+                }
+            }
+            if !active.is_empty() && override_active_sessions {
+                for managed in &active_handles {
+                    managed.handle.stop().await?;
+                }
+                for managed in active_handles {
+                    let mut completed = managed.completed.clone();
+                    while !*completed.borrow() && completed.changed().await.is_ok() {}
+                }
+            }
+            let disposition = state
+                .upgrade
+                .prepare_install(&active, override_active_sessions)
+                .await?;
+            let native_handoff = if let InstallDisposition::Prepared { .. } = &disposition {
+                let UpgradeStatus::Installing { release } = state.upgrade.status().await else {
+                    return Err(DaemonError::Lifecycle(
+                        "upgrade handoff lost its verified release".into(),
+                    ));
+                };
+                let client_process_ids = state
+                    .client_processes
+                    .lock()
+                    .map_err(|_| {
+                        DaemonError::Lifecycle("client process registry is unavailable".into())
+                    })?
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>();
+                if client_process_ids.len() > MAX_UPGRADE_CLIENT_PROCESSES {
+                    state.upgrade.cancel_prepared_install().await;
+                    return Err(DaemonError::Lifecycle(
+                        "too many connected applications to coordinate an upgrade".into(),
+                    ));
+                }
+                Some((release, client_process_ids))
+            } else {
+                None
+            };
+            let _ = state.events.send(DaemonEvent::UpgradeProgress {
+                status: state.upgrade.status().await,
+            });
+            let prepared = matches!(disposition, InstallDisposition::Prepared { .. });
+            if let Some((release, client_process_ids)) = native_handoff {
+                let handoff_result = async {
+                    wait_for_other_client_processes(state, client_process_id).await?;
+                    spawn_upgrade_helper(&state.runtime_paths, release, client_process_ids).await
+                }
+                .await;
+                if let Err(error) = handoff_result {
+                    state.upgrade.cancel_prepared_install().await;
+                    let _ = state.events.send(DaemonEvent::UpgradeProgress {
+                        status: state.upgrade.status().await,
+                    });
+                    return Err(error);
+                }
+            }
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::UpdateInstall(disposition),
+            )
+            .await?;
+            if prepared {
+                state.shutdown.send_replace(true);
+                lifecycle_quiesce.commit();
+            }
+            Ok(())
+        }
+        ClientRequest::PrepareDataRemoval { confirmation } => {
+            let mut lifecycle_quiesce = state.lifecycle.quiesce().await?;
+            if confirmation != DATA_REMOVAL_CONFIRMATION {
+                return Err(crate::data_removal::DataRemovalError::ConfirmationRequired.into());
+            }
+            let managed_sessions: Vec<_> = state.sessions.read().await.values().cloned().collect();
+            for managed in managed_sessions {
+                if matches!(
+                    managed.record.read().await.state,
+                    SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
+                ) {
+                    return Err(DaemonError::Lifecycle(
+                        "user data cannot be removed while sessions are active".into(),
+                    ));
+                }
+            }
+            let snapshot = state.database.snapshot().await?;
+            let protected_paths = snapshot
+                .projects
+                .iter()
+                .map(|project| PathBuf::from(&project.canonical_repository_path))
+                .chain(
+                    snapshot
+                        .worktrees
+                        .iter()
+                        .map(|worktree| PathBuf::from(&worktree.canonical_path)),
+                )
+                .collect::<Vec<_>>();
+            DataRemovalPlan::prepare(&state.runtime_paths, &confirmation, &protected_paths)?;
+            state
+                .database
+                .audit(
+                    "user_data_removal_prepared",
+                    "succeeded",
+                    &serde_json::json!({ "protected_paths": protected_paths.len() }).to_string(),
+                )
+                .await?;
+            send_response_queue(outgoing, request_id, &DaemonResponse::DataRemovalPrepared).await?;
+            state.shutdown.send_replace(true);
+            lifecycle_quiesce.commit();
             Ok(())
         }
         ClientRequest::ShutdownDaemon => {
@@ -1604,6 +2113,8 @@ fn failure_code(error: &DaemonError) -> &'static str {
         DaemonError::Git(_) => "git_validation_failed",
         DaemonError::Provider(_) => "provider_operation_failed",
         DaemonError::Database(_) => "state_operation_failed",
+        DaemonError::Upgrade(_) => "upgrade_operation_failed",
+        DaemonError::DataRemoval(_) => "data_removal_refused",
         DaemonError::Pty(_) | DaemonError::ProcessTree(_) => "session_runtime_failed",
         DaemonError::SessionStopped | DaemonError::RequestCancelled => "session_unavailable",
         DaemonError::Ipc(_) | DaemonError::Configuration(_) | DaemonError::Lifecycle(_) => {
@@ -1612,7 +2123,7 @@ fn failure_code(error: &DaemonError) -> &'static str {
     }
 }
 
-async fn complete_handshake(stream: &mut BoxStream, state: &DaemonState) -> Result<bool> {
+async fn complete_handshake(stream: &mut BoxStream, state: &DaemonState) -> Result<Option<u32>> {
     let frame = timeout(HANDSHAKE_TIMEOUT, read_frame(stream))
         .await
         .map_err(|_| DaemonError::Lifecycle("client handshake timed out".into()))??;
@@ -1626,7 +2137,7 @@ async fn complete_handshake(stream: &mut BoxStream, state: &DaemonState) -> Resu
             false,
         )
         .await?;
-        return Ok(false);
+        return Ok(None);
     };
     if !authenticate(&hello, &state.authentication_token) {
         send_failure(
@@ -1637,7 +2148,7 @@ async fn complete_handshake(stream: &mut BoxStream, state: &DaemonState) -> Resu
             false,
         )
         .await?;
-        return Ok(false);
+        return Ok(None);
     }
     if hello.protocol_major != PROTOCOL_MAJOR || hello.protocol_minor != PROTOCOL_MINOR {
         send_failure(
@@ -1648,9 +2159,31 @@ async fn complete_handshake(stream: &mut BoxStream, state: &DaemonState) -> Resu
             false,
         )
         .await?;
-        return Ok(false);
+        return Ok(None);
     }
-    send_response(
+    if hello.client_process_id == 0 {
+        send_failure(
+            stream,
+            frame.message_id,
+            "invalid_request",
+            "client process ID is invalid",
+            false,
+        )
+        .await?;
+        return Ok(None);
+    }
+    if !register_client_process(state, hello.client_process_id)? {
+        send_failure(
+            stream,
+            frame.message_id,
+            "daemon_quiescing",
+            "daemon is not accepting new clients during lifecycle replacement",
+            true,
+        )
+        .await?;
+        return Ok(None);
+    }
+    if let Err(error) = send_response(
         stream,
         frame.message_id,
         &DaemonResponse::Welcome(WelcomeResponse {
@@ -1659,8 +2192,35 @@ async fn complete_handshake(stream: &mut BoxStream, state: &DaemonState) -> Resu
             protocol_minor: PROTOCOL_MINOR,
         }),
     )
-    .await?;
+    .await
+    {
+        unregister_client_process(&state.client_processes, hello.client_process_id);
+        return Err(error);
+    }
+    Ok(Some(hello.client_process_id))
+}
+
+fn register_client_process(state: &DaemonState, process_id: u32) -> Result<bool> {
+    let mut processes = state
+        .client_processes
+        .lock()
+        .map_err(|_| DaemonError::Lifecycle("client process registry is unavailable".into()))?;
+    if state.lifecycle.is_quiescing() {
+        return Ok(false);
+    }
+    *processes.entry(process_id).or_default() += 1;
     Ok(true)
+}
+
+fn unregister_client_process(processes: &StdMutex<HashMap<u32, u32>>, process_id: u32) {
+    if let Ok(mut processes) = processes.lock()
+        && let Some(count) = processes.get_mut(&process_id)
+    {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            processes.remove(&process_id);
+        }
+    }
 }
 
 fn decode_request(frame: &Frame) -> Result<ClientRequest> {
@@ -1764,9 +2324,42 @@ fn remove_token_if_owned(paths: &RuntimePaths, token: &AuthenticationToken) {
 }
 
 #[derive(Debug)]
-struct ClientGuard(Arc<AtomicU32>);
+struct ClientGuard {
+    count: Arc<AtomicU32>,
+    processes: Arc<StdMutex<HashMap<u32, u32>>>,
+    process_id: u32,
+}
 impl Drop for ClientGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        unregister_client_process(&self.processes, self.process_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LifecycleCoordinator;
+
+    #[tokio::test]
+    async fn lifecycle_quiescing_drains_existing_activity_and_refuses_new_work() {
+        let lifecycle = LifecycleCoordinator::new();
+        let activity = lifecycle.begin().unwrap();
+        let waiting = {
+            let lifecycle = lifecycle.clone();
+            tokio::spawn(async move { lifecycle.quiesce().await.unwrap() })
+        };
+        while !lifecycle
+            .quiescing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(lifecycle.begin().is_err());
+
+        drop(activity);
+        let quiesce = waiting.await.unwrap();
+        assert!(lifecycle.begin().is_err());
+        drop(quiesce);
+        assert!(lifecycle.begin().is_ok());
     }
 }
