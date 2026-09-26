@@ -13,7 +13,7 @@ Repository contents and paths, IPC clients, hook payloads, provider output, Git 
 - Bound frames, queues, PTY buffers, hook bodies, subprocess output, and diagnostic retention.
 - Apply timeouts and cancellation to external operations.
 - Start providers from a reviewed environment allowlist and never log environment values.
-- Never persist API keys, cookies, OAuth tokens, or copied CLI credentials.
+- Never persist prompts, provider transcripts, API keys, cookies, OAuth tokens, or copied CLI credentials.
 - Strip URL user-info, query strings, and fragments from Git remote metadata before persistence.
 - Audit security-relevant mutations and failures using redacted structured fields.
 - Require visible user action for repository-defined commands and every destructive operation.

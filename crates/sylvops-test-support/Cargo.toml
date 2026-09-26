@@ -19,6 +19,7 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 sylvops-core = { path = "../sylvops-core" }
 sylvops-daemon = { path = "../sylvops-daemon" }
 tempfile = "3"

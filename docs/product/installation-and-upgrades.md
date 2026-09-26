@@ -44,10 +44,9 @@ The runtime already creates user-local state and configuration directories, so i
 
 - Replace beta, prerelease, and one-time cut language in current product, development, packaging, workflow, and agent documentation. Preserve historical decisions as historical records rather than active roadmap items.
 - Change the workspace version from `0.1.0-beta.1` to the first promoted ordinary `0.x` version.
-- Stop inserting initial prompts into `session_prompts`.
-- Stop persisting provider argument arrays that contain prompts or other user-authored transient input.
-- Add a new numbered migration that deletes existing prompt rows and scrubs prompt-bearing launch metadata. Never edit the applied initial migration.
-- Add persistence tests using a unique prompt sentinel and assert that it is absent from every SQLite text field after session creation.
+- Preserve the prompt-privacy invariant: initial prompts never enter `session_prompts` or persisted provider argument arrays.
+- Retain the additive migration that deletes legacy prompt rows and scrubs prompt-bearing launch metadata; never edit the applied initial migration.
+- Keep the persistence test that uses a unique prompt sentinel and asserts that it is absent from every SQLite text field after session creation.
 - Add guarded Resume actions to desktop and TUI using the daemon's existing eligibility policy and typed `ResumeSession` request.
 
 ### 2. Establish application identity and packaging

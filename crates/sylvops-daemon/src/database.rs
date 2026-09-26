@@ -30,8 +30,14 @@ const MAX_TUI_STATE_BYTES: usize = 4 * 1024;
 const DESKTOP_STATE_SCOPE: &str = "desktop";
 const DESKTOP_STATE_KEY: &str = "navigation.v1";
 const MAX_DESKTOP_STATE_BYTES: usize = 16 * 1024;
-const MIGRATIONS: &[(i64, &str, &str)] =
-    &[(1, "initial", include_str!("../migrations/0001_initial.sql"))];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "initial", include_str!("../migrations/0001_initial.sql")),
+    (
+        2,
+        "stop_persisting_codex_prompts",
+        include_str!("../migrations/0002_stop_persisting_codex_prompts.sql"),
+    ),
+];
 
 #[derive(Clone, Debug)]
 pub struct DatabaseHandle {
@@ -184,7 +190,6 @@ pub struct NewSession {
     pub command: String,
     pub arguments_json: String,
     pub cwd: String,
-    pub initial_prompt: Option<String>,
     pub external_session_id: Option<String>,
 }
 
@@ -1339,21 +1344,6 @@ fn insert_session(connection: &mut Connection, record: &NewSession) -> Result<Se
             ],
         )
         .map_err(database_error)?;
-    if let Some(prompt) = record.initial_prompt.as_deref() {
-        transaction
-            .execute(
-                "INSERT INTO session_prompts(id, session_id, submitted_at, prompt_text, byte_length, retention_class) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'recent')",
-                params![
-                    Uuid::now_v7().to_string(),
-                    record.id.to_string(),
-                    now,
-                    prompt,
-                    i64::try_from(prompt.len()).unwrap_or(i64::MAX)
-                ],
-            )
-            .map_err(database_error)?;
-    }
     insert_entity_audit(
         &transaction,
         "session_created",
@@ -2024,6 +2014,140 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_removes_persisted_prompts_without_losing_session_record() {
+        const SENTINEL: &str = "SYLVOPS_LEGACY_PRIVATE_PROMPT_25_10e7a682";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATIONS[0].2).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (\
+                 version INTEGER PRIMARY KEY, \
+                 name TEXT NOT NULL, \
+                 applied_at INTEGER NOT NULL, \
+                 checksum TEXT NOT NULL\
+                 ) STRICT;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at, checksum) \
+                 VALUES (1, 'initial', 1, ?1)",
+                [checksum(MIGRATIONS[0].2)],
+            )
+            .unwrap();
+        let workspace_id = WorkspaceId::new();
+        let project_id = ProjectId::new();
+        let worktree_id = WorktreeId::new();
+        let session_id = SessionId::new();
+        connection
+            .execute(
+                "INSERT INTO workspaces \
+                 (id, name, created_at, updated_at, last_opened_at, is_open) \
+                 VALUES (?1, 'Legacy workspace', 1, 2, 3, 1)",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects \
+                 (id, workspace_id, name, repository_path, canonical_repository_path, \
+                  default_branch, remote_url, created_at, last_activity_at) \
+                 VALUES (?1, ?2, 'Legacy project', 'C:/repo', 'C:/repo', 'main', NULL, 4, 5)",
+                params![project_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO worktrees \
+                 (id, project_id, name, path, canonical_path, branch, base_ref, base_commit, \
+                  is_root_checkout, status, created_at, last_activity_at, removed_at) \
+                 VALUES (?1, ?2, 'Legacy worktree', 'C:/repo', 'C:/repo', 'main', 'main', \
+                         'deadbeef', 1, 'active', 6, 7, NULL)",
+                params![worktree_id.to_string(), project_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions \
+                 (id, worktree_id, provider_profile_id, provider_kind, display_name, state, \
+                  process_id, process_identity, external_session_id, command, arguments_json, \
+                  cwd, created_at, started_at, ended_at, last_activity_at, \
+                  last_seen_output_sequence, exit_code, failure_reason) \
+                 VALUES (?1, ?2, NULL, 'codex', 'Legacy Codex', 'failed', NULL, NULL, \
+                         'verified-resume-id', 'codex', ?3, 'C:/repo', 8, 9, 10, 11, 12, 17, \
+                         'expected outcome')",
+                params![
+                    session_id.to_string(),
+                    worktree_id.to_string(),
+                    serde_json::to_string(&["--cd", "C:/repo", SENTINEL]).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_prompts \
+                 (id, session_id, submitted_at, prompt_text, byte_length, retention_class) \
+                 VALUES (?1, ?2, 13, ?3, ?4, 'recent')",
+                params![
+                    Uuid::now_v7().to_string(),
+                    session_id.to_string(),
+                    SENTINEL,
+                    i64::try_from(SENTINEL.len()).unwrap()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = DatabaseHandle::open(&path).unwrap();
+        let migrated = database.session(session_id).await.unwrap();
+        assert_eq!(migrated.provider_kind.to_string(), "codex");
+        assert_eq!(migrated.state, SessionState::Failed);
+        assert_eq!(migrated.created_at, 8);
+        assert_eq!(migrated.started_at, Some(9));
+        assert_eq!(migrated.ended_at, Some(10));
+        assert_eq!(migrated.last_activity_at, 11);
+        assert_eq!(migrated.last_seen_output_sequence, 12);
+        assert_eq!(migrated.exit_code, Some(17));
+        assert_eq!(migrated.failure_reason.as_deref(), Some("expected outcome"));
+        assert_eq!(
+            migrated.external_session_id.as_deref(),
+            Some("verified-resume-id")
+        );
+        assert_eq!(migrated.arguments_json, "[]");
+        database.shutdown().await.unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let prompt_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM session_prompts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(prompt_count, 0);
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+        drop(connection);
+
+        let database = DatabaseHandle::open(&path).unwrap();
+        database.shutdown().await.unwrap();
+        let connection = Connection::open(path).unwrap();
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+    }
+
+    #[tokio::test]
     async fn tui_state_round_trips_without_advancing_revision() {
         let directory = tempfile::tempdir().unwrap();
         let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
@@ -2279,7 +2403,6 @@ mod tests {
                 command: "shell".into(),
                 arguments_json: "[]".into(),
                 cwd: managed_path,
-                initial_prompt: None,
                 external_session_id: None,
             })
             .await

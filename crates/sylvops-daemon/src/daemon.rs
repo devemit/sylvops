@@ -880,9 +880,8 @@ async fn handle_request(
                 provider_profile_id: Some(provider_profile_id(provider)),
                 provider_kind: provider,
                 command: path_text(&spec.executable)?,
-                arguments_json: arguments_json(&spec.arguments)?,
+                arguments_json: arguments_json(spec.arguments.persisted_values())?,
                 cwd: worktree.canonical_path.clone(),
-                initial_prompt,
                 external_session_id: None,
             };
             let (revision, running) =
@@ -954,9 +953,8 @@ async fn handle_request(
                 provider_profile_id: source.provider_profile_id,
                 provider_kind: source.provider_kind,
                 command: path_text(&spec.executable)?,
-                arguments_json: arguments_json(&spec.arguments)?,
+                arguments_json: arguments_json(spec.arguments.persisted_values())?,
                 cwd: worktree.canonical_path,
-                initial_prompt: None,
                 external_session_id: Some(external_session_id),
             };
             let (revision, running) =
@@ -1205,7 +1203,7 @@ async fn spawn_managed_session(
     let _ = state.database.create_session(record).await?;
     let spec = SessionSpec {
         program: launch.executable,
-        arguments: launch.arguments,
+        arguments: launch.arguments.into_all(),
         cwd,
         columns,
         rows,

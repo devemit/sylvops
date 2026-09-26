@@ -56,8 +56,65 @@ pub struct ResumeContext {
 #[derive(Clone)]
 pub struct LaunchSpec {
     pub executable: PathBuf,
-    pub arguments: Vec<OsString>,
+    pub arguments: LaunchArguments,
     pub environment: BTreeMap<OsString, OsString>,
+}
+
+#[derive(Clone, Default)]
+pub struct LaunchArguments {
+    values: Vec<OsString>,
+    persisted_len: usize,
+}
+
+impl fmt::Debug for LaunchArguments {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchArguments")
+            .field("argument_count", &self.values.len())
+            .field("persisted_argument_count", &self.persisted_len)
+            .finish()
+    }
+}
+
+impl LaunchArguments {
+    #[must_use]
+    pub fn persisted(values: Vec<OsString>) -> Self {
+        Self {
+            persisted_len: values.len(),
+            values,
+        }
+    }
+
+    #[must_use]
+    pub fn with_transient_tail(mut persisted: Vec<OsString>, transient: Vec<OsString>) -> Self {
+        let persisted_len = persisted.len();
+        persisted.extend(transient);
+        Self {
+            values: persisted,
+            persisted_len,
+        }
+    }
+
+    pub fn prepend_persisted(&mut self, values: impl IntoIterator<Item = OsString>) {
+        let values: Vec<_> = values.into_iter().collect();
+        self.persisted_len = self.persisted_len.saturating_add(values.len());
+        self.values.splice(0..0, values);
+    }
+
+    #[must_use]
+    pub fn all(&self) -> &[OsString] {
+        &self.values
+    }
+
+    #[must_use]
+    pub fn persisted_values(&self) -> &[OsString] {
+        &self.values[..self.persisted_len]
+    }
+
+    #[must_use]
+    pub fn into_all(self) -> Vec<OsString> {
+        self.values
+    }
 }
 
 impl fmt::Debug for LaunchSpec {
@@ -65,7 +122,11 @@ impl fmt::Debug for LaunchSpec {
         formatter
             .debug_struct("LaunchSpec")
             .field("executable", &self.executable)
-            .field("argument_count", &self.arguments.len())
+            .field("argument_count", &self.arguments.all().len())
+            .field(
+                "persisted_argument_count",
+                &self.arguments.persisted_values().len(),
+            )
             .field("environment_keys", &self.environment.keys())
             .finish()
     }
