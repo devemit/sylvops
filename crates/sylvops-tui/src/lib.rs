@@ -221,6 +221,7 @@ async fn execute_effects(
     for effect in effects {
         match effect {
             Effect::Attach => attach_selected(client, app).await?,
+            Effect::Resume(session_id) => resume_session(client, app, session_id).await?,
             Effect::OpenCreate => open_create_form(app),
             Effect::OpenRename => open_rename_form(app),
             Effect::OpenDelete => open_destructive_confirmation(client, app).await?,
@@ -954,6 +955,65 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
     Ok(())
 }
 
+async fn resume_session(
+    client: &DaemonClient,
+    app: &mut App,
+    source_session_id: SessionId,
+) -> Result<(), DaemonError> {
+    let response = client
+        .request(&ClientRequest::ResumeSession {
+            session_id: source_session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            app.resume_pending = None;
+            return Err(error);
+        }
+    };
+    let Some(session) = apply_resume_response(app, response) else {
+        return Ok(());
+    };
+    app.snapshot = snapshot(client).await?;
+    select_resumed_session(app, &session);
+    app.flash = Some(Flash::transient(
+        FlashKind::Success,
+        "Session resumed into a new history record.",
+    ));
+    Ok(())
+}
+
+fn apply_resume_response(
+    app: &mut App,
+    response: DaemonResponse,
+) -> Option<sylvops_core::domain::Session> {
+    app.resume_pending = None;
+    match response {
+        DaemonResponse::SessionResumed { session, .. } => Some(session),
+        response => {
+            app.flash = Some(Flash::error(response_message("session resume", response)));
+            None
+        }
+    }
+}
+
+fn select_resumed_session(app: &mut App, session: &sylvops_core::domain::Session) {
+    if let Some(worktree) = app
+        .snapshot
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.id == session.worktree_id)
+    {
+        app.expanded_projects.insert(worktree.project_id);
+        app.expanded_worktrees.insert(worktree.id);
+    }
+    app.select_node(ExplorerNode::Session(session.id));
+    app.set_tab(MainTab::Terminal);
+}
+
 async fn handle_terminal(
     client: &DaemonClient,
     app: &mut App,
@@ -1264,6 +1324,76 @@ mod tests {
             }],
             provider_profiles: Vec::new(),
         }
+    }
+
+    #[test]
+    fn successful_resume_selects_successor_and_preserves_source_history() {
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions[0].provider_kind = ProviderKind::Codex;
+        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.sessions[0].process_id = None;
+        snapshot.sessions[0].external_session_id = Some("verified-id".into());
+        snapshot.sessions[0].ended_at = Some(2);
+        let source = snapshot.sessions[0].clone();
+        let mut successor = source.clone();
+        successor.id = SessionId::new();
+        successor.created_at = 3;
+        successor.display_name = "Codex (resumed)".into();
+        successor.state = SessionState::Running;
+        successor.ended_at = None;
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.snapshot.sessions.push(successor.clone());
+
+        select_resumed_session(&mut app, &successor);
+
+        assert_eq!(app.selected_session_id, Some(successor.id));
+        assert_eq!(app.main_tab, MainTab::Terminal);
+        assert!(
+            app.snapshot
+                .sessions
+                .iter()
+                .any(|item| item.id == source.id)
+        );
+        assert!(
+            app.snapshot
+                .sessions
+                .iter()
+                .any(|item| item.id == successor.id)
+        );
+        let historical_source = app
+            .snapshot
+            .sessions
+            .iter()
+            .find(|item| item.id == source.id)
+            .expect("historical source");
+        assert!(!sylvops_core::domain::session_can_resume(
+            historical_source,
+            &app.snapshot.sessions
+        ));
+    }
+
+    #[test]
+    fn stale_resume_error_clears_pending_and_is_actionable() {
+        let source_session_id = SessionId::new();
+        let mut app = App::new(DaemonSnapshot::default(), Vec::new(), None);
+        app.resume_pending = Some(source_session_id);
+
+        let resumed = apply_resume_response(
+            &mut app,
+            DaemonResponse::Error(sylvops_core::protocol::ProtocolFailure {
+                code: "conflict".into(),
+                message: "This session has already been resumed.".into(),
+                retryable: false,
+            }),
+        );
+
+        assert!(resumed.is_none());
+        assert!(app.resume_pending.is_none());
+        assert!(
+            app.flash
+                .as_ref()
+                .is_some_and(|flash| flash.text.contains("already been resumed"))
+        );
     }
 
     #[test]

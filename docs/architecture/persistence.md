@@ -2,9 +2,9 @@
 
 SQLite stores operational session metadata, not prompts, provider transcripts, terminal input, or unbounded terminal output. Initial prompts are passed only to the launched provider process; they are excluded from both prompt history and the recorded argument vector. UUIDv7 identifiers are canonical text and timestamps are UTC Unix milliseconds. The initial migration is `crates/sylvops-daemon/migrations/0001_initial.sql`.
 
-The schema contains `schema_migrations`, `workspaces`, `projects`, `worktrees`, `provider_profiles`, `sessions`, `session_prompts`, `pull_request_links`, `audit_events`, `settings`, and `ui_state`, with foreign keys, status constraints, uniqueness constraints, and activity/attention indexes.
+The schema contains `schema_migrations`, `workspaces`, `projects`, `worktrees`, `provider_profiles`, `sessions`, `session_resumptions`, `session_prompts`, `pull_request_links`, `audit_events`, `settings`, and `ui_state`, with foreign keys, status constraints, uniqueness constraints, and activity/attention indexes.
 
-Migrations are embedded, checksum-validated, and applied before accepting IPC connections. Applied migrations are immutable. Migration 2 deletes legacy prompt rows and clears historical Codex argument arrays that could contain an untagged prompt while preserving session identity, lifecycle, outcome, and verified resume metadata. Startup refuses an unknown newer schema rather than attempting a destructive downgrade.
+Migrations are embedded, checksum-validated, and applied before accepting IPC connections. Applied migrations are immutable. Migration 2 deletes legacy prompt rows and clears historical Codex argument arrays that could contain an untagged prompt while preserving session identity, lifecycle, outcome, and verified resume metadata. Migration 3 records one unique source-to-successor relationship for every successful provider resume so stale and concurrent attempts fail transactionally without mutating the historical source session. Startup refuses an unknown newer schema rather than attempting a destructive downgrade.
 
 Multi-entity state transitions use short transactions. No transaction spans a subprocess. Worktree mutation therefore follows validate → external Git command → verify → transactional record/audit, with conservative recovery if the final persistence step fails.
 

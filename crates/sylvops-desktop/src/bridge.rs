@@ -30,6 +30,7 @@ pub(crate) enum Operation {
     RegisterProject,
     CreateWorktree,
     CreateSession(WorktreeId),
+    Resume(SessionId),
     RenameProject,
     RenameWorktree,
     RenameSession,

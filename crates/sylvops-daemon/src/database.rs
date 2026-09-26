@@ -37,6 +37,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "stop_persisting_codex_prompts",
         include_str!("../migrations/0002_stop_persisting_codex_prompts.sql"),
     ),
+    (
+        3,
+        "session_resumptions",
+        include_str!("../migrations/0003_session_resumptions.sql"),
+    ),
 ];
 
 #[derive(Clone, Debug)]
@@ -191,6 +196,7 @@ pub struct NewSession {
     pub arguments_json: String,
     pub cwd: String,
     pub external_session_id: Option<String>,
+    pub resumed_from_session_id: Option<SessionId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1324,6 +1330,22 @@ fn insert_session(connection: &mut Connection, record: &NewSession) -> Result<Se
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
+    if let Some(source_session_id) = record.resumed_from_session_id {
+        let successor: Option<String> = transaction
+            .query_row(
+                "SELECT successor_session_id FROM session_resumptions \
+                 WHERE source_session_id = ?1",
+                [source_session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if successor.is_some() {
+            return Err(DaemonError::Provider(
+                "session has already been resumed; refresh and select the successor session".into(),
+            ));
+        }
+    }
     transaction
         .execute(
             "INSERT INTO sessions(id, worktree_id, provider_profile_id, provider_kind, display_name, state, command, \
@@ -1344,6 +1366,15 @@ fn insert_session(connection: &mut Connection, record: &NewSession) -> Result<Se
             ],
         )
         .map_err(database_error)?;
+    if let Some(source_session_id) = record.resumed_from_session_id {
+        transaction
+            .execute(
+                "INSERT INTO session_resumptions(source_session_id, successor_session_id, created_at) \
+                 VALUES (?1, ?2, ?3)",
+                params![source_session_id.to_string(), record.id.to_string(), now],
+            )
+            .map_err(database_error)?;
+    }
     insert_entity_audit(
         &transaction,
         "session_created",
@@ -2132,6 +2163,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migration_count, 1);
+        let resumption_migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resumption_migration_count, 1);
         drop(connection);
 
         let database = DatabaseHandle::open(&path).unwrap();
@@ -2404,6 +2443,7 @@ mod tests {
                 arguments_json: "[]".into(),
                 cwd: managed_path,
                 external_session_id: None,
+                resumed_from_session_id: None,
             })
             .await
             .unwrap();

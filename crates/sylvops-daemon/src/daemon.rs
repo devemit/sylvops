@@ -883,6 +883,7 @@ async fn handle_request(
                 arguments_json: arguments_json(spec.arguments.persisted_values())?,
                 cwd: worktree.canonical_path.clone(),
                 external_session_id: None,
+                resumed_from_session_id: None,
             };
             let (revision, running) =
                 spawn_managed_session(state, record, spec, columns, rows).await?;
@@ -912,9 +913,10 @@ async fn handle_request(
                 DaemonError::Provider("session has no verified provider resume identifier".into())
             })?;
             if !state_allows_resume(source.state) {
-                return Err(DaemonError::Provider(
-                    "only inactive sessions may be resumed".into(),
-                ));
+                return Err(DaemonError::Provider(format!(
+                    "session state {} is not eligible for resume; only finished, failed, or disconnected sessions may be resumed",
+                    source.state
+                )));
             }
             if let Some(managed) = get_managed_session(state, source_session_id).await
                 && !*managed.completed.borrow()
@@ -956,6 +958,7 @@ async fn handle_request(
                 arguments_json: arguments_json(spec.arguments.persisted_values())?,
                 cwd: worktree.canonical_path,
                 external_session_id: Some(external_session_id),
+                resumed_from_session_id: Some(source_session_id),
             };
             let (revision, running) =
                 spawn_managed_session(state, record, spec, columns, rows).await?;

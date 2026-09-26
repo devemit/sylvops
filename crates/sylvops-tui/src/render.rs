@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use sylvops_core::{
-    domain::{Session, SessionState, state_allows_resume},
+    domain::{Session, SessionState, session_can_resume},
     ui::MainTab,
 };
 
@@ -321,14 +321,24 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             Some(("[ Detach · Ctrl+] ]", HitTarget::Detach)),
         )
     } else if let Some(session) = app.selected_session() {
+        let can_resume = session_can_resume(session, &app.snapshot.sessions);
         (
             " Terminal · detached ".into(),
             format!(
-                "{} is {}.\n\nSelecting a session never attaches automatically.\nPress Enter or click Attach to connect.",
+                "{} is {}.\n\nSelecting a session never attaches automatically.\n{}",
                 session.display_name,
-                status_label(session.state)
+                status_label(session.state),
+                if can_resume {
+                    "Press Enter to inspect retained output, or resume to continue in a new session."
+                } else {
+                    "Press Enter or click Attach to connect."
+                }
             ),
-            Some(("[ Attach ]", HitTarget::Attach)),
+            Some(if can_resume {
+                ("[ Resume · u ]", HitTarget::Resume)
+            } else {
+                ("[ Attach ]", HitTarget::Attach)
+            }),
         )
     } else {
         (
@@ -470,17 +480,15 @@ fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<
         ]),
         Line::from(vec![
             Span::styled("Resume       ", theme.muted),
-            Span::raw(
-                if session.external_session_id.is_some() && state_allows_resume(session.state) {
-                    "Available from the CLI"
-                } else {
-                    "Unavailable"
-                },
-            ),
+            Span::raw(if session_can_resume(session, &app.snapshot.sessions) {
+                "Available · press u"
+            } else {
+                "Unavailable"
+            }),
         ]),
         Line::from(""),
         Line::from(
-            "Safe actions: Attach, Rename, Stop. Commit, push, merge, and PR actions are not available.",
+            "Safe actions: Attach, Resume, Rename, Stop. Commit, push, merge, and PR actions are not available.",
         ),
     ]
 }
@@ -515,7 +523,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy\n← →: collapse / expand\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\n/: commands and entity search\nShift+A: next attention item\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy\n← →: collapse / expand\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\n/: commands and entity search\nShift+A: next attention item\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL)).wrap(Wrap { trim: false }), popup);
 }
 
