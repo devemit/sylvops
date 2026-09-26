@@ -1,0 +1,202 @@
+#!/bin/bash
+
+set -euo pipefail
+
+run_with_timeout() {
+  local limit_seconds="$1"
+  shift
+  "$@" &
+  local command_pid=$!
+  (
+    sleep "$limit_seconds"
+    if kill -0 "$command_pid" 2>/dev/null; then
+      echo "A macOS package test command exceeded its ${limit_seconds}-second limit." >&2
+      kill -TERM "$command_pid" 2>/dev/null || true
+      sleep 5
+      kill -KILL "$command_pid" 2>/dev/null || true
+    fi
+  ) &
+  local watchdog_pid=$!
+  local status=0
+  wait "$command_pid" || status=$?
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$status"
+}
+
+usage() {
+  echo "usage: $0 --dmg <path> --architecture <x86_64|aarch64> --expected-version <version> [--require-developer-id] [--require-notarization]" >&2
+}
+
+dmg_path=""
+architecture=""
+expected_version=""
+require_developer_id=false
+require_notarization=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dmg)
+      dmg_path="${2:-}"
+      shift 2
+      ;;
+    --architecture)
+      architecture="${2:-}"
+      shift 2
+      ;;
+    --expected-version)
+      expected_version="${2:-}"
+      shift 2
+      ;;
+    --require-developer-id)
+      require_developer_id=true
+      shift
+      ;;
+    --require-notarization)
+      require_notarization=true
+      shift
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "The SylvOps macOS package smoke test must run on a native macOS host." >&2
+  exit 1
+fi
+if [[ ! -f "$dmg_path" || ! -s "$dmg_path" ]]; then
+  echo "The DMG is missing or empty: $dmg_path" >&2
+  exit 1
+fi
+case "$architecture" in
+  x86_64) lipo_architecture="x86_64" ;;
+  aarch64) lipo_architecture="arm64" ;;
+  *)
+    echo "Unsupported package architecture: $architecture" >&2
+    exit 1
+    ;;
+esac
+if [[ -z "$expected_version" ]]; then
+  echo "An expected application version is required." >&2
+  exit 1
+fi
+
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/sylvops-macos-package.XXXXXX")"
+mount_dir="$test_root/mounted"
+install_dir="$test_root/Applications"
+installed_app="$install_dir/SylvOps.app"
+state_root="$test_root/state"
+repository_dir="$test_root/repository"
+worktree_dir="$test_root/worktree"
+mounted=false
+
+desktop_pattern=""
+cleanup() {
+  if [[ -n "$desktop_pattern" ]]; then
+    while IFS= read -r desktop_pid; do
+      [[ -n "$desktop_pid" ]] && kill "$desktop_pid" 2>/dev/null || true
+    done < <(run_with_timeout 10 pgrep -f -x "$desktop_pattern" 2>/dev/null || true)
+  fi
+  if $mounted; then
+    run_with_timeout 120 hdiutil detach "$mount_dir" -force >/dev/null 2>&1 || true
+  fi
+  rm -rf "$test_root"
+}
+trap cleanup EXIT
+
+mkdir -p "$mount_dir" "$install_dir" "$state_root"
+state_sentinel="$state_root/package-preserve.txt"
+printf '%s\n' "preserve SylvOps state" > "$state_sentinel"
+
+run_with_timeout 30 git init --quiet "$repository_dir"
+run_with_timeout 30 git -C "$repository_dir" config user.name "SylvOps CI"
+run_with_timeout 30 git -C "$repository_dir" config user.email "sylvops-ci@example.invalid"
+printf '%s\n' "# macOS package smoke test" > "$repository_dir/README.md"
+run_with_timeout 30 git -C "$repository_dir" add README.md
+run_with_timeout 30 git -C "$repository_dir" commit --quiet -m "test: seed macOS package repository"
+run_with_timeout 60 git -C "$repository_dir" worktree add --quiet -b macos-package-smoke-branch "$worktree_dir"
+printf '%s\n' "preserve worktree content" > "$worktree_dir/package-preserve.txt"
+
+run_with_timeout 120 codesign --verify --verbose=2 "$dmg_path"
+if $require_notarization; then
+  run_with_timeout 120 xcrun stapler validate "$dmg_path"
+  run_with_timeout 120 spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
+fi
+
+run_with_timeout 120 hdiutil attach "$dmg_path" -nobrowse -readonly -mountpoint "$mount_dir" >/dev/null
+mounted=true
+if [[ ! -d "$mount_dir/SylvOps.app" || ! -L "$mount_dir/Applications" ]]; then
+  echo "The DMG must contain SylvOps.app and an Applications shortcut." >&2
+  exit 1
+fi
+run_with_timeout 120 ditto "$mount_dir/SylvOps.app" "$installed_app"
+
+info_plist="$installed_app/Contents/Info.plist"
+installed_binary="$installed_app/Contents/MacOS/sylvops"
+if [[ ! -f "$info_plist" || ! -x "$installed_binary" ]]; then
+  echo "The installed application bundle is incomplete." >&2
+  exit 1
+fi
+
+bundle_identifier="$(run_with_timeout 30 plutil -extract CFBundleIdentifier raw -o - "$info_plist")"
+bundle_name="$(run_with_timeout 30 plutil -extract CFBundleName raw -o - "$info_plist")"
+bundle_version="$(run_with_timeout 30 plutil -extract CFBundleShortVersionString raw -o - "$info_plist")"
+icon_name="$(run_with_timeout 30 plutil -extract CFBundleIconFile raw -o - "$info_plist")"
+[[ "$bundle_identifier" == "com.devemit.sylvops" ]] || { echo "Unexpected bundle identifier: $bundle_identifier" >&2; exit 1; }
+[[ "$bundle_name" == "SylvOps" ]] || { echo "Unexpected bundle name: $bundle_name" >&2; exit 1; }
+[[ "$bundle_version" == "$expected_version" ]] || { echo "Unexpected bundle version: $bundle_version" >&2; exit 1; }
+[[ -n "$icon_name" && -f "$installed_app/Contents/Resources/$icon_name" ]] || { echo "The shared application icon is missing from the bundle." >&2; exit 1; }
+
+installed_architectures="$(run_with_timeout 30 lipo -archs "$installed_binary")"
+[[ "$installed_architectures" == "$lipo_architecture" ]] || { echo "Unexpected installed architecture: $installed_architectures" >&2; exit 1; }
+run_with_timeout 120 codesign --verify --deep --strict --verbose=2 "$installed_app"
+codesign_details="$test_root/codesign-details.txt"
+run_with_timeout 120 codesign --display --verbose=4 "$installed_app" 2> "$codesign_details"
+grep -Eq '^flags=.*runtime' "$codesign_details"
+if $require_developer_id; then
+  grep -Fq 'Authority=Developer ID Application:' "$codesign_details"
+  grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' "$codesign_details"
+fi
+if $require_notarization; then
+  run_with_timeout 120 spctl --assess --type execute --verbose=4 "$installed_app"
+fi
+
+run_with_timeout 30 open -na "$installed_app" --args --state-dir "$state_root"
+status_output="$test_root/daemon-status.txt"
+deadline=$((SECONDS + 30))
+until run_with_timeout 5 "$installed_binary" --state-dir "$state_root" daemon status > "$status_output" 2>&1; do
+  if (( SECONDS >= deadline )); then
+    echo "The installed app did not start its daemon through LaunchServices within 30 seconds." >&2
+    sed -n '1,80p' "$status_output" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+desktop_pattern="$installed_binary --state-dir $state_root desktop"
+deadline=$((SECONDS + 15))
+until run_with_timeout 5 pgrep -f -x "$desktop_pattern" >/dev/null 2>&1; do
+  if (( SECONDS >= deadline )); then
+    echo "The installed app did not start its desktop client through LaunchServices within 15 seconds." >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+run_with_timeout 15 "$installed_binary" --state-dir "$state_root" daemon stop
+while IFS= read -r desktop_pid; do
+  [[ -n "$desktop_pid" ]] && kill "$desktop_pid"
+done < <(run_with_timeout 10 pgrep -f -x "$desktop_pattern" 2>/dev/null || true)
+desktop_pattern=""
+
+rm -rf "$installed_app"
+[[ ! -e "$installed_app" ]] || { echo "Removing the application bundle failed." >&2; exit 1; }
+[[ -f "$state_sentinel" ]] || { echo "Removing the app deleted SylvOps state." >&2; exit 1; }
+[[ -d "$repository_dir/.git" ]] || { echo "Removing the app deleted the repository." >&2; exit 1; }
+[[ -f "$worktree_dir/package-preserve.txt" ]] || { echo "Removing the app deleted worktree content." >&2; exit 1; }
+run_with_timeout 30 git -C "$repository_dir" show-ref --verify --quiet refs/heads/macos-package-smoke-branch
+
+echo "[ok] signed macOS $architecture app installed, launched, and was removed without deleting user content"

@@ -3,6 +3,7 @@ param(
     [string]$RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
     [string]$ArchivePath,
     [string]$InstallerPath,
+    [string[]]$MacosPackagePath,
     [string]$DistDirectory,
     [string]$ExpectedTag
 )
@@ -147,6 +148,17 @@ function Assert-WindowsInstaller {
     Write-Host "[ok] signed Windows installer is present"
 }
 
+function Assert-MacosPackage {
+    param([string]$Path)
+
+    Assert-ReleaseCondition (Test-Path -LiteralPath $Path -PathType Leaf) "macOS package is missing: $Path"
+    Assert-ReleaseCondition ((Get-Item -LiteralPath $Path).Length -gt 0) "macOS package is empty: $Path"
+    $name = Split-Path -Leaf $Path
+    Assert-ReleaseCondition ($name -in @('sylvops-macos-x86_64.dmg', 'sylvops-macos-aarch64.dmg')) "Unexpected macOS package name: $name"
+
+    Write-Host "[ok] signed and notarized macOS package is present: $name"
+}
+
 $root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 $cargo = Get-Content -Raw -LiteralPath (Join-Path $root 'Cargo.toml')
 $versionMatch = [regex]::Match($cargo, '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"([^"]+)"')
@@ -213,6 +225,36 @@ foreach ($scriptPath in @(
     Assert-ReleaseCondition (Test-Path -LiteralPath (Join-Path $root $scriptPath) -PathType Leaf) "Windows installer workflow script is missing: $scriptPath"
 }
 
+$macosPackagerConfigPath = Join-Path $root 'packaging\macos\Packager.toml'
+Assert-ReleaseCondition (Test-Path -LiteralPath $macosPackagerConfigPath -PathType Leaf) "The macOS packager configuration is missing."
+$macosPackagerConfig = Get-Content -Raw -LiteralPath $macosPackagerConfigPath
+foreach ($requiredSetting in @(
+    'product-name = "SylvOps"',
+    "version = `"$version`"",
+    "identifier = `"$applicationId`"",
+    'formats = ["app"]',
+    'packaging/icons/sylvops.png',
+    'entitlements = "packaging/macos/entitlements.plist"'
+)) {
+    Assert-ReleaseCondition ($macosPackagerConfig.Contains($requiredSetting)) "The macOS packager configuration is missing the locked setting: $requiredSetting"
+}
+
+foreach ($macosPath in @(
+    'packaging\macos\entitlements.plist',
+    'scripts\package-macos.sh',
+    'scripts\test-macos-package.sh'
+)) {
+    Assert-ReleaseCondition (Test-Path -LiteralPath (Join-Path $root $macosPath) -PathType Leaf) "The macOS package workflow file is missing: $macosPath"
+}
+$macosPackageScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\package-macos.sh')
+foreach ($requiredText in @('run_with_timeout', '--options runtime', 'Developer ID Application:', 'notarytool submit', 'stapler staple', 'stapler validate')) {
+    Assert-ReleaseCondition ($macosPackageScript.Contains($requiredText)) "The macOS package script is missing a release control: $requiredText"
+}
+$macosSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-package.sh')
+foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'CFBundleIdentifier', 'TeamIdentifier', 'package-preserve.txt', 'show-ref --verify')) {
+    Assert-ReleaseCondition ($macosSmokeScript.Contains($requiredText)) "The macOS package smoke test is missing an acceptance check: $requiredText"
+}
+
 $quickstart = Get-Content -Raw -LiteralPath (Join-Path $root 'packaging\windows\QUICKSTART.txt')
 Assert-ReleaseCondition ($quickstart -match "(?m)^SYLVOPS $([regex]::Escape($version))$") "Windows QUICKSTART version does not match workspace version $version."
 
@@ -235,6 +277,9 @@ $readme = Get-Content -Raw -LiteralPath (Join-Path $root 'README.md')
 Assert-BundledReadme $readme
 Assert-ReleaseCondition ($readme.Contains('Start-Process sylvops')) "README does not document the installed CLI discovery surface."
 Assert-ReleaseCondition ($readme.Contains('preserves configuration, session data, repositories, worktrees, and branches')) "README does not state the Windows uninstall preservation contract."
+foreach ($requiredText in @('sylvops-macos-x86_64.dmg', 'sylvops-macos-aarch64.dmg', '/Applications', 'Gatekeeper')) {
+    Assert-ReleaseCondition ($readme.Contains($requiredText)) "README is missing normal macOS installation guidance: $requiredText"
+}
 
 $releasingGuide = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\development\releasing.md')
 foreach ($requiredText in @(
@@ -244,9 +289,15 @@ foreach ($requiredText in @(
     'WINDOWS_SIGNING_TIMESTAMP_URL',
     '%LOCALAPPDATA%\Programs\SylvOps',
     '%LOCALAPPDATA%\SylvOps',
-    '%APPDATA%\SylvOps'
+    '%APPDATA%\SylvOps',
+    'MACOS_SIGNING_CERTIFICATE_BASE64',
+    'MACOS_SIGNING_CERTIFICATE_PASSWORD',
+    'MACOS_SIGNING_IDENTITY',
+    'MACOS_NOTARY_KEY_BASE64',
+    'MACOS_NOTARY_KEY_ID',
+    'MACOS_NOTARY_ISSUER_ID'
 )) {
-    Assert-ReleaseCondition ($releasingGuide.Contains($requiredText)) "Release guide is missing Windows installer guidance: $requiredText"
+    Assert-ReleaseCondition ($releasingGuide.Contains($requiredText)) "Release guide is missing protected package guidance: $requiredText"
 }
 
 $ci = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\ci.yml')
@@ -266,7 +317,9 @@ foreach ($asset in @(
     'sylvops-windows-x86_64.zip',
     'sylvops-linux-x86_64.tar.gz',
     'sylvops-macos-x86_64.tar.gz',
-    'sylvops-macos-aarch64.tar.gz'
+    'sylvops-macos-aarch64.tar.gz',
+    'sylvops-macos-x86_64.dmg',
+    'sylvops-macos-aarch64.dmg'
 )) {
     Assert-ReleaseCondition ($release.Contains($asset)) "Release workflow is missing required archive: $asset"
 }
@@ -287,6 +340,14 @@ Assert-ReleaseCondition ($release -match '(?ms)^  package-windows:.*?^    enviro
 Assert-ReleaseCondition ($release.Contains('scripts/package-windows-installer.ps1')) "Release packaging does not build the signed Windows installer."
 Assert-ReleaseCondition ($release.Contains('scripts/test-windows-installer.ps1')) "Release packaging does not run the native Windows installer smoke test."
 Assert-ReleaseCondition ($release.Contains('sylvops-windows-x86_64-setup.exe')) "Release packaging does not publish the Windows installer asset."
+Assert-ReleaseCondition ($release.Contains('MACOS_SIGNING_CERTIFICATE_BASE64')) "Release packaging does not load the protected macOS signing certificate."
+Assert-ReleaseCondition ($release.Contains('MACOS_SIGNING_CERTIFICATE_PASSWORD')) "Release packaging does not load the protected macOS signing certificate password."
+Assert-ReleaseCondition ($release.Contains('MACOS_SIGNING_IDENTITY')) "Release packaging does not select the Developer ID signing identity."
+Assert-ReleaseCondition ($release.Contains('MACOS_NOTARY_KEY_BASE64')) "Release packaging does not load the protected notarization key."
+Assert-ReleaseCondition ($release.Contains('MACOS_NOTARY_KEY_ID')) "Release packaging does not load the notarization key ID."
+Assert-ReleaseCondition ($release.Contains('MACOS_NOTARY_ISSUER_ID')) "Release packaging does not load the notarization issuer ID."
+Assert-ReleaseCondition ($release.Contains('scripts/package-macos.sh')) "Release packaging does not build the signed and notarized macOS DMGs."
+Assert-ReleaseCondition ($release.Contains('scripts/test-macos-package.sh')) "Release packaging does not run the native macOS package smoke test."
 Assert-NoLegacyReleasePhaseWording -Path '.github\workflows\release.yml' -Text $release
 
 $ciInstallerJob = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\ci.yml')
@@ -294,6 +355,10 @@ Assert-ReleaseCondition ($ciInstallerJob.Contains('windows-installer')) "CI is m
 Assert-ReleaseCondition ($ciInstallerJob.Contains('New-SelfSignedCertificate')) "CI does not create an isolated test signing identity for installer verification."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-windows-installer.ps1')) "CI does not exercise the production Windows packaging script."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-windows-installer.ps1')) "CI does not install, launch, verify, and uninstall the Windows package."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('macos-package')) "CI is missing the native macOS package matrix."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('macos-15-intel')) "CI is missing the native Intel macOS package job."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-macos.sh')) "CI does not exercise the production macOS packaging script."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-macos-package.sh')) "CI does not install, launch, verify, and remove the macOS package."
 
 $activeNonDocumentationSurfaces = @(
     'packaging\windows\QUICKSTART.txt',
@@ -349,6 +414,10 @@ if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
     Assert-WindowsInstaller -Path (Resolve-Path -LiteralPath $InstallerPath).Path
 }
 
+foreach ($packagePath in @($MacosPackagePath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+    Assert-MacosPackage -Path (Resolve-Path -LiteralPath $packagePath).Path
+}
+
 if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
     $dist = (Resolve-Path -LiteralPath $DistDirectory).Path
     $archives = @(
@@ -358,7 +427,11 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
         'sylvops-macos-aarch64.tar.gz'
     )
     $installer = 'sylvops-windows-x86_64-setup.exe'
-    $releaseAssets = @($archives + $installer)
+    $macosPackages = @(
+        'sylvops-macos-x86_64.dmg',
+        'sylvops-macos-aarch64.dmg'
+    )
+    $releaseAssets = @($archives + $installer + $macosPackages)
     $expectedFiles = @($releaseAssets + 'SHA256SUMS')
     $actualFiles = @(Get-ChildItem -LiteralPath $dist -File | ForEach-Object { $_.Name })
     $directories = @(Get-ChildItem -LiteralPath $dist -Directory)
@@ -382,10 +455,13 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
         if ($asset -eq $installer) {
             Assert-WindowsInstaller -Path $path
         }
+        elseif ($asset -in $macosPackages) {
+            Assert-MacosPackage -Path $path
+        }
         else {
             Assert-Archive -Path $path
         }
         Write-Host "[ok] $asset sha256=$actualHash"
     }
-    Write-Host "[ok] release bundle has exactly five validated assets and one checksum manifest"
+    Write-Host "[ok] release bundle has exactly seven validated assets and one checksum manifest"
 }

@@ -62,3 +62,36 @@ jobs:
           if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
             Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
           }
+
+  macos-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            architecture: x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            architecture: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install pinned cargo-packager
+        shell: pwsh
+        run: |
+          $packagerVersion = (Get-Content -Raw packaging/cargo-packager.version).Trim()
+          cargo install cargo-packager --version $packagerVersion --locked
+      - name: Build ad-hoc signed application package
+        run: ./scripts/package-macos.sh --target '${{ matrix.target }}' --architecture '${{ matrix.architecture }}' --signing-identity -
+      - name: Install, launch, verify, and remove
+        run: |
+          expected_version="$(awk '/^\[workspace.package\]/{workspace_package=1; next} workspace_package && /^version = /{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"
+          ./scripts/test-macos-package.sh \
+            --dmg 'dist/sylvops-macos-${{ matrix.architecture }}.dmg' \
+            --architecture '${{ matrix.architecture }}' \
+            --expected-version "$expected_version"

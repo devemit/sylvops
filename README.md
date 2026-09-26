@@ -14,6 +14,8 @@ Start-Process sylvops -ArgumentList 'doctor'
 
 The explicit path `%LOCALAPPDATA%\Programs\SylvOps\sylvops.exe` remains available for shells that do not resolve App Paths. Uninstalling SylvOps removes the application and its Windows integration but preserves configuration, session data, repositories, worktrees, and branches.
 
+On macOS, download `sylvops-macos-x86_64.dmg` for an Intel Mac or `sylvops-macos-aarch64.dmg` for Apple silicon, verify it against `SHA256SUMS`, open the DMG, and drag **SylvOps** to `/Applications`. The application and disk image are Developer ID signed, the application uses the hardened runtime, and the notarized DMG carries a stapled ticket, so Finder launch is accepted by Gatekeeper without a security workaround. Removing `/Applications/SylvOps.app` removes only the application; configuration, session data, repositories, worktrees, and branches remain in place. Advanced CLI users can invoke `/Applications/SylvOps.app/Contents/MacOS/sylvops` directly.
+
 Portable archives remain available on every platform as an advanced and recovery fallback. After extracting one and placing the binary on `PATH`, run this inside a Git repository:
 
 ```text
@@ -22,7 +24,7 @@ sylvops up .
 
 This starts the local daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the native desktop app. It does not launch an agent automatically. `sylvops open .` is a compatibility alias, while `sylvops tui` opens the terminal interface.
 
-Every release asset is covered by the release's `SHA256SUMS` and build-provenance attestations. The Windows installer and executable are Authenticode signed and timestamped; portable archives do not edit `PATH`. macOS portable builds remain unidentified and unnotarized, so after verifying the checksum and attempting to run one, use **System Settings → Privacy & Security → Open Anyway**, confirm **Open**, and do not disable Gatekeeper globally. Linux desktop launch requires a graphical session and the system libraries normally provided by a supported desktop installation.
+Every release asset is covered by the release's `SHA256SUMS` and build-provenance attestations. The Windows installer and executable are Authenticode signed and timestamped, and the macOS DMGs provide the signed and notarized normal installation path. Portable archives do not edit `PATH`; macOS portable archives remain an unsigned advanced fallback. Linux desktop launch requires a graphical session and the system libraries normally provided by a supported desktop installation.
 
 To build from source, install stable Rust 1.88 or newer, Git, and the platform C toolchain:
 
@@ -38,7 +40,7 @@ The executable is written to `target/release/sylvops` (`sylvops.exe` on Windows)
 ./target/release/sylvops up .
 ```
 
-On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the unsigned portable Windows ZIP with `powershell -File scripts/package-windows.ps1`; the signed installer workflow is documented in [docs/development/releasing.md](docs/development/releasing.md). Generated packages are intentionally excluded from Git.
+On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the unsigned portable Windows ZIP with `powershell -File scripts/package-windows.ps1`; signed Windows and macOS package workflows are documented in [docs/development/releasing.md](docs/development/releasing.md). Generated packages are intentionally excluded from Git.
 
 The repository now contains a **cross-platform application-release baseline**. It includes:
 

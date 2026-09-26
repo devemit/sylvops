@@ -36,7 +36,9 @@ The platform shape follows current vendor guidance and the capabilities of the R
 
 Windows x86_64 now has a signed, timestamped, per-user NSIS installer produced by pinned cargo-packager 0.11.8. It installs separately from user data, assigns the same stable application ID and icon to the executable, package, and Start Menu shortcut, registers uninstall and CLI discovery, and passes a native install/launch/daemon/uninstall/data-preservation smoke job. The validated portable Windows ZIP remains available as a fallback.
 
-Linux and macOS still produce portable archives containing one executable. Their install scripts download an archive, compare its SHA-256 digest with the release manifest, copy the executable to a user-local directory, and ask the user to modify `PATH`. Native macOS and Linux packages, upgrade discovery, staged replacement, health-checked rollback, and application-managed upgrades remain future delivery steps.
+macOS x86_64 and arm64 now have architecture-specific Developer ID-signed application bundles inside signed, notarized, and stapled DMGs. They carry the shared application identity, version, and icon, enable the hardened runtime, launch from Finder, pass Gatekeeper assessment, and run native install/launch/daemon/removal/data-preservation smoke jobs. Portable macOS archives remain available as an advanced fallback.
+
+Linux still produces a portable archive containing one executable. Its install script downloads the archive, compares its SHA-256 digest with the release manifest, copies the executable to a user-local directory, and asks the user to modify `PATH`. Native Linux packages, upgrade discovery, staged replacement, health-checked rollback, and application-managed upgrades remain future delivery steps.
 
 ## Delivery plan
 
