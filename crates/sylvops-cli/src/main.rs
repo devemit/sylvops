@@ -212,6 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
     let paths = RuntimePaths::discover(arguments.state_dir.as_deref())?;
     if matches!(arguments.command, Some(Command::Desktop)) {
+        configure_desktop_app_identity()?;
         sylvops_desktop::run(paths)?;
         return Ok(());
     }
@@ -1228,4 +1229,25 @@ fn configure_detached_process(command: &mut ProcessCommand) {
     };
 
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS);
+}
+
+#[cfg(not(windows))]
+fn configure_desktop_app_identity() -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn configure_desktop_app_identity() -> Result<(), Box<dyn std::error::Error>> {
+    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+    let application_id = sylvops_core::APPLICATION_ID
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe { SetCurrentProcessExplicitAppUserModelID(application_id.as_ptr()) };
+    if result < 0 {
+        return Err(format!("failed to set Windows application identity: 0x{result:08x}").into());
+    }
+    Ok(())
 }

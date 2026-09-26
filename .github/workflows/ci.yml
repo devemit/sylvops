@@ -26,3 +26,39 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
+
+  windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned cargo-packager
+        shell: pwsh
+        run: |
+          $packagerVersion = (Get-Content -Raw packaging/cargo-packager.version).Trim()
+          cargo install cargo-packager --version $packagerVersion --locked
+      - name: Create isolated test signing identity
+        id: test-signing
+        shell: pwsh
+        run: |
+          $certificate = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject 'CN=SylvOps CI Installer Test' `
+            -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -NotAfter (Get-Date).AddDays(1)
+          "thumbprint=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Build test-signed installer
+        shell: pwsh
+        run: ./scripts/package-windows-installer.ps1 -CertificateThumbprint '${{ steps.test-signing.outputs.thumbprint }}'
+      - name: Install, launch, verify, and uninstall
+        shell: pwsh
+        run: ./scripts/test-windows-installer.ps1 -InstallerPath dist/sylvops-windows-x86_64-setup.exe -CertificateThumbprint '${{ steps.test-signing.outputs.thumbprint }}'
+      - name: Remove isolated test signing identity
+        if: always()
+        shell: pwsh
+        run: |
+          $thumbprint = '${{ steps.test-signing.outputs.thumbprint }}'
+          if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
+            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
+          }

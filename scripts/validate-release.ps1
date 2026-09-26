@@ -2,6 +2,7 @@
 param(
     [string]$RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
     [string]$ArchivePath,
+    [string]$InstallerPath,
     [string]$DistDirectory,
     [string]$ExpectedTag
 )
@@ -47,7 +48,7 @@ function Assert-Quickstart {
 function Assert-BundledReadme {
     param([string]$Text)
 
-    foreach ($requiredText in @('sylvops up .', 'sylvops tui', 'SHA256SUMS', 'Open Anyway', 'native desktop')) {
+    foreach ($requiredText in @('sylvops up .', 'sylvops tui', 'SHA256SUMS', 'native desktop', 'sylvops-windows-x86_64-setup.exe', 'Start Menu')) {
         Assert-ReleaseCondition ($Text.Contains($requiredText)) "Bundled README is missing release guidance: $requiredText"
     }
 }
@@ -131,6 +132,21 @@ function Assert-Archive {
     Write-Host "[ok] $name has the locked package contents"
 }
 
+function Assert-WindowsInstaller {
+    param([string]$Path)
+
+    Assert-ReleaseCondition (Test-Path -LiteralPath $Path -PathType Leaf) "Windows installer is missing: $Path"
+    Assert-ReleaseCondition ((Get-Item -LiteralPath $Path).Length -gt 0) "Windows installer is empty: $Path"
+    Assert-ReleaseCondition ((Split-Path -Leaf $Path) -eq 'sylvops-windows-x86_64-setup.exe') "Unexpected Windows installer name: $Path"
+
+    if ($IsWindows) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $Path
+        Assert-ReleaseCondition ($null -ne $signature.SignerCertificate) "Windows installer is not Authenticode signed: $Path"
+        Assert-ReleaseCondition ($signature.Status -notin @('HashMismatch', 'NotSigned')) "Windows installer has an invalid Authenticode signature: $($signature.Status)"
+    }
+    Write-Host "[ok] signed Windows installer is present"
+}
+
 $root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 $cargo = Get-Content -Raw -LiteralPath (Join-Path $root 'Cargo.toml')
 $versionMatch = [regex]::Match($cargo, '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"([^"]+)"')
@@ -139,6 +155,62 @@ $version = $versionMatch.Groups[1].Value
 Assert-ReleaseCondition ($version -match '^0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') "Workspace version must be an ordinary semantic 0.x version without prerelease or build metadata, found $version."
 if (-not [string]::IsNullOrWhiteSpace($ExpectedTag)) {
     Assert-ReleaseCondition ($ExpectedTag -eq "v$version") "Release tag $ExpectedTag does not match workspace version $version."
+}
+
+$applicationId = 'com.devemit.sylvops'
+$publisher = 'devemit'
+$coreLibrary = Get-Content -Raw -LiteralPath (Join-Path $root 'crates\sylvops-core\src\lib.rs')
+Assert-ReleaseCondition ($coreLibrary.Contains("APPLICATION_ID: &str = `"$applicationId`"")) "The runtime application ID does not match the package identity."
+Assert-ReleaseCondition ($coreLibrary.Contains("APPLICATION_PUBLISHER: &str = `"$publisher`"")) "The runtime publisher does not match the package identity."
+$packagerConfigPath = Join-Path $root 'Packager.toml'
+Assert-ReleaseCondition (Test-Path -LiteralPath $packagerConfigPath -PathType Leaf) "Packager.toml is missing."
+$packagerConfig = Get-Content -Raw -LiteralPath $packagerConfigPath
+foreach ($requiredSetting in @(
+    'product-name = "SylvOps"',
+    "version = `"$version`"",
+    "identifier = `"$applicationId`"",
+    "publisher = `"$publisher`"",
+    'formats = ["nsis"]',
+    'installMode = "currentUser"',
+    'allow-downgrades = false',
+    'binaries-dir = "target/installer-input"',
+    'packaging/icons/sylvops.ico'
+)) {
+    Assert-ReleaseCondition ($packagerConfig.Contains($requiredSetting)) "Packager.toml is missing the locked Windows packaging setting: $requiredSetting"
+}
+
+$cliManifest = Get-Content -Raw -LiteralPath (Join-Path $root 'crates\sylvops-cli\Cargo.toml')
+foreach ($requiredMetadata in @(
+    '[package.metadata.winresource]',
+    'ProductName = "SylvOps"',
+    "CompanyName = `"$publisher`"",
+    'OriginalFilename = "sylvops.exe"'
+)) {
+    Assert-ReleaseCondition ($cliManifest.Contains($requiredMetadata)) "CLI manifest is missing Windows executable metadata: $requiredMetadata"
+}
+
+$buildScriptPath = Join-Path $root 'crates\sylvops-cli\build.rs'
+Assert-ReleaseCondition (Test-Path -LiteralPath $buildScriptPath -PathType Leaf) "The CLI Windows resource build script is missing."
+$buildScript = Get-Content -Raw -LiteralPath $buildScriptPath
+Assert-ReleaseCondition ($buildScript.Contains('packaging/icons/sylvops.ico')) "The CLI build script does not embed the shared SylvOps icon."
+
+foreach ($iconPath in @('packaging\icons\sylvops.png', 'packaging\icons\sylvops.ico')) {
+    $resolvedIconPath = Join-Path $root $iconPath
+    Assert-ReleaseCondition (Test-Path -LiteralPath $resolvedIconPath -PathType Leaf) "Application icon is missing: $iconPath"
+    Assert-ReleaseCondition ((Get-Item -LiteralPath $resolvedIconPath).Length -gt 0) "Application icon is empty: $iconPath"
+}
+
+$packagerVersionPath = Join-Path $root 'packaging\cargo-packager.version'
+Assert-ReleaseCondition (Test-Path -LiteralPath $packagerVersionPath -PathType Leaf) "The cargo-packager version pin is missing."
+$packagerVersion = (Get-Content -Raw -LiteralPath $packagerVersionPath).Trim()
+Assert-ReleaseCondition ($packagerVersion -eq '0.11.8') "cargo-packager must stay pinned to the reviewed 0.11.8 release, found $packagerVersion."
+
+foreach ($scriptPath in @(
+    'scripts\package-windows-installer.ps1',
+    'scripts\sign-windows.ps1',
+    'scripts\test-windows-installer.ps1'
+)) {
+    Assert-ReleaseCondition (Test-Path -LiteralPath (Join-Path $root $scriptPath) -PathType Leaf) "Windows installer workflow script is missing: $scriptPath"
 }
 
 $quickstart = Get-Content -Raw -LiteralPath (Join-Path $root 'packaging\windows\QUICKSTART.txt')
@@ -161,6 +233,21 @@ foreach ($package in $workspacePackages) {
 Assert-Quickstart $quickstart
 $readme = Get-Content -Raw -LiteralPath (Join-Path $root 'README.md')
 Assert-BundledReadme $readme
+Assert-ReleaseCondition ($readme.Contains('Start-Process sylvops')) "README does not document the installed CLI discovery surface."
+Assert-ReleaseCondition ($readme.Contains('preserves configuration, session data, repositories, worktrees, and branches')) "README does not state the Windows uninstall preservation contract."
+
+$releasingGuide = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\development\releasing.md')
+foreach ($requiredText in @(
+    'cargo-packager 0.11.8',
+    'WINDOWS_SIGNING_CERTIFICATE_BASE64',
+    'WINDOWS_SIGNING_CERTIFICATE_PASSWORD',
+    'WINDOWS_SIGNING_TIMESTAMP_URL',
+    '%LOCALAPPDATA%\Programs\SylvOps',
+    '%LOCALAPPDATA%\SylvOps',
+    '%APPDATA%\SylvOps'
+)) {
+    Assert-ReleaseCondition ($releasingGuide.Contains($requiredText)) "Release guide is missing Windows installer guidance: $requiredText"
+}
 
 $ci = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\ci.yml')
 foreach ($command in @(
@@ -192,7 +279,21 @@ Assert-ReleaseCondition ($release.Contains('environment: release')) "Release pub
 Assert-ReleaseCondition ($release.Contains('gh release create')) "Release workflow does not publish through GitHub Releases."
 Assert-ReleaseCondition ($release.Contains('target/release/sylvops.exe --version')) "Windows package job does not verify the application version."
 Assert-ReleaseCondition ($release.Contains('target/${{ matrix.target }}/release/sylvops --version')) "Unix package jobs do not verify the application version."
+Assert-ReleaseCondition ($release.Contains('packaging/cargo-packager.version')) "Windows packaging does not use the checked-in cargo-packager version pin."
+Assert-ReleaseCondition ($release.Contains('cargo install cargo-packager --version $packagerVersion --locked')) "Windows packaging does not install the exact locked cargo-packager version."
+Assert-ReleaseCondition ($release.Contains('WINDOWS_SIGNING_CERTIFICATE_BASE64')) "Release packaging does not load the protected Windows signing certificate."
+Assert-ReleaseCondition ($release.Contains('WINDOWS_SIGNING_CERTIFICATE_PASSWORD')) "Release packaging does not load the protected Windows signing certificate password."
+Assert-ReleaseCondition ($release -match '(?ms)^  package-windows:.*?^    environment: release$') "The Windows signing job does not use the protected release environment."
+Assert-ReleaseCondition ($release.Contains('scripts/package-windows-installer.ps1')) "Release packaging does not build the signed Windows installer."
+Assert-ReleaseCondition ($release.Contains('scripts/test-windows-installer.ps1')) "Release packaging does not run the native Windows installer smoke test."
+Assert-ReleaseCondition ($release.Contains('sylvops-windows-x86_64-setup.exe')) "Release packaging does not publish the Windows installer asset."
 Assert-NoLegacyReleasePhaseWording -Path '.github\workflows\release.yml' -Text $release
+
+$ciInstallerJob = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\ci.yml')
+Assert-ReleaseCondition ($ciInstallerJob.Contains('windows-installer')) "CI is missing the clean native Windows installer job."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('New-SelfSignedCertificate')) "CI does not create an isolated test signing identity for installer verification."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-windows-installer.ps1')) "CI does not exercise the production Windows packaging script."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-windows-installer.ps1')) "CI does not install, launch, verify, and uninstall the Windows package."
 
 $activeNonDocumentationSurfaces = @(
     'packaging\windows\QUICKSTART.txt',
@@ -244,6 +345,10 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
     Assert-Archive -Path (Resolve-Path -LiteralPath $ArchivePath).Path
 }
 
+if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
+    Assert-WindowsInstaller -Path (Resolve-Path -LiteralPath $InstallerPath).Path
+}
+
 if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
     $dist = (Resolve-Path -LiteralPath $DistDirectory).Path
     $archives = @(
@@ -252,7 +357,9 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
         'sylvops-macos-x86_64.tar.gz',
         'sylvops-macos-aarch64.tar.gz'
     )
-    $expectedFiles = @($archives + 'SHA256SUMS')
+    $installer = 'sylvops-windows-x86_64-setup.exe'
+    $releaseAssets = @($archives + $installer)
+    $expectedFiles = @($releaseAssets + 'SHA256SUMS')
     $actualFiles = @(Get-ChildItem -LiteralPath $dist -File | ForEach-Object { $_.Name })
     $directories = @(Get-ChildItem -LiteralPath $dist -Directory)
     Assert-ReleaseCondition ($directories.Count -eq 0) "Release bundle directory contains unexpected subdirectories."
@@ -267,13 +374,18 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
         Assert-ReleaseCondition (-not $manifest.ContainsKey($manifestName)) "Duplicate SHA256SUMS entry: $manifestName"
         $manifest[$manifestName] = $match.Groups[1].Value.ToLowerInvariant()
     }
-    Assert-ExactNames @($manifest.Keys) $archives 'SHA256SUMS'
-    foreach ($archive in $archives) {
-        $path = Join-Path $dist $archive
+    Assert-ExactNames @($manifest.Keys) $releaseAssets 'SHA256SUMS'
+    foreach ($asset in $releaseAssets) {
+        $path = Join-Path $dist $asset
         $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
-        Assert-ReleaseCondition ($actualHash -eq $manifest[$archive]) "Checksum mismatch for $archive."
-        Assert-Archive -Path $path
-        Write-Host "[ok] $archive sha256=$actualHash"
+        Assert-ReleaseCondition ($actualHash -eq $manifest[$asset]) "Checksum mismatch for $asset."
+        if ($asset -eq $installer) {
+            Assert-WindowsInstaller -Path $path
+        }
+        else {
+            Assert-Archive -Path $path
+        }
+        Write-Host "[ok] $asset sha256=$actualHash"
     }
-    Write-Host "[ok] release bundle has exactly four validated archives and one checksum manifest"
+    Write-Host "[ok] release bundle has exactly five validated assets and one checksum manifest"
 }
