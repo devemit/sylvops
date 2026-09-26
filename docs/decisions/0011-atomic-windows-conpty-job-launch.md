@@ -1,5 +1,7 @@
 # ADR-0011: Atomic Windows ConPTY and Job Object launch
 
+> **Historical context:** release-phase terminology below records when this decision was made. Current delivery uses ordinary semantic `0.x` application releases.
+
 ## Status
 
 Accepted for the cross-platform beta candidate; hosted Windows acceptance remains required.

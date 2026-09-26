@@ -9,6 +9,8 @@ blocked_by:
   - Choose the first-run and provider-recovery experience
 ---
 
+> **Historical release-planning record:** this ticket belongs to the retired beta-phase plan and is not an active roadmap item or release gate.
+
 ## Question
 
 Which automated and manual checks on clean Windows, Linux, and macOS hosts are sufficient evidence that the archives, checksums, launchers, daemon lifecycle, Git workflow, Shell workflow, fake Codex workflow, and opt-in real Codex smoke test are ready to publish?

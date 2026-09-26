@@ -6,6 +6,8 @@ assignee: null
 blocked_by: []
 ---
 
+> **Historical release-planning record:** this ticket belongs to the retired beta-phase plan and is not an active roadmap item or release gate.
+
 ## Question
 
 Which exact existing desktop, TUI, CLI, daemon, worktree, Shell, Codex, recovery, packaging, and cross-platform behaviors are release-blocking for `v0.1.0-beta.1`, and which observed imperfections are explicitly acceptable beta limitations?

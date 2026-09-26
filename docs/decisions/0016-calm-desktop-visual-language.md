@@ -1,5 +1,7 @@
 # ADR 0016: Calm desktop visual language and contextual session actions
 
+> **Historical context:** release-phase terminology below records when this decision was made. Current delivery uses ordinary semantic `0.x` application releases.
+
 ## Context
 
 The beta desktop made state unmistakable with saturated fills, repeated action colors, and hover tooltips. In practice this made repositories, checkouts, sessions, content tabs, and lifecycle actions compete for attention. `Open terminal` / `Leave terminal` and `Stop` also appeared beside Terminal/Changes/Details even though they act on the session, not on the selected view.

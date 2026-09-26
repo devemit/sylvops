@@ -6,6 +6,8 @@ assignee: null
 blocked_by: []
 ---
 
+> **Historical release-planning record:** this ticket belongs to the retired beta-phase plan and is not an active roadmap item or release gate.
+
 ## Question
 
 What is the smallest desktop flow that lets a first-time user understand Workspace versus Project versus Worktree, recover from unavailable or unauthenticated providers, and successfully launch a session without consulting documentation?

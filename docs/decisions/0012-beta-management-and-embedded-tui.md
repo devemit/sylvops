@@ -1,5 +1,7 @@
 # ADR-0012: Beta management workflow and embedded terminal
 
+> **Historical context:** release-phase terminology below records when this decision was made. Current delivery uses ordinary semantic `0.x` application releases.
+
 ## Status
 
 Accepted for the cross-platform beta candidate; hosted acceptance remains required.

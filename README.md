@@ -4,7 +4,7 @@ SylvOps is a local-first mission control for supervising interactive coding-agen
 
 ## Quick start
 
-SylvOps is currently a public-beta candidate, not a stable release. Once a beta archive is published, extract it, put the binary on `PATH`, and run this inside a Git repository:
+SylvOps is distributed through explicitly promoted semantic `0.x` application releases on GitHub. Download the portable archive for your platform, extract it, put the binary on `PATH`, and run this inside a Git repository:
 
 ```text
 sylvops up .
@@ -12,7 +12,7 @@ sylvops up .
 
 This starts the local daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the native desktop app. It does not launch an agent automatically. `sylvops open .` is a compatibility alias, while `sylvops tui` opens the terminal interface.
 
-The beta is distributed as unsigned portable archives and does not edit `PATH`. Verify the downloaded archive against the release's `SHA256SUMS` before extracting it. Windows may show an unrecognized-app warning; after verifying the checksum, choose **More info → Run anyway** for this build. macOS may block an unidentified, unnotarized binary; after verifying the checksum and attempting to run it, use **System Settings → Privacy & Security → Open Anyway**, confirm **Open**, and do not disable Gatekeeper globally. Linux desktop launch requires a graphical session and the system libraries normally provided by a supported desktop installation.
+Current releases provide unsigned portable archives and do not edit `PATH`. Verify the downloaded archive against the release's `SHA256SUMS` before extracting it. Windows may show an unrecognized-app warning; after verifying the checksum, choose **More info → Run anyway** for this build. macOS may block an unidentified, unnotarized binary; after verifying the checksum and attempting to run it, use **System Settings → Privacy & Security → Open Anyway**, confirm **Open**, and do not disable Gatekeeper globally. Linux desktop launch requires a graphical session and the system libraries normally provided by a supported desktop installation.
 
 To build from source, install stable Rust 1.88 or newer, Git, and the platform C toolchain:
 
@@ -30,7 +30,7 @@ The executable is written to `target/release/sylvops` (`sylvops.exe` on Windows)
 
 On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the unsigned portable Windows ZIP with `powershell -File scripts/package-windows.ps1`; generated packages are intentionally excluded from Git.
 
-The repository now contains a **cross-platform beta candidate**. It includes:
+The repository now contains a **cross-platform application-release baseline**. It includes:
 
 - versioned, length-prefixed MessagePack framing;
 - authenticated local Unix-socket and Windows named-pipe control transport;
@@ -55,7 +55,7 @@ The repository now contains a **cross-platform beta candidate**. It includes:
 
 Claude, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
 
-The beta branch contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The prior beta baseline passed the complete hosted Windows, Linux, and macOS quality gates; the redesigned UX must pass those gates before `v0.1.0-beta.1` is published.
+The Windows implementation contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The prior cross-platform baseline passed the complete hosted Windows, Linux, and macOS quality gates; the current tree must pass those gates before `v0.1.0` is promoted.
 
 ### TUI essentials
 

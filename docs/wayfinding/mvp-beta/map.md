@@ -1,5 +1,7 @@
 # SylvOps beta closure map
 
+> **Historical release-planning record:** this map captures the retired beta-phase plan and is not the active roadmap or release gate. Current delivery follows ordinary semantic `0.x` application releases and `docs/adr/0001-continuous-application-delivery.md`.
+
 Label: `wayfinder:map`
 
 ## Destination

@@ -1,4 +1,4 @@
-name: Release beta
+name: Release
 
 on:
   push:
@@ -31,6 +31,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release binary
         run: cargo build --release --locked -p sylvops-cli
+      - name: Verify application version
+        shell: pwsh
+        run: |
+          $expected = "sylvops $($env:GITHUB_REF_NAME.Substring(1))"
+          $actual = (& target/release/sylvops.exe --version).Trim()
+          if ($actual -ne $expected) { throw "Application version '$actual' does not match release tag '$env:GITHUB_REF_NAME'." }
       - name: Package
         shell: pwsh
         run: |
@@ -74,6 +80,11 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --release --locked -p sylvops-cli --target "${{ matrix.target }}"
+      - name: Verify application version
+        run: |
+          expected="sylvops ${GITHUB_REF_NAME#v}"
+          actual="$(target/${{ matrix.target }}/release/sylvops --version)"
+          test "$actual" = "$expected"
       - name: Package
         run: |
           test -x "target/${{ matrix.target }}/release/sylvops"
@@ -104,29 +115,29 @@ jobs:
       - name: Create checksums
         working-directory: dist
         run: sha256sum sylvops-* > SHA256SUMS
-      - name: Validate staged release candidate
+      - name: Validate staged release bundle
         shell: pwsh
         run: ./scripts/validate-release.ps1 -DistDirectory dist -ExpectedTag "$env:GITHUB_REF_NAME"
       - uses: actions/upload-artifact@v4
         with:
-          name: release-candidate-${{ github.sha }}
+          name: release-bundle-${{ github.sha }}
           path: dist/*
           if-no-files-found: error
 
   publish:
     needs: stage-release
     runs-on: ubuntu-latest
-    environment: beta-release
+    environment: release
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
-          name: release-candidate-${{ github.sha }}
+          name: release-bundle-${{ github.sha }}
           path: dist
-      - name: Revalidate approved release candidate
+      - name: Revalidate approved release bundle
         shell: pwsh
         run: ./scripts/validate-release.ps1 -DistDirectory dist -ExpectedTag "$env:GITHUB_REF_NAME"
-      - name: Publish GitHub prerelease
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --prerelease --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes

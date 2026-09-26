@@ -1,6 +1,6 @@
 # Desktop UX language and interaction contract
 
-- Status: accepted for the beta desktop
+- Status: accepted for the current desktop
 - Date: 2026-09-25
 
 ## User-facing vocabulary
@@ -36,7 +36,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 
 ## Embedded terminal baseline
 
-The desktop terminal renders the daemon-owned VT screen; it does not print raw provider escape sequences into a host shell. The beta terminal supports:
+The desktop terminal renders the daemon-owned VT screen; it does not print raw provider escape sequences into a host shell. The embedded terminal supports:
 
 - indexed, 256-color, and RGB ANSI foreground/background colors;
 - bold, dim, italic, underline, and inverse cell attributes;
@@ -49,4 +49,4 @@ The desktop terminal renders the daemon-owned VT screen; it does not print raw p
 
 The scrollbar maps the oldest retained history to the top and live output to the bottom. Typing or pasting while viewing history returns to live output before the input is forwarded, so the real provider-owned input remains visible. The scrollbar is not an outer application scroll view and does not alter PTY ownership.
 
-`Ctrl+]` remains the explicit leave-terminal shortcut. Click and drag mouse-protocol forwarding remains unavailable so desktop text selection stays native; only requested wheel events are forwarded. Scrollback persistence across daemon restart remains an explicit beta limitation.
+`Ctrl+]` remains the explicit leave-terminal shortcut. Click and drag mouse-protocol forwarding remains unavailable so desktop text selection stays native; only requested wheel events are forwarded. Scrollback persistence across daemon restart remains an explicit current limitation.

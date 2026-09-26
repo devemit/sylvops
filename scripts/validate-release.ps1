@@ -52,6 +52,15 @@ function Assert-BundledReadme {
     }
 }
 
+function Assert-NoLegacyReleasePhaseWording {
+    param(
+        [string]$Path,
+        [string]$Text
+    )
+
+    Assert-ReleaseCondition ($Text -notmatch '(?i)\b(beta|prerelease|pre-release|stable release|post-beta)\b') "$Path still uses legacy beta/stable release-phase wording."
+}
+
 function Get-ArchiveNames {
     param([string]$Path)
 
@@ -127,12 +136,28 @@ $cargo = Get-Content -Raw -LiteralPath (Join-Path $root 'Cargo.toml')
 $versionMatch = [regex]::Match($cargo, '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"([^"]+)"')
 Assert-ReleaseCondition $versionMatch.Success "Could not read workspace.package.version from Cargo.toml."
 $version = $versionMatch.Groups[1].Value
-Assert-ReleaseCondition ($version -eq '0.1.0-beta.1') "Release-proof validation is locked to workspace version 0.1.0-beta.1, found $version."
+Assert-ReleaseCondition ($version -match '^0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') "Workspace version must be an ordinary semantic 0.x version without prerelease or build metadata, found $version."
 if (-not [string]::IsNullOrWhiteSpace($ExpectedTag)) {
     Assert-ReleaseCondition ($ExpectedTag -eq "v$version") "Release tag $ExpectedTag does not match workspace version $version."
 }
 
 $quickstart = Get-Content -Raw -LiteralPath (Join-Path $root 'packaging\windows\QUICKSTART.txt')
+Assert-ReleaseCondition ($quickstart -match "(?m)^SYLVOPS $([regex]::Escape($version))$") "Windows QUICKSTART version does not match workspace version $version."
+
+$windowsInstallScriptText = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\install.ps1')
+$windowsDefault = '[string]$Version = "{0}"' -f $version
+Assert-ReleaseCondition ($windowsInstallScriptText.Contains($windowsDefault)) "Windows install script default does not match workspace version $version."
+
+$unixInstallScriptText = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\install.sh')
+Assert-ReleaseCondition ($unixInstallScriptText.Contains("SYLVOPS_VERSION:-$version")) "Unix install script default does not match workspace version $version."
+
+$lock = Get-Content -Raw -LiteralPath (Join-Path $root 'Cargo.lock')
+$workspacePackages = [regex]::Matches($lock, '(?ms)^\[\[package\]\]\r?\nname = "(sylvops-[^"]+)"\r?\nversion = "([^"]+)"')
+Assert-ReleaseCondition ($workspacePackages.Count -eq 6) "Cargo.lock does not contain the six expected SylvOps workspace packages."
+foreach ($package in $workspacePackages) {
+    Assert-ReleaseCondition ($package.Groups[2].Value -eq $version) "Cargo.lock version for $($package.Groups[1].Value) does not match workspace version $version."
+}
+
 Assert-Quickstart $quickstart
 $readme = Get-Content -Raw -LiteralPath (Join-Path $root 'README.md')
 Assert-BundledReadme $readme
@@ -163,11 +188,57 @@ Assert-ReleaseCondition ($release.Contains('cargo build --release --locked')) "R
 Assert-ReleaseCondition ($release.Contains('test -x "target/${{ matrix.target }}/release/sylvops"')) "Release workflow does not verify Unix executable permissions."
 Assert-ReleaseCondition ($release.Contains('actions/attest-build-provenance@')) "Release workflow does not create build-provenance attestations."
 Assert-ReleaseCondition ($release.Contains('scripts/validate-release.ps1')) "Release workflow does not invoke release-package validation."
-Assert-ReleaseCondition ($release.Contains('environment: beta-release')) "Release publication is not protected by the beta-release evidence gate."
+Assert-ReleaseCondition ($release.Contains('environment: release')) "Release publication is not protected by the release environment gate."
+Assert-ReleaseCondition ($release.Contains('gh release create')) "Release workflow does not publish through GitHub Releases."
+Assert-ReleaseCondition ($release.Contains('target/release/sylvops.exe --version')) "Windows package job does not verify the application version."
+Assert-ReleaseCondition ($release.Contains('target/${{ matrix.target }}/release/sylvops --version')) "Unix package jobs do not verify the application version."
+Assert-NoLegacyReleasePhaseWording -Path '.github\workflows\release.yml' -Text $release
 
-$candidateCommit = @(& git -C $root rev-parse HEAD 2>&1)
-Assert-ReleaseCondition ($LASTEXITCODE -eq 0) "Could not identify the candidate commit: $($candidateCommit -join [Environment]::NewLine)"
-Write-Host "[ok] source release contract validated for $($candidateCommit[0]) ($version)"
+$activeNonDocumentationSurfaces = @(
+    'packaging\windows\QUICKSTART.txt',
+    'scripts\install.ps1',
+    'scripts\install.sh',
+    'crates\sylvops-tui\src\lib.rs'
+)
+foreach ($relativePath in $activeNonDocumentationSurfaces) {
+    $text = Get-Content -Raw -LiteralPath (Join-Path $root $relativePath)
+    Assert-NoLegacyReleasePhaseWording -Path $relativePath -Text $text
+}
+
+$historicalPlanRoot = Join-Path $root 'docs\wayfinding\mvp-beta'
+foreach ($historicalFile in Get-ChildItem -LiteralPath $historicalPlanRoot -Recurse -File -Filter '*.md') {
+    $text = Get-Content -Raw -LiteralPath $historicalFile.FullName
+    Assert-ReleaseCondition ($text.Contains('Historical release-planning record:')) "$($historicalFile.FullName) is legacy release planning without a historical marker."
+}
+
+foreach ($relativePath in @(
+    'docs\decisions\0011-atomic-windows-conpty-job-launch.md',
+    'docs\decisions\0012-beta-management-and-embedded-tui.md',
+    'docs\decisions\0013-hierarchical-tui-and-navigation-state.md',
+    'docs\decisions\0016-calm-desktop-visual-language.md'
+)) {
+    $text = Get-Content -Raw -LiteralPath (Join-Path $root $relativePath)
+    Assert-ReleaseCondition ($text.Contains('Historical context:')) "$relativePath uses legacy release-phase terminology without a historical marker."
+}
+
+$documentationFiles = @(
+    (Get-Item -LiteralPath (Join-Path $root 'README.md')),
+    (Get-Item -LiteralPath (Join-Path $root 'AGENTS.md')),
+    (Get-Item -LiteralPath (Join-Path $root 'CONTEXT.md'))
+) + @(Get-ChildItem -LiteralPath (Join-Path $root 'docs') -Recurse -File -Filter '*.md')
+foreach ($documentationFile in $documentationFiles) {
+    $text = Get-Content -Raw -LiteralPath $documentationFile.FullName
+    if ($text.Contains('Historical release-planning record:') -or $text.Contains('Historical context:')) {
+        continue
+    }
+    $visibleText = $text -replace '\]\([^)]+\)', ']'
+    $relativePath = [System.IO.Path]::GetRelativePath($root, $documentationFile.FullName)
+    Assert-NoLegacyReleasePhaseWording -Path $relativePath -Text $visibleText
+}
+
+$releaseCommit = @(& git -C $root rev-parse HEAD 2>&1)
+Assert-ReleaseCondition ($LASTEXITCODE -eq 0) "Could not identify the release commit: $($releaseCommit -join [Environment]::NewLine)"
+Write-Host "[ok] source release contract validated for $($releaseCommit[0]) ($version)"
 
 if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
     Assert-Archive -Path (Resolve-Path -LiteralPath $ArchivePath).Path
@@ -184,8 +255,8 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
     $expectedFiles = @($archives + 'SHA256SUMS')
     $actualFiles = @(Get-ChildItem -LiteralPath $dist -File | ForEach-Object { $_.Name })
     $directories = @(Get-ChildItem -LiteralPath $dist -Directory)
-    Assert-ReleaseCondition ($directories.Count -eq 0) "Release candidate directory contains unexpected subdirectories."
-    Assert-ExactNames $actualFiles $expectedFiles 'release candidate'
+    Assert-ReleaseCondition ($directories.Count -eq 0) "Release bundle directory contains unexpected subdirectories."
+    Assert-ExactNames $actualFiles $expectedFiles 'release bundle'
 
     $manifestPath = Join-Path $dist 'SHA256SUMS'
     $manifest = @{}
@@ -204,5 +275,5 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
         Assert-Archive -Path $path
         Write-Host "[ok] $archive sha256=$actualHash"
     }
-    Write-Host "[ok] release candidate has exactly four validated archives and one checksum manifest"
+    Write-Host "[ok] release bundle has exactly four validated archives and one checksum manifest"
 }

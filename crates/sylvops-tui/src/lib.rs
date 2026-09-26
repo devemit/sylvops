@@ -307,7 +307,7 @@ async fn open_destructive_confirmation(
     match selected_node(app) {
         Some(ExplorerNode::Project(_)) => {
             app.flash = Some(Flash::error(
-                "Project deletion is intentionally unavailable in this beta.",
+                "Project deletion is intentionally unavailable.",
             ));
         }
         Some(ExplorerNode::Worktree(id)) => {
