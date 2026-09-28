@@ -418,8 +418,10 @@ async fn prepare_upgrade(paths: &RuntimePaths) -> Result<Arc<UpgradeCoordinator>
             DaemonError::Lifecycle("system clock is outside the supported range".into())
         })?;
     let update_source = HttpReleaseSource::github(&manifest_url(release_target))?;
-    let upgrade = Arc::new(UpgradeCoordinator::new(
-        paths.data_directory.join("upgrades"),
+    let installed_executable = canonical_current_executable()?;
+    let upgrade = Arc::new(UpgradeCoordinator::new_for_installation(
+        &paths.data_directory.join("upgrades"),
+        &installed_executable,
         Box::new(update_source),
         embedded_verifying_key()?,
         sylvops_core::upgrade::ReleaseValidationContext {
@@ -429,7 +431,7 @@ async fn prepare_upgrade(paths: &RuntimePaths) -> Result<Arc<UpgradeCoordinator>
             oldest_allowed_publication: now.saturating_sub(180 * 24 * 60 * 60),
             newest_seen_publication: None,
         },
-    ));
+    )?);
     if let Err(error) = upgrade.recover_staged().await {
         tracing::warn!(error = %error, "discarded invalid staged application upgrade");
     }
