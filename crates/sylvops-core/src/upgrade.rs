@@ -351,7 +351,14 @@ mod tests {
 
     fn signed_release() -> (Vec<u8>, ed25519_dalek::VerifyingKey) {
         let key = SigningKey::from_bytes(&[7; 32]);
-        let metadata = ReleaseMetadata {
+        let metadata = release();
+        let signature = key.sign(&metadata.signed_bytes().unwrap());
+        let envelope = SignedReleaseMetadata::new(metadata, signature.to_bytes());
+        (serde_json::to_vec(&envelope).unwrap(), key.verifying_key())
+    }
+
+    fn release() -> ReleaseMetadata {
+        ReleaseMetadata {
             schema_version: 1,
             minimum_source_version: "0.1.0".into(),
             target_version: "0.2.0".into(),
@@ -362,10 +369,12 @@ mod tests {
             release_notes_url: "https://github.com/devemit/sylvops/releases/tag/v0.2.0".into(),
             release_notes: "Health-checked application upgrades.".into(),
             published_at_unix_seconds: NOW,
-        };
+        }
+    }
+
+    fn signed(metadata: ReleaseMetadata, key: &SigningKey) -> Vec<u8> {
         let signature = key.sign(&metadata.signed_bytes().unwrap());
-        let envelope = SignedReleaseMetadata::new(metadata, signature.to_bytes());
-        (serde_json::to_vec(&envelope).unwrap(), key.verifying_key())
+        serde_json::to_vec(&SignedReleaseMetadata::new(metadata, signature.to_bytes())).unwrap()
     }
 
     fn context() -> ReleaseValidationContext {
@@ -412,31 +421,96 @@ mod tests {
     }
 
     #[test]
-    fn tampering_wrong_target_downgrade_stale_and_oversized_metadata_fail_closed() {
-        let (encoded, key) = signed_release();
+    fn malformed_release_metadata_is_rejected() {
+        let key = SigningKey::from_bytes(&[7; 32]);
 
+        assert_eq!(
+            SignedReleaseMetadata::decode_and_validate(
+                b"not json",
+                &key.verifying_key(),
+                &context()
+            ),
+            Err(super::ReleaseValidationError::Malformed)
+        );
+    }
+
+    #[test]
+    fn oversized_release_metadata_is_rejected() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let oversized = vec![b'x'; super::MAX_RELEASE_METADATA_BYTES + 1];
+
+        assert_eq!(
+            SignedReleaseMetadata::decode_and_validate(
+                &oversized,
+                &key.verifying_key(),
+                &context()
+            ),
+            Err(super::ReleaseValidationError::OversizedMetadata)
+        );
+    }
+
+    #[test]
+    fn stale_release_metadata_is_rejected() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut stale = context();
+        stale.oldest_allowed_publication = NOW + 1;
+
+        assert_eq!(
+            SignedReleaseMetadata::decode_and_validate(
+                &signed(release(), &key),
+                &key.verifying_key(),
+                &stale
+            ),
+            Err(super::ReleaseValidationError::StalePublication)
+        );
+    }
+
+    #[test]
+    fn downgrade_release_metadata_is_rejected() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut downgrade = context();
+        downgrade.current_version = "0.3.0".into();
+
+        assert_eq!(
+            SignedReleaseMetadata::decode_and_validate(
+                &signed(release(), &key),
+                &key.verifying_key(),
+                &downgrade
+            ),
+            Err(super::ReleaseValidationError::Downgrade)
+        );
+    }
+
+    #[test]
+    fn wrong_target_release_metadata_is_rejected() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut wrong_target = context();
+        wrong_target.expected_target.architecture = ReleaseArchitecture::Aarch64;
+
+        assert_eq!(
+            SignedReleaseMetadata::decode_and_validate(
+                &signed(release(), &key),
+                &key.verifying_key(),
+                &wrong_target
+            ),
+            Err(super::ReleaseValidationError::WrongTarget)
+        );
+    }
+
+    #[test]
+    fn invalid_signature_release_metadata_is_rejected() {
+        let (encoded, key) = signed_release();
         let mut tampered = encoded.clone();
         let digit = tampered
             .iter()
             .position(|byte| *byte == b'2')
             .expect("version digit");
         tampered[digit] = b'3';
-        assert!(SignedReleaseMetadata::decode_and_validate(&tampered, &key, &context()).is_err());
 
-        let mut wrong_target = context();
-        wrong_target.expected_target.architecture = ReleaseArchitecture::Aarch64;
-        assert!(SignedReleaseMetadata::decode_and_validate(&encoded, &key, &wrong_target).is_err());
-
-        let mut downgrade = context();
-        downgrade.current_version = "0.3.0".into();
-        assert!(SignedReleaseMetadata::decode_and_validate(&encoded, &key, &downgrade).is_err());
-
-        let mut stale = context();
-        stale.oldest_allowed_publication = NOW + 1;
-        assert!(SignedReleaseMetadata::decode_and_validate(&encoded, &key, &stale).is_err());
-
-        let oversized = vec![b'x'; super::MAX_RELEASE_METADATA_BYTES + 1];
-        assert!(SignedReleaseMetadata::decode_and_validate(&oversized, &key, &context()).is_err());
+        assert_eq!(
+            SignedReleaseMetadata::decode_and_validate(&tampered, &key, &context()),
+            Err(super::ReleaseValidationError::InvalidSignature)
+        );
     }
 
     #[test]
