@@ -30,6 +30,7 @@ use tokio::{
 
 const RELEASE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const RELEASE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CANCELLATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 const MAX_REDIRECTS: usize = 5;
 const MAX_PUBLICATION_WATERMARK_BYTES: usize = 32;
 const PUBLICATION_WATERMARK_FILE: &str = "publication-watermark";
@@ -240,12 +241,11 @@ impl ReleaseSource for HttpReleaseSource {
                 "payload URL is outside the allowed GitHub origin".into(),
             ));
         }
-        let response = self
-            .client
-            .get(parsed)
-            .send()
-            .await
-            .map_err(|_| UpgradeError::ReleaseService("payload request failed".into()))?;
+        let response = tokio::select! {
+            response = self.client.get(parsed).send() => response
+                .map_err(|_| UpgradeError::ReleaseService("payload request failed".into()))?,
+            () = wait_until_cancelled(cancelled) => return Err(UpgradeError::Cancelled),
+        };
         if !response.status().is_success()
             || response
                 .content_length()
@@ -255,27 +255,50 @@ impl ReleaseSource for HttpReleaseSource {
                 "payload response was refused".into(),
             ));
         }
-        let mut output = File::create(destination).await?;
-        let mut received = 0_u64;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            if cancelled.load(Ordering::Acquire) {
-                return Err(UpgradeError::Cancelled);
-            }
-            let chunk = chunk
-                .map_err(|_| UpgradeError::ReleaseService("payload transfer failed".into()))?;
-            received = received
+        write_payload_response(response, destination, maximum_bytes, cancelled).await
+    }
+}
+
+async fn write_payload_response(
+    response: reqwest::Response,
+    destination: &Path,
+    maximum_bytes: u64,
+    cancelled: &AtomicBool,
+) -> Result<(), UpgradeError> {
+    let mut output = File::create(destination).await?;
+    let mut received = 0_u64;
+    let mut stream = response.bytes_stream();
+    loop {
+        let next = tokio::select! {
+            next = stream.next() => next,
+            () = wait_until_cancelled(cancelled) => return Err(UpgradeError::Cancelled),
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return Err(UpgradeError::Cancelled);
+        }
+        let chunk =
+            chunk.map_err(|_| UpgradeError::ReleaseService("payload transfer failed".into()))?;
+        received =
+            received
                 .checked_add(u64::try_from(chunk.len()).map_err(|_| {
                     UpgradeError::ReleaseService("payload chunk is oversized".into())
                 })?)
                 .ok_or_else(|| UpgradeError::ReleaseService("payload is oversized".into()))?;
-            if received > maximum_bytes {
-                return Err(UpgradeError::ReleaseService("payload is oversized".into()));
-            }
-            output.write_all(&chunk).await?;
+        if received > maximum_bytes {
+            return Err(UpgradeError::ReleaseService("payload is oversized".into()));
         }
-        output.flush().await?;
-        Ok(())
+        output.write_all(&chunk).await?;
+    }
+    output.flush().await?;
+    Ok(())
+}
+
+async fn wait_until_cancelled(cancelled: &AtomicBool) {
+    while !cancelled.load(Ordering::Acquire) {
+        tokio::time::sleep(CANCELLATION_POLL_INTERVAL).await;
     }
 }
 
@@ -372,6 +395,7 @@ pub struct UpgradeCoordinator {
     state: Arc<RwLock<CoordinatorState>>,
     mutation_in_progress: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    installation_bound: bool,
     started: Instant,
 }
 
@@ -393,8 +417,27 @@ impl UpgradeCoordinator {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
             mutation_in_progress: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            installation_bound: false,
             started: Instant::now(),
         }
+    }
+
+    /// Creates a coordinator after proving its staging root cannot overlap the active installation.
+    ///
+    /// # Errors
+    ///
+    /// Refuses relative, unresolved, or overlapping installation and staging paths.
+    pub fn new_for_installation(
+        staging_root: &Path,
+        installed_executable: &Path,
+        source: Box<dyn ReleaseSource>,
+        verifying_key: VerifyingKey,
+        validation: ReleaseValidationContext,
+    ) -> Result<Self, UpgradeError> {
+        let staging_root = validate_staging_location(staging_root, installed_executable)?;
+        let mut coordinator = Self::new(staging_root, source, verifying_key, validation);
+        coordinator.installation_bound = true;
+        Ok(coordinator)
     }
 
     #[cfg(test)]
@@ -414,6 +457,7 @@ impl UpgradeCoordinator {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
             mutation_in_progress: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            installation_bound: false,
             started: Instant::now(),
         }
     }
@@ -489,7 +533,7 @@ impl UpgradeCoordinator {
     }
 
     async fn persist_publication_watermark(&self, value: i64) -> Result<(), UpgradeError> {
-        prepare_staging_root(&self.staging_root).await?;
+        prepare_staging_root(&self.staging_root, self.installation_bound).await?;
         crate::atomic_file::write(
             &self.staging_root.join(PUBLICATION_WATERMARK_FILE),
             value.to_string().as_bytes(),
@@ -521,35 +565,64 @@ impl UpgradeCoordinator {
         self.state.write().await.status = UpgradeStatus::Downloading {
             release: release.clone(),
         };
-        prepare_staging_root(&self.staging_root).await?;
         let partial = self.staging_root.join("payload.partial");
         let payload = self.staging_root.join("payload.staged");
-        remove_file_if_present(&partial).await?;
-        let downloaded = self
-            .source
-            .download(
-                &release.installer_url,
-                &partial,
-                release.byte_length.min(MAX_UPGRADE_PAYLOAD_BYTES),
-                &self.cancelled,
-            )
-            .await;
-        if let Err(error) = downloaded {
-            let _ = remove_file_if_present(&partial).await;
-            return Err(error);
-        }
-        if self.cancelled.load(Ordering::Acquire) {
+        let metadata_partial = self.staging_root.join("release.partial");
+        let metadata = self.staging_root.join("release.json");
+        let result = async {
+            prepare_staging_root(&self.staging_root, self.installation_bound).await?;
             remove_file_if_present(&partial).await?;
+            remove_file_if_present(&metadata_partial).await?;
+            self.source
+                .download(
+                    &release.installer_url,
+                    &partial,
+                    release.byte_length.min(MAX_UPGRADE_PAYLOAD_BYTES),
+                    &self.cancelled,
+                )
+                .await?;
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(UpgradeError::Cancelled);
+            }
+            verify_payload(&partial, &release).await?;
+            tokio::fs::write(&metadata_partial, metadata_bytes).await?;
+            remove_file_if_present(&payload).await?;
+            remove_file_if_present(&metadata).await?;
+            tokio::fs::rename(&partial, &payload).await?;
+            if let Err(error) = tokio::fs::rename(&metadata_partial, &metadata).await {
+                let _ = remove_file_if_present(&payload).await;
+                return Err(error.into());
+            }
+            Ok(StagedUpgrade {
+                release: release.clone(),
+                payload: payload.clone(),
+            })
+        }
+        .await;
+        let staged = match result {
+            Ok(staged) => staged,
+            Err(error) => {
+                for path in [&partial, &metadata_partial, &payload, &metadata] {
+                    let _ = remove_file_if_present(path).await;
+                }
+                let mut state = self.state.write().await;
+                state.staged = None;
+                state.status = UpgradeStatus::Available {
+                    release: release.clone(),
+                };
+                return Err(error);
+            }
+        };
+        if self.cancelled.load(Ordering::Acquire) {
+            let _ = remove_file_if_present(&partial).await;
+            let _ = remove_file_if_present(&metadata_partial).await;
+            let _ = remove_file_if_present(&payload).await;
+            let _ = remove_file_if_present(&metadata).await;
+            let mut state = self.state.write().await;
+            state.staged = None;
+            state.status = UpgradeStatus::Available { release };
             return Err(UpgradeError::Cancelled);
         }
-        if let Err(error) = verify_payload(&partial, &release).await {
-            let _ = remove_file_if_present(&partial).await;
-            return Err(error);
-        }
-        remove_file_if_present(&payload).await?;
-        tokio::fs::rename(&partial, &payload).await?;
-        tokio::fs::write(self.staging_root.join("release.json"), metadata_bytes).await?;
-        let staged = StagedUpgrade { release, payload };
         self.state.write().await.staged = Some(staged.clone());
         self.state.write().await.status = UpgradeStatus::Staged {
             release: staged.release.clone(),
@@ -564,7 +637,9 @@ impl UpgradeCoordinator {
     /// Corrupt or incompatible staged state is removed before an error is returned.
     pub async fn recover_staged(&self) -> Result<bool, UpgradeError> {
         let _mutation = MutationGuard::begin(&self.mutation_in_progress)?;
-        prepare_staging_root(&self.staging_root).await?;
+        prepare_staging_root(&self.staging_root, self.installation_bound).await?;
+        remove_file_if_present(&self.staging_root.join("payload.partial")).await?;
+        remove_file_if_present(&self.staging_root.join("release.partial")).await?;
         let metadata_path = self.staging_root.join("release.json");
         let payload = self.staging_root.join("payload.staged");
         if !tokio::fs::try_exists(&metadata_path).await? || !tokio::fs::try_exists(&payload).await?
@@ -755,16 +830,71 @@ impl UpgradeCoordinator {
     }
 }
 
-async fn prepare_staging_root(path: &Path) -> Result<(), UpgradeError> {
+fn validate_staging_location(
+    staging_root: &Path,
+    installed_executable: &Path,
+) -> Result<PathBuf, UpgradeError> {
+    if !staging_root.is_absolute() || !installed_executable.is_absolute() {
+        return Err(UpgradeError::UnsafeStagingPath);
+    }
+    let staging_parent = staging_root
+        .parent()
+        .ok_or(UpgradeError::UnsafeStagingPath)?;
+    let staging_name = staging_root
+        .file_name()
+        .ok_or(UpgradeError::UnsafeStagingPath)?;
+    let staging_root = if staging_root.exists() {
+        std::fs::canonicalize(staging_root)?
+    } else {
+        std::fs::canonicalize(staging_parent)?.join(staging_name)
+    };
+    let installed_executable = std::fs::canonicalize(installed_executable)?;
+    let installation_root =
+        active_installation_root(&installed_executable).ok_or(UpgradeError::UnsafeStagingPath)?;
+    if staging_root.starts_with(installation_root) || installation_root.starts_with(&staging_root) {
+        return Err(UpgradeError::UnsafeStagingPath);
+    }
+    Ok(staging_root)
+}
+
+#[cfg(target_os = "macos")]
+fn active_installation_root(executable: &Path) -> Option<&Path> {
+    executable
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+        .or_else(|| executable.parent())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn active_installation_root(executable: &Path) -> Option<&Path> {
+    executable.parent()
+}
+
+async fn prepare_staging_root(
+    path: &Path,
+    require_canonical_match: bool,
+) -> Result<(), UpgradeError> {
     tokio::fs::create_dir_all(path).await?;
-    if tokio::fs::symlink_metadata(path)
-        .await?
-        .file_type()
-        .is_symlink()
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if unsafe_staging_entry(&metadata)
+        || require_canonical_match && tokio::fs::canonicalize(path).await? != path
     {
         return Err(UpgradeError::UnsafeStagingPath);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn unsafe_staging_entry(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn unsafe_staging_entry(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 pub(crate) async fn verify_payload(
@@ -888,7 +1018,7 @@ pub enum UpgradeError {
 mod tests {
     use std::{
         net::Ipv4Addr,
-        path::{Path, PathBuf},
+        path::Path,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -950,6 +1080,33 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct StorageFailureSource {
+        metadata: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl ReleaseSource for StorageFailureSource {
+        async fn metadata(&self) -> Result<Vec<u8>, UpgradeError> {
+            Ok(self.metadata.clone())
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+            destination: &Path,
+            _maximum_bytes: u64,
+            _cancelled: &std::sync::atomic::AtomicBool,
+        ) -> Result<(), UpgradeError> {
+            tokio::fs::write(destination, b"partial payload").await?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "simulated full staging volume",
+            )
+            .into())
+        }
+    }
+
+    #[derive(Debug)]
     struct MetadataOnlySource {
         metadata: Vec<u8>,
     }
@@ -968,6 +1125,203 @@ mod tests {
             _cancelled: &std::sync::atomic::AtomicBool,
         ) -> Result<(), UpgradeError> {
             panic!("release discovery must not download an upgrade payload");
+        }
+    }
+
+    #[derive(Debug)]
+    struct EndpointReleaseSource {
+        client: reqwest::Client,
+        metadata_url: String,
+        payload_url: String,
+    }
+
+    #[async_trait]
+    impl ReleaseSource for EndpointReleaseSource {
+        async fn metadata(&self) -> Result<Vec<u8>, UpgradeError> {
+            let response = self
+                .client
+                .get(&self.metadata_url)
+                .send()
+                .await
+                .map_err(|_| {
+                    UpgradeError::ReleaseService("release metadata request failed".into())
+                })?;
+            HttpReleaseSource::bounded_response(
+                response,
+                u64::try_from(MAX_RELEASE_METADATA_BYTES).expect("metadata limit fits u64"),
+            )
+            .await
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+            destination: &Path,
+            maximum_bytes: u64,
+            cancelled: &std::sync::atomic::AtomicBool,
+        ) -> Result<(), UpgradeError> {
+            let response = self
+                .client
+                .get(&self.payload_url)
+                .send()
+                .await
+                .map_err(|_| UpgradeError::ReleaseService("payload request failed".into()))?;
+            if !response.status().is_success()
+                || response
+                    .content_length()
+                    .is_some_and(|length| length > maximum_bytes)
+            {
+                return Err(UpgradeError::ReleaseService(
+                    "payload response was refused".into(),
+                ));
+            }
+            super::write_payload_response(response, destination, maximum_bytes, cancelled).await
+        }
+    }
+
+    #[derive(Debug)]
+    enum FakePayloadResponse {
+        Immediate(Vec<u8>),
+        Paused {
+            first: Vec<u8>,
+            rest: Vec<u8>,
+            first_sent: Arc<tokio::sync::Notify>,
+            resume: Arc<tokio::sync::Notify>,
+        },
+    }
+
+    #[derive(Debug)]
+    struct FakeUpgradeEndpoint {
+        metadata_url: String,
+        payload_url: String,
+        server: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl FakeUpgradeEndpoint {
+        async fn finish(mut self) {
+            let mut server = self.server.take().expect("fake upgrade endpoint task");
+            if let Ok(joined) = tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+                joined.unwrap();
+            } else {
+                server.abort();
+                let _ = server.await;
+                panic!("fake upgrade endpoint shutdown timed out");
+            }
+        }
+    }
+
+    impl Drop for FakeUpgradeEndpoint {
+        fn drop(&mut self) {
+            if let Some(server) = &self.server {
+                server.abort();
+            }
+        }
+    }
+
+    async fn read_fake_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = [0_u8; 2_048];
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut request))
+            .await
+            .expect("fake upgrade endpoint read timed out")
+            .unwrap();
+        String::from_utf8_lossy(&request[..read]).into_owned()
+    }
+
+    async fn write_fake_response(stream: &mut tokio::net::TcpStream, body: &[u8]) {
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        tokio::time::timeout(Duration::from_secs(5), stream.write_all(headers.as_bytes()))
+            .await
+            .expect("fake upgrade endpoint header write timed out")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stream.write_all(body))
+            .await
+            .expect("fake upgrade endpoint body write timed out")
+            .unwrap();
+    }
+
+    async fn fake_upgrade_endpoint(
+        metadata: Vec<u8>,
+        payload: FakePayloadResponse,
+    ) -> FakeUpgradeEndpoint {
+        let listener = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .await
+        .expect("fake upgrade endpoint bind timed out")
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut metadata_stream, _) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("fake metadata endpoint accept timed out")
+                    .unwrap();
+            assert!({
+                let request = read_fake_request(&mut metadata_stream).await;
+                assert!(!request.to_ascii_lowercase().contains("\r\nauthorization:"));
+                request.starts_with("GET /release.json HTTP/1.1")
+            });
+            write_fake_response(&mut metadata_stream, &metadata).await;
+            let _ = metadata_stream.shutdown().await;
+
+            let (mut payload_stream, _) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("fake payload endpoint accept timed out")
+                    .unwrap();
+            assert!({
+                let request = read_fake_request(&mut payload_stream).await;
+                assert!(!request.to_ascii_lowercase().contains("\r\nauthorization:"));
+                request.starts_with("GET /payload HTTP/1.1")
+            });
+            match payload {
+                FakePayloadResponse::Immediate(body) => {
+                    write_fake_response(&mut payload_stream, &body).await;
+                }
+                FakePayloadResponse::Paused {
+                    first,
+                    rest,
+                    first_sent,
+                    resume,
+                } => {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        first.len() + rest.len()
+                    );
+                    payload_stream.write_all(headers.as_bytes()).await.unwrap();
+                    payload_stream.write_all(&first).await.unwrap();
+                    payload_stream.flush().await.unwrap();
+                    first_sent.notify_one();
+                    tokio::time::timeout(Duration::from_secs(5), resume.notified())
+                        .await
+                        .expect("fake payload endpoint resume timed out");
+                    let _ = payload_stream.write_all(&rest).await;
+                }
+            }
+            let _ = payload_stream.shutdown().await;
+        });
+        let base_url = format!("http://{address}");
+        FakeUpgradeEndpoint {
+            metadata_url: format!("{base_url}/release.json"),
+            payload_url: format!("{base_url}/payload"),
+            server: Some(server),
+        }
+    }
+
+    fn endpoint_source(endpoint: &FakeUpgradeEndpoint) -> EndpointReleaseSource {
+        EndpointReleaseSource {
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            metadata_url: endpoint.metadata_url.clone(),
+            payload_url: endpoint.payload_url.clone(),
         }
     }
 
@@ -1230,6 +1584,340 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_payload_is_cleaned_up_and_remains_available_for_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (mut payload, release, key) = release_fixture();
+        payload[0] ^= 0xff;
+        let coordinator = UpgradeCoordinator::new(
+            temporary.path().join("rejected-payload"),
+            Box::new(FakeSource {
+                metadata: signed_metadata(release.clone(), &key),
+                payload,
+            }),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+
+        coordinator.check().await.unwrap();
+        assert!(matches!(
+            coordinator.download().await,
+            Err(UpgradeError::DigestMismatch)
+        ));
+
+        assert!(matches!(
+            coordinator.status().await,
+            UpgradeStatus::Available { release: available } if available == release
+        ));
+        assert!(
+            !temporary
+                .path()
+                .join("rejected-payload/payload.partial")
+                .exists()
+        );
+        assert!(
+            !temporary
+                .path()
+                .join("rejected-payload/payload.staged")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_staging_volume_cleans_partial_payload_and_allows_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join("storage-full");
+        let (_payload, release, key) = release_fixture();
+        let coordinator = UpgradeCoordinator::new(
+            staging.clone(),
+            Box::new(StorageFailureSource {
+                metadata: signed_metadata(release.clone(), &key),
+            }),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+
+        coordinator.check().await.unwrap();
+        assert!(matches!(
+            coordinator.download().await,
+            Err(UpgradeError::Io(error)) if error.kind() == std::io::ErrorKind::StorageFull
+        ));
+
+        assert!(matches!(
+            coordinator.status().await,
+            UpgradeStatus::Available { release: available } if available == release
+        ));
+        assert!(!staging.join("payload.partial").exists());
+        assert!(!staging.join("payload.staged").exists());
+        assert!(!staging.join("release.partial").exists());
+        assert!(!staging.join("release.json").exists());
+    }
+
+    #[tokio::test]
+    async fn fake_endpoint_downloads_and_stages_verified_payload() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join("endpoint-success");
+        let (payload, release, key) = release_fixture();
+        let endpoint = fake_upgrade_endpoint(
+            signed_metadata(release.clone(), &key),
+            FakePayloadResponse::Immediate(payload.clone()),
+        )
+        .await;
+        let coordinator = UpgradeCoordinator::new(
+            staging.clone(),
+            Box::new(endpoint_source(&endpoint)),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+
+        coordinator.check().await.unwrap();
+        let staged = tokio::time::timeout(Duration::from_secs(5), coordinator.download())
+            .await
+            .expect("upgrade download timed out")
+            .unwrap();
+        endpoint.finish().await;
+
+        assert_eq!(tokio::fs::read(&staged.payload).await.unwrap(), payload);
+        assert_eq!(staged.payload, staging.join("payload.staged"));
+        assert!(staging.join("release.json").exists());
+        assert!(!staging.join("payload.partial").exists());
+        assert!(!staging.join("release.partial").exists());
+        assert_eq!(
+            coordinator.status().await,
+            UpgradeStatus::Staged { release }
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_endpoint_cancellation_removes_partial_payload_and_allows_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join("endpoint-cancelled");
+        let (payload, release, key) = release_fixture();
+        let split = payload.len() / 2;
+        let first_sent = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let endpoint = fake_upgrade_endpoint(
+            signed_metadata(release.clone(), &key),
+            FakePayloadResponse::Paused {
+                first: payload[..split].to_vec(),
+                rest: payload[split..].to_vec(),
+                first_sent: first_sent.clone(),
+                resume: resume.clone(),
+            },
+        )
+        .await;
+        let coordinator = Arc::new(UpgradeCoordinator::new(
+            staging.clone(),
+            Box::new(endpoint_source(&endpoint)),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        ));
+        coordinator.check().await.unwrap();
+
+        let downloading = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move { coordinator.download().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), first_sent.notified())
+            .await
+            .expect("fake endpoint did not begin the payload response");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::fs::metadata(staging.join("payload.partial"))
+                    .await
+                    .is_ok_and(|metadata| metadata.len() > 0)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("download did not persist the first payload chunk");
+        coordinator.cancel_download();
+        let result = tokio::time::timeout(Duration::from_secs(1), downloading)
+            .await
+            .expect("cancelled download did not stop promptly")
+            .unwrap();
+        resume.notify_one();
+        endpoint.finish().await;
+
+        assert!(matches!(result, Err(UpgradeError::Cancelled)));
+        assert!(matches!(
+            coordinator.status().await,
+            UpgradeStatus::Available { release: available } if available == release
+        ));
+        for name in [
+            "payload.partial",
+            "payload.staged",
+            "release.partial",
+            "release.json",
+        ] {
+            assert!(!staging.join(name).exists(), "left staging artifact {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_endpoint_truncated_payload_fails_closed_and_cleans_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join("endpoint-truncated");
+        let (payload, release, key) = release_fixture();
+        let endpoint = fake_upgrade_endpoint(
+            signed_metadata(release.clone(), &key),
+            FakePayloadResponse::Immediate(payload[..payload.len() - 3].to_vec()),
+        )
+        .await;
+        let coordinator = UpgradeCoordinator::new(
+            staging.clone(),
+            Box::new(endpoint_source(&endpoint)),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+
+        coordinator.check().await.unwrap();
+        let result = coordinator.download().await;
+        endpoint.finish().await;
+
+        assert!(matches!(result, Err(UpgradeError::LengthMismatch)));
+        assert!(matches!(
+            coordinator.status().await,
+            UpgradeStatus::Available { .. }
+        ));
+        assert!(!staging.join("payload.partial").exists());
+        assert!(!staging.join("payload.staged").exists());
+    }
+
+    #[tokio::test]
+    async fn fake_endpoint_corrupt_payload_fails_closed_and_cleans_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join("endpoint-corrupt");
+        let (mut payload, release, key) = release_fixture();
+        payload[0] ^= 0xff;
+        let endpoint = fake_upgrade_endpoint(
+            signed_metadata(release.clone(), &key),
+            FakePayloadResponse::Immediate(payload),
+        )
+        .await;
+        let coordinator = UpgradeCoordinator::new(
+            staging.clone(),
+            Box::new(endpoint_source(&endpoint)),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+
+        coordinator.check().await.unwrap();
+        let result = coordinator.download().await;
+        endpoint.finish().await;
+
+        assert!(matches!(result, Err(UpgradeError::DigestMismatch)));
+        assert!(matches!(
+            coordinator.status().await,
+            UpgradeStatus::Available { .. }
+        ));
+        assert!(!staging.join("payload.partial").exists());
+        assert!(!staging.join("payload.staged").exists());
+    }
+
+    #[tokio::test]
+    async fn fake_endpoint_staged_payload_recovers_after_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join("endpoint-restart");
+        let (payload, release, key) = release_fixture();
+        let metadata = signed_metadata(release.clone(), &key);
+        let endpoint =
+            fake_upgrade_endpoint(metadata.clone(), FakePayloadResponse::Immediate(payload)).await;
+        let coordinator = UpgradeCoordinator::new(
+            staging.clone(),
+            Box::new(endpoint_source(&endpoint)),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+        coordinator.check().await.unwrap();
+        coordinator.download().await.unwrap();
+        endpoint.finish().await;
+
+        let restarted = UpgradeCoordinator::new(
+            staging.clone(),
+            Box::new(MetadataOnlySource { metadata }),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+
+        assert!(restarted.recover_staged().await.unwrap());
+        assert_eq!(restarted.status().await, UpgradeStatus::Staged { release });
+        assert!(staging.join("payload.staged").exists());
+        assert!(staging.join("release.json").exists());
+    }
+
+    #[tokio::test]
+    async fn fake_endpoint_interrupted_download_is_cleaned_after_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join("endpoint-interrupted");
+        let (payload, release, key) = release_fixture();
+        let metadata = signed_metadata(release, &key);
+        let split = payload.len() / 2;
+        let first_sent = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let endpoint = fake_upgrade_endpoint(
+            metadata.clone(),
+            FakePayloadResponse::Paused {
+                first: payload[..split].to_vec(),
+                rest: payload[split..].to_vec(),
+                first_sent: first_sent.clone(),
+                resume: resume.clone(),
+            },
+        )
+        .await;
+        let coordinator = Arc::new(UpgradeCoordinator::new(
+            staging.clone(),
+            Box::new(endpoint_source(&endpoint)),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        ));
+        coordinator.check().await.unwrap();
+        let downloading = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move { coordinator.download().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), first_sent.notified())
+            .await
+            .expect("fake endpoint did not begin the payload response");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::fs::metadata(staging.join("payload.partial"))
+                    .await
+                    .is_ok_and(|metadata| metadata.len() > 0)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("download did not persist the first payload chunk");
+        downloading.abort();
+        let _ = downloading.await;
+        tokio::fs::write(staging.join("release.partial"), &metadata)
+            .await
+            .unwrap();
+        resume.notify_one();
+        endpoint.finish().await;
+        drop(coordinator);
+
+        let restarted = UpgradeCoordinator::new(
+            staging.clone(),
+            Box::new(MetadataOnlySource { metadata }),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+
+        assert!(!restarted.recover_staged().await.unwrap());
+        assert!(!staging.join("payload.partial").exists());
+        assert!(!staging.join("release.partial").exists());
+        assert!(!staging.join("payload.staged").exists());
+        assert!(!staging.join("release.json").exists());
+    }
+
+    #[tokio::test]
     async fn check_discovers_signed_metadata_without_downloading_the_payload() {
         let temporary = tempfile::tempdir().unwrap();
         let (_payload, release, key) = release_fixture();
@@ -1485,8 +2173,40 @@ mod tests {
     }
 
     #[test]
-    fn staging_path_is_not_the_installation_path() {
-        let path = PathBuf::from("installation/sylvops");
-        assert_ne!(path, PathBuf::from("staging/payload"));
+    fn installation_bound_coordinator_refuses_overlapping_staging_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let installation = temporary.path().join("installation");
+        let user_data = temporary.path().join("user-data");
+        std::fs::create_dir_all(&installation).unwrap();
+        std::fs::create_dir_all(&user_data).unwrap();
+        let executable = installation.join("sylvops.exe");
+        std::fs::write(&executable, b"test executable").unwrap();
+        let (payload, release, key) = release_fixture();
+        let metadata = signed_metadata(release, &key);
+
+        let refused = UpgradeCoordinator::new_for_installation(
+            &installation.join("upgrades"),
+            &executable,
+            Box::new(FakeSource {
+                metadata: metadata.clone(),
+                payload: payload.clone(),
+            }),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        );
+        assert!(matches!(refused, Err(UpgradeError::UnsafeStagingPath)));
+
+        let accepted = UpgradeCoordinator::new_for_installation(
+            &user_data.join("upgrades"),
+            &executable,
+            Box::new(FakeSource { metadata, payload }),
+            key.verifying_key(),
+            validation_context("0.1.0"),
+        )
+        .unwrap();
+        assert_eq!(
+            accepted.staging_root,
+            std::fs::canonicalize(&user_data).unwrap().join("upgrades")
+        );
     }
 }
