@@ -49,9 +49,6 @@ pub async fn run(handoff_path: &Path) -> Result<()> {
         handoff.runtime_directory.clone(),
     )?;
     validate_handoff_path(handoff_path, &handoff)?;
-    let payload = validate_staged_release(&handoff).await?;
-    verify_platform_signature(&payload, handoff.release.target.installer)?;
-    let backup = create_backup(&handoff)?;
     wait_for_daemon_stop(&paths).await?;
     if let Err(error) = wait_for_client_processes_exit(&handoff.client_process_ids).await {
         start_installed_daemon(&handoff)?;
@@ -65,6 +62,28 @@ pub async fn run(handoff_path: &Path) -> Result<()> {
             "application upgrade was cancelled before package replacement: {error}"
         )));
     }
+    let preparation = async {
+        let payload = validate_staged_release(&handoff).await?;
+        verify_platform_signature(&payload, handoff.release.target.installer)?;
+        let backup = create_backup(&handoff)?;
+        Ok::<_, DaemonError>((payload, backup))
+    }
+    .await;
+    let (payload, backup) = match preparation {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            start_installed_daemon(&handoff)?;
+            report_outcome(
+                &paths,
+                &handoff.release.target_version,
+                NativeUpgradeOutcome::RolledBack,
+            )
+            .await?;
+            return Err(DaemonError::Lifecycle(format!(
+                "application upgrade preparation failed after quiescing: {error}"
+            )));
+        }
+    };
     if let Err(error) = apply_package(&handoff, &payload) {
         return rollback_and_restart(&paths, &handoff, &backup, &error).await;
     }

@@ -623,9 +623,7 @@ impl DesktopApp {
             Message::DownloadUpdate => {
                 self.send_request(Operation::DownloadUpdate, ClientRequest::DownloadUpdate);
             }
-            Message::InstallUpdate => {
-                self.send_install_request(false);
-            }
+            Message::InstallUpdate => self.send_install_request(Vec::new()),
             Message::TogglePeriodicUpdateChecks => {
                 self.desktop_state.periodic_update_checks =
                     !self.desktop_state.periodic_update_checks;
@@ -1925,12 +1923,16 @@ impl DesktopApp {
             ),
             Confirmation::InstallUpdate {
                 version,
-                active_session_names,
+                active_sessions,
             } => (
                 "Stop sessions and install update",
                 format!(
                     "Install SylvOps {version}? The following active sessions and their complete process trees will stop: {}.",
-                    active_session_names.join(", ")
+                    active_sessions
+                        .iter()
+                        .map(|session| session.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             ),
         };
@@ -2446,10 +2448,7 @@ impl DesktopApp {
                 };
                 self.modal = Some(Modal::Confirmation(Confirmation::InstallUpdate {
                     version,
-                    active_session_names: active_sessions
-                        .into_iter()
-                        .map(|session| session.name)
-                        .collect(),
+                    active_sessions,
                 }));
             }
             (
@@ -2523,11 +2522,11 @@ impl DesktopApp {
         }
     }
 
-    fn send_install_request(&mut self, override_active_sessions: bool) {
+    fn send_install_request(&mut self, confirmed_active_sessions: Vec<SessionId>) {
         self.install_request = if self.bridge.request(
             Operation::InstallUpdate,
             ClientRequest::InstallUpdate {
-                override_active_sessions,
+                confirmed_active_sessions,
                 requesting_process_id: std::process::id(),
             },
         ) {
@@ -3197,8 +3196,15 @@ impl DesktopApp {
                     },
                 );
             }
-            Confirmation::InstallUpdate { .. } => {
-                self.send_install_request(true);
+            Confirmation::InstallUpdate {
+                active_sessions, ..
+            } => {
+                self.send_install_request(
+                    active_sessions
+                        .into_iter()
+                        .map(|session| session.id)
+                        .collect(),
+                );
                 self.modal = None;
             }
         }

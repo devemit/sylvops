@@ -17,6 +17,7 @@ use sylvops_core::{
     domain::{ProviderKind, SessionState},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+    upgrade::InstallDisposition,
 };
 use sylvops_daemon::data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan};
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
@@ -213,10 +214,10 @@ enum UpdateCommand {
     Status,
     /// Cancel an in-progress download.
     Cancel,
-    /// Apply the staged upgrade, optionally stopping the named active sessions.
+    /// Apply the staged upgrade, optionally confirming the exact active sessions to stop.
     Install {
-        #[arg(long)]
-        override_active_sessions: bool,
+        #[arg(long = "confirm-active-session", value_name = "SESSION_ID")]
+        confirmed_active_sessions: Vec<SessionId>,
     },
 }
 
@@ -991,9 +992,9 @@ async fn update_application(
         UpdateCommand::Status => ClientRequest::GetUpdateStatus,
         UpdateCommand::Cancel => ClientRequest::CancelUpdateDownload,
         UpdateCommand::Install {
-            override_active_sessions,
+            confirmed_active_sessions,
         } => ClientRequest::InstallUpdate {
-            override_active_sessions,
+            confirmed_active_sessions,
             requesting_process_id: std::process::id(),
         },
     };
@@ -1017,6 +1018,20 @@ async fn update_application(
             println!("{status:#?}");
             Ok(())
         }
+        DaemonResponse::UpdateInstall(InstallDisposition::Blocked { active_sessions }) => {
+            println!(
+                "Installation is blocked by active sessions. Confirm that their complete process trees may be stopped by rerunning with {}.",
+                active_sessions
+                    .iter()
+                    .map(|session| format!("--confirm-active-session {}", session.id))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            for session in active_sessions {
+                println!("- {} ({})", session.name, session.id);
+            }
+            Ok(())
+        }
         DaemonResponse::UpdateInstall(disposition) => {
             println!("{disposition:#?}");
             Ok(())
@@ -1035,6 +1050,15 @@ async fn remove_user_data(paths: &RuntimePaths, confirmation: &str) -> sylvops_d
             sylvops_daemon::data_removal::DataRemovalError::ConfirmationRequired,
         ));
     }
+    if let Some(protected_paths) = sylvops_daemon::data_removal::reservation(paths)? {
+        wait_for_daemon_stop_for_data_removal(paths).await?;
+        let plan = DataRemovalPlan::prepare(paths, confirmation, &protected_paths)?;
+        plan.execute().await?;
+        println!(
+            "Removed SylvOps user data. Repositories, worktrees, and branches were preserved."
+        );
+        return Ok(());
+    }
     let client = DaemonClient::connect(paths, "sylvops-data-removal").await?;
     let snapshot = match client.request(&ClientRequest::GetSnapshot).await? {
         DaemonResponse::Snapshot(snapshot) => snapshot,
@@ -1051,6 +1075,7 @@ async fn remove_user_data(paths: &RuntimePaths, confirmation: &str) -> sylvops_d
                 .map(|worktree| PathBuf::from(&worktree.canonical_path)),
         )
         .collect::<Vec<_>>();
+    let plan = DataRemovalPlan::prepare(paths, confirmation, &protected_paths)?;
     match client
         .request(&ClientRequest::PrepareDataRemoval {
             confirmation: confirmation.into(),
@@ -1060,8 +1085,14 @@ async fn remove_user_data(paths: &RuntimePaths, confirmation: &str) -> sylvops_d
         DaemonResponse::DataRemovalPrepared => {}
         response => return unexpected("data-removal preparation", response),
     }
-    let plan = DataRemovalPlan::prepare(paths, confirmation, &protected_paths)?;
     drop(client);
+    wait_for_daemon_stop_for_data_removal(paths).await?;
+    plan.execute().await?;
+    println!("Removed SylvOps user data. Repositories, worktrees, and branches were preserved.");
+    Ok(())
+}
+
+async fn wait_for_daemon_stop_for_data_removal(paths: &RuntimePaths) -> sylvops_daemon::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while paths.authentication_token.exists() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1071,8 +1102,6 @@ async fn remove_user_data(paths: &RuntimePaths, confirmation: &str) -> sylvops_d
             "daemon did not stop before user-data removal".into(),
         ));
     }
-    plan.execute().await?;
-    println!("Removed SylvOps user data. Repositories, worktrees, and branches were preserved.");
     Ok(())
 }
 

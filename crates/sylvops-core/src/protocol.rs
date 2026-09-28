@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 8;
+pub const PROTOCOL_MINOR: u16 = 9;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -435,7 +435,7 @@ pub enum ClientRequest {
     DownloadUpdate,
     CancelUpdateDownload,
     InstallUpdate {
-        override_active_sessions: bool,
+        confirmed_active_sessions: Vec<SessionId>,
         requesting_process_id: u32,
     },
     FinalizeUpdate {
@@ -698,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_7_ui_state_round_trips() {
+    fn protocol_1_9_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -710,13 +710,21 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 8);
+        assert_eq!(PROTOCOL_MINOR, 9);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
         };
         let frame = Frame::message(MessageClass::Request, 10, &desktop).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), desktop);
+
+        let session_id = crate::ids::SessionId::new();
+        let install = ClientRequest::InstallUpdate {
+            confirmed_active_sessions: vec![session_id],
+            requesting_process_id: 42,
+        };
+        let frame = Frame::message(MessageClass::Request, 10, &install).unwrap();
+        assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), install);
     }
 
     #[test]

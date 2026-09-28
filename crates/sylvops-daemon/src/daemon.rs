@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
 use subtle::ConstantTimeEq;
 use sylvops_core::{
     domain::{
@@ -27,8 +28,8 @@ use sylvops_core::{
     provider::{LaunchContext, LaunchSpec, ResumeContext},
     status::{NormalizedProviderEvent, SessionStatusMachine},
     upgrade::{
-        ActiveUpgradeSession, InstallDisposition, MAX_UPGRADE_CLIENT_PROCESSES,
-        NativeUpgradeHandoff, ReleaseMetadata, UpgradeStatus,
+        ActiveUpgradeSession, InstallDisposition, MAX_UPGRADE_ACTIVE_SESSIONS,
+        MAX_UPGRADE_CLIENT_PROCESSES, NativeUpgradeHandoff, ReleaseMetadata, UpgradeStatus,
     },
 };
 use tokio::{
@@ -62,6 +63,8 @@ const CLIENT_QUEUE_CAPACITY: usize = 256;
 const CLIENT_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
 const LIFECYCLE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
+const ACTIVE_SESSION_REAP_TIMEOUT: Duration = Duration::from_secs(15);
+const UPGRADE_HANDOFF_FILE: &str = "handoff.json";
 
 #[derive(Debug)]
 struct OutboundFrame {
@@ -227,6 +230,91 @@ impl Drop for LifecycleQuiesce {
     }
 }
 
+#[derive(Debug)]
+struct ApplicationMutationCoordinator {
+    in_progress: AtomicBool,
+    handoff_pending: AtomicBool,
+    handoff_finalizing: AtomicBool,
+}
+
+impl ApplicationMutationCoordinator {
+    fn new(handoff_pending: bool) -> Arc<Self> {
+        Arc::new(Self {
+            in_progress: AtomicBool::new(handoff_pending),
+            handoff_pending: AtomicBool::new(handoff_pending),
+            handoff_finalizing: AtomicBool::new(false),
+        })
+    }
+
+    fn begin(self: &Arc<Self>) -> Result<ApplicationMutation> {
+        self.in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                DaemonError::Lifecycle("another application mutation is already in progress".into())
+            })?;
+        Ok(ApplicationMutation(self.clone()))
+    }
+
+    fn handoff_pending(&self) -> bool {
+        self.handoff_pending.load(Ordering::Acquire)
+    }
+
+    fn begin_handoff_finalization(self: &Arc<Self>) -> Result<HandoffFinalization> {
+        if !self.handoff_pending() {
+            return Err(DaemonError::Lifecycle(
+                "no detached application mutation is awaiting finalization".into(),
+            ));
+        }
+        self.handoff_finalizing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                DaemonError::Lifecycle("application handoff is already being finalized".into())
+            })?;
+        Ok(HandoffFinalization {
+            coordinator: self.clone(),
+            completed: false,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ApplicationMutation(Arc<ApplicationMutationCoordinator>);
+
+impl Drop for ApplicationMutation {
+    fn drop(&mut self) {
+        self.0.in_progress.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct HandoffFinalization {
+    coordinator: Arc<ApplicationMutationCoordinator>,
+    completed: bool,
+}
+
+impl HandoffFinalization {
+    fn complete(mut self) {
+        self.coordinator
+            .handoff_pending
+            .store(false, Ordering::Release);
+        self.coordinator.in_progress.store(false, Ordering::Release);
+        self.coordinator
+            .handoff_finalizing
+            .store(false, Ordering::Release);
+        self.completed = true;
+    }
+}
+
+impl Drop for HandoffFinalization {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.coordinator
+                .handoff_finalizing
+                .store(false, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DaemonState {
     database: DatabaseHandle,
@@ -240,12 +328,14 @@ struct DaemonState {
     project_locks: Arc<RwLock<HashMap<ProjectId, Arc<Mutex<()>>>>>,
     worktree_locks: Arc<RwLock<HashMap<WorktreeId, Arc<Mutex<()>>>>>,
     lifecycle: Arc<LifecycleCoordinator>,
+    application_mutations: Arc<ApplicationMutationCoordinator>,
     scrollback_bytes: usize,
     managed_worktree_root: PathBuf,
     providers: Arc<ProviderRegistry>,
     status_machines: Arc<Mutex<HashMap<SessionId, SessionStatusMachine>>>,
     hook_tracking: Arc<Mutex<HashMap<SessionId, HookTracking>>>,
     upgrade: Arc<UpgradeCoordinator>,
+    upgrade_handoff: Arc<dyn UpgradeHandoffLauncher>,
     runtime_paths: RuntimePaths,
 }
 
@@ -275,13 +365,60 @@ impl HookTracking {
     }
 }
 
+#[async_trait]
+pub trait UpgradeHandoffLauncher: std::fmt::Debug + Send + Sync {
+    /// Transfers a verified release to the detached platform installer or helper.
+    async fn launch(
+        &self,
+        paths: &RuntimePaths,
+        release: ReleaseMetadata,
+        client_process_ids: Vec<u32>,
+    ) -> Result<()>;
+}
+
+#[derive(Debug)]
+struct NativeUpgradeHandoffLauncher;
+
+#[async_trait]
+impl UpgradeHandoffLauncher for NativeUpgradeHandoffLauncher {
+    async fn launch(
+        &self,
+        paths: &RuntimePaths,
+        release: ReleaseMetadata,
+        client_process_ids: Vec<u32>,
+    ) -> Result<()> {
+        spawn_native_upgrade_helper(paths, release, client_process_ids).await
+    }
+}
+
 /// Runs the authoritative daemon until an authenticated shutdown request is received.
 ///
 /// # Errors
 ///
 /// Returns an error when runtime setup, persistence, IPC, hook binding, or cleanup fails.
-#[allow(clippy::too_many_lines)]
 pub async fn run(paths: RuntimePaths) -> Result<()> {
+    run_with_handoff_launcher(paths, Arc::new(NativeUpgradeHandoffLauncher)).await
+}
+
+/// Runs the daemon with an explicit native-upgrade handoff boundary.
+///
+/// This is public so cross-platform IPC integration tests can replace the platform package
+/// launcher without executing an installer.
+///
+/// # Errors
+///
+/// Returns an error when runtime setup, persistence, IPC, hook binding, or cleanup fails.
+#[doc(hidden)]
+#[allow(clippy::too_many_lines)]
+pub async fn run_with_handoff_launcher(
+    paths: RuntimePaths,
+    upgrade_handoff: Arc<dyn UpgradeHandoffLauncher>,
+) -> Result<()> {
+    if crate::data_removal::reservation_pending(&paths)? {
+        return Err(DaemonError::Lifecycle(
+            "user-data removal is still in progress".into(),
+        ));
+    }
     paths.prepare()?;
     let config = config_store::load(&paths.config, &paths.machine_config)?;
     let managed_worktree_root = prepare_managed_worktree_root(&paths, &config).await?;
@@ -297,6 +434,13 @@ pub async fn run(paths: RuntimePaths) -> Result<()> {
         &config.enabled_providers,
     )?);
     let upgrade = prepare_upgrade(&paths).await?;
+    let upgrade_handoff_pending = tokio::fs::try_exists(
+        paths
+            .data_directory
+            .join("upgrades")
+            .join(UPGRADE_HANDOFF_FILE),
+    )
+    .await?;
     let mut hook_deliveries = hook_receiver.take_deliveries();
     let mut listener = LocalListener::bind(&paths.endpoint)?;
     let database = DatabaseHandle::open(&paths.database)?;
@@ -329,12 +473,14 @@ pub async fn run(paths: RuntimePaths) -> Result<()> {
         project_locks: Arc::new(RwLock::new(HashMap::new())),
         worktree_locks: Arc::new(RwLock::new(HashMap::new())),
         lifecycle: LifecycleCoordinator::new(),
+        application_mutations: ApplicationMutationCoordinator::new(upgrade_handoff_pending),
         scrollback_bytes: config.scrollback_capacity_bytes,
         managed_worktree_root,
         providers,
         status_machines: Arc::new(Mutex::new(HashMap::new())),
         hook_tracking: Arc::new(Mutex::new(HashMap::new())),
         upgrade,
+        upgrade_handoff,
         runtime_paths: paths.clone(),
     };
     tracing::info!(reconciled, "SylvOps daemon is ready");
@@ -438,7 +584,7 @@ async fn prepare_upgrade(paths: &RuntimePaths) -> Result<Arc<UpgradeCoordinator>
     Ok(upgrade)
 }
 
-async fn spawn_upgrade_helper(
+async fn spawn_native_upgrade_helper(
     paths: &RuntimePaths,
     release: ReleaseMetadata,
     client_process_ids: Vec<u32>,
@@ -474,27 +620,33 @@ async fn spawn_upgrade_helper(
         client_process_ids,
         relaunch_desktop: true,
     };
-    let handoff_path = staging_root.join("handoff.json");
+    let handoff_path = staging_root.join(UPGRADE_HANDOFF_FILE);
     let encoded = serde_json::to_vec(&handoff)
         .map_err(|_| DaemonError::Lifecycle("could not encode upgrade handoff".into()))?;
     crate::atomic_file::write(&handoff_path, &encoded)?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.daemon_log)?;
-    let error_log = log.try_clone()?;
-    crate::background_process::command(&helper)
-        .arg("update-helper")
-        .arg("--handoff")
-        .arg(&handoff_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(error_log))
-        .spawn()
-        .map_err(|error| {
-            DaemonError::Lifecycle(format!("could not start upgrade helper: {error}"))
-        })?;
-    Ok(())
+    let result = (|| {
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&paths.daemon_log)?;
+        let error_log = log.try_clone()?;
+        crate::background_process::command(&helper)
+            .arg("update-helper")
+            .arg("--handoff")
+            .arg(&handoff_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(error_log))
+            .spawn()
+            .map_err(|error| {
+                DaemonError::Lifecycle(format!("could not start upgrade helper: {error}"))
+            })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&handoff_path).await;
+    }
+    result
 }
 
 async fn reconcile_worktrees(database: &DatabaseHandle) -> Result<serde_json::Value> {
@@ -670,6 +822,9 @@ async fn periodic_update_checks(state: DaemonState, interval: Duration) {
                         continue;
                     }
                 }
+                let Ok(_mutation) = state.application_mutations.begin() else {
+                    continue;
+                };
                 match state.upgrade.check().await {
                     Ok(Some(release)) => {
                         let _ = state.events.send(DaemonEvent::UpgradeProgress {
@@ -1383,6 +1538,7 @@ async fn handle_request(
             Ok(())
         }
         ClientRequest::CheckForUpdate => {
+            let _mutation = state.application_mutations.begin()?;
             let _lifecycle_activity = state.lifecycle.begin()?;
             if let Some(release) = state.upgrade.check().await? {
                 let status = UpgradeStatus::Available {
@@ -1410,6 +1566,7 @@ async fn handle_request(
             }
         }
         ClientRequest::DownloadUpdate => {
+            let _mutation = state.application_mutations.begin()?;
             let _lifecycle_activity = state.lifecycle.begin()?;
             let staged = state.upgrade.download().await?;
             let status = UpgradeStatus::Staged {
@@ -1436,6 +1593,17 @@ async fn handle_request(
             .await
         }
         ClientRequest::FinalizeUpdate { version, outcome } => {
+            let handoff_pending = state.application_mutations.handoff_pending();
+            let handoff_finalization = if handoff_pending {
+                Some(state.application_mutations.begin_handoff_finalization()?)
+            } else {
+                None
+            };
+            let _mutation = if handoff_pending {
+                None
+            } else {
+                Some(state.application_mutations.begin()?)
+            };
             let _lifecycle_activity = state.lifecycle.begin()?;
             state.upgrade.record_outcome(&version, outcome).await?;
             let status = state.upgrade.status().await;
@@ -1446,17 +1614,34 @@ async fn handle_request(
                 .database
                 .audit(
                     "application_upgrade",
-                    match outcome {
-                        sylvops_core::upgrade::NativeUpgradeOutcome::Installed => "installed",
-                        sylvops_core::upgrade::NativeUpgradeOutcome::RolledBack => "rolled_back",
-                    },
-                    &serde_json::json!({ "version": version }).to_string(),
+                    "succeeded",
+                    &serde_json::json!({
+                        "version": version,
+                        "result": match outcome {
+                            sylvops_core::upgrade::NativeUpgradeOutcome::Installed => "installed",
+                            sylvops_core::upgrade::NativeUpgradeOutcome::RolledBack => "rolled_back",
+                        }
+                    })
+                    .to_string(),
                 )
                 .await?;
+            if handoff_pending {
+                tokio::fs::remove_file(
+                    state
+                        .runtime_paths
+                        .data_directory
+                        .join("upgrades")
+                        .join(UPGRADE_HANDOFF_FILE),
+                )
+                .await?;
+                handoff_finalization
+                    .expect("pending handoff has a finalization lease")
+                    .complete();
+            }
             send_response_queue(outgoing, request_id, &DaemonResponse::Acknowledged).await
         }
         ClientRequest::InstallUpdate {
-            override_active_sessions,
+            confirmed_active_sessions,
             requesting_process_id,
         } => {
             if requesting_process_id != client_process_id {
@@ -1464,6 +1649,12 @@ async fn handle_request(
                     "upgrade request process ID does not match its authenticated client".into(),
                 ));
             }
+            if confirmed_active_sessions.len() > MAX_UPGRADE_ACTIVE_SESSIONS {
+                return Err(DaemonError::Lifecycle(
+                    "active-session upgrade confirmation is oversized".into(),
+                ));
+            }
+            let _mutation = state.application_mutations.begin()?;
             let mut lifecycle_quiesce = state.lifecycle.quiesce().await?;
             let managed_sessions: Vec<_> = state.sessions.read().await.values().cloned().collect();
             let mut active = Vec::new();
@@ -1474,26 +1665,57 @@ async fn handle_request(
                     record.state,
                     SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
                 ) {
+                    if active.len() >= MAX_UPGRADE_ACTIVE_SESSIONS {
+                        return Err(DaemonError::Lifecycle(
+                            "too many active sessions to coordinate an upgrade".into(),
+                        ));
+                    }
                     active.push(ActiveUpgradeSession {
-                        id: record.id.to_string(),
+                        id: record.id,
                         name: record.display_name,
                     });
                     active_handles.push(managed);
                 }
             }
-            if !active.is_empty() && override_active_sessions {
-                for managed in &active_handles {
-                    managed.handle.stop().await?;
-                }
-                for managed in active_handles {
-                    let mut completed = managed.completed.clone();
-                    while !*completed.borrow() && completed.changed().await.is_ok() {}
-                }
-            }
+            active.sort_by_key(|session| session.id.to_string());
+            let active_ids = active
+                .iter()
+                .map(|session| session.id)
+                .collect::<HashSet<_>>();
+            let confirmed_ids = confirmed_active_sessions
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let override_confirmed = !active.is_empty()
+                && confirmed_ids.len() == confirmed_active_sessions.len()
+                && confirmed_ids == active_ids;
             let disposition = state
                 .upgrade
-                .prepare_install(&active, override_active_sessions)
+                .prepare_install(&active, override_confirmed)
                 .await?;
+            if matches!(disposition, InstallDisposition::Prepared { .. }) && override_confirmed {
+                let stop_result = timeout(ACTIVE_SESSION_REAP_TIMEOUT, async {
+                    for managed in &active_handles {
+                        managed.handle.stop().await?;
+                    }
+                    for managed in active_handles {
+                        let mut completed = managed.completed.clone();
+                        while !*completed.borrow() && completed.changed().await.is_ok() {}
+                    }
+                    Ok::<(), DaemonError>(())
+                })
+                .await
+                .map_err(|_| {
+                    DaemonError::Lifecycle(
+                        "active sessions did not stop before the upgrade deadline".into(),
+                    )
+                })
+                .and_then(std::convert::identity);
+                if let Err(error) = stop_result {
+                    state.upgrade.cancel_prepared_install().await;
+                    return Err(error);
+                }
+            }
             let native_handoff = if let InstallDisposition::Prepared { .. } = &disposition {
                 let UpgradeStatus::Installing { release } = state.upgrade.status().await else {
                     return Err(DaemonError::Lifecycle(
@@ -1526,7 +1748,10 @@ async fn handle_request(
             if let Some((release, client_process_ids)) = native_handoff {
                 let handoff_result = async {
                     wait_for_other_client_processes(state, client_process_id).await?;
-                    spawn_upgrade_helper(&state.runtime_paths, release, client_process_ids).await
+                    state
+                        .upgrade_handoff
+                        .launch(&state.runtime_paths, release, client_process_ids)
+                        .await
                 }
                 .await;
                 if let Err(error) = handoff_result {
@@ -1550,6 +1775,7 @@ async fn handle_request(
             Ok(())
         }
         ClientRequest::PrepareDataRemoval { confirmation } => {
+            let _mutation = state.application_mutations.begin()?;
             let mut lifecycle_quiesce = state.lifecycle.quiesce().await?;
             if confirmation != DATA_REMOVAL_CONFIRMATION {
                 return Err(crate::data_removal::DataRemovalError::ConfirmationRequired.into());
@@ -1586,7 +1812,14 @@ async fn handle_request(
                     &serde_json::json!({ "protected_paths": protected_paths.len() }).to_string(),
                 )
                 .await?;
-            send_response_queue(outgoing, request_id, &DaemonResponse::DataRemovalPrepared).await?;
+            crate::data_removal::reserve(&state.runtime_paths, &protected_paths)?;
+            if let Err(error) =
+                send_response_queue(outgoing, request_id, &DaemonResponse::DataRemovalPrepared)
+                    .await
+            {
+                crate::data_removal::clear_reservation(&state.runtime_paths);
+                return Err(error);
+            }
             state.shutdown.send_replace(true);
             lifecycle_quiesce.commit();
             Ok(())
@@ -2340,7 +2573,7 @@ impl Drop for ClientGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::LifecycleCoordinator;
+    use super::{ApplicationMutationCoordinator, LifecycleCoordinator};
 
     #[tokio::test]
     async fn lifecycle_quiescing_drains_existing_activity_and_refuses_new_work() {
@@ -2363,5 +2596,19 @@ mod tests {
         assert!(lifecycle.begin().is_err());
         drop(quiesce);
         assert!(lifecycle.begin().is_ok());
+    }
+
+    #[test]
+    fn detached_handoff_allows_only_one_finalizer() {
+        let coordinator = ApplicationMutationCoordinator::new(true);
+        let finalization = coordinator.begin_handoff_finalization().unwrap();
+        assert!(coordinator.begin_handoff_finalization().is_err());
+        assert!(coordinator.begin().is_err());
+
+        drop(finalization);
+        let finalization = coordinator.begin_handoff_finalization().unwrap();
+        finalization.complete();
+        assert!(!coordinator.handoff_pending());
+        assert!(coordinator.begin().is_ok());
     }
 }

@@ -393,7 +393,6 @@ pub struct UpgradeCoordinator {
     verifying_key: VerifyingKey,
     validation: ReleaseValidationContext,
     state: Arc<RwLock<CoordinatorState>>,
-    mutation_in_progress: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     installation_bound: bool,
     started: Instant,
@@ -415,7 +414,6 @@ impl UpgradeCoordinator {
             verifying_key,
             validation,
             state: Arc::new(RwLock::new(CoordinatorState::default())),
-            mutation_in_progress: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
             installation_bound: false,
             started: Instant::now(),
@@ -455,7 +453,6 @@ impl UpgradeCoordinator {
             verifying_key,
             validation,
             state: Arc::new(RwLock::new(CoordinatorState::default())),
-            mutation_in_progress: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
             installation_bound: false,
             started: Instant::now(),
@@ -466,9 +463,8 @@ impl UpgradeCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns a redacted error for concurrent, transport, parsing, or validation failures.
+    /// Returns a redacted error for transport, parsing, or validation failures.
     pub async fn check(&self) -> Result<Option<ReleaseMetadata>, UpgradeError> {
-        let _mutation = MutationGuard::begin(&self.mutation_in_progress)?;
         let bytes = self.source.metadata().await?;
         let mut validation = self.validation.clone();
         let elapsed = i64::try_from(self.started.elapsed().as_secs()).unwrap_or(i64::MAX);
@@ -547,7 +543,6 @@ impl UpgradeCoordinator {
     ///
     /// Returns an error without changing the active installation when transfer or verification fails.
     pub async fn download(&self) -> Result<StagedUpgrade, UpgradeError> {
-        let _mutation = MutationGuard::begin(&self.mutation_in_progress)?;
         self.cancelled.store(false, Ordering::Release);
         let (release, metadata_bytes) = {
             let state = self.state.read().await;
@@ -636,7 +631,6 @@ impl UpgradeCoordinator {
     ///
     /// Corrupt or incompatible staged state is removed before an error is returned.
     pub async fn recover_staged(&self) -> Result<bool, UpgradeError> {
-        let _mutation = MutationGuard::begin(&self.mutation_in_progress)?;
         prepare_staging_root(&self.staging_root, self.installation_bound).await?;
         remove_file_if_present(&self.staging_root.join("payload.partial")).await?;
         remove_file_if_present(&self.staging_root.join("release.partial")).await?;
@@ -708,7 +702,6 @@ impl UpgradeCoordinator {
                 active_sessions: active_sessions.to_vec(),
             });
         }
-        let _mutation = MutationGuard::begin(&self.mutation_in_progress)?;
         let staged = self
             .state
             .read()
@@ -741,7 +734,6 @@ impl UpgradeCoordinator {
                 active_sessions: active_sessions.to_vec(),
             });
         }
-        let _mutation = MutationGuard::begin(&self.mutation_in_progress)?;
         let staged = self
             .state
             .read()
@@ -801,8 +793,26 @@ impl UpgradeCoordinator {
         version: &str,
         outcome: NativeUpgradeOutcome,
     ) -> Result<(), UpgradeError> {
-        let _mutation = MutationGuard::begin(&self.mutation_in_progress)?;
         let mut state = self.state.write().await;
+        if matches!(
+            (&state.status, outcome),
+            (
+                UpgradeStatus::Installed {
+                    version: installed_version
+                },
+                NativeUpgradeOutcome::Installed
+            ) if installed_version == version
+        ) || matches!(
+            (&state.status, outcome),
+            (
+                UpgradeStatus::RolledBack {
+                    version: rolled_back_version
+                },
+                NativeUpgradeOutcome::RolledBack
+            ) if rolled_back_version == version
+        ) {
+            return Ok(());
+        }
         let staged_version = state
             .staged
             .as_ref()
@@ -965,27 +975,8 @@ async fn remove_file_if_present(path: &Path) -> Result<(), UpgradeError> {
     }
 }
 
-#[derive(Debug)]
-struct MutationGuard(Arc<AtomicBool>);
-
-impl MutationGuard {
-    fn begin(flag: &Arc<AtomicBool>) -> Result<Self, UpgradeError> {
-        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| UpgradeError::Busy)?;
-        Ok(Self(flag.clone()))
-    }
-}
-
-impl Drop for MutationGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum UpgradeError {
-    #[error("another application lifecycle operation is already in progress")]
-    Busy,
     #[error("no compatible application upgrade has been selected")]
     NoAvailableRelease,
     #[error("no verified application upgrade is staged")]
@@ -2113,7 +2104,7 @@ mod tests {
         coordinator.check().await.unwrap();
         coordinator.download().await.unwrap();
         let active = vec![ActiveUpgradeSession {
-            id: "session-1".into(),
+            id: sylvops_core::ids::SessionId::new(),
             name: "Release work".into(),
         }];
 
@@ -2137,7 +2128,7 @@ mod tests {
         coordinator.check().await.unwrap();
         coordinator.download().await.unwrap();
         let active = vec![ActiveUpgradeSession {
-            id: "session-1".into(),
+            id: sylvops_core::ids::SessionId::new(),
             name: "Release work".into(),
         }];
 
