@@ -12,6 +12,7 @@ out-dir = "dist/windows-installer"
 binaries-dir = "target/installer-input"
 binaries = [{ path = "sylvops", main = true }]
 icons = ["packaging/icons/sylvops.ico"]
+resources = [{ src = "README.md", target = "README.md" }]
 
 [nsis]
 installMode = "currentUser"

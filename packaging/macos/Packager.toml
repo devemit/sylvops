@@ -12,6 +12,7 @@ out-dir = "dist/macos-package"
 binaries-dir = "target/macos-installer-input"
 binaries = [{ path = "sylvops", main = true }]
 icons = ["packaging/icons/sylvops.png"]
+resources = [{ src = "README.md", target = "README.md" }]
 
 [macos]
 minimum-system-version = "13.0"
