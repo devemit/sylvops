@@ -180,7 +180,7 @@ fn desktop_window_settings() -> window::Settings {
     #[cfg(target_os = "linux")]
     let settings = {
         let mut settings = settings;
-        settings.platform_specific.application_id = sylvops_core::LINUX_DESKTOP_ID.to_owned();
+        sylvops_core::LINUX_DESKTOP_ID.clone_into(&mut settings.platform_specific.application_id);
         settings
     };
     settings

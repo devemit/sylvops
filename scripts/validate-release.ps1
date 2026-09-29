@@ -352,7 +352,7 @@ foreach ($requiredText in @('Type=Application', 'Name={{name}}', 'Exec={{exec}}'
     Assert-ReleaseCondition ($linuxDesktopEntry.Contains($requiredText)) "The Linux desktop entry is missing required metadata: $requiredText"
 }
 $desktopSource = Get-Content -Raw -LiteralPath (Join-Path $root 'crates\sylvops-desktop\src\lib.rs')
-Assert-ReleaseCondition ($desktopSource.Contains('settings.platform_specific.application_id = sylvops_core::LINUX_DESKTOP_ID.to_owned();')) "The Linux window identity must use the shared desktop-file identity."
+Assert-ReleaseCondition ($desktopSource -match 'sylvops_core::LINUX_DESKTOP_ID\s*\.clone_into\(&mut settings\.platform_specific\.application_id\);') "The Linux window identity must use the shared desktop-file identity."
 
 $linuxMetainfoPath = Join-Path $root 'packaging\linux\com.devemit.sylvops.metainfo.xml'
 Assert-ReleaseCondition (Test-Path -LiteralPath $linuxMetainfoPath -PathType Leaf) "The Linux AppStream metadata is missing."
