@@ -10,7 +10,7 @@ homepage = "https://github.com/devemit/sylvops"
 license-file = "LICENSE"
 category = "DeveloperTool"
 formats = ["appimage", "deb"]
-out-dir = "dist/linux-package"
+out-dir = "../../dist/linux-package"
 binaries-dir = "target/linux-installer-input"
 binaries = [{ path = "sylvops", main = true }]
 icons = ["packaging/icons/sylvops.png"]

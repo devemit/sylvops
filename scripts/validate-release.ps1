@@ -370,6 +370,10 @@ $windowsInstallerSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 's
 foreach ($requiredText in @('installedGuidePath', '## Install on Windows', '## First run', '## Troubleshooting')) {
     Assert-ReleaseCondition ($windowsInstallerSmokeScript.Contains($requiredText)) "The Windows installer smoke test is missing bundled-guide validation: $requiredText"
 }
+$windowsInstallerPackageScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\package-windows-installer.ps1')
+$createWindowsOutputRoot = $windowsInstallerPackageScript.IndexOf('New-Item -ItemType Directory -Path $expectedOutputRoot -Force')
+$resolveWindowsOutputRoot = $windowsInstallerPackageScript.IndexOf('$resolvedOutputParent = (Resolve-Path -LiteralPath (Split-Path -Parent $outputDirectory)).Path')
+Assert-ReleaseCondition ($createWindowsOutputRoot -ge 0 -and $createWindowsOutputRoot -lt $resolveWindowsOutputRoot) "The Windows installer script must create its output root before resolving it."
 
 $macosPackagerConfigPath = Join-Path $root 'packaging\macos\Packager.toml'
 Assert-ReleaseCondition (Test-Path -LiteralPath $macosPackagerConfigPath -PathType Leaf) "The macOS packager configuration is missing."
@@ -379,6 +383,7 @@ foreach ($requiredSetting in @(
     "version = `"$version`"",
     "identifier = `"$applicationId`"",
     'formats = ["app"]',
+    'out-dir = "../../dist/macos-package"',
     'packaging/icons/sylvops.png',
     'entitlements = "packaging/macos/entitlements.plist"',
     'resources = [{ src = "README.md", target = "README.md" }]'
@@ -417,6 +422,7 @@ foreach ($requiredSetting in @(
     "publisher = `"$publisher`"",
     "authors = [`"$publisher`"]",
     'formats = ["appimage", "deb"]',
+    'out-dir = "../../dist/linux-package"',
     'packaging/icons/sylvops.png',
     'generate-desktop-entry = true',
     'desktop-template = "packaging/linux/sylvops.desktop.hbs"',

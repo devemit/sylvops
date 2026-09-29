@@ -8,7 +8,7 @@ long-description = "A native desktop application for supervising coding-agent se
 homepage = "https://github.com/devemit/sylvops"
 license-file = "LICENSE"
 formats = ["app"]
-out-dir = "dist/macos-package"
+out-dir = "../../dist/macos-package"
 binaries-dir = "target/macos-installer-input"
 binaries = [{ path = "sylvops", main = true }]
 icons = ["packaging/icons/sylvops.png"]
