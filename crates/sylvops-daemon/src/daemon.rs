@@ -644,15 +644,7 @@ async fn spawn_native_upgrade_helper(
 ) -> Result<()> {
     let staging_root = paths.data_directory.join("upgrades");
     let installed_executable =
-        if release.target.installer == sylvops_core::upgrade::InstallerKind::LinuxAppImage {
-            std::env::var_os("APPIMAGE")
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    DaemonError::Lifecycle("AppImage update lost its installed image path".into())
-                })?
-        } else {
-            canonical_current_executable()?
-        };
+        crate::native_upgrade::active_installed_executable(release.target.installer)?;
     let helper = staging_root.join(if cfg!(windows) {
         "sylvops-upgrade-helper.exe"
     } else {

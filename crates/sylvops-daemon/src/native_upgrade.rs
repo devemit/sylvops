@@ -15,7 +15,7 @@ use sylvops_core::{
     protocol::{ClientRequest, DaemonResponse, PROTOCOL_MAJOR},
     upgrade::{
         InstallerKind, MAX_UPGRADE_CLIENT_PROCESSES, NativeUpgradeHandoff, NativeUpgradeOutcome,
-        ReleaseValidationContext, SignedReleaseMetadata,
+        ReleaseMetadata, ReleaseValidationContext, SignedReleaseMetadata,
     },
 };
 
@@ -39,6 +39,14 @@ const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_VERSION_OUTPUT_BYTES: u64 = 4 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_MACOS_SIGNATURE_OUTPUT_BYTES: u64 = 16 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_LINUX_COMMAND_OUTPUT_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_LINUX_PROCESS_ENVIRONMENT_BYTES: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_LINUX_METADATA_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_LINUX_ICON_ENTRIES: u64 = 2_048;
 const MAX_PACKAGE_TREE_DEPTH: usize = 32;
 const MAX_PACKAGE_TREE_ENTRIES: u64 = 8_192;
 const MAX_PACKAGE_TREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -115,6 +123,73 @@ impl NativeUpgradeAttempt {
             backup_sha256: None,
         }
     }
+}
+
+/// Resolves the package entry point that a detached helper may replace.
+///
+/// # Errors
+///
+/// Refuses a package kind that does not match the active platform installation or an unsafe entry
+/// point.
+#[cfg(target_os = "linux")]
+pub(crate) fn active_installed_executable(installer: InstallerKind) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match installer {
+        InstallerKind::LinuxAppImage => {
+            let requested = std::env::var_os("APPIMAGE")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    DaemonError::Lifecycle("active AppImage path is unavailable".into())
+                })?;
+            let metadata = fs::symlink_metadata(&requested)?;
+            if !requested.is_absolute()
+                || metadata_is_link(&metadata)
+                || !metadata.is_file()
+                || metadata.permissions().mode() & 0o111 == 0
+            {
+                return Err(DaemonError::Lifecycle(
+                    "active AppImage path is unsafe".into(),
+                ));
+            }
+            fs::canonicalize(requested).map_err(Into::into)
+        }
+        InstallerKind::LinuxDeb => {
+            let executable = fs::canonicalize(std::env::current_exe()?)?;
+            verify_debian_installation(&executable, Some(env!("CARGO_PKG_VERSION")))?;
+            Ok(executable)
+        }
+        _ => Err(DaemonError::Lifecycle(
+            "active Linux package kind is invalid".into(),
+        )),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn active_installed_executable(installer: InstallerKind) -> Result<PathBuf> {
+    if installer != InstallerKind::WindowsNsis {
+        return Err(DaemonError::Lifecycle(
+            "active Windows package kind is invalid".into(),
+        ));
+    }
+    fs::canonicalize(std::env::current_exe()?).map_err(Into::into)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn active_installed_executable(installer: InstallerKind) -> Result<PathBuf> {
+    if installer != InstallerKind::MacosDmg {
+        return Err(DaemonError::Lifecycle(
+            "active macOS package kind is invalid".into(),
+        ));
+    }
+    fs::canonicalize(std::env::current_exe()?).map_err(Into::into)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
+pub(crate) fn active_installed_executable(_installer: InstallerKind) -> Result<PathBuf> {
+    Err(DaemonError::Lifecycle(
+        "native upgrades are unavailable on this platform".into(),
+    ))
 }
 
 /// Applies one daemon-prepared update from a detached helper process.
@@ -259,8 +334,9 @@ async fn apply_and_verify_replacement(
 async fn prepare_application_replacement(
     handoff: &NativeUpgradeHandoff,
 ) -> Result<(PathBuf, Backup)> {
+    validate_installed_package_mode(handoff)?;
     let payload = validate_staged_release(handoff).await?;
-    verify_staged_package_signature(&payload, handoff.release.target.installer)?;
+    verify_staged_package_signature(&payload, &handoff.release)?;
     let backup = create_backup(handoff)?;
     Ok((payload, backup))
 }
@@ -798,7 +874,7 @@ fn create_backup(handoff: &NativeUpgradeHandoff) -> Result<Backup> {
             copy_macos_bundle(&app, &backup)?;
             backup
         }
-        InstallerKind::LinuxDeb => create_debian_backup(&rollback)?,
+        InstallerKind::LinuxDeb => create_debian_backup(handoff, &rollback)?,
     };
     create_database_backup(handoff, &rollback)?;
     let sha256 = backup_tree_sha256(handoff)?;
@@ -1155,21 +1231,129 @@ fn verify_backup_signature(handoff: &NativeUpgradeHandoff, backup: &Backup) -> R
         InstallerKind::MacosDmg => {
             verify_application_signature(&backup.payload, InstallerKind::MacosDmg)
         }
-        InstallerKind::LinuxAppImage | InstallerKind::LinuxDeb => Ok(()),
+        InstallerKind::LinuxAppImage | InstallerKind::LinuxDeb => {
+            verify_linux_backup(&backup.payload, handoff.release.target.installer)
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_backup(path: &Path, installer: InstallerKind) -> Result<()> {
+    match installer {
+        InstallerKind::LinuxAppImage => {
+            verify_application_signature(path, InstallerKind::LinuxAppImage)
+        }
+        InstallerKind::LinuxDeb => verify_debian_package(path, None),
+        _ => Err(DaemonError::Lifecycle(
+            "Linux rollback package kind is invalid".into(),
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_linux_backup(_path: &Path, _installer: InstallerKind) -> Result<()> {
+    Err(DaemonError::Lifecycle(
+        "Linux rollback verification is unavailable on this platform".into(),
+    ))
 }
 
 fn installed_payload_path(handoff: &NativeUpgradeHandoff) -> Result<&Path> {
     if !handoff.installed_executable.is_absolute()
-        || fs::symlink_metadata(&handoff.installed_executable)?
-            .file_type()
-            .is_symlink()
+        || metadata_is_link(&fs::symlink_metadata(&handoff.installed_executable)?)
+        || !handoff.installed_executable.is_file()
     {
         return Err(DaemonError::Lifecycle(
             "installed executable path is unsafe".into(),
         ));
     }
     Ok(&handoff.installed_executable)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_installed_package_mode(handoff: &NativeUpgradeHandoff) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = installed_payload_path(handoff)?;
+    let canonical = fs::canonicalize(executable)?;
+    let staging = fs::canonicalize(&handoff.staging_root)?;
+    if canonical.starts_with(&staging) || staging.starts_with(&canonical) {
+        return Err(DaemonError::Lifecycle(
+            "Linux installation overlaps upgrade staging".into(),
+        ));
+    }
+    match handoff.release.target.installer {
+        InstallerKind::LinuxAppImage => {
+            if fs::metadata(&canonical)?.permissions().mode() & 0o111 == 0 {
+                return Err(DaemonError::Lifecycle(
+                    "installed AppImage is not executable".into(),
+                ));
+            }
+            Ok(())
+        }
+        InstallerKind::LinuxDeb => verify_debian_installation(&canonical, None),
+        _ => Err(DaemonError::Lifecycle(
+            "Linux installer kind is invalid".into(),
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn validate_installed_package_mode(_handoff: &NativeUpgradeHandoff) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn replace_appimage(source: &Path, target: &Path, permissions: fs::Permissions) -> Result<()> {
+    let target_parent = fs::canonicalize(
+        target
+            .parent()
+            .ok_or_else(|| DaemonError::Lifecycle("AppImage target has no parent".into()))?,
+    )?;
+    if fs::canonicalize(target)?.parent() != Some(target_parent.as_path())
+        || metadata_is_link(&fs::symlink_metadata(target)?)
+    {
+        return Err(DaemonError::Lifecycle(
+            "AppImage replacement target is unsafe".into(),
+        ));
+    }
+    let replacement = target.with_extension("AppImage.update");
+    if symlink_metadata_if_present(&replacement)?.is_some() {
+        return Err(DaemonError::Lifecycle(
+            "AppImage replacement path already exists".into(),
+        ));
+    }
+    let result = (|| {
+        let copied = fs::copy(source, &replacement)?;
+        if copied != fs::metadata(source)?.len() {
+            return Err(DaemonError::Lifecycle(
+                "AppImage source changed during replacement".into(),
+            ));
+        }
+        fs::set_permissions(&replacement, permissions)?;
+        fs::File::open(&replacement)?.sync_all()?;
+        if metadata_is_link(&fs::symlink_metadata(target)?)
+            || metadata_is_link(&fs::symlink_metadata(&replacement)?)
+        {
+            return Err(DaemonError::Lifecycle(
+                "AppImage replacement path became unsafe".into(),
+            ));
+        }
+        fs::rename(&replacement, target)?;
+        fs::File::open(target_parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() && fs::symlink_metadata(&replacement).is_ok() {
+        let _ = fs::remove_file(&replacement);
+    }
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn replace_appimage(_source: &Path, _target: &Path, _permissions: fs::Permissions) -> Result<()> {
+    Err(DaemonError::Lifecycle(
+        "AppImage replacement is unavailable on this platform".into(),
+    ))
 }
 
 #[cfg(windows)]
@@ -1187,15 +1371,11 @@ fn apply_package(handoff: &NativeUpgradeHandoff, payload: &Path) -> Result<()> {
     match handoff.release.target.installer {
         InstallerKind::LinuxAppImage => {
             let target = installed_payload_path(handoff)?;
-            let replacement = target.with_extension("AppImage.new");
-            fs::copy(payload, &replacement)?;
-            fs::set_permissions(&replacement, fs::metadata(target)?.permissions())?;
-            fs::rename(replacement, target)?;
-            Ok(())
+            replace_appimage(payload, target, fs::metadata(target)?.permissions())
         }
         InstallerKind::LinuxDeb => successful(
-            Command::new("pkexec")
-                .args(["dpkg", "--install"])
+            Command::new("/usr/bin/pkexec")
+                .args(["/usr/bin/dpkg", "--install"])
                 .arg(payload),
             "Debian installer",
         ),
@@ -1267,8 +1447,12 @@ fn restore_backup(handoff: &NativeUpgradeHandoff, backup: &Backup) -> Result<()>
     match handoff.release.target.installer {
         InstallerKind::WindowsNsis => restore_windows_backup(handoff, &backup.payload),
         InstallerKind::LinuxAppImage => {
-            fs::copy(&backup.payload, installed_payload_path(handoff)?)?;
-            Ok(())
+            let target = installed_payload_path(handoff)?;
+            replace_appimage(
+                &backup.payload,
+                target,
+                fs::metadata(&backup.payload)?.permissions(),
+            )
         }
         InstallerKind::MacosDmg => {
             cleanup_macos_staging(handoff)?;
@@ -1279,8 +1463,8 @@ fn restore_backup(handoff: &NativeUpgradeHandoff, backup: &Backup) -> Result<()>
             copy_macos_bundle(&backup.payload, &target)
         }
         InstallerKind::LinuxDeb => successful(
-            Command::new("pkexec")
-                .args(["dpkg", "--install"])
+            Command::new("/usr/bin/pkexec")
+                .args(["/usr/bin/dpkg", "--install"])
                 .arg(&backup.payload),
             "Debian rollback installer",
         ),
@@ -1554,23 +1738,32 @@ fn windows_registry_keys() -> [&'static str; 3] {
 }
 
 #[cfg(target_os = "linux")]
-fn create_debian_backup(directory: &Path) -> Result<PathBuf> {
+fn create_debian_backup(handoff: &NativeUpgradeHandoff, directory: &Path) -> Result<PathBuf> {
+    let installed_version = debian_installed_version()?;
+    verify_debian_installation(&fs::canonicalize(&handoff.installed_executable)?, None)?;
     successful(
-        Command::new("pkexec")
-            .arg("dpkg-repack")
+        Command::new("/usr/bin/pkexec")
+            .args(["--keep-cwd", "/usr/bin/dpkg-repack"])
             .arg("sylvops")
             .current_dir(directory),
         "Debian rollback package creation",
     )?;
-    fs::read_dir(directory)?
+    let packages = fs::read_dir(directory)?
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|extension| extension == "deb"))
-        .ok_or_else(|| DaemonError::Lifecycle("Debian rollback package was not created".into()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "deb"))
+        .collect::<Vec<_>>();
+    let [package] = packages.as_slice() else {
+        return Err(DaemonError::Lifecycle(
+            "Debian rollback package creation was ambiguous".into(),
+        ));
+    };
+    verify_debian_package(package, Some(&installed_version))?;
+    Ok(package.clone())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn create_debian_backup(_directory: &Path) -> Result<PathBuf> {
+fn create_debian_backup(_handoff: &NativeUpgradeHandoff, _directory: &Path) -> Result<PathBuf> {
     Err(DaemonError::Lifecycle(
         "Debian rollback is unavailable on this platform".into(),
     ))
@@ -1841,6 +2034,7 @@ fn remove_macos_staging_path(handoff: &NativeUpgradeHandoff, path: &Path) -> Res
     Ok(())
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     copy_tree_with_budget(
         source,
@@ -1859,6 +2053,7 @@ struct CopyBudget {
     bytes: u64,
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn copy_tree_with_budget(
     source: &Path,
     destination: &Path,
@@ -1996,6 +2191,575 @@ fn successful_with_timeout(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn spawn_bounded_stdout_reader(
+    mut stdout: std::process::ChildStdout,
+    byte_limit: u64,
+    oversized: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> thread::JoinHandle<std::io::Result<(Vec<u8>, u64)>> {
+    use std::sync::atomic::Ordering;
+
+    thread::spawn(move || {
+        let mut retained =
+            Vec::with_capacity(usize::try_from(byte_limit.min(16 * 1024)).unwrap_or(16 * 1024));
+        let mut observed = 0_u64;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stdout.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            if observed > byte_limit {
+                oversized.store(true, Ordering::Release);
+                break;
+            }
+            let remaining = usize::try_from(byte_limit)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(retained.len());
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        Ok((retained, observed))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_command_stdout(
+    command: &mut Command,
+    operation: &str,
+    byte_limit: u64,
+) -> Result<Vec<u8>> {
+    use std::{
+        os::unix::process::CommandExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| DaemonError::Lifecycle(format!("{operation} did not start: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| DaemonError::Lifecycle(format!("{operation} output is unavailable")))?;
+    let oversized = Arc::new(AtomicBool::new(false));
+    let reader = spawn_bounded_stdout_reader(stdout, byte_limit, oversized.clone());
+    let process_id = child.id();
+    let mut completed_status = None;
+    let process_tree = match crate::process_tree::attach(process_id, i32::try_from(process_id).ok())
+    {
+        Ok(tree) => Some(tree),
+        Err(error) => {
+            if let Some(status) = child.try_wait().map_err(|wait_error| {
+                DaemonError::Lifecycle(format!(
+                    "{operation} could not be observed after process-tree attachment failed: {wait_error}"
+                ))
+            })? {
+                completed_status = Some(status);
+                None
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(error);
+            }
+        }
+    };
+    let deadline = Instant::now() + NATIVE_COMMAND_TIMEOUT;
+    let status = if let Some(status) = completed_status {
+        status
+    } else {
+        loop {
+            if oversized.load(Ordering::Acquire) {
+                if let Some(process_tree) = &process_tree {
+                    let _ = process_tree.terminate();
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(DaemonError::Lifecycle(format!(
+                    "{operation} output exceeded its byte limit"
+                )));
+            }
+            if let Some(status) = child.try_wait().map_err(|error| {
+                DaemonError::Lifecycle(format!("{operation} could not be observed: {error}"))
+            })? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                if let Some(process_tree) = &process_tree {
+                    let _ = process_tree.terminate();
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(DaemonError::Lifecycle(format!("{operation} timed out")));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    if let Some(process_tree) = &process_tree {
+        process_tree.terminate()?;
+    }
+    let (retained, observed) = reader
+        .join()
+        .map_err(|_| DaemonError::Lifecycle(format!("{operation} output reader failed")))??;
+    if !status.success() {
+        return Err(DaemonError::Lifecycle(format!("{operation} failed")));
+    }
+    if oversized.load(Ordering::Acquire) || observed > byte_limit {
+        return Err(DaemonError::Lifecycle(format!(
+            "{operation} output exceeded its byte limit"
+        )));
+    }
+    Ok(retained)
+}
+
+#[cfg(target_os = "linux")]
+fn command_utf8(output: Vec<u8>, operation: &str) -> Result<String> {
+    String::from_utf8(output)
+        .map_err(|_| DaemonError::Lifecycle(format!("{operation} output was not UTF-8")))
+}
+
+#[cfg(target_os = "linux")]
+fn debian_package_field(path: &Path, field: &str) -> Result<String> {
+    let output = bounded_command_stdout(
+        Command::new("/usr/bin/dpkg-deb")
+            .args(["--field"])
+            .arg(path)
+            .arg(field),
+        "Debian package metadata query",
+        MAX_LINUX_COMMAND_OUTPUT_BYTES,
+    )?;
+    Ok(command_utf8(output, "Debian package metadata query")?
+        .trim()
+        .to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn debian_installed_field(format: &str) -> Result<String> {
+    let output = bounded_command_stdout(
+        Command::new("/usr/bin/dpkg-query")
+            .args(["--show"])
+            .arg(format!("--showformat={format}"))
+            .arg("sylvops"),
+        "Debian installation metadata query",
+        MAX_LINUX_COMMAND_OUTPUT_BYTES,
+    )?;
+    Ok(command_utf8(output, "Debian installation metadata query")?
+        .trim()
+        .to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn debian_installed_version() -> Result<String> {
+    let version = debian_installed_field("${Version}")?;
+    if version.is_empty() || version.len() > 128 {
+        return Err(DaemonError::Lifecycle(
+            "installed Debian package version is invalid".into(),
+        ));
+    }
+    Ok(version)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_debian_package(path: &Path, expected_version: Option<&str>) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata_is_link(&metadata) || !metadata.is_file() || metadata.len() == 0 {
+        return Err(DaemonError::Lifecycle("Debian package is unsafe".into()));
+    }
+    if debian_package_field(path, "Package")? != "sylvops"
+        || debian_package_field(path, "Architecture")? != "amd64"
+    {
+        return Err(DaemonError::Lifecycle(
+            "Debian package identity does not match SylvOps".into(),
+        ));
+    }
+    let version = debian_package_field(path, "Version")?;
+    if version.is_empty() || expected_version.is_some_and(|expected| version != expected) {
+        return Err(DaemonError::Lifecycle(
+            "Debian package version does not match the upgrade".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_debian_installation(path: &Path, expected_version: Option<&str>) -> Result<()> {
+    let expected = fs::canonicalize("/usr/bin/sylvops")?;
+    if path != expected {
+        return Err(DaemonError::Lifecycle(
+            "active executable is not the Debian package entry point".into(),
+        ));
+    }
+    if debian_installed_field("${Status}")? != "install ok installed" {
+        return Err(DaemonError::Lifecycle(
+            "SylvOps Debian package is not fully installed".into(),
+        ));
+    }
+    let version = debian_installed_version()?;
+    if expected_version.is_some_and(|expected| version != expected) {
+        return Err(DaemonError::Lifecycle(
+            "installed Debian package version does not match the upgrade".into(),
+        ));
+    }
+    let owner = command_utf8(
+        bounded_command_stdout(
+            Command::new("/usr/bin/dpkg-query")
+                .arg("--search")
+                .arg("/usr/bin/sylvops"),
+            "Debian executable ownership query",
+            MAX_LINUX_COMMAND_OUTPUT_BYTES,
+        )?,
+        "Debian executable ownership query",
+    )?;
+    if !owner.lines().any(|line| {
+        line.strip_suffix(": /usr/bin/sylvops")
+            .is_some_and(|package| package == "sylvops" || package == "sylvops:amd64")
+    }) {
+        return Err(DaemonError::Lifecycle(
+            "Debian package does not own the installed executable".into(),
+        ));
+    }
+    successful(
+        Command::new("/usr/bin/dpkg").args(["--verify", "sylvops"]),
+        "Debian installed-file verification",
+    )?;
+    let installed_files = command_utf8(
+        bounded_command_stdout(
+            Command::new("/usr/bin/dpkg-query").args(["--listfiles", "sylvops"]),
+            "Debian installed-file listing",
+            MAX_LINUX_COMMAND_OUTPUT_BYTES,
+        )?,
+        "Debian installed-file listing",
+    )?;
+    let icon = installed_files
+        .lines()
+        .map(Path::new)
+        .find(|entry| {
+            entry.is_absolute()
+                && entry.file_name().is_some_and(|name| name == "sylvops.png")
+                && entry
+                    .parent()
+                    .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "apps"))
+        })
+        .ok_or_else(|| DaemonError::Lifecycle("Debian desktop icon is unavailable".into()))?;
+    verify_linux_desktop_metadata(Path::new("/"), icon)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_metadata(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata_is_link(&metadata)
+        || !metadata.is_file()
+        || metadata.len() > MAX_LINUX_METADATA_BYTES
+    {
+        return Err(DaemonError::Lifecycle(
+            "Linux desktop metadata is unsafe".into(),
+        ));
+    }
+    let mut encoded = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    fs::File::open(path)?
+        .take(MAX_LINUX_METADATA_BYTES.saturating_add(1))
+        .read_to_end(&mut encoded)?;
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_LINUX_METADATA_BYTES {
+        return Err(DaemonError::Lifecycle(
+            "Linux desktop metadata exceeded its byte limit".into(),
+        ));
+    }
+    String::from_utf8(encoded)
+        .map_err(|_| DaemonError::Lifecycle("Linux desktop metadata was not UTF-8".into()))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn verify_linux_desktop_entry(desktop: &str) -> Result<()> {
+    use std::collections::HashMap;
+
+    let required = [
+        ("Type", "Application"),
+        ("Name", "SylvOps"),
+        ("Exec", "sylvops"),
+        ("Icon", "sylvops"),
+        ("Terminal", "false"),
+        ("StartupWMClass", "sylvops"),
+    ];
+    let mut in_desktop_entry = false;
+    let mut saw_desktop_entry = false;
+    let mut values = HashMap::new();
+    for raw_line in desktop.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_desktop_entry = line == "[Desktop Entry]";
+            if in_desktop_entry {
+                if saw_desktop_entry {
+                    return Err(DaemonError::Lifecycle(
+                        "Linux desktop entry contains duplicate primary sections".into(),
+                    ));
+                }
+                saw_desktop_entry = true;
+            }
+            continue;
+        }
+        if !in_desktop_entry {
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            DaemonError::Lifecycle("Linux desktop entry contains a malformed key".into())
+        })?;
+        if required
+            .iter()
+            .any(|(required_key, _)| key == *required_key)
+            && values.insert(key, value).is_some()
+        {
+            return Err(DaemonError::Lifecycle(
+                "Linux desktop entry contains duplicate identity keys".into(),
+            ));
+        }
+    }
+    if !saw_desktop_entry
+        || required
+            .iter()
+            .any(|(key, expected)| values.get(key).copied() != Some(*expected))
+    {
+        return Err(DaemonError::Lifecycle(
+            "Linux desktop entry identity is incomplete".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn verify_linux_appstream_metadata(metainfo: &str) -> Result<()> {
+    let document = roxmltree::Document::parse(metainfo)
+        .map_err(|_| DaemonError::Lifecycle("Linux AppStream metadata is malformed".into()))?;
+    let component = document.root_element();
+    if component.tag_name().name() != "component"
+        || component.attribute("type") != Some("desktop-application")
+    {
+        return Err(DaemonError::Lifecycle(
+            "Linux AppStream component identity is invalid".into(),
+        ));
+    }
+    for (name, expected) in [("id", "com.devemit.sylvops"), ("name", "SylvOps")] {
+        let matches = component
+            .children()
+            .filter(|child| child.is_element() && child.tag_name().name() == name)
+            .collect::<Vec<_>>();
+        let [value] = matches.as_slice() else {
+            return Err(DaemonError::Lifecycle(
+                "Linux AppStream identity element is missing or duplicated".into(),
+            ));
+        };
+        if value.text().map(str::trim) != Some(expected) {
+            return Err(DaemonError::Lifecycle(
+                "Linux AppStream identity does not match SylvOps".into(),
+            ));
+        }
+    }
+    let launchables = component
+        .children()
+        .filter(|child| child.is_element() && child.tag_name().name() == "launchable")
+        .collect::<Vec<_>>();
+    let [launchable] = launchables.as_slice() else {
+        return Err(DaemonError::Lifecycle(
+            "Linux AppStream launchable is missing or duplicated".into(),
+        ));
+    };
+    if launchable.attribute("type") != Some("desktop-id")
+        || launchable.text().map(str::trim) != Some("sylvops.desktop")
+    {
+        return Err(DaemonError::Lifecycle(
+            "Linux AppStream launchable identity is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_desktop_metadata(root: &Path, icon: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = fs::canonicalize(root)?;
+    let desktop_path = root.join("usr/share/applications/sylvops.desktop");
+    let metainfo_path = root.join("usr/share/metainfo/com.devemit.sylvops.metainfo.xml");
+    let binary_path = root.join("usr/bin/sylvops");
+    let icon_root_path = root.join("usr/share/icons");
+    let icon_root_metadata = fs::symlink_metadata(&icon_root_path)?;
+    let icon_root = fs::canonicalize(&icon_root_path)?;
+    let icon_metadata = fs::symlink_metadata(icon)?;
+    let icon = fs::canonicalize(icon)?;
+    if metadata_is_link(&icon_root_metadata)
+        || !icon_root_metadata.is_dir()
+        || metadata_is_link(&icon_metadata)
+        || !icon_metadata.is_file()
+        || !icon.starts_with(&icon_root)
+        || icon
+            .parent()
+            .is_none_or(|parent| parent.file_name().is_none_or(|name| name != "apps"))
+    {
+        return Err(DaemonError::Lifecycle(
+            "Linux desktop icon escaped the package icon hierarchy".into(),
+        ));
+    }
+    for path in [&desktop_path, &metainfo_path, &binary_path, &icon] {
+        let metadata = fs::symlink_metadata(path)?;
+        let canonical = fs::canonicalize(path)?;
+        if metadata_is_link(&metadata) || !metadata.is_file() || !canonical.starts_with(&root) {
+            return Err(DaemonError::Lifecycle(
+                "Linux desktop integration escaped its package root".into(),
+            ));
+        }
+    }
+    if fs::metadata(&binary_path)?.permissions().mode() & 0o111 == 0
+        || fs::metadata(&icon)?.len() == 0
+    {
+        return Err(DaemonError::Lifecycle(
+            "Linux executable or icon permissions are invalid".into(),
+        ));
+    }
+    let desktop = read_linux_metadata(&desktop_path)?;
+    verify_linux_desktop_entry(&desktop)?;
+    let metainfo = read_linux_metadata(&metainfo_path)?;
+    verify_linux_appstream_metadata(&metainfo)
+}
+
+#[cfg(target_os = "linux")]
+fn find_appimage_icon(root: &Path) -> Result<PathBuf> {
+    let icons = root.join("usr/share/icons");
+    let root = fs::canonicalize(&icons)?;
+    let mut pending = vec![(root.clone(), 0_usize)];
+    let mut entries = 0_u64;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > 8 {
+            return Err(DaemonError::Lifecycle(
+                "AppImage icon tree exceeded its depth limit".into(),
+            ));
+        }
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            entries = entries.saturating_add(1);
+            if entries > MAX_LINUX_ICON_ENTRIES {
+                return Err(DaemonError::Lifecycle(
+                    "AppImage icon tree exceeded its entry limit".into(),
+                ));
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata_is_link(&metadata) || !fs::canonicalize(&path)?.starts_with(&root) {
+                return Err(DaemonError::Lifecycle(
+                    "AppImage icon tree contains an unsafe entry".into(),
+                ));
+            }
+            if metadata.is_dir() {
+                pending.push((path, depth.saturating_add(1)));
+            } else if metadata.is_file()
+                && path.file_name().is_some_and(|name| name == "sylvops.png")
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "apps"))
+            {
+                return Ok(path);
+            }
+        }
+    }
+    Err(DaemonError::Lifecycle(
+        "AppImage desktop icon is unavailable".into(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_environment(process_id: u32) -> Result<Vec<Vec<u8>>> {
+    let path = PathBuf::from(format!("/proc/{process_id}/environ"));
+    let mut encoded = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_LINUX_PROCESS_ENVIRONMENT_BYTES.saturating_add(1))
+        .read_to_end(&mut encoded)?;
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_LINUX_PROCESS_ENVIRONMENT_BYTES {
+        return Err(DaemonError::Lifecycle(
+            "updated daemon environment exceeded its byte limit".into(),
+        ));
+    }
+    Ok(encoded
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_environment_path(environment: &[Vec<u8>], name: &[u8]) -> Result<PathBuf> {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let prefix = [name, b"="].concat();
+    let value = environment
+        .iter()
+        .find_map(|entry| entry.strip_prefix(prefix.as_slice()))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DaemonError::Lifecycle("updated AppImage process identity is unavailable".into())
+        })?;
+    Ok(PathBuf::from(OsString::from_vec(value.to_vec())))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_desktop_integration(handoff: &NativeUpgradeHandoff) -> Result<()> {
+    match handoff.release.target.installer {
+        InstallerKind::LinuxAppImage => {
+            let extraction = handoff.staging_root.join("appimage-health");
+            if symlink_metadata_if_present(&extraction)?.is_some() {
+                return Err(DaemonError::Lifecycle(
+                    "AppImage health extraction path already exists".into(),
+                ));
+            }
+            fs::create_dir(&extraction)?;
+            let verification = (|| {
+                successful(
+                    Command::new(&handoff.installed_executable)
+                        .arg("--appimage-extract")
+                        .env_remove("APPIMAGE_EXTRACT_AND_RUN")
+                        .current_dir(&extraction),
+                    "AppImage desktop integration extraction",
+                )?;
+                let package_root = extraction.join("squashfs-root");
+                let icon = find_appimage_icon(&package_root)?;
+                verify_linux_desktop_metadata(&package_root, &icon)
+            })();
+            let cleanup = (|| {
+                let staging = fs::canonicalize(&handoff.staging_root)?;
+                let extracted = fs::canonicalize(&extraction)?;
+                if extracted.parent() != Some(staging.as_path())
+                    || metadata_is_link(&fs::symlink_metadata(&extraction)?)
+                {
+                    return Err(DaemonError::Lifecycle(
+                        "AppImage health extraction escaped staging".into(),
+                    ));
+                }
+                fs::remove_dir_all(extracted)?;
+                Ok(())
+            })();
+            verification?;
+            cleanup
+        }
+        InstallerKind::LinuxDeb => verify_debian_installation(
+            &fs::canonicalize(&handoff.installed_executable)?,
+            Some(&handoff.release.target_version),
+        ),
+        _ => Err(DaemonError::Lifecycle(
+            "Linux installer kind is invalid".into(),
+        )),
+    }
+}
+
 fn state_override(handoff: &NativeUpgradeHandoff) -> Option<PathBuf> {
     let data = handoff.data_directory.parent()?;
     (handoff.data_directory.file_name()? == "data"
@@ -2083,6 +2847,8 @@ async fn verify_health(paths: &RuntimePaths, handoff: &NativeUpgradeHandoff) -> 
                 &handoff.installed_executable,
                 handoff.release.target.installer,
             )?;
+            #[cfg(target_os = "linux")]
+            verify_linux_desktop_integration(handoff)?;
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2186,7 +2952,41 @@ fn verify_daemon_executable_identity(
     Ok(())
 }
 
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn verify_daemon_executable_identity(
+    process_id: u32,
+    handoff: &NativeUpgradeHandoff,
+) -> Result<()> {
+    match handoff.release.target.installer {
+        InstallerKind::LinuxAppImage => {
+            let environment = linux_process_environment(process_id)?;
+            let image = fs::canonicalize(linux_environment_path(&environment, b"APPIMAGE")?)?;
+            let expected_image = fs::canonicalize(&handoff.installed_executable)?;
+            let process_executable = PathBuf::from(format!("/proc/{process_id}/exe"));
+            if image != expected_image || !fs::metadata(process_executable)?.is_file() {
+                return Err(DaemonError::Lifecycle(
+                    "updated AppImage daemon identity does not match the installation".into(),
+                ));
+            }
+            Ok(())
+        }
+        InstallerKind::LinuxDeb => {
+            let actual = fs::canonicalize(fs::read_link(format!("/proc/{process_id}/exe"))?)?;
+            let expected = fs::canonicalize(&handoff.installed_executable)?;
+            if actual != expected {
+                return Err(DaemonError::Lifecycle(
+                    "updated Debian daemon identity does not match the installation".into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(DaemonError::Lifecycle(
+            "Linux installer kind is invalid".into(),
+        )),
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn verify_daemon_executable_identity(
     _process_id: u32,
     _handoff: &NativeUpgradeHandoff,
@@ -2241,8 +3041,8 @@ fn verify_platform_signature(path: &Path, _installer: InstallerKind) -> Result<(
 }
 
 #[cfg(target_os = "macos")]
-fn verify_staged_package_signature(path: &Path, installer: InstallerKind) -> Result<()> {
-    if installer != InstallerKind::MacosDmg {
+fn verify_staged_package_signature(path: &Path, release: &ReleaseMetadata) -> Result<()> {
+    if release.target.installer != InstallerKind::MacosDmg {
         return Err(DaemonError::Lifecycle(
             "macOS installer kind is invalid".into(),
         ));
@@ -2291,25 +3091,55 @@ fn verify_application_signature(path: &Path, installer: InstallerKind) -> Result
     )
 }
 
-#[cfg(not(target_os = "macos"))]
-fn verify_staged_package_signature(path: &Path, installer: InstallerKind) -> Result<()> {
-    verify_platform_signature(path, installer)
+#[cfg(windows)]
+fn verify_staged_package_signature(path: &Path, release: &ReleaseMetadata) -> Result<()> {
+    verify_platform_signature(path, release.target.installer)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn verify_application_signature(path: &Path, installer: InstallerKind) -> Result<()> {
     verify_platform_signature(path, installer)
 }
 
 #[cfg(target_os = "linux")]
-fn verify_platform_signature(_path: &Path, installer: InstallerKind) -> Result<()> {
-    if installer == InstallerKind::LinuxDeb {
-        successful(
-            Command::new("dpkg").args(["--verify", "sylvops"]),
-            "Debian package verification",
-        )?;
+fn verify_staged_package_signature(path: &Path, release: &ReleaseMetadata) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata_is_link(&metadata) || !metadata.is_file() || metadata.len() == 0 {
+        return Err(DaemonError::Lifecycle(
+            "Linux staged package is unsafe".into(),
+        ));
     }
-    Ok(())
+    match release.target.installer {
+        InstallerKind::LinuxAppImage => Ok(()),
+        InstallerKind::LinuxDeb => verify_debian_package(path, None),
+        _ => Err(DaemonError::Lifecycle(
+            "Linux installer kind is invalid".into(),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_application_signature(path: &Path, installer: InstallerKind) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match installer {
+        InstallerKind::LinuxAppImage => {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata_is_link(&metadata)
+                || !metadata.is_file()
+                || metadata.permissions().mode() & 0o111 == 0
+            {
+                return Err(DaemonError::Lifecycle(
+                    "installed AppImage identity is invalid".into(),
+                ));
+            }
+            Ok(())
+        }
+        InstallerKind::LinuxDeb => verify_debian_installation(&fs::canonicalize(path)?, None),
+        _ => Err(DaemonError::Lifecycle(
+            "Linux installer kind is invalid".into(),
+        )),
+    }
 }
 
 #[cfg(target_os = "macos")]

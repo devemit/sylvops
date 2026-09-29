@@ -352,7 +352,7 @@ foreach ($requiredText in @('Type=Application', 'Name={{name}}', 'Exec={{exec}}'
     Assert-ReleaseCondition ($linuxDesktopEntry.Contains($requiredText)) "The Linux desktop entry is missing required metadata: $requiredText"
 }
 $desktopSource = Get-Content -Raw -LiteralPath (Join-Path $root 'crates\sylvops-desktop\src\lib.rs')
-Assert-ReleaseCondition ($desktopSource.Contains('settings.platform_specific.application_id = sylvops_core::LINUX_DESKTOP_ID.to_owned();')) "The Linux window identity must use the shared desktop-file identity."
+Assert-ReleaseCondition ($desktopSource -match 'sylvops_core::LINUX_DESKTOP_ID\s*\.clone_into\(&mut settings\.platform_specific\.application_id\);') "The Linux window identity must use the shared desktop-file identity."
 
 $linuxMetainfoPath = Join-Path $root 'packaging\linux\com.devemit.sylvops.metainfo.xml'
 Assert-ReleaseCondition (Test-Path -LiteralPath $linuxMetainfoPath -PathType Leaf) "The Linux AppStream metadata is missing."
@@ -373,6 +373,13 @@ Assert-ReleaseCondition (Test-Path -LiteralPath $linuxSmokeScriptPath -PathType 
 $linuxSmokeScript = Get-Content -Raw -LiteralPath $linuxSmokeScriptPath
 foreach ($requiredText in @('run_with_timeout', 'run_with_timeout 10 realpath --', 'APPIMAGE_EXTRACT_AND_RUN=1', '--appimage-extract', '--previous-appimage', '--previous-deb', '--allow-downgrades', 'run_with_timeout 30 dpkg-deb --info', 'run_with_timeout 30 dpkg-deb --contents', 'run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install', 'run_with_timeout 30 ldd /usr/bin/sylvops', 'run_with_timeout 30 dpkg-query -L sylvops', 'gtk-launch sylvops', 'desktop-file-validate', 'daemon status', 'pgrep -f', 'run_with_timeout 120 sudo --non-interactive dpkg --remove', 'package-preserve.txt', 'show-ref --verify', 'user_integration_path', 'usr/share/applications/sylvops.desktop', 'usr/share/metainfo/com.devemit.sylvops.metainfo.xml', 'apps/sylvops\.png')) {
     Assert-ReleaseCondition ($linuxSmokeScript.Contains($requiredText)) "The Linux package smoke test is missing an acceptance check: $requiredText"
+}
+
+$linuxUpgradeScriptPath = Join-Path $root 'scripts\test-linux-native-upgrade.sh'
+Assert-ReleaseCondition (Test-Path -LiteralPath $linuxUpgradeScriptPath -PathType Leaf) "The Linux native-upgrade test is missing."
+$linuxUpgradeScript = Get-Content -Raw -LiteralPath $linuxUpgradeScriptPath
+foreach ($requiredText in @('update-helper', 'linux_app_image', 'linux_deb', 'helper_interrupted', 'health_check_failed', 'rollback_attempts', 'gtk-launch sylvops', 'dpkg --verify sylvops', 'desktop-file-validate', 'usr/share/applications/sylvops.desktop', 'usr/share/metainfo/com.devemit.sylvops.metainfo.xml', 'apps/sylvops.png')) {
+    Assert-ReleaseCondition ($linuxUpgradeScript.Contains($requiredText)) "The Linux native-upgrade test is missing an acceptance check: $requiredText"
 }
 
 $quickstart = Get-Content -Raw -LiteralPath (Join-Path $root 'packaging\windows\QUICKSTART.txt')
@@ -492,6 +499,9 @@ Assert-ReleaseCondition ($release.Contains('macos-upgrade-invalid-trust.json')) 
 Assert-ReleaseCondition ($release.Contains('macos-upgrade-failed-health.json')) "Release packaging does not exercise a signed macOS failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('scripts/package-linux.sh')) "Release packaging does not build the AppImage and deb packages."
 Assert-ReleaseCondition ($release.Contains('scripts/test-linux-packages.sh')) "Release packaging does not run the native Linux package smoke test."
+Assert-ReleaseCondition ($release.Contains('scripts/test-linux-native-upgrade.sh')) "Release packaging does not run the native Linux N-1 upgrade test."
+Assert-ReleaseCondition ($release.Contains('linux-appimage-upgrade-failed-health.json')) "Release packaging does not exercise signed AppImage failed-health rollback."
+Assert-ReleaseCondition ($release.Contains('linux-deb-upgrade-failed-health.json')) "Release packaging does not exercise signed deb failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('needs: [package-windows, package-linux, package-macos]')) "Release staging is not gated on the native Linux package job."
 Assert-ReleaseCondition ([regex]::Matches($release, 'chmod 755 dist/sylvops-linux-x86_64\.AppImage').Count -eq 2) "Release staging and publication do not restore the AppImage executable permission after artifact transport."
 Assert-ReleaseCondition ($release.Contains('UPDATE_SIGNING_PRIVATE_KEY_BASE64')) "Release staging does not load the protected application-update signing key."
