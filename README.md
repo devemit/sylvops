@@ -18,7 +18,7 @@ On macOS, download `sylvops-macos-x86_64.dmg` for an Intel Mac or `sylvops-macos
 
 On Linux x86_64, download either `sylvops-linux-x86_64.deb` for normal Debian-family installation or `sylvops-linux-x86_64.AppImage` as a portable fallback, then verify it against `SHA256SUMS`. Install the Debian package with `sudo apt install ./sylvops-linux-x86_64.deb`; it provides the shared SylvOps name, icon, desktop entry, AppStream metadata, and `sylvops` CLI. Remove it with `sudo apt remove sylvops`. Package removal deletes application integration while preserving SylvOps state, repositories, worktrees, and branches. The AppImage requires `chmod +x sylvops-linux-x86_64.AppImage` before launch and does not install files or desktop integration.
 
-The desktop Settings panel can check signed release metadata, show the target version, size, and notes, download a verified package, and install only after a visible confirmation. Periodic checks default to a bounded 24-hour interval and can be disabled. Installation defers while agent sessions are active; the override confirmation names every session whose process tree will stop. The same controls are available as `sylvops update check`, `download`, `status`, `cancel`, and `install --override-active-sessions`.
+The desktop Settings panel can check signed release metadata, show the target version, size, and notes, download a verified package, and install only after a visible confirmation. Periodic checks default to a bounded 24-hour interval and can be disabled. Installation defers while agent sessions are active; the override confirmation names every session whose process tree will stop. The same controls are available as `sylvops update check`, `download`, `status`, `cancel`, and `install --confirm-active-session <SESSION_ID>` (repeat the option for every named session).
 
 Git is a separate prerequisite and must already be installed and discoverable by the operating system. Codex is optional and separately discovered: install the Codex CLI and complete its login using OpenAI's own instructions before selecting the Codex provider. SylvOps does not install either tool, run login commands, copy credentials, or store provider secrets. Use `sylvops doctor` and `sylvops provider probe codex` to distinguish a missing executable from an authentication problem.
 
@@ -109,7 +109,7 @@ sylvops update download
 sylvops update status
 sylvops update cancel
 sylvops update install
-sylvops update install --override-active-sessions
+sylvops update install --confirm-active-session <SESSION_ID>
 sylvops data remove --confirm "DELETE SYLVOPS USER DATA"
 sylvops daemon start
 sylvops daemon status

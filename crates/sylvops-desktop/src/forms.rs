@@ -1,6 +1,7 @@
 use sylvops_core::{
     domain::{GitWorktreeState, ProviderKind},
     ui_forms::Form,
+    upgrade::ActiveUpgradeSession,
 };
 
 #[derive(Clone, Debug)]
@@ -44,7 +45,7 @@ pub(crate) enum Confirmation {
     },
     InstallUpdate {
         version: String,
-        active_session_names: Vec<String>,
+        active_sessions: Vec<ActiveUpgradeSession>,
     },
 }
 

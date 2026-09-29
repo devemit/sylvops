@@ -5,11 +5,113 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::runtime::{OWNERSHIP_MARKER, RuntimePaths};
 
 pub const DATA_REMOVAL_CONFIRMATION: &str = "DELETE SYLVOPS USER DATA";
+pub const DATA_REMOVAL_RESERVATION_FILE: &str = ".sylvops-data-removal-pending";
+const MAX_DATA_REMOVAL_RESERVATION_BYTES: u64 = 64 * 1024;
+const MAX_PROTECTED_PATHS: usize = 4_096;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DataRemovalReservation {
+    application_id: String,
+    protected_paths: Vec<PathBuf>,
+}
+
+/// Reads and validates a durable removal reservation from the surviving owned directories.
+///
+/// # Errors
+///
+/// Fails closed when markers are linked, oversized, malformed, inconsistent, or unreadable.
+pub fn reservation(paths: &RuntimePaths) -> Result<Option<Vec<PathBuf>>, DataRemovalError> {
+    let mut reservation: Option<DataRemovalReservation> = None;
+    for directory in owned_directories(paths) {
+        let marker = directory.join(DATA_REMOVAL_RESERVATION_FILE);
+        let metadata = match std::fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(DataRemovalError::RemovalFailed),
+        };
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_DATA_REMOVAL_RESERVATION_BYTES
+        {
+            return Err(DataRemovalError::RemovalFailed);
+        }
+        let bytes = std::fs::read(marker).map_err(|_| DataRemovalError::RemovalFailed)?;
+        let current: DataRemovalReservation =
+            serde_json::from_slice(&bytes).map_err(|_| DataRemovalError::RemovalFailed)?;
+        if current.application_id != sylvops_core::APPLICATION_ID
+            || current.protected_paths.len() > MAX_PROTECTED_PATHS
+            || reservation
+                .as_ref()
+                .is_some_and(|existing| existing != &current)
+        {
+            return Err(DataRemovalError::RemovalFailed);
+        }
+        reservation = Some(current);
+    }
+    Ok(reservation.map(|value| value.protected_paths))
+}
+
+/// Reports whether any owned state directory carries an active removal reservation.
+///
+/// # Errors
+///
+/// Fails closed when a reservation path cannot be inspected.
+pub fn reservation_pending(paths: &RuntimePaths) -> Result<bool, DataRemovalError> {
+    Ok(reservation(paths)?.is_some())
+}
+
+/// Reserves every owned state directory before the daemon yields to the removal client.
+///
+/// # Errors
+///
+/// Removes any partial reservation and fails when a marker cannot be written atomically.
+pub fn reserve(paths: &RuntimePaths, protected_paths: &[PathBuf]) -> Result<(), DataRemovalError> {
+    if protected_paths.len() > MAX_PROTECTED_PATHS {
+        return Err(DataRemovalError::RemovalFailed);
+    }
+    let encoded = serde_json::to_vec(&DataRemovalReservation {
+        application_id: sylvops_core::APPLICATION_ID.into(),
+        protected_paths: protected_paths.to_vec(),
+    })
+    .map_err(|_| DataRemovalError::RemovalFailed)?;
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_DATA_REMOVAL_RESERVATION_BYTES {
+        return Err(DataRemovalError::RemovalFailed);
+    }
+    let mut written = Vec::new();
+    for directory in owned_directories(paths) {
+        let marker = directory.join(DATA_REMOVAL_RESERVATION_FILE);
+        if crate::atomic_file::write(&marker, &encoded).is_err() {
+            for path in written {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(DataRemovalError::RemovalFailed);
+        }
+        written.push(marker);
+    }
+    Ok(())
+}
+
+/// Best-effort cleanup used when the daemon cannot deliver the prepared response.
+pub fn clear_reservation(paths: &RuntimePaths) {
+    for directory in owned_directories(paths) {
+        let _ = std::fs::remove_file(directory.join(DATA_REMOVAL_RESERVATION_FILE));
+    }
+}
+
+fn owned_directories(paths: &RuntimePaths) -> [&Path; 3] {
+    [
+        &paths.data_directory,
+        &paths.config_directory,
+        &paths.runtime_directory,
+    ]
+}
 
 #[derive(Clone, Debug)]
 pub struct DataRemovalPlan {

@@ -24,12 +24,13 @@ ed25519-dalek.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sylvops-core = { path = "../sylvops-core" }
+tempfile = "3"
 tokio.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 rusqlite.workspace = true
 sylvops-daemon = { path = "../sylvops-daemon" }
-tempfile = "3"
 uuid.workspace = true
 
 [lints]

@@ -8,11 +8,14 @@ use std::path::PathBuf;
 use thiserror::Error;
 use url::Url;
 
+use crate::ids::SessionId;
+
 pub const RELEASE_SCHEMA_VERSION: u16 = 1;
 pub const MAX_RELEASE_METADATA_BYTES: usize = 64 * 1024;
 pub const MAX_RELEASE_NOTES_BYTES: usize = 32 * 1024;
 pub const MAX_UPGRADE_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_UPGRADE_CLIENT_PROCESSES: usize = 128;
+pub const MAX_UPGRADE_ACTIVE_SESSIONS: usize = 128;
 const MAX_URL_BYTES: usize = 2_048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -175,7 +178,7 @@ pub struct ReleaseValidationContext {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActiveUpgradeSession {
-    pub id: String,
+    pub id: SessionId,
     pub name: String,
 }
 
