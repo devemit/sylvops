@@ -352,6 +352,11 @@ foreach ($iconPath in @('packaging\icons\sylvops.png', 'packaging\icons\sylvops.
     Assert-ReleaseCondition (Test-Path -LiteralPath $resolvedIconPath -PathType Leaf) "Application icon is missing: $iconPath"
     Assert-ReleaseCondition ((Get-Item -LiteralPath $resolvedIconPath).Length -gt 0) "Application icon is empty: $iconPath"
 }
+$pngIconBytes = [IO.File]::ReadAllBytes((Join-Path $root 'packaging\icons\sylvops.png'))
+Assert-ReleaseCondition ($pngIconBytes.Length -ge 24) "The PNG application icon is malformed."
+$pngIconWidth = [Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($pngIconBytes, 16))
+$pngIconHeight = [Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($pngIconBytes, 20))
+Assert-ReleaseCondition ($pngIconWidth -eq 1024 -and $pngIconHeight -eq 1024) "The PNG application icon must be 1024x1024 for macOS ICNS generation."
 
 $packagerVersionPath = Join-Path $root 'packaging\cargo-packager.version'
 Assert-ReleaseCondition (Test-Path -LiteralPath $packagerVersionPath -PathType Leaf) "The cargo-packager version pin is missing."
