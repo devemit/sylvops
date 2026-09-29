@@ -375,6 +375,13 @@ foreach ($requiredText in @('run_with_timeout', 'run_with_timeout 10 realpath --
     Assert-ReleaseCondition ($linuxSmokeScript.Contains($requiredText)) "The Linux package smoke test is missing an acceptance check: $requiredText"
 }
 
+$linuxUpgradeScriptPath = Join-Path $root 'scripts\test-linux-native-upgrade.sh'
+Assert-ReleaseCondition (Test-Path -LiteralPath $linuxUpgradeScriptPath -PathType Leaf) "The Linux native-upgrade test is missing."
+$linuxUpgradeScript = Get-Content -Raw -LiteralPath $linuxUpgradeScriptPath
+foreach ($requiredText in @('update-helper', 'linux_app_image', 'linux_deb', 'helper_interrupted', 'health_check_failed', 'rollback_attempts', 'gtk-launch sylvops', 'dpkg --verify sylvops', 'desktop-file-validate', 'usr/share/applications/sylvops.desktop', 'usr/share/metainfo/com.devemit.sylvops.metainfo.xml', 'apps/sylvops.png')) {
+    Assert-ReleaseCondition ($linuxUpgradeScript.Contains($requiredText)) "The Linux native-upgrade test is missing an acceptance check: $requiredText"
+}
+
 $quickstart = Get-Content -Raw -LiteralPath (Join-Path $root 'packaging\windows\QUICKSTART.txt')
 Assert-ReleaseCondition ($quickstart -match "(?m)^SYLVOPS $([regex]::Escape($version))$") "Windows QUICKSTART version does not match workspace version $version."
 
@@ -492,6 +499,9 @@ Assert-ReleaseCondition ($release.Contains('macos-upgrade-invalid-trust.json')) 
 Assert-ReleaseCondition ($release.Contains('macos-upgrade-failed-health.json')) "Release packaging does not exercise a signed macOS failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('scripts/package-linux.sh')) "Release packaging does not build the AppImage and deb packages."
 Assert-ReleaseCondition ($release.Contains('scripts/test-linux-packages.sh')) "Release packaging does not run the native Linux package smoke test."
+Assert-ReleaseCondition ($release.Contains('scripts/test-linux-native-upgrade.sh')) "Release packaging does not run the native Linux N-1 upgrade test."
+Assert-ReleaseCondition ($release.Contains('linux-appimage-upgrade-failed-health.json')) "Release packaging does not exercise signed AppImage failed-health rollback."
+Assert-ReleaseCondition ($release.Contains('linux-deb-upgrade-failed-health.json')) "Release packaging does not exercise signed deb failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('needs: [package-windows, package-linux, package-macos]')) "Release staging is not gated on the native Linux package job."
 Assert-ReleaseCondition ([regex]::Matches($release, 'chmod 755 dist/sylvops-linux-x86_64\.AppImage').Count -eq 2) "Release staging and publication do not restore the AppImage executable permission after artifact transport."
 Assert-ReleaseCondition ($release.Contains('UPDATE_SIGNING_PRIVATE_KEY_BASE64')) "Release staging does not load the protected application-update signing key."

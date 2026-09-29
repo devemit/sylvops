@@ -12,6 +12,7 @@ base64.workspace = true
 ed25519-dalek.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
+roxmltree = "0.20"
 sylvops-core = { path = "../sylvops-core" }
 serde.workspace = true
 serde_json.workspace = true

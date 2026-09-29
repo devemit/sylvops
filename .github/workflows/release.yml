@@ -246,6 +246,40 @@ jobs:
         env:
           SYLVOPS_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.UPDATE_SIGNING_PUBLIC_KEY_BASE64 }}
         run: ./scripts/package-linux.sh --skip-build
+      - name: Generate Linux native-upgrade test manifests
+        if: steps.previous-linux.outputs.appimage != ''
+        env:
+          UPDATE_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY_BASE64 }}
+          UPDATE_SIGNING_PUBLIC_KEY_BASE64: ${{ vars.UPDATE_SIGNING_PUBLIC_KEY_BASE64 }}
+        run: |
+          test -n "$UPDATE_SIGNING_PRIVATE_KEY_BASE64"
+          test -n "$UPDATE_SIGNING_PUBLIC_KEY_BASE64"
+          key_path="$RUNNER_TEMP/sylvops-update-signing-key"
+          trap 'rm -f "$key_path"' EXIT
+          printf '%s' "$UPDATE_SIGNING_PRIVATE_KEY_BASE64" > "$key_path"
+          chmod 600 "$key_path"
+          version="${GITHUB_REF_NAME#v}"
+          IFS=. read -r major minor patch <<< "$version"
+          failed_version="$major.$minor.$((patch + 1))"
+          published_at="$(date +%s)"
+          notes_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
+          generate_manifest() {
+            local package="$1" manifest="$2" target_version="$3" installer="$4" notes="$5"
+            local asset_name asset_url
+            asset_name="$(basename "$package")"
+            asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${asset_name}"
+            cargo run --locked -p sylvops-test-support --bin release-manifest -- generate \
+              "$package" "$manifest" "$asset_url" "$notes_url" 0.1.0 "$target_version" \
+              linux x86_64 "$installer" "$key_path" "$published_at" "$notes"
+            cargo run --locked -p sylvops-test-support --bin release-manifest -- verify \
+              "$manifest" "$package" "$UPDATE_SIGNING_PUBLIC_KEY_BASE64"
+          }
+          generate_manifest dist/sylvops-linux-x86_64.AppImage linux-appimage-upgrade-success.json "$version" linux_app_image 'Linux AppImage native upgrade success probe.'
+          generate_manifest dist/sylvops-linux-x86_64.AppImage linux-appimage-upgrade-failed-health.json "$failed_version" linux_app_image 'Linux AppImage native upgrade failed-health probe.'
+          generate_manifest dist/sylvops-linux-x86_64.deb linux-deb-upgrade-success.json "$version" linux_deb 'Linux deb native upgrade success probe.'
+          generate_manifest dist/sylvops-linux-x86_64.deb linux-deb-upgrade-failed-health.json "$failed_version" linux_deb 'Linux deb native upgrade failed-health probe.'
+          rm -f "$key_path"
+          trap - EXIT
       - name: Verify Debian dependency closure
         run: |
           timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$(realpath dist/sylvops-linux-x86_64.deb)"
@@ -262,6 +296,18 @@ jobs:
             previous+=(--previous-appimage '${{ steps.previous-linux.outputs.appimage }}' --previous-deb '${{ steps.previous-linux.outputs.deb }}')
           fi
           ./scripts/test-linux-packages.sh --appimage dist/sylvops-linux-x86_64.AppImage --deb dist/sylvops-linux-x86_64.deb --expected-version "${GITHUB_REF_NAME#v}" "${previous[@]}"
+      - name: Exercise native N-1 upgrade and rollback
+        if: steps.previous-linux.outputs.appimage != ''
+        run: |
+          ./scripts/test-linux-native-upgrade.sh \
+            --candidate-appimage dist/sylvops-linux-x86_64.AppImage \
+            --candidate-deb dist/sylvops-linux-x86_64.deb \
+            --previous-appimage '${{ steps.previous-linux.outputs.appimage }}' \
+            --previous-deb '${{ steps.previous-linux.outputs.deb }}' \
+            --appimage-success-manifest linux-appimage-upgrade-success.json \
+            --appimage-failed-health-manifest linux-appimage-upgrade-failed-health.json \
+            --deb-success-manifest linux-deb-upgrade-success.json \
+            --deb-failed-health-manifest linux-deb-upgrade-failed-health.json
       - name: Record Linux native package evidence
         run: jq -n --arg status '${{ steps.previous-linux.outputs.coverage }}' '{target: "linux_x86_64", native_package_upgrade_and_rollback: $status}' > native-package-evidence-linux-x86_64.json
       - name: Validate package contents
