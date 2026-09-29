@@ -1429,6 +1429,7 @@ fn configure_detached_process(command: &mut ProcessCommand) {
 }
 
 #[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)]
 fn configure_desktop_app_identity() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }

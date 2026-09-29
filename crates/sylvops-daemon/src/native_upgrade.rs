@@ -2692,7 +2692,7 @@ fn linux_environment_path(environment: &[Vec<u8>], name: &[u8]) -> Result<PathBu
     let prefix = [name, b"="].concat();
     let value = environment
         .iter()
-        .find_map(|entry| entry.strip_prefix(&prefix))
+        .find_map(|entry| entry.strip_prefix(prefix.as_slice()))
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             DaemonError::Lifecycle("updated AppImage process identity is unavailable".into())
