@@ -163,10 +163,12 @@ async fn detached_helper_restores_and_reports_after_native_health_failure() {
         .expect("native helper timed out")
         .unwrap();
     assert!(!output.status.success());
+    let helper_error = String::from_utf8_lossy(&output.stderr);
+    let daemon_log = fs::read_to_string(&fixture.paths.daemon_log).ok();
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("previous version was restored"),
-        "unexpected helper error: {}",
-        String::from_utf8_lossy(&output.stderr)
+        helper_error.contains("previous version was restored"),
+        "unexpected helper error: {helper_error}; attempt={:?}; daemon_log={daemon_log:?}",
+        fs::read_to_string(fixture.staging.join("native-upgrade-attempt.json")).ok()
     );
     assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.previous);
 
