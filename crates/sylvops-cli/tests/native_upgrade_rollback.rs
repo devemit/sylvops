@@ -144,6 +144,7 @@ impl NativeUpgradeFixture {
             .arg("update-helper")
             .arg("--handoff")
             .arg(&self.handoff_path)
+            .env("APPIMAGE", &self.installed)
             .kill_on_drop(true);
         command
     }
