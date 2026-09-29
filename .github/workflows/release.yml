@@ -309,7 +309,10 @@ jobs:
             --deb-success-manifest linux-deb-upgrade-success.json \
             --deb-failed-health-manifest linux-deb-upgrade-failed-health.json
       - name: Record Linux native package evidence
-        run: jq -n --arg status '${{ steps.previous-linux.outputs.coverage }}' '{target: "linux_x86_64", native_package_upgrade_and_rollback: $status}' > native-package-evidence-linux-x86_64.json
+        run: >-
+          jq -n --arg status '${{ steps.previous-linux.outputs.coverage }}'
+          '{target: "linux_x86_64", native_package_upgrade_and_rollback: $status}'
+          > native-package-evidence-linux-x86_64.json
       - name: Validate package contents
         shell: pwsh
         run: ./scripts/validate-release.ps1 -ArchivePath sylvops-linux-x86_64.tar.gz -LinuxPackagePath dist/sylvops-linux-x86_64.AppImage,dist/sylvops-linux-x86_64.deb -ExpectedTag "$env:GITHUB_REF_NAME"
@@ -506,7 +509,11 @@ jobs:
             --invalid-trust-manifest macos-upgrade-invalid-trust.json \
             --failed-health-manifest macos-upgrade-failed-health.json
       - name: Record macOS native package evidence
-        run: jq -n --arg target 'macos_${{ matrix.architecture }}' --arg status '${{ steps.previous-macos.outputs.coverage }}' '{target: $target, native_package_upgrade_and_rollback: $status}' > 'native-package-evidence-macos-${{ matrix.architecture }}.json'
+        run: >-
+          jq -n --arg target 'macos_${{ matrix.architecture }}'
+          --arg status '${{ steps.previous-macos.outputs.coverage }}'
+          '{target: $target, native_package_upgrade_and_rollback: $status}'
+          > 'native-package-evidence-macos-${{ matrix.architecture }}.json'
       - name: Validate package contents
         shell: pwsh
         run: ./scripts/validate-release.ps1 -ArchivePath '${{ matrix.archive }}' -MacosPackagePath 'dist/${{ matrix.dmg }}' -ExpectedTag "$env:GITHUB_REF_NAME"
