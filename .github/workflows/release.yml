@@ -1,9 +1,19 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Ordinary semantic 0.x tag matching the workspace version"
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag }}
+
+concurrency:
+  group: application-release-promotion
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -18,13 +28,19 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     environment: release
+    timeout-minutes: 10
     env:
       SYLVOPS_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.UPDATE_SIGNING_PUBLIC_KEY_BASE64 }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       - uses: actions/checkout@v5
-      - name: Verify release sources and tag
+      - name: Verify explicit promotion source and tag
         shell: pwsh
-        run: ./scripts/validate-release.ps1 -ExpectedTag "$env:GITHUB_REF_NAME"
+        run: |
+          if ($env:GITHUB_REF -ne "refs/heads/$env:DEFAULT_BRANCH") {
+            throw "Application releases must be promoted from the repository default branch."
+          }
+          ./scripts/validate-release.ps1 -ExpectedTag "$env:RELEASE_TAG" -ExpectedCommit "$env:GITHUB_SHA"
 
   package-windows:
     needs: validate-release
@@ -41,17 +57,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $previousJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=1"
+          $previousJson = gh release list --repo $env:GITHUB_REPOSITORY --exclude-drafts --exclude-pre-releases --limit 1 --json tagName
           if ($LASTEXITCODE -ne 0) { throw 'Could not determine the previous GitHub release.' }
           $releases = @($previousJson | ConvertFrom-Json)
           $previous = if ($releases.Count -gt 0) { $releases[0] } else { $null }
-          if ($null -eq $previous -or $previous.tag_name -eq $env:GITHUB_REF_NAME) {
+          if ($null -eq $previous -or $previous.tagName -eq $env:RELEASE_TAG) {
             'installer=' | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             'coverage=not_applicable_initial_release' | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
           else {
             New-Item -ItemType Directory -Path previous | Out-Null
-            gh release download $previous.tag_name --repo $env:GITHUB_REPOSITORY --pattern 'sylvops-windows-x86_64-setup.exe' --dir previous
+            gh release download $previous.tagName --repo $env:GITHUB_REPOSITORY --pattern 'sylvops-windows-x86_64-setup.exe' --dir previous
             "installer=$env:GITHUB_WORKSPACE\previous\sylvops-windows-x86_64-setup.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             'coverage=passed' | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
@@ -94,9 +110,9 @@ jobs:
       - name: Verify application version
         shell: pwsh
         run: |
-          $expected = "sylvops $($env:GITHUB_REF_NAME.Substring(1))"
+          $expected = "sylvops $($env:RELEASE_TAG.Substring(1))"
           $actual = (& target/release/sylvops.exe --version).Trim()
-          if ($actual -ne $expected) { throw "Application version '$actual' does not match release tag '$env:GITHUB_REF_NAME'." }
+          if ($actual -ne $expected) { throw "Application version '$actual' does not match release tag '$env:RELEASE_TAG'." }
       - name: Package
         shell: pwsh
         run: |
@@ -122,13 +138,13 @@ jobs:
           $keyPath = Join-Path $env:RUNNER_TEMP 'sylvops-update-signing-key'
           try {
             [IO.File]::WriteAllText($keyPath, $env:UPDATE_SIGNING_PRIVATE_KEY_BASE64)
-            $version = $env:GITHUB_REF_NAME.Substring(1)
+            $version = $env:RELEASE_TAG.Substring(1)
             $semanticVersion = [version]$version
             $failedVersion = "$($semanticVersion.Major).$($semanticVersion.Minor).$($semanticVersion.Build + 1)"
             $publishedAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
             $asset = 'dist/sylvops-windows-x86_64-setup.exe'
-            $notesUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:GITHUB_REF_NAME"
-            $assetUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/sylvops-windows-x86_64-setup.exe"
+            $notesUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG"
+            $assetUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/sylvops-windows-x86_64-setup.exe"
             cargo run --locked -p sylvops-test-support --bin release-manifest -- generate $asset windows-upgrade-success.json $assetUrl $notesUrl 0.1.0 $version windows x86_64 windows_nsis $keyPath $publishedAt 'Windows native upgrade success probe.'
             if ($LASTEXITCODE -ne 0) { throw 'Could not generate the Windows native-upgrade success manifest.' }
             cargo run --locked -p sylvops-test-support --bin release-manifest -- generate $asset windows-upgrade-failed-health.json $assetUrl $notesUrl 0.1.0 $failedVersion windows x86_64 windows_nsis $keyPath $publishedAt 'Windows native upgrade failed-health probe.'
@@ -162,10 +178,23 @@ jobs:
       - name: Record Windows native package evidence
         shell: pwsh
         run: |
-          @{ target = 'windows_x86_64'; native_package_upgrade_and_rollback = '${{ steps.previous-windows.outputs.coverage }}' } | ConvertTo-Json -Compress | Set-Content native-package-evidence-windows-x86_64.json
+          $upgradeResult = '${{ steps.previous-windows.outputs.coverage }}'
+          @{
+            schema_version = 1
+            target = 'windows_x86_64'
+            version = $env:RELEASE_TAG.Substring(1)
+            commit = $env:GITHUB_SHA
+            workflow_run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            install = 'passed'
+            launch = 'passed'
+            update = $upgradeResult
+            failed_health_rollback = $upgradeResult
+            uninstall = 'passed'
+            native_package_signature = 'verified'
+          } | ConvertTo-Json | Set-Content native-package-evidence-windows-x86_64.json
       - name: Validate package contents
         shell: pwsh
-        run: ./scripts/validate-release.ps1 -ArchivePath sylvops-windows-x86_64.zip -InstallerPath dist/sylvops-windows-x86_64-setup.exe -ExpectedTag "$env:GITHUB_REF_NAME"
+        run: ./scripts/validate-release.ps1 -ArchivePath sylvops-windows-x86_64.zip -InstallerPath dist/sylvops-windows-x86_64-setup.exe -ExpectedTag "$env:RELEASE_TAG" -ExpectedCommit "$env:GITHUB_SHA"
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
@@ -202,8 +231,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          previous_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=1" --jq '.[0].tag_name // ""')"
-          [[ "$previous_tag" != "$GITHUB_REF_NAME" ]] || previous_tag=""
+          previous_tag="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // ""')"
+          [[ "$previous_tag" != "$RELEASE_TAG" ]] || previous_tag=""
           if [[ -z "$previous_tag" ]]; then
             echo 'appimage=' >> "$GITHUB_OUTPUT"
             echo 'deb=' >> "$GITHUB_OUTPUT"
@@ -233,7 +262,7 @@ jobs:
         run: cargo build --release --locked -p sylvops-cli --target x86_64-unknown-linux-gnu
       - name: Verify application version
         run: |
-          expected="sylvops ${GITHUB_REF_NAME#v}"
+          expected="sylvops ${RELEASE_TAG#v}"
           actual="$(target/x86_64-unknown-linux-gnu/release/sylvops --version)"
           test "$actual" = "$expected"
       - name: Package portable fallback
@@ -258,16 +287,16 @@ jobs:
           trap 'rm -f "$key_path"' EXIT
           printf '%s' "$UPDATE_SIGNING_PRIVATE_KEY_BASE64" > "$key_path"
           chmod 600 "$key_path"
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           IFS=. read -r major minor patch <<< "$version"
           failed_version="$major.$minor.$((patch + 1))"
           published_at="$(date +%s)"
-          notes_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
+          notes_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
           generate_manifest() {
             local package="$1" manifest="$2" target_version="$3" installer="$4" notes="$5"
             local asset_name asset_url
             asset_name="$(basename "$package")"
-            asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${asset_name}"
+            asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${asset_name}"
             cargo run --locked -p sylvops-test-support --bin release-manifest -- generate \
               "$package" "$manifest" "$asset_url" "$notes_url" 0.1.0 "$target_version" \
               linux x86_64 "$installer" "$key_path" "$published_at" "$notes"
@@ -285,7 +314,7 @@ jobs:
           timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$(realpath dist/sylvops-linux-x86_64.deb)"
           timeout --signal=TERM --kill-after=5 30 ldd /usr/bin/sylvops | tee /tmp/sylvops-ldd.txt
           ! grep -Fq 'not found' /tmp/sylvops-ldd.txt
-          test "$(sylvops --version)" = "sylvops ${GITHUB_REF_NAME#v}"
+          test "$(sylvops --version)" = "sylvops ${RELEASE_TAG#v}"
           timeout --signal=TERM --kill-after=5 120 sudo --non-interactive dpkg --remove sylvops
       - name: Install desktop smoke test dependencies
         run: timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes xvfb x11-utils libgtk-3-bin desktop-file-utils libfuse2 libxdo3
@@ -295,7 +324,7 @@ jobs:
           if [[ -n '${{ steps.previous-linux.outputs.appimage }}' ]]; then
             previous+=(--previous-appimage '${{ steps.previous-linux.outputs.appimage }}' --previous-deb '${{ steps.previous-linux.outputs.deb }}')
           fi
-          ./scripts/test-linux-packages.sh --appimage dist/sylvops-linux-x86_64.AppImage --deb dist/sylvops-linux-x86_64.deb --expected-version "${GITHUB_REF_NAME#v}" "${previous[@]}"
+          ./scripts/test-linux-packages.sh --appimage dist/sylvops-linux-x86_64.AppImage --deb dist/sylvops-linux-x86_64.deb --expected-version "${RELEASE_TAG#v}" "${previous[@]}"
       - name: Exercise native N-1 upgrade and rollback
         if: steps.previous-linux.outputs.appimage != ''
         run: |
@@ -309,13 +338,17 @@ jobs:
             --deb-success-manifest linux-deb-upgrade-success.json \
             --deb-failed-health-manifest linux-deb-upgrade-failed-health.json
       - name: Record Linux native package evidence
-        run: >-
-          jq -n --arg status '${{ steps.previous-linux.outputs.coverage }}'
-          '{target: "linux_x86_64", native_package_upgrade_and_rollback: $status}'
-          > native-package-evidence-linux-x86_64.json
+        run: |
+          jq -n \
+            --arg version "${RELEASE_TAG#v}" \
+            --arg commit "$GITHUB_SHA" \
+            --arg workflow_run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg upgrade_result '${{ steps.previous-linux.outputs.coverage }}' \
+            '{schema_version: 1, target: "linux_x86_64", version: $version, commit: $commit, workflow_run_url: $workflow_run_url, install: "passed", launch: "passed", update: $upgrade_result, failed_health_rollback: $upgrade_result, uninstall: "passed", native_package_signature: "not_applicable"}' \
+            > native-package-evidence-linux-x86_64.json
       - name: Validate package contents
         shell: pwsh
-        run: ./scripts/validate-release.ps1 -ArchivePath sylvops-linux-x86_64.tar.gz -LinuxPackagePath dist/sylvops-linux-x86_64.AppImage,dist/sylvops-linux-x86_64.deb -ExpectedTag "$env:GITHUB_REF_NAME"
+        run: ./scripts/validate-release.ps1 -ArchivePath sylvops-linux-x86_64.tar.gz -LinuxPackagePath dist/sylvops-linux-x86_64.AppImage,dist/sylvops-linux-x86_64.deb -ExpectedTag "$env:RELEASE_TAG" -ExpectedCommit "$env:GITHUB_SHA"
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
@@ -360,8 +393,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          previous_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=1" --jq '.[0].tag_name // ""')"
-          [[ "$previous_tag" != "$GITHUB_REF_NAME" ]] || previous_tag=""
+          previous_tag="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // ""')"
+          [[ "$previous_tag" != "$RELEASE_TAG" ]] || previous_tag=""
           if [[ -z "$previous_tag" ]]; then
             echo 'dmg=' >> "$GITHUB_OUTPUT"
             echo 'coverage=not_applicable_initial_release' >> "$GITHUB_OUTPUT"
@@ -450,13 +483,13 @@ jobs:
           trap 'rm -f "$key_path"' EXIT
           printf '%s' "$UPDATE_SIGNING_PRIVATE_KEY_BASE64" > "$key_path"
           chmod 600 "$key_path"
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           IFS=. read -r major minor patch <<< "$version"
           failed_version="$major.$minor.$((patch + 1))"
           published_at="$(date +%s)"
           asset='dist/${{ matrix.dmg }}'
-          asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${{ matrix.dmg }}"
-          notes_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
+          asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${{ matrix.dmg }}"
+          notes_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
           invalid_asset='macos-upgrade-invalid-trust.dmg'
           cp "$asset" "$invalid_asset"
           codesign --remove-signature "$invalid_asset"
@@ -476,7 +509,7 @@ jobs:
           trap - EXIT
       - name: Verify application version
         run: |
-          expected="sylvops ${GITHUB_REF_NAME#v}"
+          expected="sylvops ${RELEASE_TAG#v}"
           actual="$(target/${{ matrix.target }}/release/sylvops --version)"
           test "$actual" = "$expected"
       - name: Package portable fallback
@@ -494,7 +527,7 @@ jobs:
           ./scripts/test-macos-package.sh \
             --dmg 'dist/${{ matrix.dmg }}' \
             --architecture '${{ matrix.architecture }}' \
-            --expected-version "${GITHUB_REF_NAME#v}" \
+            --expected-version "${RELEASE_TAG#v}" \
             "${previous[@]}" \
             --require-developer-id \
             --require-notarization
@@ -509,14 +542,18 @@ jobs:
             --invalid-trust-manifest macos-upgrade-invalid-trust.json \
             --failed-health-manifest macos-upgrade-failed-health.json
       - name: Record macOS native package evidence
-        run: >-
-          jq -n --arg target 'macos_${{ matrix.architecture }}'
-          --arg status '${{ steps.previous-macos.outputs.coverage }}'
-          '{target: $target, native_package_upgrade_and_rollback: $status}'
-          > 'native-package-evidence-macos-${{ matrix.architecture }}.json'
+        run: |
+          jq -n \
+            --arg target 'macos_${{ matrix.architecture }}' \
+            --arg version "${RELEASE_TAG#v}" \
+            --arg commit "$GITHUB_SHA" \
+            --arg workflow_run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg upgrade_result '${{ steps.previous-macos.outputs.coverage }}' \
+            '{schema_version: 1, target: $target, version: $version, commit: $commit, workflow_run_url: $workflow_run_url, install: "passed", launch: "passed", update: $upgrade_result, failed_health_rollback: $upgrade_result, uninstall: "passed", native_package_signature: "verified"}' \
+            > 'native-package-evidence-macos-${{ matrix.architecture }}.json'
       - name: Validate package contents
         shell: pwsh
-        run: ./scripts/validate-release.ps1 -ArchivePath '${{ matrix.archive }}' -MacosPackagePath 'dist/${{ matrix.dmg }}' -ExpectedTag "$env:GITHUB_REF_NAME"
+        run: ./scripts/validate-release.ps1 -ArchivePath '${{ matrix.archive }}' -MacosPackagePath 'dist/${{ matrix.dmg }}' -ExpectedTag "$env:RELEASE_TAG" -ExpectedCommit "$env:GITHUB_SHA"
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
@@ -548,10 +585,12 @@ jobs:
     needs: [package-windows, package-linux, package-macos]
     runs-on: ubuntu-latest
     environment: release
+    timeout-minutes: 20
     env:
       SYLVOPS_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.UPDATE_SIGNING_PUBLIC_KEY_BASE64 }}
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v5
         with:
           path: dist
@@ -570,14 +609,14 @@ jobs:
           printf '%s' "$UPDATE_SIGNING_PRIVATE_KEY_BASE64" > "$key_file"
           chmod 600 "$key_file"
           published_at="$(date +%s)"
-          version="${GITHUB_REF_NAME#v}"
-          notes_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
+          version="${RELEASE_TAG#v}"
+          notes_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
           notes="See the signed SylvOps ${version} release notes before installing."
           generate_manifest() {
             local asset="$1" manifest="$2" platform="$3" architecture="$4" installer="$5"
             cargo run --locked -p sylvops-test-support --bin release-manifest -- generate \
               "dist/$asset" "dist/$manifest" \
-              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/$asset" \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/$asset" \
               "$notes_url" "0.1.0" "$version" "$platform" "$architecture" "$installer" \
               "$key_file" "$published_at" "$notes"
             cargo run --locked -p sylvops-test-support --bin release-manifest -- verify \
@@ -591,32 +630,19 @@ jobs:
           rm -f "$key_file"
       - name: Record cross-platform promotion evidence
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           evidence=(dist/native-package-evidence-*.json)
           [[ "${#evidence[@]}" -eq 4 ]]
-          passed_count="$(jq -r 'select(.native_package_upgrade_and_rollback == "passed") | .target' "${evidence[@]}" | wc -l)"
-          initial_count="$(jq -r 'select(.native_package_upgrade_and_rollback == "not_applicable_initial_release") | .target' "${evidence[@]}" | wc -l)"
-          if [[ "$passed_count" -eq 4 ]]; then
-            native_package_upgrade="passed"
-          elif [[ "$initial_count" -eq 4 && "$version" == "0.1.0" ]]; then
-            native_package_upgrade="not_applicable_initial_release"
-          else
-            echo "Native package upgrade evidence is incomplete or inconsistent." >&2
-            exit 1
-          fi
-          jq -n \
-            --arg version "$version" \
-            --arg commit "$GITHUB_SHA" \
-            --arg native_package_upgrade "$native_package_upgrade" \
-            '{schema_version: 1, version: $version, commit: $commit, native_package_jobs: {windows_x86_64: "passed", linux_x86_64: "passed", macos_x86_64: "passed", macos_aarch64: "passed"}, upgrade_contract: {signed_metadata: "verified", staged_payloads: "verified", native_package_upgrade_and_rollback: $native_package_upgrade, coordinator_rollback_unit: "passed", detached_helper_rollback_integration: "passed"}}' \
-            > dist/RELEASE-EVIDENCE.json
+          cargo run --quiet --locked -p sylvops-test-support --bin release-manifest -- \
+            assemble-evidence dist/RELEASE-EVIDENCE.json "$version" "$GITHUB_SHA" \
+            "$GITHUB_REPOSITORY" "${evidence[@]}"
           rm -f "${evidence[@]}"
       - name: Create checksums
         working-directory: dist
         run: sha256sum RELEASE-EVIDENCE.json sylvops-* > SHA256SUMS
       - name: Validate staged release bundle
         shell: pwsh
-        run: ./scripts/validate-release.ps1 -DistDirectory dist -ExpectedTag "$env:GITHUB_REF_NAME"
+        run: ./scripts/validate-release.ps1 -DistDirectory dist -ExpectedTag "$env:RELEASE_TAG" -ExpectedCommit "$env:GITHUB_SHA" -ExpectedRepository "$env:GITHUB_REPOSITORY"
       - uses: actions/upload-artifact@v4
         with:
           name: release-bundle-${{ github.sha }}
@@ -633,10 +659,12 @@ jobs:
     needs: stage-release
     runs-on: ubuntu-latest
     environment: release
+    timeout-minutes: 15
     env:
       SYLVOPS_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.UPDATE_SIGNING_PUBLIC_KEY_BASE64 }}
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v5
         with:
           name: release-bundle-${{ github.sha }}
@@ -645,8 +673,19 @@ jobs:
         run: chmod 755 dist/sylvops-linux-x86_64.AppImage
       - name: Revalidate approved release bundle
         shell: pwsh
-        run: ./scripts/validate-release.ps1 -DistDirectory dist -ExpectedTag "$env:GITHUB_REF_NAME"
+        run: ./scripts/validate-release.ps1 -DistDirectory dist -ExpectedTag "$env:RELEASE_TAG" -ExpectedCommit "$env:GITHUB_SHA" -ExpectedRepository "$env:GITHUB_REPOSITORY"
+      - name: Verify exact-revision build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while IFS= read -r -d '' asset; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA"
+          done < <(find dist -maxdepth 1 -type f -print0)
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes
+        run: gh release create "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --generate-notes --latest

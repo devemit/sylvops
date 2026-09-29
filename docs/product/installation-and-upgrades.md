@@ -93,11 +93,12 @@ Normal package removal continues to preserve application data. The separate desk
 
 ### 6. Make distribution continuously releasable
 
-- Publish an ordinary GitHub Release only from an exact semantic version tag that agrees with the workspace and packaged application version.
+- Promote an ordinary GitHub Release only through the manual `Release` workflow on `main`, with an exact semantic version tag that agrees with the workspace and packaged application version.
 - Build installers, application bundles, Linux packages, portable archives, signed upgrade payloads, checksums, attestations, and the upgrade manifest from the same commit.
 - Test clean install, launch, upgrade from the previous release, daemon coordination, rollback, uninstall-with-data-preservation, and reinstall on native hosts.
 - Continue running formatting, Clippy with warnings denied, and the complete workspace test suite on Windows, Linux, and macOS before promotion.
 - Publish only when all platform assets and metadata pass validation. A partial platform release is a failed promotion, not a degraded success.
+- Retain one bounded evidence report linking every supported target to its native install, launch, update, failed-health rollback, and uninstall result.
 
 ## Release acceptance
 

@@ -6,7 +6,9 @@ param(
     [string[]]$MacosPackagePath,
     [string[]]$LinuxPackagePath,
     [string]$DistDirectory,
-    [string]$ExpectedTag
+    [string]$ExpectedTag,
+    [string]$ExpectedCommit,
+    [string]$ExpectedRepository = 'devemit/sylvops'
 )
 
 $ErrorActionPreference = "Stop"
@@ -264,27 +266,35 @@ function Assert-UpdateManifest {
 function Assert-ReleaseEvidence {
     param(
         [string]$Path,
-        [string]$ExpectedVersion
+        [string]$ExpectedVersion,
+        [string]$ExpectedCommit,
+        [string]$ExpectedRepository
     )
 
     $evidence = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
-    Assert-ReleaseCondition ($evidence.schema_version -eq 1) "Release evidence schema is invalid."
+    Assert-ReleaseCondition ($evidence.schema_version -eq 2) "Release evidence schema is invalid."
     Assert-ReleaseCondition ($evidence.version -eq $ExpectedVersion) "Release evidence version does not match."
-    Assert-ReleaseCondition ($evidence.commit -match '^[0-9a-f]{40}$') "Release evidence commit is invalid."
+    Assert-ReleaseCondition ($evidence.commit -eq $ExpectedCommit) "Release evidence commit does not match the promoted revision."
+    Assert-ReleaseCondition ($evidence.source_url -eq "https://github.com/$ExpectedRepository/commit/$ExpectedCommit") "Release evidence source link does not match the promoted revision."
     foreach ($target in @('windows_x86_64', 'linux_x86_64', 'macos_x86_64', 'macos_aarch64')) {
-        Assert-ReleaseCondition ($evidence.native_package_jobs.$target -eq 'passed') "Release evidence is missing passed native validation for $target."
+        $targetEvidence = $evidence.targets.$target
+        Assert-ReleaseCondition ($null -ne $targetEvidence) "Release evidence is missing native validation for $target."
+        Assert-ReleaseCondition ($targetEvidence.workflow_run_url -match "^https://github\.com/$([regex]::Escape($ExpectedRepository))/actions/runs/[0-9]+$") "Release evidence is missing a bounded workflow link for $target."
+        Assert-ReleaseCondition ($targetEvidence.runtime_version -eq $ExpectedVersion) "Release evidence runtime version does not match for $target."
+        foreach ($result in @('install', 'launch', 'uninstall')) {
+            Assert-ReleaseCondition ($targetEvidence.$result -eq 'passed') "Release evidence is missing the $result result for $target."
+        }
+        $expectedUpgradeResult = if ($ExpectedVersion -eq '0.1.0') { 'not_applicable_initial_release' } else { 'passed' }
+        Assert-ReleaseCondition ($targetEvidence.update -eq $expectedUpgradeResult) "Release evidence is missing the update result for $target."
+        Assert-ReleaseCondition ($targetEvidence.failed_health_rollback -eq $expectedUpgradeResult) "Release evidence is missing the failed-health rollback result for $target."
+        $expectedSignature = if ($target -eq 'linux_x86_64') { 'not_applicable' } else { 'verified' }
+        Assert-ReleaseCondition ($targetEvidence.native_package_signature -eq $expectedSignature) "Release evidence is missing native package trust for $target."
     }
-    Assert-ReleaseCondition ($evidence.upgrade_contract.signed_metadata -eq 'verified') "Release evidence is missing signed-metadata validation."
-    Assert-ReleaseCondition ($evidence.upgrade_contract.staged_payloads -eq 'verified') "Release evidence is missing staged-payload validation."
-    Assert-ReleaseCondition ($evidence.upgrade_contract.coordinator_rollback_unit -eq 'passed') "Release evidence is missing coordinator rollback validation."
-    Assert-ReleaseCondition ($evidence.upgrade_contract.detached_helper_rollback_integration -eq 'passed') "Release evidence is missing detached-helper rollback integration validation."
-    if ($ExpectedVersion -eq '0.1.0') {
-        Assert-ReleaseCondition ($evidence.upgrade_contract.native_package_upgrade_and_rollback -in @('passed', 'not_applicable_initial_release')) "Initial release evidence has an invalid native-package upgrade result."
-    }
-    else {
-        Assert-ReleaseCondition ($evidence.upgrade_contract.native_package_upgrade_and_rollback -eq 'passed') "Release evidence is missing native N-1 package upgrade and rollback validation."
-    }
-    Write-Host "[ok] release evidence covers every supported native target"
+    Assert-ReleaseCondition ($evidence.release_contract.signed_update_metadata -eq 'verified') "Release evidence is missing signed-metadata validation."
+    Assert-ReleaseCondition ($evidence.release_contract.staged_payloads -eq 'verified') "Release evidence is missing staged-payload validation."
+    Assert-ReleaseCondition ($evidence.release_contract.coordinator_rollback_unit -eq 'passed') "Release evidence is missing coordinator rollback validation."
+    Assert-ReleaseCondition ($evidence.release_contract.detached_helper_rollback_integration -eq 'passed') "Release evidence is missing detached-helper rollback integration validation."
+    Write-Host "[ok] release evidence links every supported target to native lifecycle results"
 }
 
 $root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
@@ -550,12 +560,21 @@ foreach ($asset in @(
     Assert-ReleaseCondition ($release.Contains($asset)) "Release workflow is missing required archive: $asset"
 }
 Assert-ReleaseCondition ($release.Contains('uses: ./.github/workflows/ci.yml')) "Release workflow does not call the complete CI workflow."
+Assert-ReleaseCondition ($release.Contains('workflow_dispatch:')) "Release publication is not an explicit workflow promotion."
+Assert-ReleaseCondition ($release.Contains('release_tag:')) "Release promotion does not require an explicit semantic tag."
+Assert-ReleaseCondition ($release -notmatch '(?ms)^\s*push:\s*\r?\n\s*tags:') "A tag push still publishes an application release without the explicit promotion action."
+Assert-ReleaseCondition ($release.Contains('refs/heads/$env:DEFAULT_BRANCH')) "Release promotion is not restricted to the repository default branch."
+Assert-ReleaseCondition ($release.Contains('group: application-release-promotion')) "Concurrent release promotions are not serialized."
+Assert-ReleaseCondition ($release.Contains('cancel-in-progress: false')) "A newer promotion can still interrupt an in-progress release."
 Assert-ReleaseCondition ($release.Contains('cargo build --release --locked')) "Release workflow does not build with Cargo.lock enforced."
 Assert-ReleaseCondition ($release.Contains('test -x "target/${{ matrix.target }}/release/sylvops"')) "Release workflow does not verify Unix executable permissions."
 Assert-ReleaseCondition ($release.Contains('actions/attest-build-provenance@')) "Release workflow does not create build-provenance attestations."
 Assert-ReleaseCondition ($release.Contains('scripts/validate-release.ps1')) "Release workflow does not invoke release-package validation."
 Assert-ReleaseCondition ($release.Contains('environment: release')) "Release publication is not protected by the release environment gate."
-Assert-ReleaseCondition ($release.Contains('gh release create')) "Release workflow does not publish through GitHub Releases."
+Assert-ReleaseCondition ([regex]::Matches($release, 'gh release create').Count -eq 1) "Release workflow must have exactly one GitHub Release publication point."
+Assert-ReleaseCondition ($release.Contains('--target "$GITHUB_SHA"')) "Release publication does not pin the promoted source revision."
+Assert-ReleaseCondition ($release.Contains('--latest')) "Release publication does not update latest-release metadata explicitly."
+Assert-ReleaseCondition ($release -notmatch 'gh release create[^\r\n]*(--draft|--prerelease)') "Release publication still uses a draft or prerelease lane."
 Assert-ReleaseCondition ($release.Contains('target/release/sylvops.exe --version')) "Windows package job does not verify the application version."
 Assert-ReleaseCondition ($release.Contains('target/${{ matrix.target }}/release/sylvops --version')) "Unix package jobs do not verify the application version."
 Assert-ReleaseCondition ($release.Contains('packaging/cargo-packager.version')) "Windows packaging does not use the checked-in cargo-packager version pin."
@@ -590,6 +609,15 @@ Assert-ReleaseCondition ($release.Contains('UPDATE_SIGNING_PRIVATE_KEY_BASE64'))
 Assert-ReleaseCondition ($release.Contains('UPDATE_SIGNING_PUBLIC_KEY_BASE64')) "Release builds do not embed the application-update verification key."
 Assert-ReleaseCondition ($release.Contains('--bin release-manifest -- generate')) "Release staging does not create signed update manifests."
 Assert-ReleaseCondition ($release.Contains('--bin release-manifest -- verify')) "Release staging does not verify signed update manifests."
+Assert-ReleaseCondition ($release.Contains('assemble-evidence')) "Release staging does not assemble linked native lifecycle evidence."
+Assert-ReleaseCondition ($release.Contains('validate-release.ps1 -DistDirectory')) "Release publication does not revalidate the complete staged bundle."
+$releaseManifestTool = Get-Content -Raw -LiteralPath (Join-Path $root 'crates\sylvops-test-support\src\bin\release-manifest.rs')
+Assert-ReleaseCondition ($releaseManifestTool.Contains('verify-promotion')) "Release validation is missing cryptographic promotion verification."
+Assert-ReleaseCondition ($release.Contains('gh attestation verify')) "Release publication does not verify build-provenance attestations."
+Assert-ReleaseCondition ($release.Contains('--source-digest "$GITHUB_SHA"')) "Release provenance is not pinned to the promoted commit."
+Assert-ReleaseCondition ($release.Contains('--source-ref "$GITHUB_REF"')) "Release provenance is not pinned to the promoted ref."
+Assert-ReleaseCondition ($release.Contains('--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"')) "Release provenance is not pinned to the release workflow."
+Assert-ReleaseCondition ($release.Contains('timeout-minutes:')) "Release jobs do not bound promotion execution."
 Assert-NoLegacyReleasePhaseWording -Path '.github\workflows\release.yml' -Text $release
 
 $ciInstallerJob = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\ci.yml')
@@ -650,6 +678,11 @@ foreach ($documentationFile in $documentationFiles) {
 
 $releaseCommit = @(& git -C $root rev-parse HEAD 2>&1)
 Assert-ReleaseCondition ($LASTEXITCODE -eq 0) "Could not identify the release commit: $($releaseCommit -join [Environment]::NewLine)"
+if (-not [string]::IsNullOrWhiteSpace($ExpectedCommit)) {
+    Assert-ReleaseCondition ($ExpectedCommit -match '^[0-9a-f]{40}$') "Expected release commit must be a full lowercase Git object ID."
+    Assert-ReleaseCondition ($releaseCommit[0] -eq $ExpectedCommit) "Checked-out source does not match the promoted release commit."
+}
+$releaseCommitId = $releaseCommit[0]
 Write-Host "[ok] source release contract validated for $($releaseCommit[0]) ($version)"
 
 if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
@@ -727,12 +760,22 @@ if (-not [string]::IsNullOrWhiteSpace($DistDirectory)) {
             Assert-UpdateManifest -Path $path -AssetPath (Join-Path $dist $updateManifests[$asset]) -ExpectedVersion $version
         }
         elseif ($asset -eq $evidence) {
-            Assert-ReleaseEvidence -Path $path -ExpectedVersion $version
+            Assert-ReleaseEvidence -Path $path -ExpectedVersion $version -ExpectedCommit $releaseCommitId -ExpectedRepository $ExpectedRepository
         }
         else {
             Assert-Archive -Path $path
         }
         Write-Host "[ok] $asset sha256=$actualHash"
     }
+    Assert-ReleaseCondition (-not [string]::IsNullOrWhiteSpace($env:SYLVOPS_UPDATE_PUBLIC_KEY_BASE64)) "Release bundle validation requires the application update public key."
+    $promotionVerification = @(
+        & cargo run --quiet --locked -p sylvops-test-support --bin release-manifest -- `
+            verify-promotion $dist $version $releaseCommitId $ExpectedRepository $env:SYLVOPS_UPDATE_PUBLIC_KEY_BASE64 2>&1
+    )
+    if ($LASTEXITCODE -ne 0) {
+        $boundedVerificationOutput = @($promotionVerification | Select-Object -Last 20) -join [Environment]::NewLine
+        throw "Cryptographic promotion validation failed: $boundedVerificationOutput"
+    }
+    Write-Host "[ok] signed update metadata and native lifecycle evidence match the promoted revision"
     Write-Host "[ok] release bundle has exactly fifteen validated assets and one checksum manifest"
 }
