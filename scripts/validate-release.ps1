@@ -284,7 +284,8 @@ Assert-ReleaseCondition ($packagerVersion -eq '0.11.8') "cargo-packager must sta
 foreach ($scriptPath in @(
     'scripts\package-windows-installer.ps1',
     'scripts\sign-windows.ps1',
-    'scripts\test-windows-installer.ps1'
+    'scripts\test-windows-installer.ps1',
+    'scripts\test-windows-native-upgrade.ps1'
 )) {
     Assert-ReleaseCondition (Test-Path -LiteralPath (Join-Path $root $scriptPath) -PathType Leaf) "Windows installer workflow script is missing: $scriptPath"
 }
@@ -470,6 +471,8 @@ Assert-ReleaseCondition ($release.Contains('WINDOWS_SIGNING_CERTIFICATE_PASSWORD
 Assert-ReleaseCondition ($release -match '(?ms)^  package-windows:.*?^    environment: release$') "The Windows signing job does not use the protected release environment."
 Assert-ReleaseCondition ($release.Contains('scripts/package-windows-installer.ps1')) "Release packaging does not build the signed Windows installer."
 Assert-ReleaseCondition ($release.Contains('scripts/test-windows-installer.ps1')) "Release packaging does not run the native Windows installer smoke test."
+Assert-ReleaseCondition ($release.Contains('scripts/test-windows-native-upgrade.ps1')) "Release packaging does not run the native Windows N-1 upgrade test."
+Assert-ReleaseCondition ($release.Contains('windows-upgrade-failed-health.json')) "Release packaging does not exercise a signed failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('sylvops-windows-x86_64-setup.exe')) "Release packaging does not publish the Windows installer asset."
 Assert-ReleaseCondition ($release.Contains('MACOS_SIGNING_CERTIFICATE_BASE64')) "Release packaging does not load the protected macOS signing certificate."
 Assert-ReleaseCondition ($release.Contains('MACOS_SIGNING_CERTIFICATE_PASSWORD')) "Release packaging does not load the protected macOS signing certificate password."
