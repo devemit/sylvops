@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sylvops_core::{
     protocol::{ClientRequest, DaemonResponse, PROTOCOL_MAJOR},
     upgrade::{
@@ -25,15 +27,80 @@ use crate::{
 };
 
 const MAX_HANDOFF_BYTES: u64 = 64 * 1024;
+const MAX_ATTEMPT_BYTES: u64 = 16 * 1024;
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 const CLIENT_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
+const DESKTOP_START_TIMEOUT: Duration = Duration::from_secs(2);
 const IPC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const ROLLBACK_RETRY_TIMEOUT: Duration = Duration::from_secs(20);
 const NATIVE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_VERSION_OUTPUT_BYTES: u64 = 4 * 1024;
 const MAX_PACKAGE_TREE_DEPTH: usize = 32;
 const MAX_PACKAGE_TREE_ENTRIES: u64 = 8_192;
 const MAX_PACKAGE_TREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const ATTEMPT_FILE: &str = "native-upgrade-attempt.json";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeUpgradePhase {
+    Preparing,
+    BackupReady,
+    Applying,
+    Healthy,
+    RollbackStarted,
+    RolledBack,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeUpgradeDiagnostic {
+    HelperInterrupted,
+    PreparationFailed,
+    InstallerFailed,
+    DaemonRelaunchFailed,
+    HealthCheckFailed,
+    DesktopRelaunchFailed,
+}
+
+impl NativeUpgradeDiagnostic {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::HelperInterrupted => "upgrade helper was interrupted",
+            Self::PreparationFailed => "upgrade preparation failed",
+            Self::InstallerFailed => "native installer failed",
+            Self::DaemonRelaunchFailed => "updated daemon did not relaunch",
+            Self::HealthCheckFailed => "post-install health check failed",
+            Self::DesktopRelaunchFailed => "updated desktop did not relaunch",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeUpgradeAttempt {
+    schema_version: u16,
+    target_version: String,
+    phase: NativeUpgradePhase,
+    rollback_attempts: u8,
+    diagnostic: Option<NativeUpgradeDiagnostic>,
+    backup_sha256: Option<String>,
+}
+
+impl NativeUpgradeAttempt {
+    fn new(target_version: String) -> Self {
+        Self {
+            schema_version: 1,
+            target_version,
+            phase: NativeUpgradePhase::Preparing,
+            rollback_attempts: 0,
+            diagnostic: None,
+            backup_sha256: None,
+        }
+    }
+}
 
 /// Applies one daemon-prepared update from a detached helper process.
 ///
@@ -49,6 +116,7 @@ pub async fn run(handoff_path: &Path) -> Result<()> {
         handoff.runtime_directory.clone(),
     )?;
     validate_handoff_path(handoff_path, &handoff)?;
+    refuse_repeated_attempt(&handoff)?;
     wait_for_daemon_stop(&paths).await?;
     if let Err(error) = wait_for_client_processes_exit(&handoff.client_process_ids).await {
         start_installed_daemon(&handoff)?;
@@ -62,58 +130,132 @@ pub async fn run(handoff_path: &Path) -> Result<()> {
             "application upgrade was cancelled before package replacement: {error}"
         )));
     }
-    let preparation = async {
-        let payload = validate_staged_release(&handoff).await?;
-        verify_platform_signature(&payload, handoff.release.target.installer)?;
-        let backup = create_backup(&handoff)?;
-        Ok::<_, DaemonError>((payload, backup))
-    }
-    .await;
-    let (payload, backup) = match preparation {
+    let mut attempt = NativeUpgradeAttempt::new(handoff.release.target_version.clone());
+    write_attempt(&handoff, &attempt)?;
+    let (payload, backup) = match prepare_application_replacement(&handoff).await {
         Ok(prepared) => prepared,
-        Err(error) => {
-            start_installed_daemon(&handoff)?;
-            report_outcome(
+        Err(_error) => {
+            cancel_before_replacement(
                 &paths,
-                &handoff.release.target_version,
-                NativeUpgradeOutcome::RolledBack,
+                &handoff,
+                &mut attempt,
+                NativeUpgradeDiagnostic::PreparationFailed,
             )
             .await?;
             return Err(DaemonError::Lifecycle(format!(
-                "application upgrade preparation failed after quiescing: {error}"
+                "application upgrade preparation failed after quiescing: {}",
+                NativeUpgradeDiagnostic::PreparationFailed.message()
             )));
         }
     };
-    if let Err(error) = apply_package(&handoff, &payload) {
-        return rollback_and_restart(&paths, &handoff, &backup, &error).await;
+    attempt.phase = NativeUpgradePhase::BackupReady;
+    attempt.backup_sha256 = Some(backup.sha256.clone());
+    write_attempt(&handoff, &attempt)?;
+    if let Err(error) = spawn_watchdog(handoff_path, &backup.sha256) {
+        cancel_before_replacement(
+            &paths,
+            &handoff,
+            &mut attempt,
+            NativeUpgradeDiagnostic::PreparationFailed,
+        )
+        .await?;
+        return Err(DaemonError::Lifecycle(format!(
+            "application upgrade watchdog did not start: {error}"
+        )));
     }
-    if let Err(error) = start_installed_daemon(&handoff) {
-        return rollback_and_restart(&paths, &handoff, &backup, &error).await;
+    apply_and_verify_replacement(&paths, &handoff, &payload, &backup, &mut attempt).await
+}
+
+async fn apply_and_verify_replacement(
+    paths: &RuntimePaths,
+    handoff: &NativeUpgradeHandoff,
+    payload: &Path,
+    backup: &Backup,
+    attempt: &mut NativeUpgradeAttempt,
+) -> Result<()> {
+    attempt.phase = NativeUpgradePhase::Applying;
+    write_attempt(handoff, attempt)?;
+    if apply_package(handoff, payload).is_err() {
+        tracing::warn!(
+            diagnostic = NativeUpgradeDiagnostic::InstallerFailed.message(),
+            "native application installer failed"
+        );
+        return rollback_and_restart(
+            paths,
+            handoff,
+            backup,
+            NativeUpgradeDiagnostic::InstallerFailed,
+        )
+        .await;
     }
-    if let Err(error) = verify_health(&paths, &handoff).await {
-        return rollback_and_restart(&paths, &handoff, &backup, &error).await;
+    if start_installed_daemon(handoff).is_err() {
+        tracing::warn!(
+            diagnostic = NativeUpgradeDiagnostic::DaemonRelaunchFailed.message(),
+            "updated application daemon did not relaunch"
+        );
+        return rollback_and_restart(
+            paths,
+            handoff,
+            backup,
+            NativeUpgradeDiagnostic::DaemonRelaunchFailed,
+        )
+        .await;
+    }
+    if verify_health(paths, handoff).await.is_err() {
+        tracing::warn!(
+            diagnostic = NativeUpgradeDiagnostic::HealthCheckFailed.message(),
+            "updated application failed its health check"
+        );
+        return rollback_and_restart(
+            paths,
+            handoff,
+            backup,
+            NativeUpgradeDiagnostic::HealthCheckFailed,
+        )
+        .await;
+    }
+    attempt.phase = NativeUpgradePhase::Healthy;
+    write_attempt(handoff, attempt)?;
+    if handoff.relaunch_desktop && relaunch_desktop(handoff).is_err() {
+        tracing::warn!(
+            diagnostic = NativeUpgradeDiagnostic::DesktopRelaunchFailed.message(),
+            "updated application desktop did not relaunch"
+        );
+        return rollback_and_restart(
+            paths,
+            handoff,
+            backup,
+            NativeUpgradeDiagnostic::DesktopRelaunchFailed,
+        )
+        .await;
     }
     report_outcome(
-        &paths,
+        paths,
         &handoff.release.target_version,
         NativeUpgradeOutcome::Installed,
     )
     .await?;
-    if handoff.relaunch_desktop {
-        relaunch_desktop(&handoff)?;
-    }
+    attempt.phase = NativeUpgradePhase::Completed;
+    write_attempt(handoff, attempt)?;
+    remove_backup(handoff)?;
     Ok(())
 }
 
-async fn rollback_and_restart(
+async fn prepare_application_replacement(
+    handoff: &NativeUpgradeHandoff,
+) -> Result<(PathBuf, Backup)> {
+    let payload = validate_staged_release(handoff).await?;
+    verify_platform_signature(&payload, handoff.release.target.installer)?;
+    let backup = create_backup(handoff)?;
+    Ok((payload, backup))
+}
+
+async fn cancel_before_replacement(
     paths: &RuntimePaths,
     handoff: &NativeUpgradeHandoff,
-    backup: &Backup,
-    cause: &dyn std::fmt::Display,
+    attempt: &mut NativeUpgradeAttempt,
+    diagnostic: NativeUpgradeDiagnostic,
 ) -> Result<()> {
-    stop_daemon_if_running(paths).await;
-    wait_for_daemon_stop(paths).await?;
-    restore_backup(handoff, backup)?;
     start_installed_daemon(handoff)?;
     report_outcome(
         paths,
@@ -124,9 +266,331 @@ async fn rollback_and_restart(
     if handoff.relaunch_desktop {
         relaunch_desktop(handoff)?;
     }
+    attempt.phase = NativeUpgradePhase::RolledBack;
+    attempt.diagnostic = Some(diagnostic);
+    write_attempt(handoff, attempt)
+}
+
+/// Watches one detached native helper and restores N-1 if that helper is interrupted.
+///
+/// # Errors
+///
+/// Returns an error when the handoff or attempt journal is invalid, the supervisor does not exit
+/// within the bounded deadline, or the one allowed recovery attempt cannot complete.
+pub async fn watch(
+    handoff_path: &Path,
+    supervisor_process_id: u32,
+    expected_backup_sha256: &str,
+) -> Result<()> {
+    if supervisor_process_id == 0
+        || expected_backup_sha256.len() != 64
+        || !expected_backup_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(DaemonError::Lifecycle(
+            "upgrade watchdog arguments are invalid".into(),
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + WATCHDOG_TIMEOUT;
+    while process_is_running(supervisor_process_id)? && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if process_is_running(supervisor_process_id)? {
+        return Err(DaemonError::Lifecycle(
+            "upgrade helper watchdog timed out".into(),
+        ));
+    }
+    if !handoff_path.exists() {
+        return Ok(());
+    }
+    let handoff = read_handoff(handoff_path)?;
+    let paths = RuntimePaths::from_explicit_directories(
+        handoff.data_directory.clone(),
+        handoff.config_directory.clone(),
+        handoff.runtime_directory.clone(),
+    )?;
+    validate_handoff_path(handoff_path, &handoff)?;
+    let attempt = read_attempt(&handoff)?;
+    validate_attempt(&handoff, &attempt)?;
+    if attempt.backup_sha256.as_deref() != Some(expected_backup_sha256) {
+        return Err(DaemonError::Lifecycle(
+            "upgrade watchdog backup identity does not match the attempt".into(),
+        ));
+    }
+    match attempt.phase {
+        NativeUpgradePhase::Completed | NativeUpgradePhase::RolledBack => Ok(()),
+        NativeUpgradePhase::Preparing => Err(DaemonError::Lifecycle(
+            "upgrade watchdog observed an incomplete backup".into(),
+        )),
+        NativeUpgradePhase::Healthy => {
+            if verify_health(&paths, &handoff).await.is_ok() {
+                if handoff.relaunch_desktop && relaunch_desktop(&handoff).is_err() {
+                    let backup = existing_backup(&handoff, expected_backup_sha256)?;
+                    return perform_rollback(
+                        &paths,
+                        &handoff,
+                        &backup,
+                        NativeUpgradeDiagnostic::DesktopRelaunchFailed,
+                    )
+                    .await;
+                }
+                report_outcome(
+                    &paths,
+                    &handoff.release.target_version,
+                    NativeUpgradeOutcome::Installed,
+                )
+                .await?;
+                let mut completed = attempt;
+                completed.phase = NativeUpgradePhase::Completed;
+                write_attempt(&handoff, &completed)?;
+                remove_backup(&handoff)?;
+                Ok(())
+            } else {
+                let backup = existing_backup(&handoff, expected_backup_sha256)?;
+                perform_rollback(
+                    &paths,
+                    &handoff,
+                    &backup,
+                    NativeUpgradeDiagnostic::HelperInterrupted,
+                )
+                .await
+            }
+        }
+        NativeUpgradePhase::BackupReady | NativeUpgradePhase::Applying => {
+            let backup = existing_backup(&handoff, expected_backup_sha256)?;
+            perform_rollback(
+                &paths,
+                &handoff,
+                &backup,
+                NativeUpgradeDiagnostic::HelperInterrupted,
+            )
+            .await
+        }
+        NativeUpgradePhase::RollbackStarted => {
+            let backup = existing_backup(&handoff, expected_backup_sha256)?;
+            complete_rollback(&paths, &handoff, &backup, attempt).await
+        }
+    }
+}
+
+async fn rollback_and_restart(
+    paths: &RuntimePaths,
+    handoff: &NativeUpgradeHandoff,
+    backup: &Backup,
+    diagnostic: NativeUpgradeDiagnostic,
+) -> Result<()> {
+    perform_rollback(paths, handoff, backup, diagnostic).await?;
     Err(DaemonError::Lifecycle(format!(
-        "application upgrade failed and the previous version was restored: {cause}"
+        "application upgrade failed and the previous version was restored: {}",
+        diagnostic.message()
     )))
+}
+
+async fn perform_rollback(
+    paths: &RuntimePaths,
+    handoff: &NativeUpgradeHandoff,
+    backup: &Backup,
+    diagnostic: NativeUpgradeDiagnostic,
+) -> Result<()> {
+    verify_backup_before_restore(handoff, backup)?;
+    let mut attempt = read_attempt(handoff)?;
+    validate_attempt(handoff, &attempt)?;
+    if attempt.rollback_attempts != 0
+        || matches!(
+            attempt.phase,
+            NativeUpgradePhase::RollbackStarted | NativeUpgradePhase::RolledBack
+        )
+    {
+        return Err(DaemonError::Lifecycle(
+            "automatic rollback was already attempted".into(),
+        ));
+    }
+    attempt.phase = NativeUpgradePhase::RollbackStarted;
+    attempt.rollback_attempts = 1;
+    attempt.diagnostic = Some(diagnostic);
+    write_attempt(handoff, &attempt)?;
+    complete_rollback(paths, handoff, backup, attempt).await
+}
+
+async fn complete_rollback(
+    paths: &RuntimePaths,
+    handoff: &NativeUpgradeHandoff,
+    backup: &Backup,
+    mut attempt: NativeUpgradeAttempt,
+) -> Result<()> {
+    verify_backup_before_restore(handoff, backup)?;
+    if attempt.phase != NativeUpgradePhase::RollbackStarted || attempt.rollback_attempts != 1 {
+        return Err(DaemonError::Lifecycle(
+            "rollback resumption state is invalid".into(),
+        ));
+    }
+    stop_daemon_if_running(paths).await;
+    wait_for_daemon_stop(paths).await?;
+    restore_backup_before_deadline(handoff, backup).await?;
+    verify_restored_package(handoff)?;
+    start_installed_daemon(handoff)?;
+    if handoff.relaunch_desktop {
+        relaunch_desktop(handoff)?;
+    }
+    report_outcome(
+        paths,
+        &handoff.release.target_version,
+        NativeUpgradeOutcome::RolledBack,
+    )
+    .await?;
+    attempt.phase = NativeUpgradePhase::RolledBack;
+    write_attempt(handoff, &attempt)?;
+    Ok(())
+}
+
+fn verify_backup_before_restore(handoff: &NativeUpgradeHandoff, backup: &Backup) -> Result<()> {
+    if backup_tree_sha256(handoff)? != backup.sha256 {
+        return Err(DaemonError::Lifecycle(
+            "rollback package integrity check failed".into(),
+        ));
+    }
+    verify_backup_signature(handoff, backup)
+}
+
+fn verify_restored_package(handoff: &NativeUpgradeHandoff) -> Result<()> {
+    verify_platform_signature(
+        &handoff.installed_executable,
+        handoff.release.target.installer,
+    )?;
+    #[cfg(windows)]
+    if handoff.release.target.installer == InstallerKind::WindowsNsis {
+        verify_platform_signature(
+            &windows_install_path(handoff)?.join("uninstall.exe"),
+            InstallerKind::WindowsNsis,
+        )?;
+    }
+    Ok(())
+}
+
+async fn restore_backup_before_deadline(
+    handoff: &NativeUpgradeHandoff,
+    backup: &Backup,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + ROLLBACK_RETRY_TIMEOUT;
+    loop {
+        match restore_backup(handoff, backup) {
+            Ok(()) => return Ok(()),
+            Err(_error) if tokio::time::Instant::now() < deadline => {
+                tracing::warn!(
+                    diagnostic = "rollback_target_still_locked",
+                    "waiting to restore the previous application package"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn spawn_watchdog(handoff_path: &Path, backup_sha256: &str) -> Result<()> {
+    let executable = std::env::current_exe().map_err(|error| {
+        DaemonError::Lifecycle(format!("upgrade helper executable is unavailable: {error}"))
+    })?;
+    crate::background_process::command(executable)
+        .arg("update-watchdog")
+        .arg("--handoff")
+        .arg(handoff_path)
+        .arg("--supervisor-process-id")
+        .arg(std::process::id().to_string())
+        .arg("--backup-sha256")
+        .arg(backup_sha256)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            DaemonError::Lifecycle(format!("upgrade watchdog did not start: {error}"))
+        })?;
+    Ok(())
+}
+
+fn attempt_path(handoff: &NativeUpgradeHandoff) -> PathBuf {
+    handoff.staging_root.join(ATTEMPT_FILE)
+}
+
+fn write_attempt(handoff: &NativeUpgradeHandoff, attempt: &NativeUpgradeAttempt) -> Result<()> {
+    validate_attempt(handoff, attempt)?;
+    let encoded = serde_json::to_vec(attempt)
+        .map_err(|_| DaemonError::Lifecycle("upgrade attempt could not be encoded".into()))?;
+    if encoded.len() > usize::try_from(MAX_ATTEMPT_BYTES).unwrap_or(usize::MAX) {
+        return Err(DaemonError::Lifecycle(
+            "upgrade attempt exceeded its byte limit".into(),
+        ));
+    }
+    crate::atomic_file::write(&attempt_path(handoff), &encoded)
+}
+
+fn read_attempt(handoff: &NativeUpgradeHandoff) -> Result<NativeUpgradeAttempt> {
+    let path = attempt_path(handoff);
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || metadata.len() > MAX_ATTEMPT_BYTES {
+        return Err(DaemonError::Lifecycle(
+            "upgrade attempt journal is invalid".into(),
+        ));
+    }
+    let mut encoded = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    fs::File::open(path)?
+        .take(MAX_ATTEMPT_BYTES.saturating_add(1))
+        .read_to_end(&mut encoded)?;
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_ATTEMPT_BYTES {
+        return Err(DaemonError::Lifecycle(
+            "upgrade attempt journal is oversized".into(),
+        ));
+    }
+    serde_json::from_slice(&encoded)
+        .map_err(|_| DaemonError::Lifecycle("upgrade attempt journal is malformed".into()))
+}
+
+fn validate_attempt(handoff: &NativeUpgradeHandoff, attempt: &NativeUpgradeAttempt) -> Result<()> {
+    if attempt.schema_version != 1 || attempt.target_version != handoff.release.target_version {
+        return Err(DaemonError::Lifecycle(
+            "upgrade attempt journal does not match the handoff".into(),
+        ));
+    }
+    if attempt.rollback_attempts > 1 {
+        return Err(DaemonError::Lifecycle(
+            "upgrade attempt journal has an invalid rollback count".into(),
+        ));
+    }
+    if let Some(sha256) = &attempt.backup_sha256
+        && (sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(DaemonError::Lifecycle(
+            "upgrade attempt journal has an invalid backup identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn refuse_repeated_attempt(handoff: &NativeUpgradeHandoff) -> Result<()> {
+    let path = attempt_path(handoff);
+    if !path.exists() {
+        return Ok(());
+    }
+    let attempt = read_attempt(handoff)?;
+    if attempt.target_version != handoff.release.target_version {
+        return Ok(());
+    }
+    validate_attempt(handoff, &attempt)?;
+    if attempt.rollback_attempts != 0
+        || matches!(
+            attempt.phase,
+            NativeUpgradePhase::RollbackStarted | NativeUpgradePhase::RolledBack
+        )
+    {
+        return Err(DaemonError::Lifecycle(
+            "automatic rollback was already attempted for this upgrade".into(),
+        ));
+    }
+    Err(DaemonError::Lifecycle(
+        "this native upgrade attempt is already in progress or complete".into(),
+    ))
 }
 
 fn read_handoff(path: &Path) -> Result<NativeUpgradeHandoff> {
@@ -293,12 +757,14 @@ fn process_is_running(process_id: u32) -> Result<bool> {
 #[derive(Debug)]
 struct Backup {
     payload: PathBuf,
+    sha256: String,
 }
 
 fn create_backup(handoff: &NativeUpgradeHandoff) -> Result<Backup> {
     let rollback = handoff.staging_root.join("rollback");
-    if rollback.exists() {
-        fs::remove_dir_all(&rollback)?;
+    if fs::symlink_metadata(&rollback).is_ok() {
+        let existing = canonical_rollback_root(handoff)?;
+        fs::remove_dir_all(existing)?;
     }
     fs::create_dir(&rollback)?;
     let payload = match handoff.release.target.installer {
@@ -319,7 +785,230 @@ fn create_backup(handoff: &NativeUpgradeHandoff) -> Result<Backup> {
         }
         InstallerKind::LinuxDeb => create_debian_backup(&rollback)?,
     };
-    Ok(Backup { payload })
+    let sha256 = backup_tree_sha256(handoff)?;
+    Ok(Backup { payload, sha256 })
+}
+
+fn existing_backup(handoff: &NativeUpgradeHandoff, expected_sha256: &str) -> Result<Backup> {
+    let rollback = canonical_rollback_root(handoff)?;
+    let payload = match handoff.release.target.installer {
+        InstallerKind::WindowsNsis => rollback.join("windows-install"),
+        InstallerKind::LinuxAppImage => rollback.join(
+            handoff
+                .installed_executable
+                .file_name()
+                .ok_or_else(|| DaemonError::Lifecycle("installed executable has no name".into()))?,
+        ),
+        InstallerKind::MacosDmg => rollback.join("SylvOps.app"),
+        InstallerKind::LinuxDeb => fs::read_dir(&rollback)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "deb"))
+            .ok_or_else(|| {
+                DaemonError::Lifecycle("Debian rollback package is unavailable".into())
+            })?,
+    };
+    let canonical = fs::canonicalize(&payload)?;
+    if !canonical.starts_with(&rollback) {
+        return Err(DaemonError::Lifecycle(
+            "rollback package escaped the owned staging directory".into(),
+        ));
+    }
+    let actual_sha256 = backup_tree_sha256(handoff)?;
+    if actual_sha256 != expected_sha256 {
+        return Err(DaemonError::Lifecycle(
+            "rollback package integrity check failed".into(),
+        ));
+    }
+    let backup = Backup {
+        payload: canonical,
+        sha256: actual_sha256,
+    };
+    verify_backup_signature(handoff, &backup)?;
+    Ok(backup)
+}
+
+fn remove_backup(handoff: &NativeUpgradeHandoff) -> Result<()> {
+    if fs::symlink_metadata(handoff.staging_root.join("rollback")).is_ok() {
+        let rollback = canonical_rollback_root(handoff)?;
+        fs::remove_dir_all(rollback)?;
+    }
+    Ok(())
+}
+
+fn canonical_rollback_root(handoff: &NativeUpgradeHandoff) -> Result<PathBuf> {
+    let staging = fs::canonicalize(&handoff.staging_root)?;
+    let requested = handoff.staging_root.join("rollback");
+    let metadata = fs::symlink_metadata(&requested)?;
+    if metadata_is_link(&metadata) {
+        return Err(DaemonError::Lifecycle(
+            "rollback package path is a link".into(),
+        ));
+    }
+    let rollback = fs::canonicalize(requested)?;
+    if rollback.parent() != Some(staging.as_path()) {
+        return Err(DaemonError::Lifecycle(
+            "rollback package escaped the owned staging directory".into(),
+        ));
+    }
+    Ok(rollback)
+}
+
+fn backup_tree_sha256(handoff: &NativeUpgradeHandoff) -> Result<String> {
+    let root = canonical_rollback_root(handoff)?;
+    let mut entries = Vec::new();
+    let mut budget = CopyBudget {
+        entries: 0,
+        bytes: 0,
+    };
+    collect_backup_entries(&root, &root, 0, &mut budget, &mut entries)?;
+    entries.sort();
+    let mut hasher = Sha256::new();
+    for path in entries {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata_is_link(&metadata) {
+            return Err(DaemonError::Lifecycle(
+                "rollback package contains a link".into(),
+            ));
+        }
+        let relative = path.strip_prefix(&root).map_err(|_| {
+            DaemonError::Lifecycle("rollback package entry escaped its root".into())
+        })?;
+        let relative = path_identity_bytes(relative.as_os_str());
+        hasher.update(
+            u64::try_from(relative.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(relative);
+        if metadata.is_dir() {
+            hasher.update([0]);
+        } else if metadata.is_file() {
+            hasher.update([1]);
+            hasher.update(metadata.len().to_le_bytes());
+            let mut file = fs::File::open(path)?;
+            let mut buffer = [0_u8; 8 * 1024];
+            let mut observed = 0_u64;
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                observed = observed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                if observed > metadata.len() {
+                    return Err(DaemonError::Lifecycle(
+                        "rollback package changed during integrity validation".into(),
+                    ));
+                }
+                hasher.update(&buffer[..read]);
+            }
+            if observed != metadata.len() {
+                return Err(DaemonError::Lifecycle(
+                    "rollback package changed during integrity validation".into(),
+                ));
+            }
+        } else {
+            return Err(DaemonError::Lifecycle(
+                "rollback package contains an unsupported entry".into(),
+            ));
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_backup_entries(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    budget: &mut CopyBudget,
+    entries: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if depth > MAX_PACKAGE_TREE_DEPTH {
+        return Err(DaemonError::Lifecycle(
+            "rollback package exceeds the depth limit".into(),
+        ));
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata_is_link(&metadata) {
+            return Err(DaemonError::Lifecycle(
+                "rollback package contains a link".into(),
+            ));
+        }
+        if !path.starts_with(root) {
+            return Err(DaemonError::Lifecycle(
+                "rollback package entry escaped its root".into(),
+            ));
+        }
+        budget.entries = budget.entries.saturating_add(1);
+        if budget.entries > MAX_PACKAGE_TREE_ENTRIES {
+            return Err(DaemonError::Lifecycle(
+                "rollback package exceeds the entry limit".into(),
+            ));
+        }
+        if metadata.is_file() {
+            budget.bytes = budget.bytes.saturating_add(metadata.len());
+            if budget.bytes > MAX_PACKAGE_TREE_BYTES {
+                return Err(DaemonError::Lifecycle(
+                    "rollback package exceeds the byte limit".into(),
+                ));
+            }
+        }
+        entries.push(path.clone());
+        if metadata.is_dir() {
+            collect_backup_entries(root, &path, depth.saturating_add(1), budget, entries)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn path_identity_bytes(path: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn path_identity_bytes(path: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    path.encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>()
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_link(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn verify_backup_signature(handoff: &NativeUpgradeHandoff, backup: &Backup) -> Result<()> {
+    match handoff.release.target.installer {
+        InstallerKind::WindowsNsis => {
+            verify_platform_signature(
+                &backup.payload.join("sylvops.exe"),
+                InstallerKind::WindowsNsis,
+            )?;
+            verify_platform_signature(
+                &backup.payload.join("uninstall.exe"),
+                InstallerKind::WindowsNsis,
+            )
+        }
+        InstallerKind::MacosDmg => {
+            verify_platform_signature(&backup.payload, InstallerKind::MacosDmg)
+        }
+        InstallerKind::LinuxAppImage | InstallerKind::LinuxDeb => Ok(()),
+    }
 }
 
 fn installed_payload_path(handoff: &NativeUpgradeHandoff) -> Result<&Path> {
@@ -342,10 +1031,7 @@ fn apply_package(handoff: &NativeUpgradeHandoff, payload: &Path) -> Result<()> {
             "Windows installer kind is invalid".into(),
         ));
     }
-    successful(
-        Command::new(payload).args(["/S", "/R"]),
-        "Windows installer",
-    )
+    successful(Command::new(payload).arg("/S"), "Windows installer")
 }
 
 #[cfg(target_os = "linux")]
@@ -460,10 +1146,8 @@ fn restore_windows_backup(handoff: &NativeUpgradeHandoff, package: &Path) -> Res
     let rollback = package
         .parent()
         .ok_or_else(|| DaemonError::Lifecycle("Windows rollback package has no parent".into()))?;
-    let candidate_registry = rollback.join("candidate-registry");
-    if candidate_registry.exists() {
-        fs::remove_dir_all(&candidate_registry)?;
-    }
+    let candidate_registry = handoff.staging_root.join("candidate-registry");
+    remove_owned_staging_directory(handoff, &candidate_registry)?;
     export_windows_registry(&candidate_registry)?;
 
     let install_swap = WindowsTreeSwap::apply(&install_root, package, "install")?;
@@ -483,10 +1167,34 @@ fn restore_windows_backup(handoff: &NativeUpgradeHandoff, package: &Path) -> Res
         let _ = import_windows_registry(&candidate_registry);
         let _ = menu_swap.revert();
         let _ = install_swap.revert();
+        let _ = remove_owned_staging_directory(handoff, &candidate_registry);
         return Err(error);
     }
     menu_swap.commit();
     install_swap.commit();
+    remove_owned_staging_directory(handoff, &candidate_registry)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_owned_staging_directory(handoff: &NativeUpgradeHandoff, path: &Path) -> Result<()> {
+    if fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+    let staging = fs::canonicalize(&handoff.staging_root)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata_is_link(&metadata) {
+        return Err(DaemonError::Lifecycle(
+            "Windows rollback scratch path is a link".into(),
+        ));
+    }
+    let canonical = fs::canonicalize(path)?;
+    if canonical.parent() != Some(staging.as_path()) {
+        return Err(DaemonError::Lifecycle(
+            "Windows rollback scratch path escaped staging".into(),
+        ));
+    }
+    fs::remove_dir_all(canonical)?;
     Ok(())
 }
 
@@ -935,7 +1643,10 @@ async fn verify_health(paths: &RuntimePaths, handoff: &NativeUpgradeHandoff) -> 
                     "updated daemon reported incompatible health".into(),
                 ));
             }
-            if !installed_version(handoff)?.contains(&handoff.release.target_version) {
+            verify_daemon_executable_identity(health.process_id, handoff)?;
+            if installed_version(handoff)?.trim()
+                != format!("sylvops {}", handoff.release.target_version)
+            {
                 return Err(DaemonError::Lifecycle(
                     "updated executable version does not match".into(),
                 ));
@@ -953,6 +1664,66 @@ async fn verify_health(paths: &RuntimePaths, handoff: &NativeUpgradeHandoff) -> 
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn verify_daemon_executable_identity(
+    process_id: u32,
+    handoff: &NativeUpgradeHandoff,
+) -> Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+
+    // SAFETY: the returned handle is checked and transferred into `OwnedHandle` exactly once.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return Err(DaemonError::Lifecycle(
+            "updated daemon executable identity could not be inspected".into(),
+        ));
+    }
+    // SAFETY: `process` is a valid owned handle and is transferred exactly once.
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let mut executable = vec![0_u16; 32_768];
+    let mut length = u32::try_from(executable.len()).expect("executable path buffer fits u32");
+    // SAFETY: the process handle grants query access and the output buffer is valid for `length`
+    // UTF-16 code units.
+    if unsafe {
+        QueryFullProcessImageNameW(
+            process.as_raw_handle(),
+            0,
+            executable.as_mut_ptr(),
+            &raw mut length,
+        )
+    } == 0
+    {
+        return Err(DaemonError::Lifecycle(
+            "updated daemon executable identity could not be inspected".into(),
+        ));
+    }
+    executable.truncate(usize::try_from(length).unwrap_or(0));
+    let actual = fs::canonicalize(PathBuf::from(String::from_utf16_lossy(&executable)))?;
+    let expected = fs::canonicalize(&handoff.installed_executable)?;
+    if !actual
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+    {
+        return Err(DaemonError::Lifecycle(
+            "updated daemon executable identity does not match the installation".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_daemon_executable_identity(
+    _process_id: u32,
+    _handoff: &NativeUpgradeHandoff,
+) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1085,7 +1856,7 @@ async fn report_outcome(
 }
 
 fn relaunch_desktop(handoff: &NativeUpgradeHandoff) -> Result<()> {
-    installed_command(handoff)
+    let mut child = installed_command(handoff)
         .arg("desktop")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1094,5 +1865,18 @@ fn relaunch_desktop(handoff: &NativeUpgradeHandoff) -> Result<()> {
         .map_err(|error| {
             DaemonError::Lifecycle(format!("updated desktop did not relaunch: {error}"))
         })?;
-    Ok(())
+    let deadline = Instant::now() + DESKTOP_START_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            DaemonError::Lifecycle(format!("updated desktop could not be observed: {error}"))
+        })? {
+            return Err(DaemonError::Lifecycle(format!(
+                "updated desktop exited during relaunch with {status}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }

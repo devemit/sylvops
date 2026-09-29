@@ -117,6 +117,16 @@ enum Command {
         #[arg(long)]
         handoff: PathBuf,
     },
+    /// Internal watchdog for an interrupted native package helper.
+    #[command(hide = true)]
+    UpdateWatchdog {
+        #[arg(long)]
+        handoff: PathBuf,
+        #[arg(long)]
+        supervisor_process_id: u32,
+        #[arg(long)]
+        backup_sha256: String,
+    },
     #[command(hide = true)]
     Hook {
         #[command(subcommand)]
@@ -378,6 +388,14 @@ async fn run_command(
         } => remove_user_data(&paths, &confirm).await?,
         Command::UpdateHelper { handoff } => {
             sylvops_daemon::native_upgrade::run(&handoff).await?;
+        }
+        Command::UpdateWatchdog {
+            handoff,
+            supervisor_process_id,
+            backup_sha256,
+        } => {
+            sylvops_daemon::native_upgrade::watch(&handoff, supervisor_process_id, &backup_sha256)
+                .await?;
         }
         Command::Desktop => unreachable!("desktop mode is handled before starting Tokio"),
         Command::Hook {
