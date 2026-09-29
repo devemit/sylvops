@@ -31,6 +31,7 @@ const MAX_ATTEMPT_BYTES: u64 = 16 * 1024;
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 const CLIENT_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(45);
 const DESKTOP_START_TIMEOUT: Duration = Duration::from_secs(2);
 const IPC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ROLLBACK_RETRY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -2782,7 +2783,7 @@ fn start_installed_daemon(handoff: &NativeUpgradeHandoff) -> Result<()> {
     successful_with_timeout(
         &mut command,
         "installed daemon start",
-        HEALTH_TIMEOUT,
+        DAEMON_START_TIMEOUT,
         false,
     )
 }

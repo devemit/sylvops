@@ -26,6 +26,8 @@ use sylvops_daemon::data_removal::{
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
 use tracing_subscriber::EnvFilter;
 
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Parser)]
 #[command(
     name = "sylvops",
@@ -479,7 +481,7 @@ async fn start_daemon(
     let mut child = command.spawn().map_err(|error| {
         DaemonError::Lifecycle(format!("failed to start daemon process: {error}"))
     })?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
     loop {
         if let Ok(client) = DaemonClient::connect(paths, "sylvops-cli").await
             && let Ok(DaemonResponse::Health(health)) = client.request(&ClientRequest::Health).await
@@ -505,7 +507,8 @@ async fn start_daemon(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(DaemonError::Lifecycle(format!(
-                "daemon did not become ready within 10 seconds; see {}",
+                "daemon did not become ready within {} seconds; see {}",
+                DAEMON_START_TIMEOUT.as_secs(),
                 paths.daemon_log.display()
             )));
         }
