@@ -22,7 +22,7 @@ use sylvops_core::{
 use sylvops_daemon::{
     DaemonError,
     client::DaemonClient,
-    daemon::{self, CONTROL_OPCODE, UpgradeHandoffLauncher},
+    daemon::{self, CONTROL_OPCODE, DataRemovalHandoffLauncher, UpgradeHandoffLauncher},
     data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan, reservation, reservation_pending},
     database::DatabaseHandle,
     ipc::{self, BoxStream},
@@ -35,6 +35,24 @@ use sylvops_test_support::TemporaryRepository;
 struct RecordingHandoff {
     calls: AtomicUsize,
     expected_terminated_session: Mutex<Option<SessionId>>,
+}
+
+#[derive(Debug, Default)]
+struct RecordingDataRemovalHandoff {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl DataRemovalHandoffLauncher for RecordingDataRemovalHandoff {
+    async fn launch(
+        &self,
+        _paths: &RuntimePaths,
+        _handoff_token: &str,
+        _daemon_process_id: u32,
+    ) -> sylvops_daemon::Result<()> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
 }
 
 impl RecordingHandoff {
@@ -88,6 +106,7 @@ impl UpgradeHandoffLauncher for RecordingHandoff {
 struct DaemonFixture {
     client: DaemonClient,
     task: Option<tokio::task::JoinHandle<sylvops_daemon::Result<()>>>,
+    data_removal_handoff: Arc<RecordingDataRemovalHandoff>,
 }
 
 #[derive(Debug)]
@@ -194,6 +213,55 @@ async fn data_removal_reservation_blocks_daemon_restart_until_removal_finishes()
     tokio::time::timeout(Duration::from_secs(20), exercise_data_removal_reservation())
         .await
         .expect("data removal coordination integration timeout");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_sessions_block_data_removal_without_stopping_them() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let repository = TemporaryRepository::initialize()
+            .await
+            .expect("temporary repository");
+        let paths = prepared_paths(repository.root());
+        let launcher = Arc::new(RecordingHandoff::default());
+        let fixture = start_daemon(&paths, launcher).await;
+        let session_id =
+            create_active_session(&fixture.client, repository.path(), "Keep running").await;
+
+        let response = fixture
+            .client
+            .request(&ClientRequest::PrepareDataRemoval {
+                confirmation: DATA_REMOVAL_CONFIRMATION.into(),
+            })
+            .await
+            .expect("data-removal refusal");
+
+        assert!(matches!(
+            response,
+            DaemonResponse::Error(ref failure)
+                if failure.code == "daemon_operation_failed"
+                    && failure.message.contains("sessions are active")
+        ));
+        assert_session_state(&fixture.client, session_id, |state| {
+            state == SessionState::Running
+        })
+        .await;
+        assert!(!reservation_pending(&paths).expect("reservation state"));
+        fixture.shutdown().await;
+        let connection = rusqlite::Connection::open(&paths.database).expect("open database");
+        let failed_audits: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events \
+                 WHERE action = 'user_data_removal_prepared' \
+                   AND outcome = 'failed' \
+                   AND details_json = '{\"reason\":\"active_sessions\"}'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query data-removal audit");
+        assert_eq!(failed_audits, 1);
+    })
+    .await
+    .expect("active-session data-removal integration timeout");
 }
 
 async fn exercise_missing_staged_upgrade_override() {
@@ -536,8 +604,25 @@ async fn exercise_data_removal_reservation() {
             .expect("data removal response"),
         DaemonResponse::DataRemovalPrepared
     );
+    assert_eq!(
+        fixture.data_removal_handoff.calls.load(Ordering::Acquire),
+        1
+    );
     fixture.join().await;
     assert!(reservation_pending(&paths).expect("reservation state"));
+    let audit_copy = temporary.path().join("audit.sqlite");
+    std::fs::copy(&paths.database, &audit_copy).expect("copy audit database");
+    let connection = rusqlite::Connection::open(audit_copy).expect("open database");
+    let successful_audits: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events \
+             WHERE action = 'user_data_removal_prepared' AND outcome = 'succeeded'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query successful data-removal audit");
+    assert_eq!(successful_audits, 1);
+    drop(connection);
 
     let restart = daemon::run_with_handoff_launcher(paths.clone(), launcher).await;
     assert!(matches!(
@@ -687,13 +772,17 @@ fn staged_release() -> ReleaseMetadata {
 
 async fn start_daemon(paths: &RuntimePaths, launcher: Arc<RecordingHandoff>) -> DaemonFixture {
     let daemon_paths = paths.clone();
+    let data_removal_handoff = Arc::new(RecordingDataRemovalHandoff::default());
+    let daemon_data_removal_handoff = data_removal_handoff.clone();
     let mut task = PendingDaemonTask(Some(tokio::spawn(async move {
-        daemon::run_with_handoff_launcher(daemon_paths, launcher).await
+        daemon::run_with_handoff_launchers(daemon_paths, launcher, daemon_data_removal_handoff)
+            .await
     })));
     let client = connect_eventually(paths).await;
     DaemonFixture {
         client,
         task: task.0.take(),
+        data_removal_handoff,
     }
 }
 

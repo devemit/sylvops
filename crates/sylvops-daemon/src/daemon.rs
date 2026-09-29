@@ -336,6 +336,7 @@ struct DaemonState {
     hook_tracking: Arc<Mutex<HashMap<SessionId, HookTracking>>>,
     upgrade: Arc<UpgradeCoordinator>,
     upgrade_handoff: Arc<dyn UpgradeHandoffLauncher>,
+    data_removal_handoff: Arc<dyn DataRemovalHandoffLauncher>,
     runtime_paths: RuntimePaths,
 }
 
@@ -391,13 +392,44 @@ impl UpgradeHandoffLauncher for NativeUpgradeHandoffLauncher {
     }
 }
 
+#[async_trait]
+pub trait DataRemovalHandoffLauncher: std::fmt::Debug + Send + Sync {
+    /// Starts the detached daemon-owned helper that completes a prepared data removal.
+    async fn launch(
+        &self,
+        paths: &RuntimePaths,
+        handoff_token: &str,
+        daemon_process_id: u32,
+    ) -> Result<()>;
+}
+
+#[derive(Debug)]
+struct NativeDataRemovalHandoffLauncher;
+
+#[async_trait]
+impl DataRemovalHandoffLauncher for NativeDataRemovalHandoffLauncher {
+    async fn launch(
+        &self,
+        paths: &RuntimePaths,
+        handoff_token: &str,
+        daemon_process_id: u32,
+    ) -> Result<()> {
+        spawn_data_removal_helper(paths, handoff_token, daemon_process_id)
+    }
+}
+
 /// Runs the authoritative daemon until an authenticated shutdown request is received.
 ///
 /// # Errors
 ///
 /// Returns an error when runtime setup, persistence, IPC, hook binding, or cleanup fails.
 pub async fn run(paths: RuntimePaths) -> Result<()> {
-    run_with_handoff_launcher(paths, Arc::new(NativeUpgradeHandoffLauncher)).await
+    run_with_handoff_launchers(
+        paths,
+        Arc::new(NativeUpgradeHandoffLauncher),
+        Arc::new(NativeDataRemovalHandoffLauncher),
+    )
+    .await
 }
 
 /// Runs the daemon with an explicit native-upgrade handoff boundary.
@@ -413,6 +445,26 @@ pub async fn run(paths: RuntimePaths) -> Result<()> {
 pub async fn run_with_handoff_launcher(
     paths: RuntimePaths,
     upgrade_handoff: Arc<dyn UpgradeHandoffLauncher>,
+) -> Result<()> {
+    run_with_handoff_launchers(
+        paths,
+        upgrade_handoff,
+        Arc::new(NativeDataRemovalHandoffLauncher),
+    )
+    .await
+}
+
+/// Runs the daemon with explicit upgrade and data-removal handoff boundaries.
+///
+/// # Errors
+///
+/// Returns an error when runtime setup, persistence, IPC, hook binding, or cleanup fails.
+#[doc(hidden)]
+#[allow(clippy::too_many_lines)]
+pub async fn run_with_handoff_launchers(
+    paths: RuntimePaths,
+    upgrade_handoff: Arc<dyn UpgradeHandoffLauncher>,
+    data_removal_handoff: Arc<dyn DataRemovalHandoffLauncher>,
 ) -> Result<()> {
     if crate::data_removal::reservation_pending(&paths)? {
         return Err(DaemonError::Lifecycle(
@@ -481,6 +533,7 @@ pub async fn run_with_handoff_launcher(
         hook_tracking: Arc::new(Mutex::new(HashMap::new())),
         upgrade,
         upgrade_handoff,
+        data_removal_handoff,
         runtime_paths: paths.clone(),
     };
     tracing::info!(reconciled, "SylvOps daemon is ready");
@@ -640,6 +693,68 @@ async fn spawn_native_upgrade_helper(
         let _ = tokio::fs::remove_file(&handoff_path).await;
     }
     result
+}
+
+fn spawn_data_removal_helper(
+    paths: &RuntimePaths,
+    handoff_token: &str,
+    daemon_process_id: u32,
+) -> Result<()> {
+    let executable = canonical_current_executable()?;
+    for directory in [
+        &paths.data_directory,
+        &paths.config_directory,
+        &paths.runtime_directory,
+    ] {
+        let canonical = std::fs::canonicalize(directory).map_err(|_| {
+            DaemonError::Lifecycle("data-removal helper path validation failed".into())
+        })?;
+        if executable.starts_with(canonical) {
+            return Err(DaemonError::Lifecycle(
+                "data-removal helper cannot run from a removal target".into(),
+            ));
+        }
+    }
+    let mut command = crate::background_process::command(executable);
+    command
+        .arg("data-removal-helper")
+        .arg("--data-directory")
+        .arg(&paths.data_directory)
+        .arg("--config-directory")
+        .arg(&paths.config_directory)
+        .arg("--runtime-directory")
+        .arg(&paths.runtime_directory)
+        .arg("--daemon-process-id")
+        .arg(daemon_process_id.to_string())
+        .arg("--handoff-token")
+        .arg(handoff_token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_detached_data_removal_helper(&mut command);
+    command.spawn().map_err(|error| {
+        DaemonError::Lifecycle(format!("could not start data-removal helper: {error}"))
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_detached_data_removal_helper(command: &mut tokio::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_detached_data_removal_helper(command: &mut tokio::process::Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+    };
+
+    command
+        .as_std_mut()
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS);
 }
 
 async fn reconcile_worktrees(database: &DatabaseHandle) -> Result<serde_json::Value> {
@@ -1771,6 +1886,14 @@ async fn handle_request(
             let _mutation = state.application_mutations.begin()?;
             let mut lifecycle_quiesce = state.lifecycle.quiesce().await?;
             if confirmation != DATA_REMOVAL_CONFIRMATION {
+                state
+                    .database
+                    .audit(
+                        "user_data_removal_prepared",
+                        "failed",
+                        r#"{"reason":"confirmation_required"}"#,
+                    )
+                    .await?;
                 return Err(crate::data_removal::DataRemovalError::ConfirmationRequired.into());
             }
             let managed_sessions: Vec<_> = state.sessions.read().await.values().cloned().collect();
@@ -1779,6 +1902,14 @@ async fn handle_request(
                     managed.record.read().await.state,
                     SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
                 ) {
+                    state
+                        .database
+                        .audit(
+                            "user_data_removal_prepared",
+                            "failed",
+                            r#"{"reason":"active_sessions"}"#,
+                        )
+                        .await?;
                     return Err(DaemonError::Lifecycle(
                         "user data cannot be removed while sessions are active".into(),
                     ));
@@ -1796,21 +1927,77 @@ async fn handle_request(
                         .map(|worktree| PathBuf::from(&worktree.canonical_path)),
                 )
                 .collect::<Vec<_>>();
-            DataRemovalPlan::prepare(&state.runtime_paths, &confirmation, &protected_paths)?;
-            state
+            if let Err(error) =
+                DataRemovalPlan::prepare(&state.runtime_paths, &confirmation, &protected_paths)
+            {
+                state
+                    .database
+                    .audit(
+                        "user_data_removal_prepared",
+                        "failed",
+                        r#"{"reason":"unsafe_targets"}"#,
+                    )
+                    .await?;
+                return Err(error.into());
+            }
+            let handoff_token = match crate::data_removal::reserve_for_daemon(
+                &state.runtime_paths,
+                &protected_paths,
+            ) {
+                Ok(handoff_token) => handoff_token,
+                Err(error) => {
+                    state
+                        .database
+                        .audit(
+                            "user_data_removal_prepared",
+                            "failed",
+                            r#"{"reason":"reservation_failed"}"#,
+                        )
+                        .await?;
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = state
+                .data_removal_handoff
+                .launch(&state.runtime_paths, &handoff_token, std::process::id())
+                .await
+            {
+                crate::data_removal::clear_reservation(&state.runtime_paths);
+                let _ = state
+                    .database
+                    .audit(
+                        "user_data_removal_prepared",
+                        "failed",
+                        r#"{"reason":"helper_launch_failed"}"#,
+                    )
+                    .await;
+                return Err(error);
+            }
+            if let Err(error) = state
                 .database
                 .audit(
                     "user_data_removal_prepared",
                     "succeeded",
                     &serde_json::json!({ "protected_paths": protected_paths.len() }).to_string(),
                 )
-                .await?;
-            crate::data_removal::reserve(&state.runtime_paths, &protected_paths)?;
+                .await
+            {
+                crate::data_removal::clear_reservation(&state.runtime_paths);
+                return Err(error);
+            }
             if let Err(error) =
                 send_response_queue(outgoing, request_id, &DaemonResponse::DataRemovalPrepared)
                     .await
             {
                 crate::data_removal::clear_reservation(&state.runtime_paths);
+                let _ = state
+                    .database
+                    .audit(
+                        "user_data_removal_prepared",
+                        "failed",
+                        r#"{"reason":"response_delivery_failed"}"#,
+                    )
+                    .await;
                 return Err(error);
             }
             state.shutdown.send_replace(true);

@@ -19,7 +19,10 @@ use sylvops_core::{
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     upgrade::InstallDisposition,
 };
-use sylvops_daemon::data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan};
+use sylvops_daemon::data_removal::{
+    DATA_REMOVAL_CONFIRMATION, recover_prepared_removal, removal_complete,
+    run_prepared_removal_after_process, wait_for_removal_completion,
+};
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
 use tracing_subscriber::EnvFilter;
 
@@ -126,6 +129,20 @@ enum Command {
         supervisor_process_id: u32,
         #[arg(long)]
         backup_sha256: String,
+    },
+    /// Internal detached user-data removal helper.
+    #[command(hide = true)]
+    DataRemovalHelper {
+        #[arg(long)]
+        data_directory: PathBuf,
+        #[arg(long)]
+        config_directory: PathBuf,
+        #[arg(long)]
+        runtime_directory: PathBuf,
+        #[arg(long)]
+        daemon_process_id: u32,
+        #[arg(long)]
+        handoff_token: String,
     },
     #[command(hide = true)]
     Hook {
@@ -395,6 +412,21 @@ async fn run_command(
             backup_sha256,
         } => {
             sylvops_daemon::native_upgrade::watch(&handoff, supervisor_process_id, &backup_sha256)
+                .await?;
+        }
+        Command::DataRemovalHelper {
+            data_directory,
+            config_directory,
+            runtime_directory,
+            daemon_process_id,
+            handoff_token,
+        } => {
+            let helper_paths = RuntimePaths::from_explicit_directories(
+                data_directory,
+                config_directory,
+                runtime_directory,
+            )?;
+            run_prepared_removal_after_process(&helper_paths, daemon_process_id, &handoff_token)
                 .await?;
         }
         Command::Desktop => unreachable!("desktop mode is handled before starting Tokio"),
@@ -1068,32 +1100,22 @@ async fn remove_user_data(paths: &RuntimePaths, confirmation: &str) -> sylvops_d
             sylvops_daemon::data_removal::DataRemovalError::ConfirmationRequired,
         ));
     }
-    if let Some(protected_paths) = sylvops_daemon::data_removal::reservation(paths)? {
-        wait_for_daemon_stop_for_data_removal(paths).await?;
-        let plan = DataRemovalPlan::prepare(paths, confirmation, &protected_paths)?;
-        plan.execute().await?;
+    if sylvops_daemon::data_removal::reservation(paths)?.is_some() {
+        if wait_for_removal_completion(paths).await.is_err() {
+            recover_prepared_removal(paths).await?;
+        }
+        println!(
+            "Removed SylvOps user data. Repositories, worktrees, and branches were preserved."
+        );
+        return Ok(());
+    }
+    if removal_complete(paths)? {
         println!(
             "Removed SylvOps user data. Repositories, worktrees, and branches were preserved."
         );
         return Ok(());
     }
     let client = DaemonClient::connect(paths, "sylvops-data-removal").await?;
-    let snapshot = match client.request(&ClientRequest::GetSnapshot).await? {
-        DaemonResponse::Snapshot(snapshot) => snapshot,
-        response => return unexpected("data-removal snapshot", response),
-    };
-    let protected_paths = snapshot
-        .projects
-        .iter()
-        .map(|project| PathBuf::from(&project.canonical_repository_path))
-        .chain(
-            snapshot
-                .worktrees
-                .iter()
-                .map(|worktree| PathBuf::from(&worktree.canonical_path)),
-        )
-        .collect::<Vec<_>>();
-    let plan = DataRemovalPlan::prepare(paths, confirmation, &protected_paths)?;
     match client
         .request(&ClientRequest::PrepareDataRemoval {
             confirmation: confirmation.into(),
@@ -1104,22 +1126,8 @@ async fn remove_user_data(paths: &RuntimePaths, confirmation: &str) -> sylvops_d
         response => return unexpected("data-removal preparation", response),
     }
     drop(client);
-    wait_for_daemon_stop_for_data_removal(paths).await?;
-    plan.execute().await?;
+    wait_for_removal_completion(paths).await?;
     println!("Removed SylvOps user data. Repositories, worktrees, and branches were preserved.");
-    Ok(())
-}
-
-async fn wait_for_daemon_stop_for_data_removal(paths: &RuntimePaths) -> sylvops_daemon::Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while paths.authentication_token.exists() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    if paths.authentication_token.exists() {
-        return Err(DaemonError::Lifecycle(
-            "daemon did not stop before user-data removal".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -1448,4 +1456,109 @@ fn configure_desktop_app_identity() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("failed to set Windows application identity: 0x{result:08x}").into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cli_data_removal_rejects_weak_confirmation_without_deleting_data() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let paths =
+            RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("runtime paths");
+        paths.prepare().expect("prepare runtime paths");
+        let sentinel = paths.data_directory.join("keep-until-confirmed");
+        std::fs::write(&sentinel, b"state").expect("write sentinel");
+
+        let error = remove_user_data(&paths, "delete it")
+            .await
+            .expect_err("weak confirmation must fail");
+
+        assert!(matches!(
+            error,
+            DaemonError::DataRemoval(
+                sylvops_daemon::data_removal::DataRemovalError::ConfirmationRequired
+            )
+        ));
+        assert!(sentinel.exists());
+    }
+
+    #[tokio::test]
+    async fn cli_data_removal_is_repeatable_without_a_running_daemon() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let paths =
+            RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("runtime paths");
+        paths.prepare().expect("prepare runtime paths");
+        sylvops_daemon::data_removal::reserve(&paths, &[]).expect("reserve removal");
+        sylvops_daemon::data_removal::run_prepared_removal(&paths)
+            .await
+            .expect("complete prepared removal");
+
+        remove_user_data(&paths, DATA_REMOVAL_CONFIRMATION)
+            .await
+            .expect("first removal");
+        remove_user_data(&paths, DATA_REMOVAL_CONFIRMATION)
+            .await
+            .expect("repeat removal");
+
+        assert!(!paths.data_directory.exists());
+        assert!(!paths.config_directory.exists());
+        assert!(!paths.runtime_directory.exists());
+    }
+
+    #[tokio::test]
+    async fn cli_repeat_cleanup_preserves_a_managed_worktree_and_branch_metadata() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let paths =
+            RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("runtime paths");
+        paths.prepare().expect("prepare runtime paths");
+        let worktree = paths.data_directory.join("worktrees/project/task");
+        std::fs::create_dir_all(&worktree).expect("managed worktree");
+        std::fs::write(worktree.join(".git"), b"gitdir: preserved").expect("worktree Git metadata");
+        std::fs::write(worktree.join("keep.txt"), b"keep").expect("worktree content");
+        sylvops_daemon::data_removal::reserve(&paths, std::slice::from_ref(&worktree))
+            .expect("reserve removal");
+        sylvops_daemon::data_removal::run_prepared_removal(&paths)
+            .await
+            .expect("complete prepared removal");
+
+        remove_user_data(&paths, DATA_REMOVAL_CONFIRMATION)
+            .await
+            .expect("repeat removal");
+
+        assert_eq!(std::fs::read(worktree.join("keep.txt")).unwrap(), b"keep");
+        assert!(worktree.join(".git").exists());
+    }
+
+    #[tokio::test]
+    async fn cli_data_removal_refuses_a_link_or_junction_root() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let paths =
+            RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("runtime paths");
+        paths.prepare().expect("prepare runtime paths");
+        let real_data = temporary.path().join("real-data");
+        std::fs::rename(&paths.data_directory, &real_data).expect("move real data");
+        create_directory_link(&real_data, &paths.data_directory).expect("directory link");
+
+        let error = remove_user_data(&paths, DATA_REMOVAL_CONFIRMATION)
+            .await
+            .expect_err("linked root must fail");
+
+        assert!(matches!(
+            error,
+            DaemonError::DataRemoval(sylvops_daemon::data_removal::DataRemovalError::UnsafeTarget)
+        ));
+        assert!(real_data.join(".sylvops-owned").exists());
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        junction::create(target, link)
+    }
 }

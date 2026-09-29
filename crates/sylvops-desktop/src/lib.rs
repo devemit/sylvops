@@ -13,7 +13,7 @@ use std::{
 };
 
 use bridge::{Bridge, BridgeEvent, Operation};
-use forms::{Confirmation, FormModal, Modal};
+use forms::{Confirmation, DataRemovalConfirmation, FormModal, Modal};
 use iced::{
     Background, Border, Center, Color, Element, Fill, Font, Length, Point, Subscription, Task,
     Theme,
@@ -381,6 +381,9 @@ enum Message {
     DownloadUpdate,
     InstallUpdate,
     TogglePeriodicUpdateChecks,
+    OpenDataRemoval,
+    DataRemovalConfirmationInput(String),
+    SubmitDataRemoval,
 }
 
 impl DesktopApp {
@@ -629,6 +632,13 @@ impl DesktopApp {
                     !self.desktop_state.periodic_update_checks;
                 self.mark_state_dirty();
             }
+            Message::OpenDataRemoval => self.open_data_removal_confirmation(),
+            Message::DataRemovalConfirmationInput(value) => {
+                if let Some(Modal::DataRemoval(confirmation)) = &mut self.modal {
+                    confirmation.update(value);
+                }
+            }
+            Message::SubmitDataRemoval => self.submit_data_removal(),
             Message::ToggleFullscreen => {
                 let Some(window_id) = self.window_id else {
                     self.error = Some("The application window is not ready yet.".into());
@@ -1561,6 +1571,7 @@ impl DesktopApp {
             Modal::Shortcuts => Self::shortcuts_view(),
             Modal::Form(form) => Self::form_view(form),
             Modal::Confirmation(confirmation) => Self::confirmation_view(confirmation),
+            Modal::DataRemoval(confirmation) => Self::data_removal_view(confirmation),
         }
     }
 
@@ -1678,6 +1689,9 @@ impl DesktopApp {
                 text("Safety").font(UI_SEMIBOLD).size(16),
                 text("The desktop remains an IPC client. The daemon still owns PTYs, Git mutations, process cleanup, and audit events.")
                     .style(text::secondary),
+                button("Remove SylvOps user data…")
+                    .on_press(Message::OpenDataRemoval)
+                    .style(danger_action_style),
             ]
             .spacing(16),
         )
@@ -1957,6 +1971,46 @@ impl DesktopApp {
         .into()
     }
 
+    fn data_removal_view(confirmation: &DataRemovalConfirmation) -> Element<'_, Message> {
+        container(
+            column![
+                text("Remove SylvOps user data").font(UI_SEMIBOLD).size(22),
+                text("Permanently remove configuration, preferences, logs, and session history. Repositories, worktrees, and Git branches are preserved."),
+                text("All sessions must be stopped. Type DELETE SYLVOPS USER DATA to continue.")
+                    .style(text::secondary),
+                text_input(
+                    "DELETE SYLVOPS USER DATA",
+                    &confirmation.confirmation,
+                )
+                .on_input_maybe(
+                    (!confirmation.pending).then_some(Message::DataRemovalConfirmationInput),
+                ),
+                row![
+                    space::horizontal(),
+                    button("Cancel")
+                        .on_press_maybe((!confirmation.pending).then_some(Message::CancelModal)),
+                    button(if confirmation.pending {
+                        "Removing…"
+                    } else {
+                        "Remove user data"
+                    })
+                    .on_press_maybe(
+                        confirmation
+                            .can_submit()
+                            .then_some(Message::SubmitDataRemoval),
+                    )
+                    .style(danger_action_style),
+                ]
+                .spacing(8),
+            ]
+            .spacing(16),
+        )
+        .padding(22)
+        .width(Length::Fixed(560.0))
+        .style(modal_card)
+        .into()
+    }
+
     fn footer(&self) -> Element<'_, Message> {
         let compact = self.desktop_state.window_width < 900;
         let workspace = self
@@ -2073,6 +2127,13 @@ impl DesktopApp {
                 if matches!(operation, Some(Operation::SaveDesktopState)) {
                     self.state_save_pending = false;
                 }
+                if matches!(operation, Some(Operation::PrepareDataRemoval)) {
+                    if let Some(Modal::DataRemoval(confirmation)) = &mut self.modal {
+                        confirmation.pending = false;
+                    }
+                    self.error = Some(message);
+                    return;
+                }
                 if matches!(&operation, Some(Operation::ProbeProvider(_))) {
                     if let Some(Modal::Form(modal)) = &mut self.modal {
                         modal.provider_probe = None;
@@ -2107,6 +2168,23 @@ impl DesktopApp {
                     self.error = Some(message);
                 }
             }
+            BridgeEvent::DataRemovalFinished(result) => match result {
+                Ok(()) => {
+                    self.connection = ConnectionState::Disconnected;
+                    self.modal = None;
+                    self.show_success(
+                        "SylvOps user data was removed; repositories, worktrees, and branches were preserved.",
+                    );
+                    self.closing_since = Some(Instant::now());
+                }
+                Err(message) => {
+                    self.connection = ConnectionState::Disconnected;
+                    self.modal = None;
+                    self.error = Some(format!(
+                        "User-data removal did not complete: {message}. Run the data-removal command again to retry."
+                    ));
+                }
+            },
             BridgeEvent::Closed => {
                 self.connection = ConnectionState::Disconnected;
                 self.error = Some("The daemon connection closed. Sessions remain daemon-owned; reopen SylvOps or restart the daemon.".into());
@@ -2316,7 +2394,8 @@ impl DesktopApp {
                         Some("Terminal input was acknowledged after the tab closed.".into());
                 }
             }
-            (Operation::Resize, DaemonResponse::Acknowledged) => {}
+            (Operation::Resize, DaemonResponse::Acknowledged)
+            | (Operation::PrepareDataRemoval, DaemonResponse::DataRemovalPrepared) => {}
             (Operation::SaveDesktopState, DaemonResponse::DesktopStateSaved) => {
                 self.state_save_pending = false;
                 if self.closing_since.is_some()
@@ -2481,6 +2560,13 @@ impl DesktopApp {
             (operation, DaemonResponse::Error(failure)) => {
                 if let Operation::Resume(session_id) = operation {
                     self.resume_pending.remove(&session_id);
+                }
+                if matches!(operation, Operation::PrepareDataRemoval) {
+                    if let Some(Modal::DataRemoval(confirmation)) = &mut self.modal {
+                        confirmation.pending = false;
+                    }
+                    self.error = Some(failure.message);
+                    return;
                 }
                 if matches!(operation, Operation::ProbeProvider(_)) {
                     if let Some(Modal::Form(modal)) = &mut self.modal {
@@ -3144,6 +3230,25 @@ impl DesktopApp {
             session_name: session.display_name.clone(),
             cwd: session.cwd.clone(),
         }));
+    }
+
+    fn open_data_removal_confirmation(&mut self) {
+        self.modal = Some(Modal::DataRemoval(DataRemovalConfirmation::default()));
+    }
+
+    fn submit_data_removal(&mut self) {
+        let Some(Modal::DataRemoval(confirmation)) = &mut self.modal else {
+            return;
+        };
+        if !confirmation.can_submit() {
+            return;
+        }
+        let phrase = confirmation.confirmation.clone();
+        if self.bridge.remove_user_data(phrase) {
+            confirmation.begin_submission();
+        } else {
+            self.error = Some("The desktop command queue is full. Try again.".into());
+        }
     }
 
     fn inspect_worktree_removal(&mut self) {
@@ -5431,5 +5536,127 @@ mod tests {
             ),
             "Open Shell"
         );
+    }
+
+    #[test]
+    fn desktop_data_removal_can_be_cancelled_before_submission() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-data-removal-cancel-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+
+        app.open_data_removal_confirmation();
+        assert!(matches!(app.modal, Some(Modal::DataRemoval(_))));
+
+        let _ = app.update(Message::CancelModal);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn desktop_data_removal_becomes_irreversible_only_after_exact_confirmation() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-data-removal-submit-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+
+        app.open_data_removal_confirmation();
+        let _ = app.update(Message::DataRemovalConfirmationInput(
+            sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION.into(),
+        ));
+        let _ = app.update(Message::SubmitDataRemoval);
+
+        assert!(matches!(
+            app.modal,
+            Some(Modal::DataRemoval(DataRemovalConfirmation {
+                pending: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn desktop_data_removal_recovers_from_an_active_session_refusal() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-data-removal-active-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        app.modal = Some(Modal::DataRemoval(DataRemovalConfirmation {
+            confirmation: sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION.into(),
+            pending: true,
+        }));
+
+        app.handle_response(
+            Operation::PrepareDataRemoval,
+            DaemonResponse::Error(sylvops_core::protocol::ProtocolFailure {
+                code: "daemon_operation_failed".into(),
+                message: "user data cannot be removed while sessions are active".into(),
+                retryable: false,
+            }),
+        );
+
+        assert!(matches!(
+            app.modal,
+            Some(Modal::DataRemoval(DataRemovalConfirmation {
+                pending: false,
+                ..
+            }))
+        ));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|message| message.contains("sessions are active"))
+        );
+    }
+
+    #[test]
+    fn desktop_closes_only_after_data_removal_finishes() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-data-removal-finished-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        app.modal = Some(Modal::DataRemoval(DataRemovalConfirmation {
+            confirmation: sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION.into(),
+            pending: true,
+        }));
+
+        app.handle_bridge_event(BridgeEvent::DataRemovalFinished(Ok(())));
+
+        assert!(app.modal.is_none());
+        assert!(app.closing_since.is_some());
+        assert!(app.success.as_ref().is_some_and(|(message, _)| {
+            message.contains("worktrees, and branches were preserved")
+        }));
+    }
+
+    #[test]
+    fn desktop_reports_a_bounded_partial_removal_failure() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-data-removal-failure-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        app.modal = Some(Modal::DataRemoval(DataRemovalConfirmation {
+            confirmation: sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION.into(),
+            pending: true,
+        }));
+
+        app.handle_bridge_event(BridgeEvent::DataRemovalFinished(Err(
+            "user-data removal did not complete".into(),
+        )));
+
+        assert!(app.modal.is_none());
+        assert!(matches!(app.connection, ConnectionState::Disconnected));
+        let message = app.error.as_deref().expect("bounded failure message");
+        assert!(message.contains("did not complete"));
+        assert!(!message.contains(&runtime_root.display().to_string()));
     }
 }
