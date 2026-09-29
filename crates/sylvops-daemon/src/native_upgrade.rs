@@ -2034,6 +2034,7 @@ fn remove_macos_staging_path(handoff: &NativeUpgradeHandoff, path: &Path) -> Res
     Ok(())
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     copy_tree_with_budget(
         source,
@@ -2052,6 +2053,7 @@ struct CopyBudget {
     bytes: u64,
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn copy_tree_with_budget(
     source: &Path,
     destination: &Path,
@@ -2190,6 +2192,38 @@ fn successful_with_timeout(
 }
 
 #[cfg(target_os = "linux")]
+fn spawn_bounded_stdout_reader(
+    mut stdout: std::process::ChildStdout,
+    byte_limit: u64,
+    oversized: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> thread::JoinHandle<std::io::Result<(Vec<u8>, u64)>> {
+    use std::sync::atomic::Ordering;
+
+    thread::spawn(move || {
+        let mut retained =
+            Vec::with_capacity(usize::try_from(byte_limit.min(16 * 1024)).unwrap_or(16 * 1024));
+        let mut observed = 0_u64;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stdout.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            if observed > byte_limit {
+                oversized.store(true, Ordering::Release);
+                break;
+            }
+            let remaining = usize::try_from(byte_limit)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(retained.len());
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        Ok((retained, observed))
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn bounded_command_stdout(
     command: &mut Command,
     operation: &str,
@@ -2216,30 +2250,7 @@ fn bounded_command_stdout(
         .take()
         .ok_or_else(|| DaemonError::Lifecycle(format!("{operation} output is unavailable")))?;
     let oversized = Arc::new(AtomicBool::new(false));
-    let reader_oversized = oversized.clone();
-    let reader = thread::spawn(move || -> std::io::Result<(Vec<u8>, u64)> {
-        let mut stdout = stdout;
-        let mut retained =
-            Vec::with_capacity(usize::try_from(byte_limit.min(16 * 1024)).unwrap_or(16 * 1024));
-        let mut observed = 0_u64;
-        let mut buffer = [0_u8; 8 * 1024];
-        loop {
-            let read = stdout.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            observed = observed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-            if observed > byte_limit {
-                reader_oversized.store(true, Ordering::Release);
-                break;
-            }
-            let remaining = usize::try_from(byte_limit)
-                .unwrap_or(usize::MAX)
-                .saturating_sub(retained.len());
-            retained.extend_from_slice(&buffer[..read.min(remaining)]);
-        }
-        Ok((retained, observed))
-    });
+    let reader = spawn_bounded_stdout_reader(stdout, byte_limit, oversized.clone());
     let process_id = child.id();
     let mut completed_status = None;
     let process_tree = match crate::process_tree::attach(process_id, i32::try_from(process_id).ok())
