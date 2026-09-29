@@ -3,6 +3,7 @@ use sylvops_core::{
     ui_forms::Form,
     upgrade::ActiveUpgradeSession,
 };
+use sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION;
 
 #[derive(Clone, Debug)]
 pub(crate) struct FormModal {
@@ -49,10 +50,57 @@ pub(crate) enum Confirmation {
     },
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DataRemovalConfirmation {
+    pub confirmation: String,
+    pub pending: bool,
+}
+
+impl DataRemovalConfirmation {
+    pub(crate) fn update(&mut self, confirmation: String) {
+        if !self.pending && confirmation.len() <= DATA_REMOVAL_CONFIRMATION.len() {
+            self.confirmation = confirmation;
+        }
+    }
+
+    pub(crate) fn can_submit(&self) -> bool {
+        !self.pending && self.confirmation == DATA_REMOVAL_CONFIRMATION
+    }
+
+    pub(crate) fn begin_submission(&mut self) {
+        if self.can_submit() {
+            self.pending = true;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Modal {
     Settings,
     Shortcuts,
     Form(FormModal),
     Confirmation(Confirmation),
+    DataRemoval(DataRemovalConfirmation),
+}
+
+#[cfg(test)]
+mod tests {
+    use sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION;
+
+    use super::DataRemovalConfirmation;
+
+    #[test]
+    fn user_data_removal_requires_the_exact_confirmation_phrase() {
+        let mut confirmation = DataRemovalConfirmation::default();
+
+        assert!(!confirmation.can_submit());
+        confirmation.update("delete sylvops user data".into());
+        assert!(!confirmation.can_submit());
+        confirmation.update(DATA_REMOVAL_CONFIRMATION.into());
+        assert!(confirmation.can_submit());
+
+        confirmation.begin_submission();
+        assert!(confirmation.pending);
+        assert!(!confirmation.can_submit());
+    }
 }

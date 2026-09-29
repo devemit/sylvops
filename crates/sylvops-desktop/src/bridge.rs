@@ -14,6 +14,7 @@ use sylvops_core::{
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     provider::ProviderHealth,
 };
+use sylvops_daemon::data_removal::wait_for_removal_completion;
 use sylvops_daemon::{client::DaemonClient, runtime::RuntimePaths};
 use tokio::sync::mpsc;
 
@@ -47,6 +48,7 @@ pub(crate) enum Operation {
     GetUpdateStatus,
     DownloadUpdate,
     InstallUpdate,
+    PrepareDataRemoval,
 }
 
 #[derive(Debug)]
@@ -54,6 +56,9 @@ enum BridgeCommand {
     Request {
         operation: Operation,
         request: ClientRequest,
+    },
+    RemoveUserData {
+        confirmation: String,
     },
     Shutdown,
 }
@@ -74,6 +79,7 @@ pub(crate) enum BridgeEvent {
         operation: Option<Operation>,
         message: String,
     },
+    DataRemovalFinished(Result<(), String>),
     Closed,
 }
 
@@ -103,6 +109,12 @@ impl Bridge {
     pub(crate) fn request(&self, operation: Operation, request: ClientRequest) -> bool {
         self.commands
             .try_send(BridgeCommand::Request { operation, request })
+            .is_ok()
+    }
+
+    pub(crate) fn remove_user_data(&self, confirmation: String) -> bool {
+        self.commands
+            .try_send(BridgeCommand::RemoveUserData { confirmation })
             .is_ok()
     }
 
@@ -235,6 +247,46 @@ async fn run_worker_async(
                             };
                             let _ = request_events.send_timeout(event, CRITICAL_EVENT_TIMEOUT);
                         });
+                    }
+                    Some(BridgeCommand::RemoveUserData { confirmation }) => {
+                        let response = client
+                            .request(&ClientRequest::PrepareDataRemoval {
+                                confirmation: confirmation.clone(),
+                            })
+                            .await;
+                        match response {
+                            Ok(response) => {
+                                let prepared = matches!(response, DaemonResponse::DataRemovalPrepared);
+                                let _ = events.send_timeout(
+                                    BridgeEvent::Response {
+                                        operation: Operation::PrepareDataRemoval,
+                                        response,
+                                    },
+                                    CRITICAL_EVENT_TIMEOUT,
+                                );
+                                if prepared {
+                                    drop(daemon_events);
+                                    drop(client);
+                                    let result = wait_for_removal_completion(&paths)
+                                        .await
+                                        .map_err(|error| error.to_string());
+                                    let _ = events.send_timeout(
+                                        BridgeEvent::DataRemovalFinished(result),
+                                        CRITICAL_EVENT_TIMEOUT,
+                                    );
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = events.send_timeout(
+                                    BridgeEvent::Error {
+                                        operation: Some(Operation::PrepareDataRemoval),
+                                        message: error.to_string(),
+                                    },
+                                    CRITICAL_EVENT_TIMEOUT,
+                                );
+                            }
+                        }
                     }
                     Some(BridgeCommand::Shutdown) | None => break,
                 }
