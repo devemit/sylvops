@@ -708,7 +708,7 @@ fn client_process_is_running(process_ids: &[u32]) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn process_is_running(process_id: u32) -> Result<bool> {
+pub(crate) fn process_is_running(process_id: u32) -> Result<bool> {
     let process_id = i32::try_from(process_id)
         .map_err(|_| DaemonError::Lifecycle("requesting process ID is invalid".into()))?;
     match nix::sys::signal::kill(nix::unistd::Pid::from_raw(process_id), None) {
@@ -722,7 +722,7 @@ fn process_is_running(process_id: u32) -> Result<bool> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn process_is_running(process_id: u32) -> Result<bool> {
+pub(crate) fn process_is_running(process_id: u32) -> Result<bool> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
     use windows_sys::Win32::{
