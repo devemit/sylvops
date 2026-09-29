@@ -37,10 +37,25 @@ const ROLLBACK_RETRY_TIMEOUT: Duration = Duration::from_secs(20);
 const NATIVE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_VERSION_OUTPUT_BYTES: u64 = 4 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_MACOS_SIGNATURE_OUTPUT_BYTES: u64 = 16 * 1024;
 const MAX_PACKAGE_TREE_DEPTH: usize = 32;
 const MAX_PACKAGE_TREE_ENTRIES: u64 = 8_192;
 const MAX_PACKAGE_TREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const ATTEMPT_FILE: &str = "native-upgrade-attempt.json";
+const DATABASE_ROLLBACK_FILES: [&str; 4] = [
+    "sylvops.db",
+    "sylvops.db-wal",
+    "sylvops.db-shm",
+    "sylvops.db-journal",
+];
+
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+#[allow(unsafe_code)]
+unsafe extern "C" {
+    fn proc_pidpath(process_id: i32, buffer: *mut std::ffi::c_void, buffer_size: u32) -> i32;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -245,7 +260,7 @@ async fn prepare_application_replacement(
     handoff: &NativeUpgradeHandoff,
 ) -> Result<(PathBuf, Backup)> {
     let payload = validate_staged_release(handoff).await?;
-    verify_platform_signature(&payload, handoff.release.target.installer)?;
+    verify_staged_package_signature(&payload, handoff.release.target.installer)?;
     let backup = create_backup(handoff)?;
     Ok((payload, backup))
 }
@@ -454,13 +469,13 @@ fn verify_backup_before_restore(handoff: &NativeUpgradeHandoff, backup: &Backup)
 }
 
 fn verify_restored_package(handoff: &NativeUpgradeHandoff) -> Result<()> {
-    verify_platform_signature(
+    verify_application_signature(
         &handoff.installed_executable,
         handoff.release.target.installer,
     )?;
     #[cfg(windows)]
     if handoff.release.target.installer == InstallerKind::WindowsNsis {
-        verify_platform_signature(
+        verify_application_signature(
             &windows_install_path(handoff)?.join("uninstall.exe"),
             InstallerKind::WindowsNsis,
         )?;
@@ -780,13 +795,144 @@ fn create_backup(handoff: &NativeUpgradeHandoff) -> Result<Backup> {
         InstallerKind::MacosDmg => {
             let app = macos_app_root(&handoff.installed_executable)?;
             let backup = rollback.join("SylvOps.app");
-            copy_tree(&app, &backup)?;
+            copy_macos_bundle(&app, &backup)?;
             backup
         }
         InstallerKind::LinuxDeb => create_debian_backup(&rollback)?,
     };
+    create_database_backup(handoff, &rollback)?;
     let sha256 = backup_tree_sha256(handoff)?;
     Ok(Backup { payload, sha256 })
+}
+
+fn create_database_backup(handoff: &NativeUpgradeHandoff, rollback: &Path) -> Result<()> {
+    let data_directory = canonical_data_directory(handoff)?;
+    let mut budget = CopyBudget {
+        entries: 0,
+        bytes: 0,
+    };
+    let mut entries = Vec::new();
+    collect_backup_entries(rollback, rollback, 0, &mut budget, &mut entries)?;
+    budget.entries = budget.entries.saturating_add(1);
+    if budget.entries > MAX_PACKAGE_TREE_ENTRIES {
+        return Err(DaemonError::Lifecycle(
+            "rollback package exceeds the entry limit".into(),
+        ));
+    }
+    let database_backup = rollback.join("database");
+    fs::create_dir(&database_backup)?;
+    for (index, name) in DATABASE_ROLLBACK_FILES.iter().enumerate() {
+        let source = data_directory.join(name);
+        let Some(metadata) = symlink_metadata_if_present(&source)? else {
+            if index == 0 {
+                return Err(DaemonError::Lifecycle(
+                    "database rollback source is unavailable".into(),
+                ));
+            }
+            continue;
+        };
+        if metadata_is_link(&metadata) || !metadata.is_file() {
+            return Err(DaemonError::Lifecycle(
+                "database rollback source is unsafe".into(),
+            ));
+        }
+        if fs::canonicalize(&source)?.parent() != Some(data_directory.as_path()) {
+            return Err(DaemonError::Lifecycle(
+                "database rollback source escaped the data directory".into(),
+            ));
+        }
+        budget.entries = budget.entries.saturating_add(1);
+        budget.bytes = budget.bytes.saturating_add(metadata.len());
+        if budget.entries > MAX_PACKAGE_TREE_ENTRIES || budget.bytes > MAX_PACKAGE_TREE_BYTES {
+            return Err(DaemonError::Lifecycle(
+                "rollback package exceeds its copy budget".into(),
+            ));
+        }
+        let copied = fs::copy(&source, database_backup.join(name))?;
+        if copied != metadata.len() {
+            return Err(DaemonError::Lifecycle(
+                "database rollback source changed during backup".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_database_backup(handoff: &NativeUpgradeHandoff) -> Result<()> {
+    let rollback = canonical_rollback_root(handoff)?;
+    let requested = rollback.join("database");
+    let metadata = fs::symlink_metadata(&requested)?;
+    if metadata_is_link(&metadata) || !metadata.is_dir() {
+        return Err(DaemonError::Lifecycle(
+            "database rollback package is unsafe".into(),
+        ));
+    }
+    let database_backup = fs::canonicalize(requested)?;
+    if database_backup.parent() != Some(rollback.as_path()) {
+        return Err(DaemonError::Lifecycle(
+            "database rollback package escaped staging".into(),
+        ));
+    }
+    let main_database = database_backup.join(DATABASE_ROLLBACK_FILES[0]);
+    if !matches!(
+        symlink_metadata_if_present(&main_database)?,
+        Some(metadata) if metadata.is_file() && !metadata_is_link(&metadata)
+    ) {
+        return Err(DaemonError::Lifecycle(
+            "database rollback package is incomplete".into(),
+        ));
+    }
+    let data_directory = canonical_data_directory(handoff)?;
+    for name in DATABASE_ROLLBACK_FILES {
+        let destination = data_directory.join(name);
+        if let Some(metadata) = symlink_metadata_if_present(&destination)? {
+            if metadata_is_link(&metadata) || !metadata.is_file() {
+                return Err(DaemonError::Lifecycle(
+                    "database restore target is unsafe".into(),
+                ));
+            }
+            fs::remove_file(&destination)?;
+        }
+    }
+    for name in DATABASE_ROLLBACK_FILES {
+        let source = database_backup.join(name);
+        let Some(metadata) = symlink_metadata_if_present(&source)? else {
+            continue;
+        };
+        if metadata_is_link(&metadata)
+            || !metadata.is_file()
+            || fs::canonicalize(&source)?.parent() != Some(database_backup.as_path())
+        {
+            return Err(DaemonError::Lifecycle(
+                "database rollback entry is unsafe".into(),
+            ));
+        }
+        let copied = fs::copy(&source, data_directory.join(name))?;
+        if copied != metadata.len() {
+            return Err(DaemonError::Lifecycle(
+                "database rollback entry changed during restore".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_data_directory(handoff: &NativeUpgradeHandoff) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(&handoff.data_directory)?;
+    if metadata_is_link(&metadata) || !metadata.is_dir() {
+        return Err(DaemonError::Lifecycle(
+            "upgrade data directory is unsafe".into(),
+        ));
+    }
+    fs::canonicalize(&handoff.data_directory).map_err(Into::into)
+}
+
+fn symlink_metadata_if_present(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn existing_backup(handoff: &NativeUpgradeHandoff, expected_sha256: &str) -> Result<Backup> {
@@ -829,6 +975,8 @@ fn existing_backup(handoff: &NativeUpgradeHandoff, expected_sha256: &str) -> Res
 }
 
 fn remove_backup(handoff: &NativeUpgradeHandoff) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    cleanup_macos_staging(handoff)?;
     if fs::symlink_metadata(handoff.staging_root.join("rollback")).is_ok() {
         let rollback = canonical_rollback_root(handoff)?;
         fs::remove_dir_all(rollback)?;
@@ -995,17 +1143,17 @@ fn metadata_is_link(metadata: &fs::Metadata) -> bool {
 fn verify_backup_signature(handoff: &NativeUpgradeHandoff, backup: &Backup) -> Result<()> {
     match handoff.release.target.installer {
         InstallerKind::WindowsNsis => {
-            verify_platform_signature(
+            verify_application_signature(
                 &backup.payload.join("sylvops.exe"),
                 InstallerKind::WindowsNsis,
             )?;
-            verify_platform_signature(
+            verify_application_signature(
                 &backup.payload.join("uninstall.exe"),
                 InstallerKind::WindowsNsis,
             )
         }
         InstallerKind::MacosDmg => {
-            verify_platform_signature(&backup.payload, InstallerKind::MacosDmg)
+            verify_application_signature(&backup.payload, InstallerKind::MacosDmg)
         }
         InstallerKind::LinuxAppImage | InstallerKind::LinuxDeb => Ok(()),
     }
@@ -1064,8 +1212,9 @@ fn apply_package(handoff: &NativeUpgradeHandoff, payload: &Path) -> Result<()> {
             "macOS installer kind is invalid".into(),
         ));
     }
+    cleanup_macos_staging(handoff)?;
     let mount = handoff.staging_root.join("mounted-update");
-    fs::create_dir_all(&mount)?;
+    fs::create_dir(&mount)?;
     successful(
         Command::new("hdiutil")
             .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
@@ -1073,23 +1222,45 @@ fn apply_package(handoff: &NativeUpgradeHandoff, payload: &Path) -> Result<()> {
             .arg(payload),
         "macOS disk image mount",
     )?;
-    let source = fs::read_dir(&mount)?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|extension| extension == "app"))
-        .ok_or_else(|| DaemonError::Lifecycle("mounted update has no application bundle".into()))?;
-    let target = macos_app_root(&handoff.installed_executable)?;
-    let pending = handoff.staging_root.join("pending.app");
-    copy_tree(&source, &pending)?;
-    if target.exists() {
-        fs::remove_dir_all(&target)?;
-    }
-    fs::rename(pending, target)?;
-    let _ = successful(
+    let result = (|| {
+        let applications = fs::read_dir(&mount)?
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().is_some_and(|extension| extension == "app")).then_some(path)
+            })
+            .collect::<Vec<_>>();
+        let [source] = applications.as_slice() else {
+            return Err(DaemonError::Lifecycle(
+                "mounted update must contain exactly one application bundle".into(),
+            ));
+        };
+        verify_application_signature(source, InstallerKind::MacosDmg)?;
+        verify_macos_bundle_identity(handoff, source)?;
+
+        let target = macos_app_root(&handoff.installed_executable)?;
+        let pending = handoff.staging_root.join("pending.app");
+        copy_macos_bundle(source, &pending)?;
+        verify_application_signature(&pending, InstallerKind::MacosDmg)?;
+        verify_macos_bundle_identity(handoff, &pending)?;
+        if symlink_metadata_if_present(&target)?.is_some() {
+            fs::remove_dir_all(&target)?;
+        }
+        if fs::rename(&pending, &target).is_err() {
+            copy_macos_bundle(&pending, &target)?;
+            remove_macos_staging_path(handoff, &pending)?;
+        }
+        Ok(())
+    })();
+    let detach = successful(
         Command::new("hdiutil").args(["detach"]).arg(&mount),
         "macOS disk image detach",
     );
-    Ok(())
+    if symlink_metadata_if_present(&mount)?.is_some() {
+        remove_macos_staging_path(handoff, &mount)?;
+    }
+    result?;
+    detach
 }
 
 fn restore_backup(handoff: &NativeUpgradeHandoff, backup: &Backup) -> Result<()> {
@@ -1100,11 +1271,12 @@ fn restore_backup(handoff: &NativeUpgradeHandoff, backup: &Backup) -> Result<()>
             Ok(())
         }
         InstallerKind::MacosDmg => {
+            cleanup_macos_staging(handoff)?;
             let target = macos_app_root(&handoff.installed_executable)?;
-            if target.exists() {
+            if symlink_metadata_if_present(&target)?.is_some() {
                 fs::remove_dir_all(&target)?;
             }
-            copy_tree(&backup.payload, &target)
+            copy_macos_bundle(&backup.payload, &target)
         }
         InstallerKind::LinuxDeb => successful(
             Command::new("pkexec")
@@ -1112,7 +1284,8 @@ fn restore_backup(handoff: &NativeUpgradeHandoff, backup: &Backup) -> Result<()>
                 .arg(&backup.payload),
             "Debian rollback installer",
         ),
-    }
+    }?;
+    restore_database_backup(handoff)
 }
 
 #[cfg(windows)]
@@ -1405,11 +1578,38 @@ fn create_debian_backup(_directory: &Path) -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn macos_app_root(executable: &Path) -> Result<PathBuf> {
-    executable
+    if !executable.is_absolute() {
+        return Err(DaemonError::Lifecycle(
+            "installed macOS bundle path is unsafe".into(),
+        ));
+    }
+    let app = executable
         .ancestors()
         .find(|path| path.extension().is_some_and(|extension| extension == "app"))
         .map(Path::to_path_buf)
-        .ok_or_else(|| DaemonError::Lifecycle("installed macOS bundle was not found".into()))
+        .ok_or_else(|| DaemonError::Lifecycle("installed macOS bundle was not found".into()))?;
+    let expected_executable = app.join("Contents/MacOS/sylvops");
+    if executable != app && executable != expected_executable {
+        return Err(DaemonError::Lifecycle(
+            "installed macOS executable is outside the application entry point".into(),
+        ));
+    }
+    if let Some(metadata) = symlink_metadata_if_present(&app)? {
+        if metadata_is_link(&metadata) || !metadata.is_dir() {
+            return Err(DaemonError::Lifecycle(
+                "installed macOS bundle path is unsafe".into(),
+            ));
+        }
+        return Ok(fs::canonicalize(app)?);
+    }
+    let parent = fs::canonicalize(
+        app.parent()
+            .ok_or_else(|| DaemonError::Lifecycle("macOS bundle has no parent".into()))?,
+    )?;
+    Ok(parent.join(
+        app.file_name()
+            .ok_or_else(|| DaemonError::Lifecycle("macOS bundle has no name".into()))?,
+    ))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1417,6 +1617,228 @@ fn macos_app_root(_executable: &Path) -> Result<PathBuf> {
     Err(DaemonError::Lifecycle(
         "macOS bundle is unavailable on this platform".into(),
     ))
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Eq, PartialEq)]
+struct MacosCodeIdentity {
+    identifier: String,
+    team_identifier: String,
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_bundle_identity(handoff: &NativeUpgradeHandoff, candidate: &Path) -> Result<()> {
+    let installed = macos_app_root(&handoff.installed_executable)?;
+    let installed_identity = macos_code_identity(&installed)?;
+    let candidate_identity = macos_code_identity(candidate)?;
+    if installed_identity != candidate_identity {
+        return Err(DaemonError::Lifecycle(
+            "macOS update code-signing identity does not match the installation".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_code_identity(application: &Path) -> Result<MacosCodeIdentity> {
+    let mut command = Command::new("codesign");
+    command.args(["--display", "--verbose=4"]).arg(application);
+    let encoded = bounded_command_stderr(
+        &mut command,
+        "macOS code-signing identity check",
+        MAX_MACOS_SIGNATURE_OUTPUT_BYTES,
+        NATIVE_COMMAND_TIMEOUT,
+    )?;
+    let details = std::str::from_utf8(&encoded).map_err(|_| {
+        DaemonError::Lifecycle("macOS code-signing identity output is invalid".into())
+    })?;
+    let identifier = details
+        .lines()
+        .find_map(|line| line.strip_prefix("Identifier="))
+        .filter(|identifier| *identifier == sylvops_core::APPLICATION_ID)
+        .ok_or_else(|| {
+            DaemonError::Lifecycle("macOS application bundle identity is invalid".into())
+        })?;
+    let team_identifier = details
+        .lines()
+        .find_map(|line| line.strip_prefix("TeamIdentifier="))
+        .filter(|team| {
+            team.len() == 10
+                && team
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        })
+        .ok_or_else(|| {
+            DaemonError::Lifecycle("macOS Developer ID team identity is invalid".into())
+        })?;
+    if !details
+        .lines()
+        .any(|line| line.starts_with("Authority=Developer ID Application:"))
+        || !details
+            .lines()
+            .any(|line| line.contains("flags=") && line.contains("runtime"))
+    {
+        return Err(DaemonError::Lifecycle(
+            "macOS application is not a hardened Developer ID build".into(),
+        ));
+    }
+    Ok(MacosCodeIdentity {
+        identifier: identifier.into(),
+        team_identifier: team_identifier.into(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn bounded_command_stderr(
+    command: &mut Command,
+    operation: &str,
+    byte_limit: u64,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    use std::os::unix::process::CommandExt;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| DaemonError::Lifecycle(format!("{operation} did not start: {error}")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| DaemonError::Lifecycle(format!("{operation} output is unavailable")))?;
+    let reader = thread::spawn(move || -> std::io::Result<(Vec<u8>, u64)> {
+        let mut stderr = stderr;
+        let mut retained =
+            Vec::with_capacity(usize::try_from(byte_limit.min(16 * 1024)).unwrap_or(16 * 1024));
+        let mut observed = 0_u64;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stderr.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            let remaining = usize::try_from(byte_limit)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(retained.len());
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        Ok((retained, observed))
+    });
+    let process_id = child.id();
+    let process_tree = match crate::process_tree::attach(process_id, i32::try_from(process_id).ok())
+    {
+        Ok(tree) => tree,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(error);
+        }
+    };
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            DaemonError::Lifecycle(format!("{operation} could not be observed: {error}"))
+        })? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = process_tree.terminate();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(DaemonError::Lifecycle(format!("{operation} timed out")));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    process_tree.terminate()?;
+    let (retained, observed) = reader
+        .join()
+        .map_err(|_| DaemonError::Lifecycle(format!("{operation} output reader failed")))??;
+    if !status.success() {
+        return Err(DaemonError::Lifecycle(format!("{operation} failed")));
+    }
+    if observed > byte_limit {
+        return Err(DaemonError::Lifecycle(format!(
+            "{operation} output exceeded its byte limit"
+        )));
+    }
+    Ok(retained)
+}
+
+#[cfg(target_os = "macos")]
+fn copy_macos_bundle(source: &Path, destination: &Path) -> Result<()> {
+    if symlink_metadata_if_present(destination)?.is_some() {
+        return Err(DaemonError::Lifecycle(
+            "macOS bundle copy target already exists".into(),
+        ));
+    }
+    copy_tree(source, destination)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_macos_bundle(_source: &Path, _destination: &Path) -> Result<()> {
+    Err(DaemonError::Lifecycle(
+        "macOS bundle copy is unavailable on this platform".into(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_macos_staging(handoff: &NativeUpgradeHandoff) -> Result<()> {
+    let mount = handoff.staging_root.join("mounted-update");
+    if let Some(metadata) = symlink_metadata_if_present(&mount)? {
+        if metadata_is_link(&metadata) || !metadata.is_dir() {
+            return Err(DaemonError::Lifecycle(
+                "macOS disk image mount path is unsafe".into(),
+            ));
+        }
+        let _ = successful(
+            Command::new("hdiutil").args(["detach"]).arg(&mount),
+            "macOS disk image detach",
+        );
+        if symlink_metadata_if_present(&mount)?.is_some() {
+            remove_macos_staging_path(handoff, &mount)?;
+        }
+    }
+    let pending = handoff.staging_root.join("pending.app");
+    if symlink_metadata_if_present(&pending)?.is_some() {
+        remove_macos_staging_path(handoff, &pending)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_macos_staging(_handoff: &NativeUpgradeHandoff) -> Result<()> {
+    Err(DaemonError::Lifecycle(
+        "macOS staging cleanup is unavailable on this platform".into(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_staging_path(handoff: &NativeUpgradeHandoff, path: &Path) -> Result<()> {
+    let staging = fs::canonicalize(&handoff.staging_root)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata_is_link(&metadata) {
+        return Err(DaemonError::Lifecycle(
+            "macOS upgrade scratch path is a link".into(),
+        ));
+    }
+    let canonical = fs::canonicalize(path)?;
+    if canonical.parent() != Some(staging.as_path()) {
+        return Err(DaemonError::Lifecycle(
+            "macOS upgrade scratch path escaped staging".into(),
+        ));
+    }
+    if metadata.is_dir() {
+        fs::remove_dir_all(canonical)?;
+    } else {
+        fs::remove_file(canonical)?;
+    }
+    Ok(())
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -1467,13 +1889,19 @@ fn copy_tree_with_budget(
         if file_type.is_dir() {
             copy_tree_with_budget(&entry.path(), &target, depth.saturating_add(1), budget)?;
         } else if file_type.is_file() {
-            budget.bytes = budget.bytes.saturating_add(entry.metadata()?.len());
+            let metadata = entry.metadata()?;
+            budget.bytes = budget.bytes.saturating_add(metadata.len());
             if budget.bytes > MAX_PACKAGE_TREE_BYTES {
                 return Err(DaemonError::Lifecycle(
                     "package tree exceeds the byte limit".into(),
                 ));
             }
-            fs::copy(entry.path(), target)?;
+            let copied = fs::copy(entry.path(), target)?;
+            if copied != metadata.len() {
+                return Err(DaemonError::Lifecycle(
+                    "package tree changed during copy".into(),
+                ));
+            }
         } else {
             return Err(DaemonError::Lifecycle(
                 "package tree contains an unsupported entry".into(),
@@ -1651,7 +2079,7 @@ async fn verify_health(paths: &RuntimePaths, handoff: &NativeUpgradeHandoff) -> 
                     "updated executable version does not match".into(),
                 ));
             }
-            verify_platform_signature(
+            verify_application_signature(
                 &handoff.installed_executable,
                 handoff.release.target.installer,
             )?;
@@ -1718,7 +2146,47 @@ fn verify_daemon_executable_identity(
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn verify_daemon_executable_identity(
+    process_id: u32,
+    handoff: &NativeUpgradeHandoff,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+
+    const PROCESS_PATH_BYTES: usize = 4 * 1024;
+    let process_id = i32::try_from(process_id)
+        .map_err(|_| DaemonError::Lifecycle("updated daemon process ID is invalid".into()))?;
+    let mut path = vec![0_u8; PROCESS_PATH_BYTES];
+    // SAFETY: `path` is writable for the supplied byte length and `proc_pidpath` does not retain
+    // the pointer after returning.
+    let length = unsafe {
+        proc_pidpath(
+            process_id,
+            path.as_mut_ptr().cast(),
+            u32::try_from(path.len()).expect("process path buffer fits u32"),
+        )
+    };
+    if length <= 0 {
+        return Err(DaemonError::Lifecycle(
+            "updated daemon executable identity could not be inspected".into(),
+        ));
+    }
+    path.truncate(usize::try_from(length).unwrap_or(0));
+    while path.last() == Some(&0) {
+        path.pop();
+    }
+    let actual = fs::canonicalize(PathBuf::from(std::ffi::OsString::from_vec(path)))?;
+    let expected = fs::canonicalize(&handoff.installed_executable)?;
+    if actual != expected {
+        return Err(DaemonError::Lifecycle(
+            "updated daemon executable identity does not match the installation".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn verify_daemon_executable_identity(
     _process_id: u32,
     _handoff: &NativeUpgradeHandoff,
@@ -1773,18 +2241,64 @@ fn verify_platform_signature(path: &Path, _installer: InstallerKind) -> Result<(
 }
 
 #[cfg(target_os = "macos")]
-fn verify_platform_signature(path: &Path, installer: InstallerKind) -> Result<()> {
-    let target = if installer == InstallerKind::MacosDmg {
-        macos_app_root(path).unwrap_or_else(|_| path.to_path_buf())
-    } else {
-        path.to_path_buf()
-    };
+fn verify_staged_package_signature(path: &Path, installer: InstallerKind) -> Result<()> {
+    if installer != InstallerKind::MacosDmg {
+        return Err(DaemonError::Lifecycle(
+            "macOS installer kind is invalid".into(),
+        ));
+    }
+    successful(
+        Command::new("codesign")
+            .args(["--verify", "--strict"])
+            .arg(path),
+        "macOS package signature check",
+    )?;
+    // The protected release job validates the stapled ticket before signing this exact DMG digest.
+    // Gatekeeper is the corresponding runtime check available on Macs without developer tools.
+    successful(
+        Command::new("spctl")
+            .args([
+                "--assess",
+                "--type",
+                "open",
+                "--context",
+                "context:primary-signature",
+            ])
+            .arg(path),
+        "macOS Gatekeeper disk image assessment",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn verify_application_signature(path: &Path, installer: InstallerKind) -> Result<()> {
+    if installer != InstallerKind::MacosDmg {
+        return Err(DaemonError::Lifecycle(
+            "macOS installer kind is invalid".into(),
+        ));
+    }
+    let application = macos_app_root(path)?;
     successful(
         Command::new("codesign")
             .args(["--verify", "--deep", "--strict"])
-            .arg(target),
+            .arg(&application),
         "macOS package signature check",
+    )?;
+    successful(
+        Command::new("spctl")
+            .args(["--assess", "--type", "execute"])
+            .arg(application),
+        "macOS Gatekeeper application assessment",
     )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_staged_package_signature(path: &Path, installer: InstallerKind) -> Result<()> {
+    verify_platform_signature(path, installer)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_application_signature(path: &Path, installer: InstallerKind) -> Result<()> {
+    verify_platform_signature(path, installer)
 }
 
 #[cfg(target_os = "linux")]
@@ -1795,6 +2309,22 @@ fn verify_platform_signature(_path: &Path, installer: InstallerKind) -> Result<(
             "Debian package verification",
         )?;
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_detached_upgrade_helper(path: &Path) -> Result<()> {
+    successful(
+        Command::new("codesign")
+            .args(["--verify", "--strict"])
+            .arg(path),
+        "macOS detached upgrade helper signature check",
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn verify_detached_upgrade_helper(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1855,6 +2385,57 @@ async fn report_outcome(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn relaunch_desktop(handoff: &NativeUpgradeHandoff) -> Result<()> {
+    let application = macos_app_root(&handoff.installed_executable)?;
+    let mut command = Command::new("open");
+    command
+        .args(["-n", "-W", "-a"])
+        .arg(application)
+        .arg("--args");
+    if let Some(root) = state_override(handoff) {
+        command.arg("--state-dir").arg(root);
+    }
+    command.arg("desktop");
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            DaemonError::Lifecycle(format!(
+                "updated desktop application did not relaunch: {error}"
+            ))
+        })?;
+    let deadline = Instant::now() + DESKTOP_START_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            DaemonError::Lifecycle(format!(
+                "updated desktop application could not be observed: {error}"
+            ))
+        })? {
+            return Err(DaemonError::Lifecycle(format!(
+                "updated desktop application exited during relaunch with {status}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            child.kill().map_err(|error| {
+                DaemonError::Lifecycle(format!(
+                    "updated desktop launch observer did not stop: {error}"
+                ))
+            })?;
+            child.wait().map_err(|error| {
+                DaemonError::Lifecycle(format!(
+                    "updated desktop launch observer could not be reaped: {error}"
+                ))
+            })?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn relaunch_desktop(handoff: &NativeUpgradeHandoff) -> Result<()> {
     let mut child = installed_command(handoff)
         .arg("desktop")

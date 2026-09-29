@@ -307,7 +307,8 @@ foreach ($requiredSetting in @(
 foreach ($macosPath in @(
     'packaging\macos\entitlements.plist',
     'scripts\package-macos.sh',
-    'scripts\test-macos-package.sh'
+    'scripts\test-macos-package.sh',
+    'scripts\test-macos-native-upgrade.sh'
 )) {
     Assert-ReleaseCondition (Test-Path -LiteralPath (Join-Path $root $macosPath) -PathType Leaf) "The macOS package workflow file is missing: $macosPath"
 }
@@ -318,6 +319,10 @@ foreach ($requiredText in @('run_with_timeout', '--options runtime', 'Developer 
 $macosSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-package.sh')
 foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'CFBundleIdentifier', 'TeamIdentifier', 'package-preserve.txt', 'show-ref --verify')) {
     Assert-ReleaseCondition ($macosSmokeScript.Contains($requiredText)) "The macOS package smoke test is missing an acceptance check: $requiredText"
+}
+$macosUpgradeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-native-upgrade.sh')
+foreach ($requiredText in @('update-helper', 'stapler validate', 'spctl --assess', 'TeamIdentifier', 'helper_interrupted', 'health_check_failed', 'rollback_attempts')) {
+    Assert-ReleaseCondition ($macosUpgradeScript.Contains($requiredText)) "The macOS native-upgrade test is missing an acceptance check: $requiredText"
 }
 
 $linuxPackagerConfigPath = Join-Path $root 'packaging\linux\Packager.toml'
@@ -482,6 +487,9 @@ Assert-ReleaseCondition ($release.Contains('MACOS_NOTARY_KEY_ID')) "Release pack
 Assert-ReleaseCondition ($release.Contains('MACOS_NOTARY_ISSUER_ID')) "Release packaging does not load the notarization issuer ID."
 Assert-ReleaseCondition ($release.Contains('scripts/package-macos.sh')) "Release packaging does not build the signed and notarized macOS DMGs."
 Assert-ReleaseCondition ($release.Contains('scripts/test-macos-package.sh')) "Release packaging does not run the native macOS package smoke test."
+Assert-ReleaseCondition ($release.Contains('scripts/test-macos-native-upgrade.sh')) "Release packaging does not run the native macOS N-1 upgrade test."
+Assert-ReleaseCondition ($release.Contains('macos-upgrade-invalid-trust.json')) "Release packaging does not exercise invalid macOS signature and notarization state."
+Assert-ReleaseCondition ($release.Contains('macos-upgrade-failed-health.json')) "Release packaging does not exercise a signed macOS failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('scripts/package-linux.sh')) "Release packaging does not build the AppImage and deb packages."
 Assert-ReleaseCondition ($release.Contains('scripts/test-linux-packages.sh')) "Release packaging does not run the native Linux package smoke test."
 Assert-ReleaseCondition ($release.Contains('needs: [package-windows, package-linux, package-macos]')) "Release staging is not gated on the native Linux package job."
