@@ -41,5 +41,12 @@ To stop the daemon, open PowerShell in this directory and run:
 
   .\sylvops.exe daemon stop
 
-This is an unsigned portable build. Windows may show an unrecognized-app warning;
-verify the archive checksum before choosing More info -> Run anyway.
+Tagged release executables are Authenticode signed and timestamped.
+Locally built archives are unsigned. Always verify the archive checksum. For a
+tagged release, also confirm that this PowerShell command reports Valid before
+launch:
+
+  (Get-AuthenticodeSignature .\sylvops.exe).Status
+
+Windows may show an unrecognized-app warning for an unsigned local build. Only
+after verifying that local archive should you choose More info -> Run anyway.

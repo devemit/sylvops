@@ -12,6 +12,18 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+$DesktopGuidanceLabels = [ordered]@{
+    'Application updates' = 'text\("Application updates"\)'
+    'Check now' = 'button\("Check now"\)'
+    'Download verified upgrade' = 'button\("Download verified upgrade"\)'
+    'Install update' = 'button\("Install update"\)'
+    'Periodic checks: Off' = '"Periodic checks: Off"'
+    'Remove SylvOps user data' = 'button\("Remove SylvOps user data'
+    'Start Codex' = 'Some\(ProviderKind::Codex\) => "Start Codex"'
+    'Retry discovery' = '"Retry discovery"'
+    'Open terminal' = '"Open terminal"'
+}
+
 function Assert-ReleaseCondition {
     param(
         [bool]$Condition,
@@ -43,15 +55,69 @@ function Assert-Quickstart {
     Assert-ReleaseCondition ($Text -match [regex]::Escape('-Repository C:\path\to\repository')) "Windows QUICKSTART must show how to pass a repository to the launcher."
     Assert-ReleaseCondition ($Text -match [regex]::Escape('.\sylvops.exe tui')) "Windows QUICKSTART must retain the explicit TUI fallback command."
     Assert-ReleaseCondition ($Text -match [regex]::Escape('Ctrl+]')) "Windows QUICKSTART must document explicit detach."
+    Assert-ReleaseCondition ($Text -match [regex]::Escape('Tagged release executables are Authenticode signed and timestamped')) "Windows QUICKSTART must describe the tagged portable signature."
+    Assert-ReleaseCondition ($Text -match [regex]::Escape('locally built archives are unsigned')) "Windows QUICKSTART must distinguish unsigned local archives."
     Assert-ReleaseCondition ($Text -notmatch '(?i)opens the terminal UI') "Windows QUICKSTART still claims that the launcher opens the terminal UI."
     Assert-ReleaseCondition ($Text -notmatch '(?i)Tab or h/l: move between panels') "Windows QUICKSTART still contains the obsolete TUI panel shortcut."
+    Assert-ReleaseCondition ($Text -notmatch '(?m)^This is an unsigned portable build\.$') "Windows QUICKSTART still calls every portable release unsigned."
 }
 
 function Assert-BundledReadme {
     param([string]$Text)
 
-    foreach ($requiredText in @('sylvops up .', 'sylvops tui', 'SHA256SUMS', 'native desktop', 'sylvops-windows-x86_64-setup.exe', 'Start Menu', 'sylvops-linux-x86_64.AppImage', 'sylvops-linux-x86_64.deb')) {
+    $requiredTextValues = @(
+        '## Install on Windows',
+        '## Install on macOS',
+        '## Install on Linux',
+        '## Portable fallback',
+        '## First run',
+        '## Updates and rollback',
+        '## Uninstall and remove user data',
+        '## Troubleshooting',
+        'sylvops-windows-x86_64-setup.exe',
+        'sylvops-windows-x86_64.zip',
+        'sylvops-macos-x86_64.dmg',
+        'sylvops-macos-aarch64.dmg',
+        'sylvops-macos-x86_64.tar.gz',
+        'sylvops-macos-aarch64.tar.gz',
+        'sylvops-linux-x86_64.AppImage',
+        'sylvops-linux-x86_64.deb',
+        'sylvops-linux-x86_64.tar.gz',
+        'sylvops up .',
+        'sylvops tui',
+        'Expand-Archive',
+        '.\sylvops-portable\sylvops.exe up',
+        'tar -xzf sylvops-macos-aarch64.tar.gz',
+        'tar -xzf sylvops-linux-x86_64.tar.gz',
+        './sylvops-portable/sylvops up',
+        'SHA256SUMS',
+        'native desktop',
+        'Start Menu',
+        'Workspace -> Project/root Worktree -> Session',
+        'sylvops provider probe codex',
+        'sylvops update check',
+        'sylvops update status',
+        'DELETE SYLVOPS USER DATA',
+        '%LOCALAPPDATA%\SylvOps',
+        '%APPDATA%\SylvOps',
+        '$XDG_DATA_HOME/sylvops',
+        '$XDG_CONFIG_HOME/sylvops',
+        'sylvops daemon status'
+    ) + @($DesktopGuidanceLabels.Keys)
+    foreach ($requiredText in $requiredTextValues) {
         Assert-ReleaseCondition ($Text.Contains($requiredText)) "Bundled README is missing release guidance: $requiredText"
+    }
+}
+
+function Assert-DesktopGuidanceMatchesReadme {
+    param(
+        [string]$ReadmeText,
+        [string]$DesktopSource
+    )
+
+    foreach ($visibleLabel in $DesktopGuidanceLabels.GetEnumerator()) {
+        Assert-ReleaseCondition ($DesktopSource -match $visibleLabel.Value) "Desktop no longer exposes the documented action: $($visibleLabel.Key)"
+        Assert-ReleaseCondition ($ReadmeText.Contains($visibleLabel.Key)) "README no longer matches the visible desktop action: $($visibleLabel.Key)"
     }
 }
 
@@ -250,7 +316,8 @@ foreach ($requiredSetting in @(
     'installMode = "currentUser"',
     'allow-downgrades = false',
     'binaries-dir = "target/installer-input"',
-    'packaging/icons/sylvops.ico'
+    'packaging/icons/sylvops.ico',
+    'resources = [{ src = "README.md", target = "README.md" }]'
 )) {
     Assert-ReleaseCondition ($packagerConfig.Contains($requiredSetting)) "Packager.toml is missing the locked Windows packaging setting: $requiredSetting"
 }
@@ -289,6 +356,10 @@ foreach ($scriptPath in @(
 )) {
     Assert-ReleaseCondition (Test-Path -LiteralPath (Join-Path $root $scriptPath) -PathType Leaf) "Windows installer workflow script is missing: $scriptPath"
 }
+$windowsInstallerSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-windows-installer.ps1')
+foreach ($requiredText in @('installedGuidePath', '## Install on Windows', '## First run', '## Troubleshooting')) {
+    Assert-ReleaseCondition ($windowsInstallerSmokeScript.Contains($requiredText)) "The Windows installer smoke test is missing bundled-guide validation: $requiredText"
+}
 
 $macosPackagerConfigPath = Join-Path $root 'packaging\macos\Packager.toml'
 Assert-ReleaseCondition (Test-Path -LiteralPath $macosPackagerConfigPath -PathType Leaf) "The macOS packager configuration is missing."
@@ -299,7 +370,8 @@ foreach ($requiredSetting in @(
     "identifier = `"$applicationId`"",
     'formats = ["app"]',
     'packaging/icons/sylvops.png',
-    'entitlements = "packaging/macos/entitlements.plist"'
+    'entitlements = "packaging/macos/entitlements.plist"',
+    'resources = [{ src = "README.md", target = "README.md" }]'
 )) {
     Assert-ReleaseCondition ($macosPackagerConfig.Contains($requiredSetting)) "The macOS packager configuration is missing the locked setting: $requiredSetting"
 }
@@ -317,7 +389,7 @@ foreach ($requiredText in @('run_with_timeout', '--options runtime', 'Developer 
     Assert-ReleaseCondition ($macosPackageScript.Contains($requiredText)) "The macOS package script is missing a release control: $requiredText"
 }
 $macosSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-package.sh')
-foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'CFBundleIdentifier', 'TeamIdentifier', 'package-preserve.txt', 'show-ref --verify')) {
+foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'CFBundleIdentifier', 'TeamIdentifier', 'package-preserve.txt', 'show-ref --verify', 'Contents/Resources/README.md', '## Install on macOS', '## First run', '## Troubleshooting')) {
     Assert-ReleaseCondition ($macosSmokeScript.Contains($requiredText)) "The macOS package smoke test is missing an acceptance check: $requiredText"
 }
 $macosUpgradeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-native-upgrade.sh')
@@ -339,6 +411,7 @@ foreach ($requiredSetting in @(
     'generate-desktop-entry = true',
     'desktop-template = "packaging/linux/sylvops.desktop.hbs"',
     'usr/share/metainfo/com.devemit.sylvops.metainfo.xml',
+    'resources = [{ src = "README.md", target = "README.md" }]',
     'dpkg-repack',
     'policykit-1'
 )) {
@@ -359,6 +432,10 @@ Assert-ReleaseCondition (Test-Path -LiteralPath $linuxMetainfoPath -PathType Lea
 $linuxMetainfo = Get-Content -Raw -LiteralPath $linuxMetainfoPath
 foreach ($requiredText in @('<id>com.devemit.sylvops</id>', '<name>SylvOps</name>', '<project_license>MIT</project_license>', '<launchable type="desktop-id">sylvops.desktop</launchable>')) {
     Assert-ReleaseCondition ($linuxMetainfo.Contains($requiredText)) "The Linux AppStream metadata is missing required content: $requiredText"
+}
+$linuxSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-linux-packages.sh')
+foreach ($requiredText in @('usr/lib/sylvops/README.md', '## Install on Linux', '## First run', '## Troubleshooting')) {
+    Assert-ReleaseCondition ($linuxSmokeScript.Contains($requiredText)) "The Linux package smoke test is missing bundled-guide validation: $requiredText"
 }
 
 $linuxPackageScriptPath = Join-Path $root 'scripts\package-linux.sh'
@@ -402,6 +479,8 @@ foreach ($package in $workspacePackages) {
 Assert-Quickstart $quickstart
 $readme = Get-Content -Raw -LiteralPath (Join-Path $root 'README.md')
 Assert-BundledReadme $readme
+$desktopSource = Get-Content -Raw -LiteralPath (Join-Path $root 'crates\sylvops-desktop\src\lib.rs')
+Assert-DesktopGuidanceMatchesReadme -ReadmeText $readme -DesktopSource $desktopSource
 Assert-ReleaseCondition ($readme.Contains('Start-Process sylvops')) "README does not document the installed CLI discovery surface."
 Assert-ReleaseCondition ($readme.Contains('preserves configuration, session data, repositories, worktrees, and branches')) "README does not state the Windows uninstall preservation contract."
 foreach ($requiredText in @('sylvops-macos-x86_64.dmg', 'sylvops-macos-aarch64.dmg', '/Applications', 'Gatekeeper')) {
@@ -424,6 +503,9 @@ foreach ($requiredText in @(
     '%LOCALAPPDATA%\Programs\SylvOps',
     '%LOCALAPPDATA%\SylvOps',
     '%APPDATA%\SylvOps',
+    'bundled lifecycle guide',
+    'Contents/Resources/README.md',
+    'usr/lib/sylvops/README.md',
     'MACOS_SIGNING_CERTIFICATE_BASE64',
     'MACOS_SIGNING_CERTIFICATE_PASSWORD',
     'MACOS_SIGNING_IDENTITY',

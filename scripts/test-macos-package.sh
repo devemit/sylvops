@@ -166,10 +166,14 @@ run_with_timeout 120 ditto "$mount_dir/SylvOps.app" "$installed_app"
 
 info_plist="$installed_app/Contents/Info.plist"
 installed_binary="$installed_app/Contents/MacOS/sylvops"
-if [[ ! -f "$info_plist" || ! -x "$installed_binary" ]]; then
+installed_guide="$installed_app/Contents/Resources/README.md"
+if [[ ! -f "$info_plist" || ! -x "$installed_binary" || ! -f "$installed_guide" ]]; then
   echo "The installed application bundle is incomplete." >&2
   exit 1
 fi
+run_with_timeout 10 grep -Fq '## Install on macOS' "$installed_guide"
+run_with_timeout 10 grep -Fq '## First run' "$installed_guide"
+run_with_timeout 10 grep -Fq '## Troubleshooting' "$installed_guide"
 
 bundle_identifier="$(run_with_timeout 30 plutil -extract CFBundleIdentifier raw -o - "$info_plist")"
 bundle_name="$(run_with_timeout 30 plutil -extract CFBundleName raw -o - "$info_plist")"

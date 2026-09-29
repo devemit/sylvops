@@ -162,6 +162,7 @@ $localSentinel = Join-Path $localDataDirectory "installer-preserve-$testId.txt"
 $roamingSentinel = Join-Path $roamingConfigDirectory "installer-preserve-$testId.txt"
 $expectedInstallLocation = Join-Path $env:LOCALAPPDATA 'Programs\SylvOps'
 $installedExecutable = Join-Path $expectedInstallLocation 'sylvops.exe'
+$installedGuidePath = Join-Path $expectedInstallLocation 'README.md'
 $uninstallerPath = Join-Path $expectedInstallLocation 'uninstall.exe'
 $installed = $false
 $desktopProcess = $null
@@ -206,6 +207,11 @@ try {
     Assert-InstallerCondition ($installLocation -eq $expectedInstallLocation) 'The installer did not use the locked per-user application directory.'
 
     Assert-InstallerCondition (Test-Path -LiteralPath $installedExecutable -PathType Leaf) 'The installed SylvOps executable is missing.'
+    Assert-InstallerCondition (Test-Path -LiteralPath $installedGuidePath -PathType Leaf) 'The installed lifecycle guide is missing.'
+    $installedGuide = Get-Content -Raw -LiteralPath $installedGuidePath
+    foreach ($requiredHeading in @('## Install on Windows', '## First run', '## Troubleshooting')) {
+        Assert-InstallerCondition ($installedGuide.Contains($requiredHeading)) "The installed lifecycle guide is missing: $requiredHeading"
+    }
     Assert-InstallerCondition (Test-Path -LiteralPath $uninstallerPath -PathType Leaf) 'The registered uninstaller is missing.'
     Assert-SignedByExpectedCertificate $installedExecutable
     Assert-SignedByExpectedCertificate $uninstallerPath

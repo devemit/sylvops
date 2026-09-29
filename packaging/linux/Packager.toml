@@ -14,6 +14,7 @@ out-dir = "dist/linux-package"
 binaries-dir = "target/linux-installer-input"
 binaries = [{ path = "sylvops", main = true }]
 icons = ["packaging/icons/sylvops.png"]
+resources = [{ src = "README.md", target = "README.md" }]
 
 [linux]
 generate-desktop-entry = true

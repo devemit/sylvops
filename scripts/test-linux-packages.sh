@@ -214,11 +214,16 @@ fi
 )
 appimage_desktop="$test_root/squashfs-root/usr/share/applications/sylvops.desktop"
 appimage_metainfo="$test_root/squashfs-root/usr/share/metainfo/com.devemit.sylvops.metainfo.xml"
+appimage_guide="$test_root/squashfs-root/usr/lib/sylvops/README.md"
 appimage_icon="$(run_with_timeout 15 find "$test_root/squashfs-root/usr/share/icons" -type f -path '*apps/sylvops.png' -print -quit)"
 [[ -f "$appimage_desktop" ]]
 [[ -f "$appimage_metainfo" ]]
+[[ -f "$appimage_guide" ]]
 [[ -n "$appimage_icon" && -f "$appimage_icon" ]]
 [[ -x "$test_root/squashfs-root/usr/bin/sylvops" ]]
+run_with_timeout 10 grep -Fq '## Install on Linux' "$appimage_guide"
+run_with_timeout 10 grep -Fq '## First run' "$appimage_guide"
+run_with_timeout 10 grep -Fq '## Troubleshooting' "$appimage_guide"
 run_with_timeout 10 grep -Fxq 'Name=SylvOps' "$appimage_desktop"
 run_with_timeout 10 grep -Fxq 'Exec=sylvops' "$appimage_desktop"
 run_with_timeout 10 grep -Fxq 'Icon=sylvops' "$appimage_desktop"
@@ -243,6 +248,7 @@ deb_info="$(run_with_timeout 30 dpkg-deb --info "$deb")"
 deb_contents="$(run_with_timeout 30 dpkg-deb --contents "$deb")"
 [[ "$deb_contents" == *'usr/share/applications/sylvops.desktop'* ]]
 [[ "$deb_contents" == *'usr/share/metainfo/com.devemit.sylvops.metainfo.xml'* ]]
+[[ "$deb_contents" == *'usr/lib/sylvops/README.md'* ]]
 if [[ -n "$previous_deb" ]]; then
   run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$previous_deb"
   previous_deb_version="$(run_with_timeout 30 sylvops --version)"
@@ -258,6 +264,10 @@ fi
 run_with_timeout 30 dpkg-query -L sylvops > "$test_root/deb-installed-files.txt"
 run_with_timeout 10 grep -Fxq '/usr/bin/sylvops' "$test_root/deb-installed-files.txt"
 run_with_timeout 10 grep -Fxq '/usr/share/applications/sylvops.desktop' "$test_root/deb-installed-files.txt"
+run_with_timeout 10 grep -Fxq '/usr/lib/sylvops/README.md' "$test_root/deb-installed-files.txt"
+run_with_timeout 10 grep -Fq '## Install on Linux' /usr/lib/sylvops/README.md
+run_with_timeout 10 grep -Fq '## First run' /usr/lib/sylvops/README.md
+run_with_timeout 10 grep -Fq '## Troubleshooting' /usr/lib/sylvops/README.md
 run_with_timeout 10 grep -Fxq '/usr/share/metainfo/com.devemit.sylvops.metainfo.xml' "$test_root/deb-installed-files.txt"
 run_with_timeout 10 grep -Eq '^/usr/share/icons/.+/apps/sylvops\.png$' "$test_root/deb-installed-files.txt"
 installed_icon="$(run_with_timeout 10 grep -m 1 -E '^/usr/share/icons/.+/apps/sylvops\.png$' "$test_root/deb-installed-files.txt")"
