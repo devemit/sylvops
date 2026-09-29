@@ -2778,11 +2778,7 @@ fn installed_command(handoff: &NativeUpgradeHandoff) -> Command {
 
 fn start_installed_daemon(handoff: &NativeUpgradeHandoff) -> Result<()> {
     let mut command = installed_command(handoff);
-    command
-        .args(["daemon", "start"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.args(["daemon", "start"]).stdin(Stdio::null());
     successful_with_timeout(
         &mut command,
         "installed daemon start",
