@@ -16,7 +16,7 @@ use sylvops_core::{
         ReleaseTarget, SignedReleaseMetadata, UpgradeStatus,
     },
 };
-use sylvops_daemon::{client::DaemonClient, runtime::RuntimePaths};
+use sylvops_daemon::{client::DaemonClient, database::DatabaseHandle, runtime::RuntimePaths};
 
 struct NativeUpgradeFixture {
     _temporary: tempfile::TempDir,
@@ -32,11 +32,16 @@ struct NativeUpgradeFixture {
 }
 
 impl NativeUpgradeFixture {
-    fn stage(extra_payload: &[u8]) -> Self {
+    async fn stage(extra_payload: &[u8]) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let state_root = temporary.path().join("state");
         let paths = RuntimePaths::discover(Some(&state_root)).unwrap();
         paths.prepare().unwrap();
+        let database = DatabaseHandle::open(&paths.database).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), database.shutdown())
+            .await
+            .expect("database fixture shutdown timed out")
+            .unwrap();
         let staging = paths.data_directory.join("upgrades");
         fs::create_dir(&staging).unwrap();
 
@@ -145,7 +150,7 @@ impl NativeUpgradeFixture {
 
 #[tokio::test]
 async fn detached_helper_restores_and_reports_after_native_health_failure() {
-    let fixture = NativeUpgradeFixture::stage(&[]);
+    let fixture = NativeUpgradeFixture::stage(&[]).await;
     let output = tokio::time::timeout(Duration::from_secs(60), fixture.command().output())
         .await
         .expect("native helper timed out")
@@ -197,7 +202,7 @@ async fn detached_helper_restores_and_reports_after_native_health_failure() {
 
 #[tokio::test]
 async fn detached_watchdog_restores_after_upgrade_helper_is_interrupted() {
-    let fixture = NativeUpgradeFixture::stage(b"interrupted-upgrade-candidate");
+    let fixture = NativeUpgradeFixture::stage(b"interrupted-upgrade-candidate").await;
     let mut helper = fixture.command().spawn().unwrap();
     let applying_deadline = Instant::now() + Duration::from_secs(10);
     let mut applying = false;

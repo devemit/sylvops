@@ -185,7 +185,7 @@ installed_architectures="$(run_with_timeout 30 lipo -archs "$installed_binary")"
 run_with_timeout 120 codesign --verify --deep --strict --verbose=2 "$installed_app"
 codesign_details="$test_root/codesign-details.txt"
 run_with_timeout 120 codesign --display --verbose=4 "$installed_app" 2> "$codesign_details"
-grep -Eq '^flags=.*runtime' "$codesign_details"
+grep -Eq 'flags=.*runtime' "$codesign_details"
 if $require_developer_id; then
   grep -Fq 'Authority=Developer ID Application:' "$codesign_details"
   grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' "$codesign_details"

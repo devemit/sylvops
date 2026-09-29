@@ -610,6 +610,7 @@ async fn spawn_native_upgrade_helper(
         .await?
         .permissions();
     tokio::fs::set_permissions(&helper, permissions).await?;
+    crate::native_upgrade::verify_detached_upgrade_helper(&helper)?;
     let handoff = NativeUpgradeHandoff {
         release,
         staging_root: staging_root.clone(),
