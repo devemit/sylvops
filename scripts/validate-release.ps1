@@ -384,9 +384,10 @@ foreach ($requiredSetting in @(
     "identifier = `"$applicationId`"",
     'formats = ["app"]',
     'out-dir = "../../dist/macos-package"',
-    'packaging/icons/sylvops.png',
-    'entitlements = "packaging/macos/entitlements.plist"',
-    'resources = [{ src = "README.md", target = "README.md" }]'
+    'binaries-dir = "../../target/macos-installer-input"',
+    'icons = ["../icons/sylvops.png"]',
+    'entitlements = "entitlements.plist"',
+    'resources = [{ src = "../../README.md", target = "README.md" }]'
 )) {
     Assert-ReleaseCondition ($macosPackagerConfig.Contains($requiredSetting)) "The macOS packager configuration is missing the locked setting: $requiredSetting"
 }
@@ -423,11 +424,12 @@ foreach ($requiredSetting in @(
     "authors = [`"$publisher`"]",
     'formats = ["appimage", "deb"]',
     'out-dir = "../../dist/linux-package"',
-    'packaging/icons/sylvops.png',
+    'binaries-dir = "../../target/linux-installer-input"',
+    'icons = ["../icons/sylvops.png"]',
     'generate-desktop-entry = true',
-    'desktop-template = "packaging/linux/sylvops.desktop.hbs"',
+    'desktop-template = "sylvops.desktop.hbs"',
     'usr/share/metainfo/com.devemit.sylvops.metainfo.xml',
-    'resources = [{ src = "README.md", target = "README.md" }]',
+    'resources = [{ src = "../../README.md", target = "README.md" }]',
     'dpkg-repack',
     'policykit-1'
 )) {

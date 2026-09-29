@@ -7,26 +7,26 @@ authors = ["devemit"]
 description = "Local-first mission control for coding-agent sessions"
 long-description = "A native desktop application for supervising coding-agent sessions in real Git worktrees."
 homepage = "https://github.com/devemit/sylvops"
-license-file = "LICENSE"
+license-file = "../../LICENSE"
 category = "DeveloperTool"
 formats = ["appimage", "deb"]
 out-dir = "../../dist/linux-package"
-binaries-dir = "target/linux-installer-input"
+binaries-dir = "../../target/linux-installer-input"
 binaries = [{ path = "sylvops", main = true }]
-icons = ["packaging/icons/sylvops.png"]
-resources = [{ src = "README.md", target = "README.md" }]
+icons = ["../icons/sylvops.png"]
+resources = [{ src = "../../README.md", target = "README.md" }]
 
 [linux]
 generate-desktop-entry = true
 
 [deb]
 depends = ["libc6", "libgcc-s1", "libx11-6", "libxkbcommon0", "libxkbcommon-x11-0", "libwayland-client0", "libegl1", "libgl1", "libvulkan1", "dpkg-repack", "policykit-1"]
-desktop-template = "packaging/linux/sylvops.desktop.hbs"
+desktop-template = "sylvops.desktop.hbs"
 section = "devel"
 priority = "optional"
 
 [deb.files]
-"packaging/linux/com.devemit.sylvops.metainfo.xml" = "usr/share/metainfo/com.devemit.sylvops.metainfo.xml"
+"com.devemit.sylvops.metainfo.xml" = "usr/share/metainfo/com.devemit.sylvops.metainfo.xml"
 
 [appimage.files]
-"packaging/linux/com.devemit.sylvops.metainfo.xml" = "usr/share/metainfo/com.devemit.sylvops.metainfo.xml"
+"com.devemit.sylvops.metainfo.xml" = "usr/share/metainfo/com.devemit.sylvops.metainfo.xml"
