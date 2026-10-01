@@ -30,7 +30,8 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     initialize_repository(&repository);
     let bin_directory = temporary.path().join("bin");
     std::fs::create_dir(&bin_directory).expect("fake provider bin directory");
-    install_fake_codex(&bin_directory);
+    let fake_codex = install_fake_codex(&bin_directory);
+    let _codex_cli_path = EnvironmentGuard::set("CODEX_CLI_PATH", fake_codex);
     let _path =
         EnvironmentGuard::set(
             "PATH",
@@ -448,7 +449,7 @@ async fn connect_eventually(paths: &RuntimePaths) -> DaemonClient {
     .expect("daemon connection timeout")
 }
 
-fn install_fake_codex(directory: &Path) {
+fn install_fake_codex(directory: &Path) -> std::path::PathBuf {
     let target = directory.join(if cfg!(windows) { "codex.exe" } else { "codex" });
     let source = std::env::var_os("SYLVOPS_TEST_FAKE_CODEX").map_or_else(
         || std::path::PathBuf::from(env!("CARGO_BIN_EXE_fake-codex")),
@@ -462,8 +463,9 @@ fn install_fake_codex(directory: &Path) {
             .expect("fake metadata")
             .permissions();
         permissions.set_mode(0o700);
-        std::fs::set_permissions(target, permissions).expect("fake executable permissions");
+        std::fs::set_permissions(&target, permissions).expect("fake executable permissions");
     }
+    target
 }
 
 #[cfg(windows)]

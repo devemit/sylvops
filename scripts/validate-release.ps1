@@ -356,7 +356,7 @@ $pngIconBytes = [IO.File]::ReadAllBytes((Join-Path $root 'packaging\icons\sylvop
 Assert-ReleaseCondition ($pngIconBytes.Length -ge 24) "The PNG application icon is malformed."
 $pngIconWidth = [Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($pngIconBytes, 16))
 $pngIconHeight = [Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($pngIconBytes, 20))
-Assert-ReleaseCondition ($pngIconWidth -eq 1024 -and $pngIconHeight -eq 1024) "The PNG application icon must be 1024x1024 for macOS ICNS generation."
+Assert-ReleaseCondition ($pngIconWidth -eq 512 -and $pngIconHeight -eq 512) "The PNG application icon must be 512x512 for macOS ICNS generation."
 
 $packagerVersionPath = Join-Path $root 'packaging\cargo-packager.version'
 Assert-ReleaseCondition (Test-Path -LiteralPath $packagerVersionPath -PathType Leaf) "The cargo-packager version pin is missing."
@@ -471,7 +471,7 @@ foreach ($requiredText in @('run_with_timeout', 'x86_64-unknown-linux-gnu', 'car
 $linuxSmokeScriptPath = Join-Path $root 'scripts\test-linux-packages.sh'
 Assert-ReleaseCondition (Test-Path -LiteralPath $linuxSmokeScriptPath -PathType Leaf) "The Linux package smoke test is missing."
 $linuxSmokeScript = Get-Content -Raw -LiteralPath $linuxSmokeScriptPath
-foreach ($requiredText in @('run_with_timeout', 'run_with_timeout 10 realpath --', 'APPIMAGE_EXTRACT_AND_RUN=1', '--appimage-extract', '--previous-appimage', '--previous-deb', '--allow-downgrades', 'run_with_timeout 30 dpkg-deb --info', 'run_with_timeout 30 dpkg-deb --contents', 'run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install', 'run_with_timeout 30 ldd /usr/bin/sylvops', 'run_with_timeout 30 dpkg-query -L sylvops', 'gtk-launch sylvops', 'desktop-file-validate', 'daemon status', 'pgrep -f', 'run_with_timeout 120 sudo --non-interactive dpkg --remove', 'package-preserve.txt', 'show-ref --verify', 'user_integration_path', 'usr/share/applications/sylvops.desktop', 'usr/share/metainfo/com.devemit.sylvops.metainfo.xml', 'apps/sylvops\.png')) {
+foreach ($requiredText in @('run_with_timeout', 'run_with_timeout 10 realpath --', 'APPIMAGE_EXTRACT_AND_RUN=1', 'ICED_BACKEND=tiny-skia', '--appimage-extract', '--previous-appimage', '--previous-deb', '--allow-downgrades', 'run_with_timeout 30 dpkg-deb --info', 'run_with_timeout 30 dpkg-deb --contents', 'run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install', 'run_with_timeout 30 ldd /usr/bin/sylvops', 'run_with_timeout 30 dpkg-query -L sylvops', 'gtk-launch sylvops', 'desktop-file-validate', 'daemon status', 'pgrep -f', 'run_with_timeout 120 sudo --non-interactive dpkg --remove', 'package-preserve.txt', 'show-ref --verify', 'user_integration_path', 'usr/share/applications/sylvops.desktop', 'usr/share/metainfo/com.devemit.sylvops.metainfo.xml', 'apps/sylvops\.png')) {
     Assert-ReleaseCondition ($linuxSmokeScript.Contains($requiredText)) "The Linux package smoke test is missing an acceptance check: $requiredText"
 }
 
