@@ -410,7 +410,7 @@ foreach ($requiredText in @('run_with_timeout', '--options runtime', 'Developer 
     Assert-ReleaseCondition ($macosPackageScript.Contains($requiredText)) "The macOS package script is missing a release control: $requiredText"
 }
 $macosSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-package.sh')
-foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'CFBundleIdentifier', 'TeamIdentifier', 'pwd -P', 'desktop.log', 'package-preserve.txt', 'show-ref --verify', 'Contents/Resources/README.md', '## Install on macOS', '## First run', '## Troubleshooting')) {
+foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -n "$installed_app"', '--stdout "$launch_stdout"', '--stderr "$launch_stderr"', 'CFBundleIdentifier', 'TeamIdentifier', 'pwd -P', 'daemon.log', 'desktop.log', 'package-preserve.txt', 'show-ref --verify', 'Contents/Resources/README.md', '## Install on macOS', '## First run', '## Troubleshooting')) {
     Assert-ReleaseCondition ($macosSmokeScript.Contains($requiredText)) "The macOS package smoke test is missing an acceptance check: $requiredText"
 }
 $macosUpgradeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-native-upgrade.sh')
@@ -435,6 +435,7 @@ foreach ($requiredSetting in @(
     'desktop-template = "sylvops.desktop.hbs"',
     'usr/share/metainfo/com.devemit.sylvops.metainfo.xml',
     'resources = [{ src = "../../README.md", target = "README.md" }]',
+    'package-name = "sylvops"',
     'dpkg-repack',
     'policykit-1'
 )) {

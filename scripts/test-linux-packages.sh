@@ -254,13 +254,13 @@ user_integration_path="$(run_with_timeout 15 find "$XDG_DATA_HOME" -type f \( -n
 [[ -z "$user_integration_path" ]] || { echo "AppImage created hidden user integration: $user_integration_path" >&2; exit 1; }
 
 deb_info="$(run_with_timeout 30 dpkg-deb --info "$deb")"
-[[ "$deb_info" == *"Version: $expected_version"* ]]
-[[ "$deb_info" == *'Package: sylvops'* ]]
-[[ "$deb_info" == *'Maintainer: devemit'* ]]
+[[ "$deb_info" == *"Version: $expected_version"* ]] || { echo "The Debian package version does not match $expected_version." >&2; exit 1; }
+[[ "$deb_info" == *'Package: sylvops'* ]] || { echo "The Debian package-manager identity is not sylvops." >&2; exit 1; }
+[[ "$deb_info" == *'Maintainer: devemit'* ]] || { echo "The Debian package maintainer is not devemit." >&2; exit 1; }
 deb_contents="$(run_with_timeout 30 dpkg-deb --contents "$deb")"
-[[ "$deb_contents" == *'usr/share/applications/sylvops.desktop'* ]]
-[[ "$deb_contents" == *'usr/share/metainfo/com.devemit.sylvops.metainfo.xml'* ]]
-[[ "$deb_contents" == *'usr/lib/sylvops/README.md'* ]]
+[[ "$deb_contents" == *'usr/share/applications/sylvops.desktop'* ]] || { echo "The Debian package is missing its desktop entry." >&2; exit 1; }
+[[ "$deb_contents" == *'usr/share/metainfo/com.devemit.sylvops.metainfo.xml'* ]] || { echo "The Debian package is missing its AppStream metadata." >&2; exit 1; }
+[[ "$deb_contents" == *'usr/lib/sylvops/README.md'* ]] || { echo "The Debian package is missing its bundled guide." >&2; exit 1; }
 if [[ -n "$previous_deb" ]]; then
   run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$previous_deb"
   previous_deb_version="$(run_with_timeout 30 sylvops --version)"

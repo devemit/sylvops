@@ -20,6 +20,7 @@ resources = [{ src = "../../README.md", target = "README.md" }]
 generate-desktop-entry = true
 
 [deb]
+package-name = "sylvops"
 depends = ["libc6", "libgcc-s1", "libx11-6", "libxkbcommon0", "libxkbcommon-x11-0", "libwayland-client0", "libegl1", "libgl1", "libvulkan1", "dpkg-repack", "policykit-1"]
 desktop-template = "sylvops.desktop.hbs"
 section = "devel"
