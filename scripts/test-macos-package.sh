@@ -93,7 +93,7 @@ if [[ -n "$previous_dmg" && ( ! -f "$previous_dmg" || ! -s "$previous_dmg" ) ]];
   exit 1
 fi
 
-test_root="$(mktemp -d "${TMPDIR:-/tmp}/sylvops-macos-package.XXXXXX")"
+test_root="$(mktemp -d "/tmp/sylvops-macos.XXXXXX")"
 test_root="$(cd "$test_root" && pwd -P)"
 mount_dir="$test_root/mounted"
 previous_mount_dir="$test_root/previous-mounted"

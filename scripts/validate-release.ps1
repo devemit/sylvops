@@ -410,11 +410,11 @@ foreach ($requiredText in @('run_with_timeout', '--options runtime', 'Developer 
     Assert-ReleaseCondition ($macosPackageScript.Contains($requiredText)) "The macOS package script is missing a release control: $requiredText"
 }
 $macosSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-package.sh')
-foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -n "$installed_app"', '--stdout "$launch_stdout"', '--stderr "$launch_stderr"', 'CFBundleIdentifier', 'TeamIdentifier', 'pwd -P', 'daemon.log', 'desktop.log', 'package-preserve.txt', 'show-ref --verify', 'Contents/Resources/README.md', '## Install on macOS', '## First run', '## Troubleshooting')) {
+foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -n "$installed_app"', '--stdout "$launch_stdout"', '--stderr "$launch_stderr"', 'CFBundleIdentifier', 'TeamIdentifier', '/tmp/sylvops-macos.', 'pwd -P', 'daemon.log', 'desktop.log', 'package-preserve.txt', 'show-ref --verify', 'Contents/Resources/README.md', '## Install on macOS', '## First run', '## Troubleshooting')) {
     Assert-ReleaseCondition ($macosSmokeScript.Contains($requiredText)) "The macOS package smoke test is missing an acceptance check: $requiredText"
 }
 $macosUpgradeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-native-upgrade.sh')
-foreach ($requiredText in @('update-helper', 'stapler validate', 'spctl --assess', 'TeamIdentifier', 'helper_interrupted', 'health_check_failed', 'rollback_attempts')) {
+foreach ($requiredText in @('update-helper', 'stapler validate', 'spctl --assess', 'TeamIdentifier', '/tmp/sylvops-macos-upgrade.', 'pwd -P', 'helper_interrupted', 'health_check_failed', 'rollback_attempts')) {
     Assert-ReleaseCondition ($macosUpgradeScript.Contains($requiredText)) "The macOS native-upgrade test is missing an acceptance check: $requiredText"
 }
 
