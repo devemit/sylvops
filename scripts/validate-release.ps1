@@ -635,6 +635,46 @@ Assert-ReleaseCondition ($release.Contains('--signer-workflow "$GITHUB_REPOSITOR
 Assert-ReleaseCondition ($release.Contains('timeout-minutes:')) "Release jobs do not bound promotion execution."
 Assert-NoLegacyReleasePhaseWording -Path '.github\workflows\release.yml' -Text $release
 
+$previewWorkflowPath = Join-Path $root '.github\workflows\unsigned-preview.yml'
+Assert-ReleaseCondition (Test-Path -LiteralPath $previewWorkflowPath -PathType Leaf) "The unsigned-preview workflow is missing."
+$previewWorkflow = Get-Content -Raw -LiteralPath $previewWorkflowPath
+foreach ($requiredText in @(
+    'name: Unsigned Preview',
+    'workflow_dispatch:',
+    'preview_tag:',
+    'uses: ./.github/workflows/ci.yml',
+    'v$version-preview\.[1-9][0-9]*',
+    'scripts/package-windows-preview.ps1',
+    'scripts/package-linux.sh --skip-build',
+    'scripts/test-linux-packages.sh',
+    'sylvops-windows-x86_64.zip',
+    'sylvops-linux-x86_64.tar.gz',
+    'sylvops-linux-x86_64.AppImage',
+    'sylvops-linux-x86_64.deb',
+    'UNSIGNED-PREVIEW.txt',
+    'actions/attest-build-provenance@',
+    'gh release create',
+    '--prerelease'
+)) {
+    Assert-ReleaseCondition ($previewWorkflow.Contains($requiredText)) "Unsigned-preview workflow is missing the locked control: $requiredText"
+}
+Assert-ReleaseCondition ($previewWorkflow -notmatch '(?m)^\s*environment:\s*release\s*$') "Unsigned previews must not read the protected release environment."
+Assert-ReleaseCondition ($previewWorkflow -notmatch 'secrets\.') "Unsigned previews must not read protected secrets."
+Assert-ReleaseCondition ($previewWorkflow -notmatch 'sylvops-macos-|package-macos|MACOS_') "Unsigned previews must not publish macOS packages."
+Assert-ReleaseCondition ($previewWorkflow -notmatch 'sylvops-windows-x86_64-setup\.exe|package-windows-installer|WINDOWS_SIGNING_') "Unsigned previews must not publish the native Windows installer."
+Assert-ReleaseCondition ($previewWorkflow -notmatch 'sylvops-update-|UPDATE_SIGNING_') "Unsigned previews must not publish signed-update metadata."
+$previewPackageScriptPath = Join-Path $root 'scripts\package-windows-preview.ps1'
+Assert-ReleaseCondition (Test-Path -LiteralPath $previewPackageScriptPath -PathType Leaf) "The unsigned Windows preview packaging script is missing."
+$previewPackageScript = Get-Content -Raw -LiteralPath $previewPackageScriptPath
+foreach ($requiredText in @('cargo build --release --locked -p sylvops-cli', 'UNSIGNED-PREVIEW.txt', 'sylvops-windows-x86_64.zip', 'Compare-Object')) {
+    Assert-ReleaseCondition ($previewPackageScript.Contains($requiredText)) "Unsigned Windows preview packaging is missing the locked control: $requiredText"
+}
+Assert-ReleaseCondition ($previewPackageScript -notmatch 'QUICKSTART\.txt|sign-windows|CertificateThumbprint') "Unsigned Windows previews must not include signed-release instructions or signing controls."
+$previewWarning = Get-Content -Raw -LiteralPath (Join-Path $root 'packaging\windows\UNSIGNED-PREVIEW.txt')
+foreach ($requiredText in @('free unsigned testing build', 'Do not bypass', 'security warning', 'do not receive signed in-app updates')) {
+    Assert-ReleaseCondition ($previewWarning.Contains($requiredText)) "Unsigned Windows preview warning is missing: $requiredText"
+}
+
 $ciInstallerJob = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\ci.yml')
 Assert-ReleaseCondition ($ciInstallerJob.Contains('windows-installer')) "CI is missing the clean native Windows installer job."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('New-SelfSignedCertificate')) "CI does not create an isolated test signing identity for installer verification."

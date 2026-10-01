@@ -1,0 +1,13 @@
+SYLVOPS UNSIGNED PREVIEW
+========================
+
+This is a free unsigned testing build, not an official signed application release.
+
+Verify this archive against SHA256SUMS before extracting it. Windows may identify
+sylvops.exe as coming from an unknown publisher. Do not bypass an operating-system
+security warning. If Windows blocks the executable, build SylvOps from source or
+wait for an official signed release.
+
+Preview builds do not receive signed in-app updates. Install a later preview
+explicitly or build the newer revision from source.
+
