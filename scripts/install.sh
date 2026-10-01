@@ -2,11 +2,25 @@
 set -eu
 
 version="${SYLVOPS_VERSION:-0.1.0}"
+printf '%s\n' "$version" | grep -Eq '^0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[1-9][0-9]*)?$' || {
+  echo "Version must be an ordinary 0.x version or an unsigned preview version such as 0.1.0-preview.1." >&2
+  exit 1
+}
+case "$version" in
+  *-preview.*) is_unsigned_preview=true ;;
+  *) is_unsigned_preview=false ;;
+esac
 install_dir="${SYLVOPS_INSTALL_DIR:-$HOME/.local/bin}"
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) asset="sylvops-linux-x86_64.tar.gz" ;;
-  Darwin-x86_64) asset="sylvops-macos-x86_64.tar.gz" ;;
-  Darwin-arm64) asset="sylvops-macos-aarch64.tar.gz" ;;
+  Darwin-x86_64)
+    $is_unsigned_preview && { echo "macOS packages are not published for unsigned previews." >&2; exit 1; }
+    asset="sylvops-macos-x86_64.tar.gz"
+    ;;
+  Darwin-arm64)
+    $is_unsigned_preview && { echo "macOS packages are not published for unsigned previews." >&2; exit 1; }
+    asset="sylvops-macos-aarch64.tar.gz"
+    ;;
   *) echo "Unsupported SylvOps platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 
@@ -27,4 +41,4 @@ tar -xzf "$temporary/$asset" -C "$temporary"
 mkdir -p "$install_dir"
 install -m 0755 "$temporary/sylvops" "$install_dir/sylvops"
 echo "Installed SylvOps to $install_dir/sylvops"
-echo "Add $install_dir to PATH yourself, then run: sylvops open ."
+echo "Add $install_dir to PATH yourself, then run: sylvops up ."
