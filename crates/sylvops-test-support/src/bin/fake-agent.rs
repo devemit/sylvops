@@ -60,7 +60,7 @@ fn run() -> io::Result<u8> {
         "cwd" => {
             println!("CWD={}", env::current_dir()?.display());
             io::stdout().flush()?;
-            Ok(0)
+            interactive()
         }
         unknown => Err(io::Error::new(
             io::ErrorKind::InvalidInput,

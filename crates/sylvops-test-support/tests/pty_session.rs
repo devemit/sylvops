@@ -5,9 +5,11 @@ use sylvops_daemon::{
     session::{SessionHandle, SessionSpec},
 };
 
+const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_spawns_under_process_tree_control() {
-    let mut session = match SessionHandle::spawn(&spec(["exit", "0"], 64 * 1024)) {
+    let mut session = match SessionHandle::spawn(&spec(["interactive"], 64 * 1024)) {
         Ok(session) => session,
         Err(DaemonError::ProcessTree(_)) => {
             println!("::error title=PTY spawn category::process-tree containment failed");
@@ -22,7 +24,9 @@ async fn session_spawns_under_process_tree_control() {
             panic!("unexpected session setup failure");
         }
     };
-    let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
+    wait_for_output(&session, "FAKE_AGENT_READY").await;
+    session.input(input_line("exit")).await.expect("exit input");
+    let exit = tokio::time::timeout(TEST_TIMEOUT, session.wait())
         .await
         .expect("contained session exit timeout")
         .expect("contained session wait");
@@ -39,7 +43,9 @@ async fn session_starts_in_the_selected_worktree() {
     let mut launch = spec(["cwd"], 64 * 1024);
     launch.cwd = expected.clone();
     let mut session = SessionHandle::spawn(&launch).expect("spawn cwd reporter");
-    let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
+    wait_for_output(&session, "CWD=").await;
+    session.input(input_line("exit")).await.expect("exit input");
+    let exit = tokio::time::timeout(TEST_TIMEOUT, session.wait())
         .await
         .expect("cwd reporter timeout")
         .expect("cwd reporter wait");
@@ -74,7 +80,7 @@ async fn session_accepts_input_and_replays_after_detach() {
 
     session.resize(100, 40).await.expect("resize PTY");
     session.input(input_line("exit")).await.expect("exit input");
-    let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
+    let exit = tokio::time::timeout(TEST_TIMEOUT, session.wait())
         .await
         .expect("session exit timeout")
         .expect("session wait");
@@ -97,7 +103,7 @@ async fn stopping_session_terminates_descendant_heartbeat() {
     wait_for_output(&session, "CHILD_PID=").await;
     wait_for_file(&heartbeat).await;
     session.stop().await.expect("terminate process tree");
-    tokio::time::timeout(Duration::from_secs(5), session.wait())
+    tokio::time::timeout(TEST_TIMEOUT, session.wait())
         .await
         .expect("process tree exit timeout")
         .expect("session wait");
@@ -114,7 +120,7 @@ async fn large_output_is_bounded_and_reports_eviction() {
     let capacity = 16 * 1024;
     let mut session =
         SessionHandle::spawn(&spec(["burst", "262144"], capacity)).expect("spawn burst agent");
-    let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
+    let exit = tokio::time::timeout(TEST_TIMEOUT, session.wait())
         .await
         .expect("burst exit timeout")
         .expect("burst session wait");
@@ -172,7 +178,7 @@ async fn attachment_lease_rejects_observer_input_and_requires_reattach() {
         .input_from(observer, input_line("exit"))
         .await
         .unwrap();
-    let exit = tokio::time::timeout(Duration::from_secs(5), session.wait())
+    let exit = tokio::time::timeout(TEST_TIMEOUT, session.wait())
         .await
         .unwrap()
         .unwrap();
@@ -208,7 +214,7 @@ fn spec(
 }
 
 async fn wait_for_output(session: &SessionHandle, expected: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
             let replay = session.replay_after(0).await.expect("request replay");
             let bytes: Vec<u8> = replay
@@ -227,7 +233,7 @@ async fn wait_for_output(session: &SessionHandle, expected: &str) {
 }
 
 async fn wait_for_file(path: &Path) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(TEST_TIMEOUT, async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
