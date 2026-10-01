@@ -9,6 +9,7 @@ mod theme;
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     io::Cursor,
     time::{Duration, Instant},
 };
@@ -31,9 +32,12 @@ use iced::{
 };
 use iced::{font, font::Weight, widget::button::Status};
 use presentation::{
-    ButtonIntent, ButtonTokens, ControlState, DensityMetrics, DesktopPresentation,
-    InteractionState as PresentationInteraction, PresentationInput, PresentationLayout,
-    PresentationTheme, SystemAppearance, TerminalPalette, Viewport, button_visual,
+    ActiveTerminalAction, ButtonIntent, ButtonTokens, ControlState, DensityMetrics,
+    DesktopPresentation, ExplorerAction, ExplorerAttention, ExplorerIntent, ExplorerKey,
+    ExplorerMode, ExplorerNodeId, InteractionState as PresentationInteraction, PresentationInput,
+    PresentationLayout, PresentationTheme, SessionIndicator, SystemAppearance, TerminalPalette,
+    Viewport, WorkspaceNavigation, button_visual, session_state_can_replay as session_can_replay,
+    session_state_can_stop as session_can_stop, session_state_label,
 };
 use sylvops_core::{
     domain::{
@@ -44,9 +48,9 @@ use sylvops_core::{
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     provider::ProviderHealth,
     ui::{
-        DesktopDensity, DesktopPanel, DesktopState, DesktopTerminalCursor, DesktopTerminalFont,
-        DesktopTheme, MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT,
-        MIN_DESKTOP_WIDTH, MIN_TERMINAL_FONT_SIZE, MainTab,
+        DesktopDensity, DesktopState, DesktopTerminalCursor, DesktopTerminalFont, DesktopTheme,
+        MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT, MIN_DESKTOP_WIDTH,
+        MIN_TERMINAL_FONT_SIZE, MainTab,
     },
     ui_forms::{Form, FormKind},
     upgrade::{InstallDisposition, UpgradeStatus},
@@ -200,16 +204,19 @@ struct DesktopApp {
     closing_since: Option<Instant>,
     pending_resize: Option<(SessionId, u16, u16, Instant)>,
     panes: pane_grid::State<DesktopPane>,
-    pane_splits: [pane_grid::Split; 3],
+    pane_splits: [pane_grid::Split; 1],
     restore_window_size: Option<(u16, u16)>,
     narrow_main: bool,
-    keyboard_panel: DesktopPanel,
+    explorer_visibility: ExplorerVisibility,
+    expanded_project_ids: HashSet<ProjectId>,
+    expanded_worktree_ids: HashSet<WorktreeId>,
+    focused_explorer_node: Option<ExplorerNodeId>,
+    hovered_explorer_node: Option<ExplorerNodeId>,
     terminal_focus: TerminalFocus,
     terminal_viewport: Option<iced::Size>,
     terminal_pointer: Option<Point>,
     terminal_selection_state: TerminalSelectionState,
     inline_session_rename: Option<InlineSessionRename>,
-    hovered_session_id: Option<SessionId>,
     resume_pending: HashSet<SessionId>,
     window_mode: window::Mode,
     update_status: UpgradeStatus,
@@ -225,9 +232,7 @@ enum InstallRequestState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DesktopPane {
-    Projects,
-    Worktrees,
-    Sessions,
+    Explorer,
     Main,
 }
 
@@ -252,6 +257,13 @@ enum TerminalSelectionState {
     Selecting,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExplorerVisibility {
+    #[default]
+    Shown,
+    Collapsed,
+}
+
 #[derive(Clone, Debug)]
 struct InlineSessionRename {
     session_id: SessionId,
@@ -259,6 +271,18 @@ struct InlineSessionRename {
     pending: bool,
     error: Option<String>,
     input_id: widget::Id,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceChoice {
+    id: WorkspaceId,
+    name: String,
+}
+
+impl fmt::Display for WorkspaceChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.name)
+    }
 }
 
 impl InlineSessionRename {
@@ -310,23 +334,22 @@ enum Message {
     Tick,
     Keyboard(keyboard::Event),
     SelectWorkspace(WorkspaceId),
-    SelectProject(ProjectId),
-    SelectWorktree(WorktreeId),
-    SelectSession(SessionId),
+    SelectExplorerNode(ExplorerNodeId),
+    ToggleExplorerNode(ExplorerNodeId),
+    OpenExplorerNode(ExplorerNodeId),
+    RunExplorerAction(ExplorerAction),
+    HoverExplorerNode(Option<ExplorerNodeId>),
     SelectOpenSession(SessionId),
     CloseSessionTab(SessionId),
     SelectMainTab(MainTab),
     NewWorkspace,
     NewProject,
-    NewWorktree,
-    NewSession,
     RenameProject,
     RenameWorktree,
     BeginSessionRename(SessionId),
     SessionRenameInput(String),
     SubmitSessionRename,
     CancelSessionRename,
-    HoverSession(Option<SessionId>),
     RemoveSelectedWorktree,
     FormInput(usize, String),
     SelectProvider(ProviderKind),
@@ -357,7 +380,7 @@ enum Message {
     SelectTerminalCursor(DesktopTerminalCursor),
     SetTerminalFontSize(u8),
     ResetLayout,
-    SelectCompactPanel(DesktopPanel),
+    ToggleExplorer,
     WindowResized(window::Id, iced::Size),
     WindowReady(Option<window::Id>),
     SystemThemeChanged(iced::theme::Mode),
@@ -377,20 +400,12 @@ enum Message {
 
 impl DesktopApp {
     fn new(paths: RuntimePaths) -> Self {
-        let (mut panes, projects) = pane_grid::State::new(DesktopPane::Projects);
-        let (worktrees, first) = panes
-            .split(pane_grid::Axis::Vertical, projects, DesktopPane::Worktrees)
-            .expect("initial desktop pane split");
-        let (sessions, second) = panes
-            .split(pane_grid::Axis::Vertical, worktrees, DesktopPane::Sessions)
-            .expect("initial desktop pane split");
-        let (_, third) = panes
-            .split(pane_grid::Axis::Vertical, sessions, DesktopPane::Main)
+        let (mut panes, explorer) = pane_grid::State::new(DesktopPane::Explorer);
+        let (_, split) = panes
+            .split(pane_grid::Axis::Vertical, explorer, DesktopPane::Main)
             .expect("initial desktop pane split");
         let defaults = DesktopState::default();
-        panes.resize(first, f32::from(defaults.panel_ratios[0]) / 1000.0);
-        panes.resize(second, f32::from(defaults.panel_ratios[1]) / 1000.0);
-        panes.resize(third, f32::from(defaults.panel_ratios[2]) / 1000.0);
+        panes.resize(split, f32::from(defaults.panel_ratios[0]) / 1000.0);
         Self {
             bridge: Bridge::spawn(paths),
             snapshot: DaemonSnapshot::default(),
@@ -416,16 +431,19 @@ impl DesktopApp {
             closing_since: None,
             pending_resize: None,
             panes,
-            pane_splits: [first, second, third],
+            pane_splits: [split],
             restore_window_size: None,
             narrow_main: false,
-            keyboard_panel: DesktopPanel::Projects,
+            explorer_visibility: ExplorerVisibility::Shown,
+            expanded_project_ids: HashSet::new(),
+            expanded_worktree_ids: HashSet::new(),
+            focused_explorer_node: None,
+            hovered_explorer_node: None,
             terminal_focus: TerminalFocus::Unfocused,
             terminal_viewport: None,
             terminal_pointer: None,
             terminal_selection_state: TerminalSelectionState::Idle,
             inline_session_rename: None,
-            hovered_session_id: None,
             resume_pending: HashSet::new(),
             window_mode: window::Mode::Windowed,
             update_status: UpgradeStatus::Idle,
@@ -478,12 +496,12 @@ impl DesktopApp {
                 }
                 if self.modal.is_none()
                     && !self.terminal_focus.is_focused()
-                    && self.keyboard_panel == DesktopPanel::Sessions
+                    && matches!(self.focused_explorer_node, Some(ExplorerNodeId::Session(_)))
                     && let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
                     && !modifiers.control()
                     && !modifiers.alt()
                     && matches!(key.as_ref(), Key::Character(value) if value.eq_ignore_ascii_case("r"))
-                    && let Some(session_id) = self.selected_session_id
+                    && let Some(ExplorerNodeId::Session(session_id)) = self.focused_explorer_node
                 {
                     return self.begin_session_rename(session_id);
                 }
@@ -503,9 +521,13 @@ impl DesktopApp {
                     ClientRequest::OpenWorkspace { workspace_id },
                 );
             }
-            Message::SelectProject(project_id) => self.select_project(project_id),
-            Message::SelectWorktree(worktree_id) => self.select_worktree(worktree_id),
-            Message::SelectSession(session_id) => self.select_session(session_id),
+            Message::SelectExplorerNode(node) => self.select_explorer_node(node),
+            Message::ToggleExplorerNode(node) => self.toggle_explorer_node(node),
+            Message::OpenExplorerNode(node) => self.open_explorer_node(node),
+            Message::RunExplorerAction(action) => {
+                return self.run_explorer_action(action);
+            }
+            Message::HoverExplorerNode(node) => self.hovered_explorer_node = node,
             Message::SelectOpenSession(session_id) => {
                 self.unfocus_terminal();
                 if self.active_session_id == Some(session_id) {
@@ -518,8 +540,9 @@ impl DesktopApp {
                 {
                     self.inline_session_rename = None;
                 }
-                self.keyboard_panel = DesktopPanel::Sessions;
                 self.select_session_context(session_id);
+                self.focused_explorer_node = Some(ExplorerNodeId::Session(session_id));
+                self.expand_selected_path();
                 self.active_session_id = Some(session_id);
                 self.mark_state_dirty();
             }
@@ -552,8 +575,6 @@ impl DesktopApp {
                 self.modal = Some(Modal::Form(FormModal::new(Form::workspace())));
             }
             Message::NewProject => self.open_project_form(),
-            Message::NewWorktree => self.open_worktree_form(),
-            Message::NewSession => self.open_session_form(),
             Message::RenameProject => self.open_project_rename_form(),
             Message::RenameWorktree => self.open_worktree_rename_form(),
             Message::BeginSessionRename(session_id) => {
@@ -568,7 +589,6 @@ impl DesktopApp {
             Message::CancelSessionRename => {
                 cancel_inline_session_rename(&mut self.inline_session_rename);
             }
-            Message::HoverSession(session_id) => self.hovered_session_id = session_id,
             Message::RemoveSelectedWorktree => self.inspect_worktree_removal(),
             Message::FormInput(index, value) => self.update_form_field(index, value),
             Message::SelectProvider(kind) => self.select_provider(kind),
@@ -674,14 +694,13 @@ impl DesktopApp {
                 self.mark_state_dirty();
                 self.queue_terminal_resize();
             }
-            Message::SelectCompactPanel(panel) => {
-                if panel != DesktopPanel::Sessions {
-                    self.inline_session_rename = None;
-                }
-                self.keyboard_panel = panel;
+            Message::ToggleExplorer => {
+                self.inline_session_rename = None;
                 self.terminal_focus = TerminalFocus::Unfocused;
-                self.desktop_state.compact_panel = panel;
-                self.mark_state_dirty();
+                self.explorer_visibility = match self.explorer_visibility {
+                    ExplorerVisibility::Shown => ExplorerVisibility::Collapsed,
+                    ExplorerVisibility::Collapsed => ExplorerVisibility::Shown,
+                };
             }
             Message::WindowResized(id, size) => self.window_resized(id, size),
             Message::WindowReady(id) => self.window_id = id,
@@ -741,7 +760,16 @@ impl DesktopApp {
                 selected_worktree_id: self.selected_worktree_id,
                 selected_session_id: self.selected_session_id,
                 active_session_id: self.active_session_id,
+                open_session_ids: self.open_sessions.clone(),
+                active_session_attached: self.active_session_id.is_some_and(|session_id| {
+                    self.terminals
+                        .get(&session_id)
+                        .is_some_and(|terminal| terminal.attached)
+                }),
                 main_tab: self.main_tab,
+                expanded_project_ids: self.expanded_project_ids.iter().copied().collect(),
+                expanded_worktree_ids: self.expanded_worktree_ids.iter().copied().collect(),
+                focused_explorer_node: self.focused_explorer_node,
             },
         })
     }
@@ -808,7 +836,8 @@ impl DesktopApp {
     }
 
     fn top_bar(&self) -> Element<'_, Message> {
-        let density = self.presentation().density;
+        let presentation = self.presentation();
+        let density = presentation.density;
         let compact = self.desktop_state.window_width < 1_000;
         let fullscreen_label = fullscreen_label(self.window_mode, compact);
         let worktree_context = self.selected_worktree().map_or_else(
@@ -831,45 +860,7 @@ impl DesktopApp {
         )
         .width(Length::Fixed(if compact { 106.0 } else { 132.0 }))
         .padding([0, 8]);
-        let mut workspace_tabs = row![].spacing(0).align_y(Center);
-        for (index, workspace) in self.snapshot.workspaces.iter().enumerate() {
-            if index > 0 {
-                workspace_tabs = workspace_tabs.push(rule::vertical(1));
-            }
-            let active = workspace.is_open;
-            let label = workspace.name.clone();
-            let action = button(
-                text(label.clone())
-                    .font(if active { UI_SEMIBOLD } else { UI_FONT })
-                    .size(UI_TEXT_SIZE)
-                    .wrapping(text::Wrapping::None),
-            )
-            .on_press(Message::SelectWorkspace(workspace.id))
-            .height(density.control_height)
-            .padding([6, 14])
-            .style(move |theme, status| workspace_tab_style(theme, status, active));
-            workspace_tabs = workspace_tabs.push(action);
-        }
-        if !self.snapshot.workspaces.is_empty() {
-            workspace_tabs = workspace_tabs.push(rule::vertical(1));
-        }
-        workspace_tabs = workspace_tabs.push(
-            button(
-                text(if compact { "+" } else { "+ Workspace" })
-                    .font(UI_MEDIUM)
-                    .size(if compact { 16.0 } else { UI_META_SIZE }),
-            )
-            .on_press(Message::NewWorkspace)
-            .height(density.control_height)
-            .padding([5, 11])
-            .style(chrome_action_style),
-        );
-        let workspace_tabs = scrollable(workspace_tabs)
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::hidden(),
-            ))
-            .width(Fill)
-            .height(density.control_height);
+        let workspace_navigation = self.workspace_navigation(&presentation, compact);
         let mut actions = row![].spacing(density.region_spacing).align_y(Center);
         if !compact {
             actions = actions.push(
@@ -896,7 +887,7 @@ impl DesktopApp {
                     .padding([6, 11])
                     .style(chrome_action_style),
             );
-        let navigation = row![brand, workspace_tabs, actions]
+        let navigation = row![brand, workspace_navigation, actions]
             .spacing(density.region_spacing)
             .align_y(Center);
         container(navigation)
@@ -905,6 +896,86 @@ impl DesktopApp {
             .padding([5, 8])
             .align_y(Vertical::Center)
             .style(chrome_surface)
+            .into()
+    }
+
+    fn workspace_navigation(
+        &self,
+        presentation: &DesktopPresentation,
+        compact: bool,
+    ) -> Element<'static, Message> {
+        let density = presentation.density;
+        if presentation.workspace_navigation == WorkspaceNavigation::LabeledSwitcher {
+            let choices: Vec<_> = self
+                .snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| WorkspaceChoice {
+                    id: workspace.id,
+                    name: workspace.name.clone(),
+                })
+                .collect();
+            let selected = self.active_workspace().map(|workspace| WorkspaceChoice {
+                id: workspace.id,
+                name: workspace.name.clone(),
+            });
+            return row![
+                text("Workspace").font(UI_MEDIUM).size(UI_META_SIZE),
+                pick_list(choices, selected, |choice| Message::SelectWorkspace(
+                    choice.id
+                ))
+                .placeholder("Choose workspace")
+                .width(Fill),
+                button(text("+").font(UI_MEDIUM).size(16))
+                    .on_press(Message::NewWorkspace)
+                    .height(density.control_height)
+                    .padding([5, 10])
+                    .style(chrome_action_style),
+            ]
+            .spacing(5)
+            .align_y(Center)
+            .width(Fill)
+            .into();
+        }
+
+        let mut workspace_tabs = row![].spacing(0).align_y(Center);
+        for (index, workspace) in self.snapshot.workspaces.iter().enumerate() {
+            if index > 0 {
+                workspace_tabs = workspace_tabs.push(rule::vertical(1));
+            }
+            let active = workspace.is_open;
+            let action = button(
+                text(workspace.name.clone())
+                    .font(if active { UI_SEMIBOLD } else { UI_FONT })
+                    .size(UI_TEXT_SIZE)
+                    .wrapping(text::Wrapping::None),
+            )
+            .on_press(Message::SelectWorkspace(workspace.id))
+            .height(density.control_height)
+            .padding([6, 14])
+            .style(move |theme, status| workspace_tab_style(theme, status, active));
+            workspace_tabs = workspace_tabs.push(action);
+        }
+        if !self.snapshot.workspaces.is_empty() {
+            workspace_tabs = workspace_tabs.push(rule::vertical(1));
+        }
+        workspace_tabs = workspace_tabs.push(
+            button(
+                text(if compact { "+" } else { "+ Workspace" })
+                    .font(UI_MEDIUM)
+                    .size(if compact { 16.0 } else { UI_META_SIZE }),
+            )
+            .on_press(Message::NewWorkspace)
+            .height(density.control_height)
+            .padding([5, 11])
+            .style(chrome_action_style),
+        );
+        scrollable(workspace_tabs)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::hidden(),
+            ))
+            .width(Fill)
+            .height(density.control_height)
             .into()
     }
 
@@ -931,36 +1002,52 @@ impl DesktopApp {
         if matches!(self.connection, ConnectionState::Connecting) {
             return centered_message("Connecting to the SylvOps daemon…");
         }
-        match self.presentation().layout {
-            PresentationLayout::Wide => pane_grid(&self.panes, |_pane, kind, _maximized| {
+        match self.presentation().explorer.mode {
+            ExplorerMode::Resizable => pane_grid(&self.panes, |_pane, kind, _maximized| {
                 let content = match kind {
-                    DesktopPane::Projects => self.projects_column(),
-                    DesktopPane::Worktrees => self.worktrees_column(),
-                    DesktopPane::Sessions => self.sessions_column(),
+                    DesktopPane::Explorer => self.explorer_view(),
                     DesktopPane::Main => self.workspace_view(),
                 };
                 pane_grid::Content::new(content)
             })
             .spacing(1)
-            .min_size(150)
+            .min_size(220)
             .on_resize(8, Message::PaneResized)
             .into(),
-            PresentationLayout::Compact => row![
-                self.compact_navigator(),
+            ExplorerMode::Collapsible
+                if self.explorer_visibility == ExplorerVisibility::Collapsed =>
+            {
+                row![
+                    container(
+                        button("Explorer")
+                            .on_press(Message::ToggleExplorer)
+                            .style(chrome_action_style)
+                    )
+                    .width(Length::Fixed(82.0))
+                    .padding([6, 5]),
+                    rule::vertical(1),
+                    self.workspace_view(),
+                ]
+                .width(Fill)
+                .height(Fill)
+                .into()
+            }
+            ExplorerMode::Collapsible => row![
+                container(self.explorer_view()).width(Length::Fixed(260.0)),
                 rule::vertical(1),
                 self.workspace_view(),
             ]
             .width(Fill)
             .height(Fill)
             .into(),
-            PresentationLayout::Narrow => {
+            ExplorerMode::Drawer => {
                 let toggle = row![
-                    button("Navigator")
+                    button("Explorer")
                         .on_press(Message::ShowNarrowNavigator)
                         .style(move |theme, status| {
                             content_tab_style(theme, status, !self.narrow_main)
                         }),
-                    button("Main")
+                    button("Active session")
                         .on_press(Message::ShowNarrowMain)
                         .style(move |theme, status| {
                             content_tab_style(theme, status, self.narrow_main)
@@ -970,7 +1057,7 @@ impl DesktopApp {
                 let content = if self.narrow_main {
                     self.workspace_view()
                 } else {
-                    self.compact_navigator()
+                    self.explorer_view()
                 };
                 column![container(toggle).padding([4, 6]), content]
                     .width(Fill)
@@ -980,25 +1067,54 @@ impl DesktopApp {
         }
     }
 
-    fn projects_column(&self) -> Element<'_, Message> {
+    fn explorer_view(&self) -> Element<'_, Message> {
         let presentation = self.presentation();
         let density = presentation.density;
-        let mut items = column![column_heading(
-            "Repositories",
-            Some(Message::NewProject),
-            density
-        )]
-        .spacing(density.region_spacing);
-        let projects = self.visible_projects();
-        for project in &projects {
-            items = items.push(select_button(
-                &project.name,
-                presentation.selection.project_id == Some(project.id),
-                Message::SelectProject(project.id),
-                density,
-            ));
+        let mut heading = row![
+            text("Explorer")
+                .font(UI_SEMIBOLD)
+                .size(UI_META_SIZE)
+                .style(text::secondary),
+            space::horizontal(),
+            button(text("+ Repository").font(UI_MEDIUM).size(UI_META_SIZE))
+                .on_press(Message::NewProject)
+                .height(density.control_height)
+                .padding([4, 8])
+                .style(chrome_action_style),
+        ]
+        .spacing(4)
+        .align_y(Center);
+        if presentation.explorer.mode == ExplorerMode::Collapsible {
+            heading = heading.push(
+                button(text("Hide").font(UI_MEDIUM).size(UI_META_SIZE))
+                    .on_press(Message::ToggleExplorer)
+                    .height(density.control_height)
+                    .padding([4, 8])
+                    .style(chrome_action_style),
+            );
         }
-        if projects.is_empty() {
+        let mut items = column![
+            container(heading)
+                .height(density.panel_header_height)
+                .padding([4, 7])
+                .width(Fill)
+        ]
+        .spacing(2);
+        for row in &presentation.explorer.rows {
+            if matches!(row.id, ExplorerNodeId::Session(session_id) if self
+                .inline_session_rename
+                .as_ref()
+                .is_some_and(|rename| rename.session_id == session_id))
+            {
+                items = items.push(self.session_rename_row());
+            } else {
+                items = items.push(self.explorer_row(row, presentation.explorer.selected));
+            }
+            if presentation.explorer.selected == Some(row.id) && !row.actions.is_empty() {
+                items = items.push(self.explorer_actions(&row.actions, row.depth));
+            }
+        }
+        if presentation.explorer.rows.is_empty() {
             items = items.push(if self.active_workspace().is_some() {
                 empty_action(
                     "No repositories in this workspace yet.",
@@ -1013,116 +1129,120 @@ impl DesktopApp {
                 )
             });
         }
-        panel(scrollable(items), 190.0)
+        panel(scrollable(items), 260.0)
     }
 
-    fn worktrees_column(&self) -> Element<'_, Message> {
-        let presentation = self.presentation();
-        let density = presentation.density;
-        let selected_project_id = presentation.selection.project_id;
-        let create = selected_project_id.map(|_| Message::NewWorktree);
-        let mut items =
-            column![column_heading("Checkouts", create, density)].spacing(density.region_spacing);
-        if let Some(project_id) = selected_project_id {
-            let worktrees = self.worktrees_for(project_id);
-            for worktree in &worktrees {
-                let branch = worktree.branch.as_deref().unwrap_or("detached");
-                let label = if worktree.is_root_checkout {
-                    format!("{}  ·  {branch}  ·  root", worktree.name)
-                } else {
-                    format!("{}  ·  {branch}", worktree.name)
-                };
-                let selected = presentation.selection.worktree_id == Some(worktree.id);
-                let select = select_button(
-                    &label,
-                    selected,
-                    Message::SelectWorktree(worktree.id),
-                    density,
-                );
-                if selected && worktree_can_delete(worktree) {
-                    items = items.push(
-                        row![
-                            select,
-                            button(text("Delete").font(UI_MEDIUM).size(UI_META_SIZE))
-                                .on_press(Message::RemoveSelectedWorktree)
-                                .height(density.row_height)
-                                .padding([4, 7])
-                                .style(flat_danger_style),
-                        ]
-                        .spacing(3)
-                        .align_y(Center),
-                    );
-                } else {
-                    items = items.push(select);
-                }
-            }
-            if worktrees.is_empty() {
-                items = items.push(empty_action(
-                    "No checkouts are available for this repository.",
-                    "Create checkout",
-                    Message::NewWorktree,
-                ));
-            }
+    fn explorer_row(
+        &self,
+        row: &presentation::ExplorerRow,
+        selected: Option<ExplorerNodeId>,
+    ) -> Element<'static, Message> {
+        let density = self.presentation().density;
+        let is_selected = selected == Some(row.id);
+        let is_hovered = self.hovered_explorer_node == Some(row.id);
+        let disclosure: Element<'static, Message> = if row.expandable {
+            button(text(if row.expanded { "▾" } else { "▸" }).size(UI_TEXT_SIZE))
+                .on_press(Message::ToggleExplorerNode(row.id))
+                .height(density.row_height)
+                .width(Length::Fixed(24.0))
+                .padding(0)
+                .style(chrome_action_style)
+                .into()
         } else {
-            items = items.push(empty_hint("Select a repository."));
-        }
-        panel(scrollable(items), 225.0)
+            space::horizontal().width(Length::Fixed(24.0)).into()
+        };
+        let detail = if let Some(attention) = row.attention {
+            format!(
+                "{} {}{}",
+                explorer_attention_symbol(attention),
+                explorer_attention_label(attention),
+                if row.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", row.detail)
+                }
+            )
+        } else if let Some(indicator) = row.indicator {
+            format!("{} {}", session_indicator_symbol(indicator), row.detail)
+        } else {
+            row.detail.clone()
+        };
+        let labels = column![
+            text(row.label.clone())
+                .font(if is_selected { UI_MEDIUM } else { UI_FONT })
+                .size(UI_TEXT_SIZE)
+                .wrapping(text::Wrapping::None),
+            text(detail)
+                .size(UI_META_SIZE)
+                .style(text::secondary)
+                .wrapping(text::Wrapping::None),
+        ]
+        .spacing(1)
+        .width(Fill);
+        let content = container(
+            row![
+                space::horizontal().width(Length::Fixed(f32::from(row.depth) * 14.0)),
+                disclosure,
+                labels,
+            ]
+            .spacing(3)
+            .align_y(Center),
+        )
+        .width(Fill)
+        .height(density.row_height.max(38))
+        .padding([3, 5])
+        .clip(true)
+        .style(move |theme| list_item_container_style(theme, is_selected, is_hovered));
+        let double_click = match row.id {
+            ExplorerNodeId::Session(session_id) => Message::BeginSessionRename(session_id),
+            ExplorerNodeId::Repository(_) | ExplorerNodeId::Checkout(_) => {
+                Message::OpenExplorerNode(row.id)
+            }
+        };
+        mouse_area(content)
+            .on_enter(Message::HoverExplorerNode(Some(row.id)))
+            .on_exit(Message::HoverExplorerNode(None))
+            .on_press(Message::SelectExplorerNode(row.id))
+            .on_double_click(double_click)
+            .interaction(mouse::Interaction::Pointer)
+            .into()
     }
 
-    fn sessions_column(&self) -> Element<'_, Message> {
-        let presentation = self.presentation();
-        let density = presentation.density;
-        let selected_worktree_id = presentation.selection.worktree_id;
-        let create = selected_worktree_id.map(|_| Message::NewSession);
-        let mut items =
-            column![column_heading("Sessions", create, density)].spacing(density.region_spacing);
-        if let Some(worktree_id) = selected_worktree_id {
-            let sessions = self.sessions_for(worktree_id);
-            for session in &sessions {
-                let selected = presentation.selection.session_id == Some(session.id);
-                if self
-                    .inline_session_rename
-                    .as_ref()
-                    .is_some_and(|rename| rename.session_id == session.id)
-                {
-                    items = items.push(self.session_rename_row());
-                } else {
-                    let label = session_navigation_label(&session.display_name, session.state);
-                    let hovered = self.hovered_session_id == Some(session.id);
-                    let height = density.row_height;
-                    let row = container(
-                        text(label.clone())
-                            .font(if selected { UI_MEDIUM } else { UI_FONT })
-                            .size(UI_TEXT_SIZE)
-                            .wrapping(text::Wrapping::None)
-                            .width(Fill),
-                    )
-                    .width(Fill)
-                    .height(height)
-                    .padding([5, 9])
-                    .align_y(Vertical::Center)
-                    .clip(true)
-                    .style(move |theme| list_item_container_style(theme, selected, hovered));
-                    let interaction = mouse_area(row)
-                        .on_enter(Message::HoverSession(Some(session.id)))
-                        .on_exit(Message::HoverSession(None))
-                        .on_press(Message::SelectSession(session.id))
-                        .on_double_click(Message::BeginSessionRename(session.id))
-                        .interaction(mouse::Interaction::Pointer);
-                    items = items.push(interaction);
-                }
-            }
-            if sessions.is_empty() {
-                items = items.push(empty_action(
-                    "No sessions in this checkout yet.",
-                    "Start a session",
-                    Message::NewSession,
-                ));
-            }
-        } else {
-            items = items.push(empty_hint("Select a checkout."));
+    fn explorer_actions(&self, actions: &[ExplorerAction], depth: u8) -> Element<'static, Message> {
+        let density = self.presentation().density;
+        let presentation_theme = self.presentation().theme;
+        let mut controls =
+            row![space::horizontal().width(Length::Fixed(f32::from(depth + 1) * 14.0 + 24.0))]
+                .spacing(4)
+                .align_y(Center);
+        for action in actions {
+            let action = *action;
+            let danger = matches!(action, ExplorerAction::DeleteCheckout(_));
+            controls = controls.push(
+                button(text(explorer_action_label(action)).size(UI_META_SIZE))
+                    .on_press(Message::RunExplorerAction(action))
+                    .height(density.control_height)
+                    .padding([4, 7])
+                    .style(move |_theme, status| {
+                        button_intent_style(
+                            presentation_theme,
+                            if danger {
+                                ButtonIntent::Danger
+                            } else {
+                                ButtonIntent::Quiet
+                            },
+                            status,
+                        )
+                    }),
+            );
         }
-        panel(scrollable(items), 255.0)
+        scrollable(controls)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::hidden(),
+            ))
+            .height(density.control_height)
+            .width(Fill)
+            .into()
     }
 
     fn session_rename_row(&self) -> Element<'_, Message> {
@@ -1140,45 +1260,6 @@ impl DesktopApp {
             content = content.push(text(error).size(UI_META_SIZE).style(text::danger));
         }
         container(content).padding([3, 0]).width(Fill).into()
-    }
-
-    fn compact_navigator(&self) -> Element<'_, Message> {
-        let presentation = self.presentation();
-        let density = presentation.density;
-        let tabs = row![
-            compact_panel_button(
-                "Repositories",
-                DesktopPanel::Projects,
-                self.desktop_state.compact_panel,
-                density
-            ),
-            compact_panel_button(
-                "Checkouts",
-                DesktopPanel::Worktrees,
-                self.desktop_state.compact_panel,
-                density
-            ),
-            compact_panel_button(
-                "Sessions",
-                DesktopPanel::Sessions,
-                self.desktop_state.compact_panel,
-                density
-            ),
-        ]
-        .spacing(3);
-        let panel = match self.desktop_state.compact_panel {
-            DesktopPanel::Projects => self.projects_column(),
-            DesktopPanel::Worktrees => self.worktrees_column(),
-            DesktopPanel::Sessions => self.sessions_column(),
-        };
-        container(column![container(tabs).padding([4, 5]), panel])
-            .width(if presentation.layout == PresentationLayout::Compact {
-                Length::Fixed(280.0)
-            } else {
-                Fill
-            })
-            .height(Fill)
-            .into()
     }
 
     fn workspace_view(&self) -> Element<'_, Message> {
@@ -1220,57 +1301,69 @@ impl DesktopApp {
         let presentation = self.presentation();
         let density = presentation.density;
         let mut tabs = row![].spacing(density.region_spacing).align_y(Center);
-        for session_id in &self.open_sessions {
-            if let Some(session) = self.session(*session_id) {
-                let label = session_tab_label(&session.display_name);
-                let active = presentation.selection.active_session_id == Some(session.id);
-                tabs = tabs.push(
-                    container(
-                        row![
-                            button(
-                                text(label)
-                                    .font(if active { UI_SEMIBOLD } else { UI_FONT })
-                                    .size(UI_TEXT_SIZE)
-                                    .wrapping(text::Wrapping::None)
-                            )
-                            .on_press(Message::SelectOpenSession(session.id))
+        for session in &presentation.active_session.tabs {
+            let label = session_tab_label(&session.label);
+            let active = session.active;
+            let session_id = session.id;
+            tabs = tabs.push(
+                container(
+                    row![
+                        button(
+                            text(label)
+                                .font(if active { UI_SEMIBOLD } else { UI_FONT })
+                                .size(UI_TEXT_SIZE)
+                                .wrapping(text::Wrapping::None)
+                        )
+                        .on_press(Message::SelectOpenSession(session_id))
+                        .height(density.row_height)
+                        .padding([5, 9])
+                        .style(move |theme, status| { tab_label_style(theme, status, active) }),
+                        button(text("×").size(15))
+                            .on_press(Message::CloseSessionTab(session_id))
                             .height(density.row_height)
-                            .padding([5, 9])
-                            .style(move |theme, status| { tab_label_style(theme, status, active) }),
-                            button(text("×").size(15))
-                                .on_press(Message::CloseSessionTab(session.id))
-                                .height(density.row_height)
-                                .padding([4, 8])
-                                .style(tab_close_style),
-                        ]
-                        .spacing(0)
-                        .align_y(Center),
-                    )
-                    .style(move |theme| session_tab_group_style(theme, active)),
-                );
-            }
+                            .padding([4, 8])
+                            .style(tab_close_style),
+                    ]
+                    .spacing(0)
+                    .align_y(Center),
+                )
+                .style(move |theme| session_tab_group_style(theme, active)),
+            );
         }
-        if self.open_sessions.is_empty() {
+        if presentation.active_session.tabs.is_empty() {
             tabs = tabs.push(
                 text("Select a session to open it")
                     .size(UI_META_SIZE)
                     .style(text::secondary),
             );
         }
-        container(
+        let context = presentation.active_session.context.as_ref().map_or_else(
+            || "No active session".to_owned(),
+            |context| {
+                format!(
+                    "Repository: {}  /  Checkout: {}  ·  {}  ·  {}",
+                    context.repository, context.checkout, context.branch, context.state
+                )
+            },
+        );
+        container(column![
+            scrollable(tabs)
+                .direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::hidden(),
+                ))
+                .height(density.control_height)
+                .width(Fill),
             row![
-                scrollable(tabs)
-                    .direction(scrollable::Direction::Horizontal(
-                        scrollable::Scrollbar::hidden(),
-                    ))
+                container(text(context).font(UI_MEDIUM).size(UI_META_SIZE))
                     .height(density.control_height)
+                    .align_y(Vertical::Center)
+                    .clip(true)
                     .width(Fill),
                 self.session_actions(),
             ]
             .spacing(density.region_spacing)
             .align_y(Center),
-        )
-        .height(density.tab_height)
+        ])
         .padding([4, 8])
         .width(Fill)
         .style(tab_strip_surface)
@@ -1280,41 +1373,35 @@ impl DesktopApp {
     fn session_actions(&self) -> Element<'_, Message> {
         let presentation = self.presentation();
         let density = presentation.density;
-        let Some(session_id) = presentation.selection.active_session_id else {
+        let Some(context) = presentation.active_session.context.as_ref() else {
             return text("No session selected").style(text::secondary).into();
         };
-        let Some(session) = self.session(session_id) else {
-            return text("Session is no longer available")
-                .style(text::secondary)
-                .into();
-        };
-        let attached = self
-            .terminals
-            .get(&session_id)
-            .is_some_and(|terminal| terminal.attached);
-        let can_stop = session_can_stop(session.state);
-        let can_resume = session_can_resume(session, &self.snapshot.sessions);
+        let session_id = context.session_id;
+        let terminal_action = context.terminal_action;
+        let can_stop = context.can_stop;
+        let can_resume = context.can_resume;
         let resume_pending = self.resume_pending.contains(&session_id);
-        let session_state = session.state;
-        let state_label = session_state_label(session.state);
+        let state_label = context.state.clone();
         let presentation_theme = presentation.theme;
         responsive(move |size| {
             let compact = size.width < 260.0;
             let mut actions = row![].spacing(4);
-            if let Some(label) = session_terminal_action_label(attached, session_state, compact) {
-                let message = if attached {
-                    Message::Detach
-                } else {
-                    Message::Attach
+            if let Some(action) = terminal_action {
+                let message = match action {
+                    ActiveTerminalAction::Leave => Message::Detach,
+                    ActiveTerminalAction::Open | ActiveTerminalAction::ViewOutput => {
+                        Message::Attach
+                    }
                 };
-                let intent = if attached {
-                    ButtonIntent::Quiet
-                } else {
-                    ButtonIntent::Primary
+                let intent = match action {
+                    ActiveTerminalAction::Leave => ButtonIntent::Quiet,
+                    ActiveTerminalAction::Open | ActiveTerminalAction::ViewOutput => {
+                        ButtonIntent::Primary
+                    }
                 };
                 actions = actions.push(
                     button(
-                        text(label)
+                        text(active_terminal_action_label(action, compact))
                             .font(UI_MEDIUM)
                             .size(UI_META_SIZE)
                             .wrapping(text::Wrapping::None),
@@ -2816,13 +2903,16 @@ impl DesktopApp {
 
         match key.as_ref() {
             Key::Named(Named::Tab) => {
-                self.cycle_keyboard_panel(if modifiers.shift() { -1 } else { 1 });
+                if self.presentation().layout == PresentationLayout::Narrow {
+                    self.narrow_main = !self.narrow_main;
+                }
             }
-            Key::Named(Named::ArrowLeft) => self.cycle_keyboard_panel(-1),
-            Key::Named(Named::ArrowRight) => self.cycle_keyboard_panel(1),
-            Key::Named(Named::ArrowUp) => self.move_keyboard_selection(-1),
-            Key::Named(Named::ArrowDown) => self.move_keyboard_selection(1),
-            Key::Named(Named::Enter) => self.open_keyboard_selection(),
+            Key::Named(Named::ArrowLeft) => self.navigate_explorer(ExplorerKey::Left),
+            Key::Named(Named::ArrowRight) => self.navigate_explorer(ExplorerKey::Right),
+            Key::Named(Named::ArrowUp) => self.navigate_explorer(ExplorerKey::Up),
+            Key::Named(Named::ArrowDown) => self.navigate_explorer(ExplorerKey::Down),
+            Key::Named(Named::Enter) => self.navigate_explorer(ExplorerKey::Enter),
+            Key::Named(Named::Delete) => self.shortcut_delete(),
             Key::Character("1") => self.select_main_tab(MainTab::Terminal),
             Key::Character("2") => self.select_main_tab(MainTab::Changes),
             Key::Character("3") => self.select_main_tab(MainTab::Details),
@@ -2867,103 +2957,114 @@ impl DesktopApp {
         self.mark_state_dirty();
     }
 
-    fn cycle_keyboard_panel(&mut self, direction: i8) {
-        let panels = [
-            DesktopPanel::Projects,
-            DesktopPanel::Worktrees,
-            DesktopPanel::Sessions,
-        ];
-        let current = panels
-            .iter()
-            .position(|panel| *panel == self.keyboard_panel)
-            .unwrap_or_default();
-        let next = if direction < 0 {
-            current.checked_sub(1).unwrap_or(panels.len() - 1)
-        } else {
-            (current + 1) % panels.len()
-        };
-        if panels[next] != DesktopPanel::Sessions {
-            self.inline_session_rename = None;
-        }
-        self.keyboard_panel = panels[next];
-        self.desktop_state.compact_panel = panels[next];
+    fn navigate_explorer(&mut self, key: ExplorerKey) {
+        self.terminal_focus = TerminalFocus::Unfocused;
         self.narrow_main = false;
-        self.mark_state_dirty();
+        let presentation = self.presentation();
+        let Some(current) = self
+            .focused_explorer_node
+            .or(presentation.explorer.selected)
+            .or_else(|| presentation.explorer.rows.first().map(|row| row.id))
+        else {
+            return;
+        };
+        let intent = presentation.explorer.navigate(current, key);
+        self.apply_explorer_intent(intent);
     }
 
-    fn move_keyboard_selection(&mut self, direction: i8) {
-        match self.keyboard_panel {
-            DesktopPanel::Projects => {
-                let ids: Vec<_> = self.visible_projects().iter().map(|item| item.id).collect();
-                if let Some(id) = next_selection(&ids, self.selected_project_id, direction) {
-                    self.select_project(id);
-                }
+    fn apply_explorer_intent(&mut self, intent: ExplorerIntent) {
+        match intent {
+            ExplorerIntent::None => {}
+            ExplorerIntent::Focus(node) => self.select_explorer_node(node),
+            ExplorerIntent::Expand(node) => self.set_explorer_expansion(node, true),
+            ExplorerIntent::Collapse(node) => self.set_explorer_expansion(node, false),
+            ExplorerIntent::Open(session_id) => {
+                self.select_session(session_id);
+                self.narrow_main = true;
             }
-            DesktopPanel::Worktrees => {
-                let ids: Vec<_> = self
-                    .selected_project_id
-                    .map_or_else(Vec::new, |project_id| {
-                        self.worktrees_for(project_id)
-                            .iter()
-                            .map(|item| item.id)
-                            .collect()
-                    });
-                if let Some(id) = next_selection(&ids, self.selected_worktree_id, direction) {
-                    self.select_worktree(id);
-                }
-            }
-            DesktopPanel::Sessions => {
-                let ids: Vec<_> = self
-                    .selected_worktree_id
-                    .map_or_else(Vec::new, |worktree_id| {
-                        self.sessions_for(worktree_id)
-                            .iter()
-                            .map(|item| item.id)
-                            .collect()
-                    });
-                if let Some(id) = next_selection(&ids, self.selected_session_id, direction) {
-                    self.select_session(id);
-                }
-            }
-        }
-    }
-
-    fn open_keyboard_selection(&mut self) {
-        if self.keyboard_panel == DesktopPanel::Sessions
-            && let Some(session_id) = self.selected_session_id
-        {
-            self.select_session(session_id);
-            self.narrow_main = true;
         }
     }
 
     fn shortcut_new(&mut self) {
         self.terminal_focus = TerminalFocus::Unfocused;
-        match self.keyboard_panel {
-            DesktopPanel::Projects => self.open_project_form(),
-            DesktopPanel::Worktrees => self.open_worktree_form(),
-            DesktopPanel::Sessions => self.open_session_form(),
+        match self.focused_explorer_node {
+            Some(ExplorerNodeId::Repository(project_id)) => {
+                self.select_explorer_node(ExplorerNodeId::Repository(project_id));
+                self.open_worktree_form();
+            }
+            Some(ExplorerNodeId::Checkout(worktree_id)) => {
+                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
+                self.open_session_form();
+            }
+            Some(ExplorerNodeId::Session(session_id)) => {
+                self.select_explorer_node(ExplorerNodeId::Session(session_id));
+                self.open_session_form();
+            }
+            None => self.open_project_form(),
         }
     }
 
     fn shortcut_rename(&mut self) {
         self.terminal_focus = TerminalFocus::Unfocused;
-        match self.keyboard_panel {
-            DesktopPanel::Projects => self.open_project_rename_form(),
-            DesktopPanel::Worktrees => self.open_worktree_rename_form(),
-            DesktopPanel::Sessions => {}
+        match self.focused_explorer_node {
+            Some(ExplorerNodeId::Repository(project_id)) => {
+                self.select_explorer_node(ExplorerNodeId::Repository(project_id));
+                self.open_project_rename_form();
+            }
+            Some(ExplorerNodeId::Checkout(worktree_id)) => {
+                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
+                self.open_worktree_rename_form();
+            }
+            Some(ExplorerNodeId::Session(_)) | None => {}
         }
     }
 
     fn shortcut_delete(&mut self) {
         self.terminal_focus = TerminalFocus::Unfocused;
-        match self.keyboard_panel {
-            DesktopPanel::Projects => {
+        match self.focused_explorer_node {
+            Some(ExplorerNodeId::Repository(_)) => {
                 self.error = Some("Repository removal is intentionally unavailable.".into());
             }
-            DesktopPanel::Worktrees => self.inspect_worktree_removal(),
-            DesktopPanel::Sessions => self.open_stop_confirmation(),
+            Some(ExplorerNodeId::Checkout(worktree_id)) => {
+                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
+                self.inspect_worktree_removal();
+            }
+            Some(ExplorerNodeId::Session(session_id)) => {
+                self.select_session(session_id);
+                self.open_stop_confirmation();
+            }
+            None => {}
         }
+    }
+
+    fn run_explorer_action(&mut self, action: ExplorerAction) -> Task<Message> {
+        match action {
+            ExplorerAction::CreateCheckout(project_id) => {
+                self.select_explorer_node(ExplorerNodeId::Repository(project_id));
+                self.open_worktree_form();
+            }
+            ExplorerAction::RenameRepository(project_id) => {
+                self.select_explorer_node(ExplorerNodeId::Repository(project_id));
+                self.open_project_rename_form();
+            }
+            ExplorerAction::CreateSession(worktree_id) => {
+                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
+                self.open_session_form();
+            }
+            ExplorerAction::RenameCheckout(worktree_id) => {
+                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
+                self.open_worktree_rename_form();
+            }
+            ExplorerAction::DeleteCheckout(worktree_id) => {
+                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
+                self.inspect_worktree_removal();
+            }
+            ExplorerAction::OpenSession(session_id) => self.select_session(session_id),
+            ExplorerAction::RenameSession(session_id) => {
+                return self.begin_session_rename(session_id);
+            }
+        }
+        Task::none()
     }
 
     fn request_snapshot(&mut self) {
@@ -3040,12 +3141,11 @@ impl DesktopApp {
             return Task::none();
         };
         let rename = InlineSessionRename::new(session.id, &session.display_name);
-        self.hovered_session_id = None;
         let input_id = rename.input_id.clone();
         self.inline_session_rename = Some(rename);
-        self.selected_session_id = Some(session_id);
-        self.keyboard_panel = DesktopPanel::Sessions;
-        self.desktop_state.compact_panel = DesktopPanel::Sessions;
+        self.select_session_context(session_id);
+        self.focused_explorer_node = Some(ExplorerNodeId::Session(session_id));
+        self.expand_selected_path();
         self.narrow_main = false;
         self.terminal_focus = TerminalFocus::Unfocused;
         Task::batch([
@@ -3708,14 +3808,19 @@ impl DesktopApp {
         }
         let main_width = match self.presentation().layout {
             PresentationLayout::Wide => {
-                let mut remaining = u32::from(self.desktop_state.window_width);
-                for ratio in self.desktop_state.panel_ratios {
-                    let pane = remaining.saturating_mul(u32::from(ratio)) / 1000;
-                    remaining = remaining.saturating_sub(pane);
-                }
+                let width = u32::from(self.desktop_state.window_width);
+                let explorer =
+                    width.saturating_mul(u32::from(self.desktop_state.panel_ratios[0])) / 1000;
+                let remaining = width.saturating_sub(explorer);
                 u16::try_from(remaining).unwrap_or(u16::MAX)
             }
-            PresentationLayout::Compact => self.desktop_state.window_width.saturating_sub(285),
+            PresentationLayout::Compact => self.desktop_state.window_width.saturating_sub(
+                if self.explorer_visibility == ExplorerVisibility::Collapsed {
+                    87
+                } else {
+                    265
+                },
+            ),
             PresentationLayout::Narrow => self.desktop_state.window_width,
         };
         let font = u16::from(self.desktop_state.terminal_font_size);
@@ -3759,45 +3864,104 @@ impl DesktopApp {
         {
             self.active_session_id = self.open_sessions.last().copied();
         }
+        self.expanded_project_ids.retain(|project_id| {
+            self.snapshot
+                .projects
+                .iter()
+                .any(|project| project.id == *project_id)
+        });
+        self.expanded_worktree_ids.retain(|worktree_id| {
+            self.snapshot
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.id == *worktree_id)
+        });
+        self.expand_selected_path();
+        let focus_exists = self.focused_explorer_node.is_some_and(|node| match node {
+            ExplorerNodeId::Repository(id) => {
+                self.snapshot.projects.iter().any(|item| item.id == id)
+            }
+            ExplorerNodeId::Checkout(id) => {
+                self.snapshot.worktrees.iter().any(|item| item.id == id)
+            }
+            ExplorerNodeId::Session(id) => self.snapshot.sessions.iter().any(|item| item.id == id),
+        });
+        if !focus_exists {
+            self.focused_explorer_node = self
+                .selected_session_id
+                .map(ExplorerNodeId::Session)
+                .or_else(|| self.selected_worktree_id.map(ExplorerNodeId::Checkout))
+                .or_else(|| self.selected_project_id.map(ExplorerNodeId::Repository));
+        }
     }
 
-    fn select_project(&mut self, project_id: ProjectId) {
+    fn select_explorer_node(&mut self, node: ExplorerNodeId) {
         self.unfocus_terminal();
-        if self.selected_project_id == Some(project_id) {
-            return;
-        }
         self.inline_session_rename = None;
-        self.keyboard_panel = DesktopPanel::Projects;
-        self.desktop_state.compact_panel = DesktopPanel::Projects;
-        self.selected_project_id = Some(project_id);
-        self.selected_worktree_id = self
-            .worktrees_for(project_id)
-            .first()
-            .map(|worktree| worktree.id);
-        self.selected_session_id = self
-            .selected_worktree_id
-            .and_then(|id| self.sessions_for(id).first().map(|session| session.id));
-        self.activate_selected_session_context();
+        self.focused_explorer_node = Some(node);
+        match node {
+            ExplorerNodeId::Repository(project_id) => {
+                self.selected_project_id = Some(project_id);
+                self.selected_worktree_id = None;
+                self.selected_session_id = None;
+            }
+            ExplorerNodeId::Checkout(worktree_id) => {
+                self.selected_worktree_id = Some(worktree_id);
+                self.selected_project_id = self
+                    .snapshot
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.id == worktree_id)
+                    .map(|worktree| worktree.project_id);
+                self.selected_session_id = None;
+            }
+            ExplorerNodeId::Session(session_id) => self.select_session_context(session_id),
+        }
         self.diff = None;
         self.mark_state_dirty();
     }
 
-    fn select_worktree(&mut self, worktree_id: WorktreeId) {
-        self.unfocus_terminal();
-        if self.selected_worktree_id == Some(worktree_id) {
-            return;
+    fn toggle_explorer_node(&mut self, node: ExplorerNodeId) {
+        let expanded = match node {
+            ExplorerNodeId::Repository(project_id) => {
+                self.expanded_project_ids.contains(&project_id)
+            }
+            ExplorerNodeId::Checkout(worktree_id) => {
+                self.expanded_worktree_ids.contains(&worktree_id)
+            }
+            ExplorerNodeId::Session(_) => return,
+        };
+        self.set_explorer_expansion(node, !expanded);
+    }
+
+    fn set_explorer_expansion(&mut self, node: ExplorerNodeId, expanded: bool) {
+        self.select_explorer_node(node);
+        match node {
+            ExplorerNodeId::Repository(project_id) => {
+                if expanded {
+                    self.expanded_project_ids.insert(project_id);
+                } else {
+                    self.expanded_project_ids.remove(&project_id);
+                }
+            }
+            ExplorerNodeId::Checkout(worktree_id) => {
+                if expanded {
+                    self.expanded_worktree_ids.insert(worktree_id);
+                } else {
+                    self.expanded_worktree_ids.remove(&worktree_id);
+                }
+            }
+            ExplorerNodeId::Session(_) => {}
         }
-        self.inline_session_rename = None;
-        self.keyboard_panel = DesktopPanel::Worktrees;
-        self.desktop_state.compact_panel = DesktopPanel::Worktrees;
-        self.selected_worktree_id = Some(worktree_id);
-        self.selected_session_id = self
-            .sessions_for(worktree_id)
-            .first()
-            .map(|session| session.id);
-        self.activate_selected_session_context();
-        self.diff = None;
-        self.mark_state_dirty();
+    }
+
+    fn open_explorer_node(&mut self, node: ExplorerNodeId) {
+        match node {
+            ExplorerNodeId::Session(session_id) => self.select_session(session_id),
+            ExplorerNodeId::Repository(_) | ExplorerNodeId::Checkout(_) => {
+                self.toggle_explorer_node(node);
+            }
+        }
     }
 
     fn select_session(&mut self, session_id: SessionId) {
@@ -3805,6 +3969,8 @@ impl DesktopApp {
         if self.selected_session_id == Some(session_id)
             && self.active_session_id == Some(session_id)
         {
+            self.focused_explorer_node = Some(ExplorerNodeId::Session(session_id));
+            self.expand_selected_path();
             return;
         }
         if self
@@ -3814,9 +3980,9 @@ impl DesktopApp {
         {
             self.inline_session_rename = None;
         }
-        self.keyboard_panel = DesktopPanel::Sessions;
-        self.desktop_state.compact_panel = DesktopPanel::Sessions;
-        self.selected_session_id = Some(session_id);
+        self.select_session_context(session_id);
+        self.focused_explorer_node = Some(ExplorerNodeId::Session(session_id));
+        self.expand_selected_path();
         self.active_session_id = Some(session_id);
         if !self.open_sessions.contains(&session_id) {
             if self.open_sessions.len() == MAX_OPEN_DESKTOP_SESSIONS {
@@ -3830,21 +3996,6 @@ impl DesktopApp {
         }
     }
 
-    fn activate_selected_session_context(&mut self) {
-        let Some(session_id) = self.selected_session_id else {
-            self.active_session_id = None;
-            self.main_tab = MainTab::Details;
-            return;
-        };
-        self.active_session_id = Some(session_id);
-        if !self.open_sessions.contains(&session_id) {
-            if self.open_sessions.len() == MAX_OPEN_DESKTOP_SESSIONS {
-                self.open_sessions.remove(0);
-            }
-            self.open_sessions.push(session_id);
-        }
-    }
-
     fn select_session_context(&mut self, session_id: SessionId) {
         self.selected_session_id = Some(session_id);
         if let Some(worktree_id) = self.session(session_id).map(|session| session.worktree_id) {
@@ -3855,6 +4006,15 @@ impl DesktopApp {
                 .iter()
                 .find(|worktree| worktree.id == worktree_id)
                 .map(|worktree| worktree.project_id);
+        }
+    }
+
+    fn expand_selected_path(&mut self) {
+        if let Some(project_id) = self.selected_project_id {
+            self.expanded_project_ids.insert(project_id);
+        }
+        if let Some(worktree_id) = self.selected_worktree_id {
+            self.expanded_worktree_ids.insert(worktree_id);
         }
     }
 
@@ -3934,25 +4094,6 @@ fn subscription(_: &DesktopApp) -> Subscription<Message> {
     ])
 }
 
-fn next_selection<T: Copy + PartialEq>(
-    items: &[T],
-    selected: Option<T>,
-    direction: i8,
-) -> Option<T> {
-    if items.is_empty() {
-        return None;
-    }
-    let current = selected
-        .and_then(|selected| items.iter().position(|item| *item == selected))
-        .unwrap_or_default();
-    let next = if direction < 0 {
-        current.checked_sub(1).unwrap_or(items.len() - 1)
-    } else {
-        (current + 1) % items.len()
-    };
-    items.get(next).copied()
-}
-
 fn optional_number<T: ToString>(value: Option<T>, fallback: &str) -> String {
     value.map_or_else(|| fallback.to_owned(), |value| value.to_string())
 }
@@ -4000,66 +4141,52 @@ fn panel<'a>(content: impl Into<Element<'a, Message>>, _width: f32) -> Element<'
         .into()
 }
 
-fn column_heading(
-    label: &str,
-    action: Option<Message>,
-    density: DensityMetrics,
-) -> Element<'_, Message> {
-    let mut heading = row![
-        text(label)
-            .font(UI_SEMIBOLD)
-            .size(UI_META_SIZE)
-            .style(text::secondary),
-        space::horizontal()
-    ]
-    .align_y(Center);
-    if let Some(action) = action {
-        heading = heading.push(
-            button(text("+").font(UI_MEDIUM).size(15))
-                .on_press(action)
-                .height(density.control_height)
-                .padding([4, 8])
-                .style(chrome_action_style),
-        );
-    }
-    container(heading)
-        .height(density.panel_header_height)
-        .padding([4, 7])
-        .width(Fill)
-        .into()
-}
-
-fn select_button(
-    label: &str,
-    selected: bool,
-    message: Message,
-    density: DensityMetrics,
-) -> Element<'static, Message> {
-    let label = label.to_owned();
-    let content = container(
-        text(label.clone())
-            .font(if selected { UI_MEDIUM } else { UI_FONT })
-            .size(UI_TEXT_SIZE)
-            .wrapping(text::Wrapping::None)
-            .width(Fill),
-    )
-    .width(Fill)
-    .clip(true);
-    let action = button(content)
-        .on_press(message)
-        .style(move |theme, status| list_item_style(theme, status, selected))
-        .width(Fill)
-        .height(density.row_height)
-        .padding(density.navigation_padding);
-    action.into()
-}
-
 const fn worktree_can_delete(worktree: &Worktree) -> bool {
     checkout_delete_available(worktree.is_root_checkout, worktree.status)
 }
 
 const fn checkout_delete_available(is_root_checkout: bool, status: WorktreeStatus) -> bool {
     !is_root_checkout && matches!(status, WorktreeStatus::Active)
+}
+
+const fn explorer_attention_symbol(attention: ExplorerAttention) -> &'static str {
+    match attention {
+        ExplorerAttention::Finished => "✓",
+        ExplorerAttention::NeedsFeedback => "!",
+        ExplorerAttention::Failed => "×",
+    }
+}
+
+const fn explorer_attention_label(attention: ExplorerAttention) -> &'static str {
+    match attention {
+        ExplorerAttention::Finished => "Finished unseen",
+        ExplorerAttention::NeedsFeedback => "Needs feedback",
+        ExplorerAttention::Failed => "Failed",
+    }
+}
+
+const fn session_indicator_symbol(indicator: SessionIndicator) -> &'static str {
+    match indicator {
+        SessionIndicator::Ready => "○",
+        SessionIndicator::Working => "▶",
+        SessionIndicator::NeedsFeedback => "!",
+        SessionIndicator::Finished => "✓",
+        SessionIndicator::Failed => "×",
+        SessionIndicator::Stopped => "■",
+        SessionIndicator::Disconnected => "◇",
+    }
+}
+
+const fn explorer_action_label(action: ExplorerAction) -> &'static str {
+    match action {
+        ExplorerAction::CreateCheckout(_) => "+ Checkout",
+        ExplorerAction::RenameRepository(_)
+        | ExplorerAction::RenameCheckout(_)
+        | ExplorerAction::RenameSession(_) => "Rename",
+        ExplorerAction::CreateSession(_) => "+ Session",
+        ExplorerAction::DeleteCheckout(_) => "Delete",
+        ExplorerAction::OpenSession(_) => "Open",
+    }
 }
 
 fn tab_button(
@@ -4078,26 +4205,6 @@ fn tab_button(
     .on_press(Message::SelectMainTab(tab))
     .height(density.control_height)
     .padding([6, 14])
-    .style(move |theme, status| content_tab_style(theme, status, selected))
-    .into()
-}
-
-fn compact_panel_button(
-    label: &str,
-    panel: DesktopPanel,
-    active: DesktopPanel,
-    density: DensityMetrics,
-) -> Element<'_, Message> {
-    let selected = panel == active;
-    button(
-        text(label)
-            .font(if selected { UI_SEMIBOLD } else { UI_FONT })
-            .size(UI_META_SIZE)
-            .wrapping(text::Wrapping::None),
-    )
-    .on_press(Message::SelectCompactPanel(panel))
-    .height(density.control_height)
-    .padding([5, 9])
     .style(move |theme, status| content_tab_style(theme, status, selected))
     .into()
 }
@@ -4345,13 +4452,6 @@ fn centered_action(
     .height(Fill)
     .center(Fill)
     .into()
-}
-
-fn empty_hint(message: &str) -> Element<'_, Message> {
-    container(text(message).size(UI_META_SIZE).style(text::secondary))
-        .padding(8)
-        .width(Fill)
-        .into()
 }
 
 fn empty_action(
@@ -4785,10 +4885,6 @@ fn detail(label: &str, value: String) -> Element<'_, Message> {
     .into()
 }
 
-fn session_navigation_label(name: &str, state: SessionState) -> String {
-    format!("{name} · {}", session_state_label(state))
-}
-
 fn session_tab_label(name: &str) -> String {
     name.to_owned()
 }
@@ -4811,49 +4907,23 @@ fn retain_inline_session_rename(
     }
 }
 
-const fn session_state_label(state: SessionState) -> &'static str {
-    match state {
-        SessionState::Fresh => "Ready",
-        SessionState::Starting => "Starting",
-        SessionState::Running => "Running",
-        SessionState::NeedsFeedback => "Needs feedback",
-        SessionState::FinishedUnseen | SessionState::FinishedSeen => "Finished",
-        SessionState::Failed => "Failed",
-        SessionState::Terminated => "Stopped",
-        SessionState::Disconnected => "Disconnected",
-    }
-}
-
-const fn session_can_stop(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::Fresh
-            | SessionState::Starting
-            | SessionState::Running
-            | SessionState::NeedsFeedback
-    )
-}
-
-const fn session_can_replay(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::FinishedUnseen | SessionState::FinishedSeen | SessionState::Failed
-    )
-}
-
-const fn session_terminal_action_label(
-    attached: bool,
-    state: SessionState,
-    compact: bool,
-) -> Option<&'static str> {
-    if attached {
-        Some(if compact { "Leave" } else { "Leave terminal" })
-    } else if session_can_stop(state) {
-        Some(if compact { "Open" } else { "Open terminal" })
-    } else if session_can_replay(state) {
-        Some("View output")
-    } else {
-        None
+const fn active_terminal_action_label(action: ActiveTerminalAction, compact: bool) -> &'static str {
+    match action {
+        ActiveTerminalAction::Open => {
+            if compact {
+                "Open"
+            } else {
+                "Open terminal"
+            }
+        }
+        ActiveTerminalAction::Leave => {
+            if compact {
+                "Leave"
+            } else {
+                "Leave terminal"
+            }
+        }
+        ActiveTerminalAction::ViewOutput => "View output",
     }
 }
 
@@ -4864,6 +4934,12 @@ fn is_open_terminal_shortcut(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::advanced::{
+        Layout,
+        layout::{Limits, Node},
+        renderer::{Headless, Renderer as _},
+        widget::Tree,
+    };
     use sylvops_core::provider::ProviderCapabilities;
 
     fn session(state: SessionState, external_session_id: Option<&str>) -> Session {
@@ -4900,6 +4976,139 @@ mod tests {
             capabilities: ProviderCapabilities::default(),
             checked_at: 0,
         }
+    }
+
+    fn desktop_hierarchy() -> (DesktopApp, ProjectId, WorktreeId, SessionId, SessionId) {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-explorer-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        let workspace_id = WorkspaceId::new();
+        let project_id = ProjectId::new();
+        let worktree_id = WorktreeId::new();
+        let mut first = session(SessionState::Running, None);
+        first.worktree_id = worktree_id;
+        first.display_name = "First".into();
+        let mut second = session(SessionState::Running, None);
+        second.worktree_id = worktree_id;
+        second.display_name = "Second".into();
+        app.snapshot.workspaces.push(Workspace {
+            id: workspace_id,
+            name: "Local".into(),
+            created_at: 1,
+            updated_at: 1,
+            last_opened_at: Some(1),
+            is_open: true,
+        });
+        app.snapshot.projects.push(Project {
+            id: project_id,
+            workspace_id,
+            name: "SylvOps".into(),
+            repository_path: "C:/repo".into(),
+            canonical_repository_path: "C:/repo".into(),
+            default_branch: Some("main".into()),
+            remote_url: None,
+            created_at: 1,
+            last_activity_at: 1,
+        });
+        app.snapshot.worktrees.push(Worktree {
+            id: worktree_id,
+            project_id,
+            name: "Primary".into(),
+            path: "C:/repo".into(),
+            canonical_path: "C:/repo".into(),
+            branch: Some("main".into()),
+            base_ref: "main".into(),
+            base_commit: "abc".into(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Active,
+            created_at: 1,
+            last_activity_at: 1,
+            removed_at: None,
+        });
+        let first_id = first.id;
+        let second_id = second.id;
+        app.snapshot.sessions.extend([first, second]);
+        app.selected_project_id = Some(project_id);
+        app.selected_worktree_id = Some(worktree_id);
+        app.selected_session_id = Some(first_id);
+        app.active_session_id = Some(first_id);
+        app.open_sessions.push(first_id);
+        app.expand_selected_path();
+        app.focused_explorer_node = Some(ExplorerNodeId::Session(first_id));
+        app.connection = ConnectionState::Connected;
+        app.desktop_state.theme = DesktopTheme::Canopy;
+        (app, project_id, worktree_id, first_id, second_id)
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct RenderedBaseline {
+        width: u16,
+        height: u16,
+        layout_nodes: usize,
+        distinct_colors: usize,
+        checksum: u64,
+    }
+
+    async fn render_desktop_baseline(
+        app: &DesktopApp,
+        width: u16,
+        height: u16,
+    ) -> RenderedBaseline {
+        let mut renderer =
+            <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
+                .await
+                .expect("tiny-skia headless renderer");
+        assert_eq!(renderer.name(), "tiny-skia");
+        let theme = app.theme();
+        let mut element = app.view();
+        let mut tree = Tree::new(&element);
+        let size = iced::Size::new(f32::from(width), f32::from(height));
+        let limits = Limits::new(size, size);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(node.size(), size);
+        let viewport = iced::Rectangle::new(iced::Point::ORIGIN, size);
+        renderer.reset(viewport);
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &theme,
+            &iced::advanced::renderer::Style::default(),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let pixels = renderer.screenshot(
+            iced::Size::new(u32::from(width), u32::from(height)),
+            1.0,
+            theme.palette().background,
+        );
+        assert_eq!(pixels.len(), usize::from(width) * usize::from(height) * 4);
+        let distinct_colors = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let checksum = pixels.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        RenderedBaseline {
+            width,
+            height,
+            layout_nodes: layout_node_count(&node),
+            distinct_colors,
+            checksum,
+        }
+    }
+
+    fn layout_node_count(node: &Node) -> usize {
+        1 + node.children().iter().map(layout_node_count).sum::<usize>()
     }
 
     fn assert_button_contrast(
@@ -4955,84 +5164,6 @@ mod tests {
     }
 
     #[test]
-    fn navigator_reselection_clears_terminal_focus_before_returning() {
-        let source = include_str!("lib.rs");
-        for function in ["select_project", "select_worktree", "select_session"] {
-            let body = source
-                .split_once(&format!("    fn {function}"))
-                .and_then(|(_, tail)| tail.split_once("\n    fn "))
-                .map(|(body, _)| body)
-                .expect("navigator selection function");
-            let focus = body
-                .find("self.unfocus_terminal()")
-                .expect("navigator selection clears terminal focus");
-            let early_return = body.find("return;").unwrap_or(usize::MAX);
-            assert!(
-                focus < early_return,
-                "{function} must clear focus even when the selection is unchanged"
-            );
-        }
-    }
-
-    #[test]
-    fn session_rename_uses_double_click_without_a_pencil_control() {
-        let source = include_str!("lib.rs");
-        let sessions = source
-            .split_once("    fn sessions_column(&self)")
-            .and_then(|(_, tail)| tail.split_once("    fn session_rename_row(&self)"))
-            .map(|(body, _)| body)
-            .expect("sessions column source");
-
-        assert!(sessions.contains("on_double_click"));
-        assert!(!sessions.contains('✎'));
-    }
-
-    #[test]
-    fn navigator_labels_are_single_line_clipped_and_have_no_tooltips() {
-        let source = include_str!("lib.rs");
-        let select_button = source
-            .split_once("fn select_button(")
-            .and_then(|(_, tail)| tail.split_once("\nfn tab_button"))
-            .map(|(body, _)| body)
-            .expect("select button source");
-
-        assert!(select_button.contains("Wrapping::None"));
-        assert!(select_button.contains(".clip(true)"));
-        assert!(!select_button.contains("tooltip("));
-    }
-
-    #[test]
-    fn inline_rename_uses_keyboard_and_click_away_without_buttons() {
-        let source = include_str!("lib.rs");
-        let rename = source
-            .split_once("    fn session_rename_row(&self)")
-            .and_then(|(_, tail)| tail.split_once("    fn compact_navigator(&self)"))
-            .map(|(body, _)| body)
-            .expect("session rename source");
-
-        assert!(rename.contains("on_submit_maybe"));
-        assert!(!rename.contains("Save"));
-        assert!(!rename.contains("Cancel"));
-        assert!(source.contains(".on_press(Message::CancelSessionRename)"));
-    }
-
-    #[test]
-    fn lifecycle_actions_live_with_the_active_session_tabs() {
-        let source = include_str!("lib.rs");
-        let workspace = source
-            .split_once("    fn workspace_view(&self)")
-            .and_then(|(_, tail)| tail.split_once("    fn session_actions(&self)"))
-            .map(|(body, _)| body)
-            .expect("workspace header source");
-
-        let session_tabs = workspace
-            .split_once("    fn session_tabs(&self)")
-            .map(|(_, body)| body)
-            .expect("session tabs source");
-        assert!(session_tabs.contains("self.session_actions()"));
-    }
-
-    #[test]
     fn measured_terminal_viewport_keeps_the_grid_inside_the_visible_screen() {
         let viewport = iced::Size::new(600.0, 400.0);
         let font_size = 14;
@@ -5049,6 +5180,97 @@ mod tests {
         assert!(f32::from(columns + 1) * cell_width > screen_width);
         assert!(f32::from(rows) * line_height <= screen_height);
         assert!(f32::from(rows + 1) * line_height > screen_height);
+    }
+
+    #[test]
+    fn explorer_selection_does_not_change_active_session_until_opened() {
+        let (mut app, _, _, first_id, second_id) = desktop_hierarchy();
+
+        app.select_explorer_node(ExplorerNodeId::Session(second_id));
+        assert_eq!(app.selected_session_id, Some(second_id));
+        assert_eq!(app.active_session_id, Some(first_id));
+        assert_eq!(app.open_sessions, vec![first_id]);
+
+        app.select_main_tab(MainTab::Changes);
+        assert_eq!(app.active_session_id, Some(first_id));
+
+        app.open_explorer_node(ExplorerNodeId::Session(second_id));
+        assert_eq!(app.active_session_id, Some(second_id));
+        assert!(app.open_sessions.contains(&second_id));
+    }
+
+    #[test]
+    fn explorer_context_actions_are_available_from_keyboard_selection() {
+        let (mut app, project_id, worktree_id, _, second_id) = desktop_hierarchy();
+
+        app.focused_explorer_node = Some(ExplorerNodeId::Repository(project_id));
+        app.shortcut_new();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form(FormModal {
+                form: Form {
+                    kind: FormKind::CreateWorktree(id),
+                    ..
+                },
+                ..
+            })) if id == project_id
+        ));
+
+        app.modal = None;
+        app.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
+        app.shortcut_rename();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form(FormModal {
+                form: Form {
+                    kind: FormKind::RenameWorktree(id),
+                    ..
+                },
+                ..
+            })) if id == worktree_id
+        ));
+
+        app.modal = None;
+        app.focused_explorer_node = Some(ExplorerNodeId::Session(second_id));
+        app.shortcut_delete();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirmation(Confirmation::StopSession { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn canopy_rendered_baselines_cover_wide_compact_and_narrow_explorer_shells() {
+        let (mut app, _, _, _, _) = desktop_hierarchy();
+
+        app.desktop_state.window_width = 1_440;
+        app.desktop_state.window_height = 900;
+        let wide = render_desktop_baseline(&app, 1_440, 900).await;
+
+        app.desktop_state.window_width = 900;
+        app.desktop_state.window_height = 700;
+        let compact = render_desktop_baseline(&app, 900, 700).await;
+
+        app.desktop_state.window_width = 680;
+        app.desktop_state.window_height = 480;
+        app.narrow_main = false;
+        let narrow_explorer = render_desktop_baseline(&app, 680, 480).await;
+        app.narrow_main = true;
+        let narrow_active = render_desktop_baseline(&app, 680, 480).await;
+
+        assert_eq!(
+            [
+                wide.layout_nodes,
+                compact.layout_nodes,
+                narrow_explorer.layout_nodes,
+                narrow_active.layout_nodes,
+            ],
+            [119, 121, 81, 72]
+        );
+        for baseline in [&wide, &compact, &narrow_explorer, &narrow_active] {
+            assert!(baseline.distinct_colors >= 8, "{baseline:?}");
+        }
+        assert_ne!(narrow_explorer.checksum, narrow_active.checksum);
     }
 
     #[test]
@@ -5273,11 +5495,7 @@ mod tests {
     }
 
     #[test]
-    fn session_labels_put_state_after_the_name_without_a_prefix() {
-        assert_eq!(
-            session_navigation_label("Build API", SessionState::Disconnected),
-            "Build API · Disconnected"
-        );
+    fn session_tabs_prioritize_the_session_name() {
         assert_eq!(session_tab_label("Build API"), "Build API");
     }
 
@@ -5481,20 +5699,24 @@ mod tests {
     #[test]
     fn terminal_actions_use_short_single_line_labels_when_space_is_tight() {
         assert_eq!(
-            session_terminal_action_label(false, SessionState::Running, false),
-            Some("Open terminal")
+            active_terminal_action_label(ActiveTerminalAction::Open, false),
+            "Open terminal"
         );
         assert_eq!(
-            session_terminal_action_label(false, SessionState::Running, true),
-            Some("Open")
+            active_terminal_action_label(ActiveTerminalAction::Open, true),
+            "Open"
         );
         assert_eq!(
-            session_terminal_action_label(true, SessionState::Running, false),
-            Some("Leave terminal")
+            active_terminal_action_label(ActiveTerminalAction::Leave, false),
+            "Leave terminal"
         );
         assert_eq!(
-            session_terminal_action_label(true, SessionState::Running, true),
-            Some("Leave")
+            active_terminal_action_label(ActiveTerminalAction::Leave, true),
+            "Leave"
+        );
+        assert_eq!(
+            active_terminal_action_label(ActiveTerminalAction::ViewOutput, true),
+            "View output"
         );
     }
 
@@ -5511,14 +5733,6 @@ mod tests {
         ] {
             assert!(!checkout_delete_available(false, status));
         }
-    }
-
-    #[test]
-    fn keyboard_selection_wraps_in_both_directions() {
-        let items = [10, 20, 30];
-        assert_eq!(next_selection(&items, Some(30), 1), Some(10));
-        assert_eq!(next_selection(&items, Some(10), -1), Some(30));
-        assert_eq!(next_selection::<u8>(&[], None, 1), None);
     }
 
     #[test]
