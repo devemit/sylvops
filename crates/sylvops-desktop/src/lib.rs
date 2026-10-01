@@ -2,6 +2,7 @@
 
 mod bridge;
 mod forms;
+mod presentation;
 mod state;
 mod terminal;
 mod theme;
@@ -29,6 +30,11 @@ use iced::{
     window,
 };
 use iced::{font, font::Weight, widget::button::Status};
+use presentation::{
+    ButtonIntent, ButtonTokens, ControlState, DensityMetrics, DesktopPresentation,
+    InteractionState as PresentationInteraction, PresentationInput, PresentationLayout,
+    PresentationTheme, SystemAppearance, TerminalPalette, Viewport, button_visual,
+};
 use sylvops_core::{
     domain::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
@@ -56,14 +62,9 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(75);
 const SUCCESS_DURATION: Duration = Duration::from_secs(4);
 const MAX_EVENTS_PER_TICK: usize = 512;
-const NAV_HEIGHT: f32 = 44.0;
-const FOOTER_HEIGHT: f32 = 32.0;
-const SESSION_TAB_HEIGHT: f32 = 42.0;
-const PANEL_HEADER_HEIGHT: f32 = 42.0;
 const UI_TEXT_SIZE: f32 = 14.0;
 const UI_META_SIZE: f32 = 12.0;
 const FOOTER_TEXT_SIZE: f32 = 12.0;
-const ACTION_HEIGHT: f32 = 34.0;
 const TERMINAL_HORIZONTAL_PADDING: f32 = 24.0;
 const TERMINAL_VERTICAL_PADDING: f32 = 16.0;
 const TERMINAL_HEADER_HEIGHT: f32 = 26.0;
@@ -72,18 +73,6 @@ const TERMINAL_SCROLLBAR_WIDTH: f32 = 14.0;
 const TERMINAL_CELL_WIDTH_RATIO: f32 = 0.6;
 const TERMINAL_LINE_HEIGHT_RATIO: f32 = 1.3;
 const MAX_WINDOW_ICON_SIDE: u32 = 256;
-const THEME_CHOICES: [DesktopTheme; 10] = [
-    DesktopTheme::System,
-    DesktopTheme::Light,
-    DesktopTheme::Dark,
-    DesktopTheme::Nord,
-    DesktopTheme::TokyoNight,
-    DesktopTheme::Catppuccin,
-    DesktopTheme::Dracula,
-    DesktopTheme::GruvboxDark,
-    DesktopTheme::SolarizedLight,
-    DesktopTheme::SolarizedDark,
-];
 const DENSITY_CHOICES: [DesktopDensity; 2] = [DesktopDensity::Comfortable, DesktopDensity::Compact];
 const TERMINAL_FONT_CHOICES: [DesktopTerminalFont; 4] = [
     DesktopTerminalFont::System,
@@ -732,7 +721,29 @@ impl DesktopApp {
     }
 
     fn theme(&self) -> Theme {
-        theme::resolve(self.desktop_state.theme, self.system_theme)
+        theme::resolve(self.presentation().theme)
+    }
+
+    fn presentation(&self) -> DesktopPresentation {
+        DesktopPresentation::build(&PresentationInput {
+            daemon: &self.snapshot,
+            preferences: &self.desktop_state,
+            viewport: Viewport::new(
+                self.desktop_state.window_width,
+                self.desktop_state.window_height,
+            ),
+            system_appearance: match self.system_theme {
+                iced::theme::Mode::Light => SystemAppearance::Light,
+                iced::theme::Mode::None | iced::theme::Mode::Dark => SystemAppearance::Dark,
+            },
+            interaction: PresentationInteraction {
+                selected_project_id: self.selected_project_id,
+                selected_worktree_id: self.selected_worktree_id,
+                selected_session_id: self.selected_session_id,
+                active_session_id: self.active_session_id,
+                main_tab: self.main_tab,
+            },
+        })
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -758,12 +769,21 @@ impl DesktopApp {
             .width(Fill)
             .height(Fill);
         if let Some(error) = &self.error {
+            let presentation_theme = self.presentation().theme;
             content = content.push(
                 container(
                     row![
                         text(error).style(text::danger),
                         space::horizontal(),
-                        button("Dismiss").on_press(Message::ClearError)
+                        button("Dismiss").on_press(Message::ClearError).style(
+                            move |_theme, status| {
+                                button_intent_style(
+                                    presentation_theme,
+                                    ButtonIntent::Secondary,
+                                    status,
+                                )
+                            }
+                        )
                     ]
                     .align_y(Center),
                 )
@@ -788,6 +808,7 @@ impl DesktopApp {
     }
 
     fn top_bar(&self) -> Element<'_, Message> {
+        let density = self.presentation().density;
         let compact = self.desktop_state.window_width < 1_000;
         let fullscreen_label = fullscreen_label(self.window_mode, compact);
         let worktree_context = self.selected_worktree().map_or_else(
@@ -824,7 +845,7 @@ impl DesktopApp {
                     .wrapping(text::Wrapping::None),
             )
             .on_press(Message::SelectWorkspace(workspace.id))
-            .height(ACTION_HEIGHT)
+            .height(density.control_height)
             .padding([6, 14])
             .style(move |theme, status| workspace_tab_style(theme, status, active));
             workspace_tabs = workspace_tabs.push(action);
@@ -839,7 +860,7 @@ impl DesktopApp {
                     .size(if compact { 16.0 } else { UI_META_SIZE }),
             )
             .on_press(Message::NewWorkspace)
-            .height(ACTION_HEIGHT)
+            .height(density.control_height)
             .padding([5, 11])
             .style(chrome_action_style),
         );
@@ -848,12 +869,12 @@ impl DesktopApp {
                 scrollable::Scrollbar::hidden(),
             ))
             .width(Fill)
-            .height(ACTION_HEIGHT);
-        let mut actions = row![].spacing(4).align_y(Center);
+            .height(density.control_height);
+        let mut actions = row![].spacing(density.region_spacing).align_y(Center);
         if !compact {
             actions = actions.push(
                 container(text(worktree_context).font(UI_MEDIUM).size(UI_META_SIZE))
-                    .height(ACTION_HEIGHT)
+                    .height(density.control_height)
                     .padding([7, 11])
                     .align_y(Vertical::Center)
                     .style(selected_context_style),
@@ -864,22 +885,22 @@ impl DesktopApp {
             .push(
                 button(text(fullscreen_label).font(UI_MEDIUM).size(UI_META_SIZE))
                     .on_press(Message::ToggleFullscreen)
-                    .height(ACTION_HEIGHT)
+                    .height(density.control_height)
                     .padding([6, 11])
                     .style(chrome_action_style),
             )
             .push(
                 button(text("Settings").font(UI_MEDIUM).size(UI_META_SIZE))
                     .on_press(Message::ToggleSettings)
-                    .height(ACTION_HEIGHT)
+                    .height(density.control_height)
                     .padding([6, 11])
                     .style(chrome_action_style),
             );
         let navigation = row![brand, workspace_tabs, actions]
-            .spacing(8)
+            .spacing(density.region_spacing)
             .align_y(Center);
         container(navigation)
-            .height(NAV_HEIGHT)
+            .height(density.navigation_height)
             .width(Fill)
             .padding([5, 8])
             .align_y(Vertical::Center)
@@ -888,6 +909,7 @@ impl DesktopApp {
     }
 
     fn refresh_button(&self, compact: bool) -> Element<'static, Message> {
+        let control_height = self.presentation().density.control_height;
         let can_refresh =
             matches!(self.connection, ConnectionState::Connected) && !self.snapshot_pending;
         let label = if self.snapshot_pending {
@@ -899,7 +921,7 @@ impl DesktopApp {
         };
         button(text(label).size(if compact { 17 } else { 12 }))
             .on_press_maybe(can_refresh.then_some(Message::Refresh))
-            .height(ACTION_HEIGHT)
+            .height(control_height)
             .padding([5, 10])
             .style(chrome_action_style)
             .into()
@@ -909,8 +931,8 @@ impl DesktopApp {
         if matches!(self.connection, ConnectionState::Connecting) {
             return centered_message("Connecting to the SylvOps daemon…");
         }
-        match state::layout_mode(self.desktop_state.window_width) {
-            state::LayoutMode::Wide => pane_grid(&self.panes, |_pane, kind, _maximized| {
+        match self.presentation().layout {
+            PresentationLayout::Wide => pane_grid(&self.panes, |_pane, kind, _maximized| {
                 let content = match kind {
                     DesktopPane::Projects => self.projects_column(),
                     DesktopPane::Worktrees => self.worktrees_column(),
@@ -923,7 +945,7 @@ impl DesktopApp {
             .min_size(150)
             .on_resize(8, Message::PaneResized)
             .into(),
-            state::LayoutMode::Compact => row![
+            PresentationLayout::Compact => row![
                 self.compact_navigator(),
                 rule::vertical(1),
                 self.workspace_view(),
@@ -931,7 +953,7 @@ impl DesktopApp {
             .width(Fill)
             .height(Fill)
             .into(),
-            state::LayoutMode::Narrow => {
+            PresentationLayout::Narrow => {
                 let toggle = row![
                     button("Navigator")
                         .on_press(Message::ShowNarrowNavigator)
@@ -959,15 +981,21 @@ impl DesktopApp {
     }
 
     fn projects_column(&self) -> Element<'_, Message> {
-        let mut items =
-            column![column_heading("Repositories", Some(Message::NewProject))].spacing(4);
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let mut items = column![column_heading(
+            "Repositories",
+            Some(Message::NewProject),
+            density
+        )]
+        .spacing(density.region_spacing);
         let projects = self.visible_projects();
         for project in &projects {
             items = items.push(select_button(
                 &project.name,
-                self.selected_project_id == Some(project.id),
+                presentation.selection.project_id == Some(project.id),
                 Message::SelectProject(project.id),
-                self.desktop_state.density,
+                density,
             ));
         }
         if projects.is_empty() {
@@ -989,9 +1017,13 @@ impl DesktopApp {
     }
 
     fn worktrees_column(&self) -> Element<'_, Message> {
-        let create = self.selected_project_id.map(|_| Message::NewWorktree);
-        let mut items = column![column_heading("Checkouts", create)].spacing(4);
-        if let Some(project_id) = self.selected_project_id {
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let selected_project_id = presentation.selection.project_id;
+        let create = selected_project_id.map(|_| Message::NewWorktree);
+        let mut items =
+            column![column_heading("Checkouts", create, density)].spacing(density.region_spacing);
+        if let Some(project_id) = selected_project_id {
             let worktrees = self.worktrees_for(project_id);
             for worktree in &worktrees {
                 let branch = worktree.branch.as_deref().unwrap_or("detached");
@@ -1000,12 +1032,12 @@ impl DesktopApp {
                 } else {
                     format!("{}  ·  {branch}", worktree.name)
                 };
-                let selected = self.selected_worktree_id == Some(worktree.id);
+                let selected = presentation.selection.worktree_id == Some(worktree.id);
                 let select = select_button(
                     &label,
                     selected,
                     Message::SelectWorktree(worktree.id),
-                    self.desktop_state.density,
+                    density,
                 );
                 if selected && worktree_can_delete(worktree) {
                     items = items.push(
@@ -1013,10 +1045,7 @@ impl DesktopApp {
                             select,
                             button(text("Delete").font(UI_MEDIUM).size(UI_META_SIZE))
                                 .on_press(Message::RemoveSelectedWorktree)
-                                .height(match self.desktop_state.density {
-                                    DesktopDensity::Comfortable => 36,
-                                    DesktopDensity::Compact => 30,
-                                })
+                                .height(density.row_height)
                                 .padding([4, 7])
                                 .style(flat_danger_style),
                         ]
@@ -1041,12 +1070,16 @@ impl DesktopApp {
     }
 
     fn sessions_column(&self) -> Element<'_, Message> {
-        let create = self.selected_worktree_id.map(|_| Message::NewSession);
-        let mut items = column![column_heading("Sessions", create)].spacing(4);
-        if let Some(worktree_id) = self.selected_worktree_id {
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let selected_worktree_id = presentation.selection.worktree_id;
+        let create = selected_worktree_id.map(|_| Message::NewSession);
+        let mut items =
+            column![column_heading("Sessions", create, density)].spacing(density.region_spacing);
+        if let Some(worktree_id) = selected_worktree_id {
             let sessions = self.sessions_for(worktree_id);
             for session in &sessions {
-                let selected = self.selected_session_id == Some(session.id);
+                let selected = presentation.selection.session_id == Some(session.id);
                 if self
                     .inline_session_rename
                     .as_ref()
@@ -1056,10 +1089,7 @@ impl DesktopApp {
                 } else {
                     let label = session_navigation_label(&session.display_name, session.state);
                     let hovered = self.hovered_session_id == Some(session.id);
-                    let height = match self.desktop_state.density {
-                        DesktopDensity::Comfortable => 36,
-                        DesktopDensity::Compact => 30,
-                    };
+                    let height = density.row_height;
                     let row = container(
                         text(label.clone())
                             .font(if selected { UI_MEDIUM } else { UI_FONT })
@@ -1113,21 +1143,26 @@ impl DesktopApp {
     }
 
     fn compact_navigator(&self) -> Element<'_, Message> {
+        let presentation = self.presentation();
+        let density = presentation.density;
         let tabs = row![
             compact_panel_button(
                 "Repositories",
                 DesktopPanel::Projects,
-                self.desktop_state.compact_panel
+                self.desktop_state.compact_panel,
+                density
             ),
             compact_panel_button(
                 "Checkouts",
                 DesktopPanel::Worktrees,
-                self.desktop_state.compact_panel
+                self.desktop_state.compact_panel,
+                density
             ),
             compact_panel_button(
                 "Sessions",
                 DesktopPanel::Sessions,
-                self.desktop_state.compact_panel
+                self.desktop_state.compact_panel,
+                density
             ),
         ]
         .spacing(3);
@@ -1137,34 +1172,34 @@ impl DesktopApp {
             DesktopPanel::Sessions => self.sessions_column(),
         };
         container(column![container(tabs).padding([4, 5]), panel])
-            .width(
-                if state::layout_mode(self.desktop_state.window_width) == state::LayoutMode::Compact
-                {
-                    Length::Fixed(280.0)
-                } else {
-                    Fill
-                },
-            )
+            .width(if presentation.layout == PresentationLayout::Compact {
+                Length::Fixed(280.0)
+            } else {
+                Fill
+            })
             .height(Fill)
             .into()
     }
 
     fn workspace_view(&self) -> Element<'_, Message> {
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let main_tab = presentation.selection.main_tab;
         let tabs = self.session_tabs();
         let views = container(
             row![
-                tab_button("Terminal", MainTab::Terminal, self.main_tab),
-                tab_button("Changes", MainTab::Changes, self.main_tab),
-                tab_button("Details", MainTab::Details, self.main_tab),
+                tab_button("Terminal", MainTab::Terminal, main_tab, density),
+                tab_button("Changes", MainTab::Changes, main_tab, density),
+                tab_button("Details", MainTab::Details, main_tab, density),
             ]
-            .spacing(4)
+            .spacing(density.region_spacing)
             .align_y(Center),
         )
-        .height(42)
+        .height(density.tab_height)
         .padding([4, 8])
         .width(Fill)
         .style(tab_strip_surface);
-        let content = match self.main_tab {
+        let content = match main_tab {
             MainTab::Terminal => self.terminal_view(),
             MainTab::Changes => self.changes_view(),
             MainTab::Details => self.details_view(),
@@ -1182,11 +1217,13 @@ impl DesktopApp {
     }
 
     fn session_tabs(&self) -> Element<'_, Message> {
-        let mut tabs = row![].spacing(6).align_y(Center);
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let mut tabs = row![].spacing(density.region_spacing).align_y(Center);
         for session_id in &self.open_sessions {
             if let Some(session) = self.session(*session_id) {
                 let label = session_tab_label(&session.display_name);
-                let active = self.active_session_id == Some(session.id);
+                let active = presentation.selection.active_session_id == Some(session.id);
                 tabs = tabs.push(
                     container(
                         row![
@@ -1197,12 +1234,12 @@ impl DesktopApp {
                                     .wrapping(text::Wrapping::None)
                             )
                             .on_press(Message::SelectOpenSession(session.id))
-                            .height(30)
+                            .height(density.row_height)
                             .padding([5, 9])
                             .style(move |theme, status| { tab_label_style(theme, status, active) }),
                             button(text("×").size(15))
                                 .on_press(Message::CloseSessionTab(session.id))
-                                .height(30)
+                                .height(density.row_height)
                                 .padding([4, 8])
                                 .style(tab_close_style),
                         ]
@@ -1226,14 +1263,14 @@ impl DesktopApp {
                     .direction(scrollable::Direction::Horizontal(
                         scrollable::Scrollbar::hidden(),
                     ))
-                    .height(ACTION_HEIGHT)
+                    .height(density.control_height)
                     .width(Fill),
                 self.session_actions(),
             ]
-            .spacing(8)
+            .spacing(density.region_spacing)
             .align_y(Center),
         )
-        .height(SESSION_TAB_HEIGHT)
+        .height(density.tab_height)
         .padding([4, 8])
         .width(Fill)
         .style(tab_strip_surface)
@@ -1241,7 +1278,9 @@ impl DesktopApp {
     }
 
     fn session_actions(&self) -> Element<'_, Message> {
-        let Some(session_id) = self.active_session_id else {
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let Some(session_id) = presentation.selection.active_session_id else {
             return text("No session selected").style(text::secondary).into();
         };
         let Some(session) = self.session(session_id) else {
@@ -1258,6 +1297,7 @@ impl DesktopApp {
         let resume_pending = self.resume_pending.contains(&session_id);
         let session_state = session.state;
         let state_label = session_state_label(session.state);
+        let presentation_theme = presentation.theme;
         responsive(move |size| {
             let compact = size.width < 260.0;
             let mut actions = row![].spacing(4);
@@ -1267,10 +1307,10 @@ impl DesktopApp {
                 } else {
                     Message::Attach
                 };
-                let style = if attached {
-                    chrome_action_style
+                let intent = if attached {
+                    ButtonIntent::Quiet
                 } else {
-                    primary_action_style
+                    ButtonIntent::Primary
                 };
                 actions = actions.push(
                     button(
@@ -1280,18 +1320,22 @@ impl DesktopApp {
                             .wrapping(text::Wrapping::None),
                     )
                     .on_press(message)
-                    .height(ACTION_HEIGHT)
+                    .height(density.control_height)
                     .padding([6, 9])
-                    .style(style),
+                    .style(move |_theme, status| {
+                        button_intent_style(presentation_theme, intent, status)
+                    }),
                 );
             }
             if can_stop {
                 actions = actions.push(
                     button(text("Stop").font(UI_MEDIUM).size(UI_META_SIZE))
                         .on_press(Message::Stop)
-                        .height(ACTION_HEIGHT)
+                        .height(density.control_height)
                         .padding([6, 9])
-                        .style(danger_action_style),
+                        .style(move |_theme, status| {
+                            button_intent_style(presentation_theme, ButtonIntent::Danger, status)
+                        }),
                 );
             } else if can_resume {
                 actions = actions.push(
@@ -1305,9 +1349,11 @@ impl DesktopApp {
                         .size(UI_META_SIZE),
                     )
                     .on_press_maybe((!resume_pending).then_some(Message::Resume(session_id)))
-                    .height(ACTION_HEIGHT)
+                    .height(density.control_height)
                     .padding([6, 9])
-                    .style(primary_action_style),
+                    .style(move |_theme, status| {
+                        button_intent_style(presentation_theme, ButtonIntent::Primary, status)
+                    }),
                 );
             } else if !compact {
                 actions = actions.push(
@@ -1317,7 +1363,7 @@ impl DesktopApp {
                             .wrapping(text::Wrapping::None)
                             .style(text::secondary),
                     )
-                    .height(ACTION_HEIGHT)
+                    .height(density.control_height)
                     .align_y(Vertical::Center)
                     .clip(true),
                 );
@@ -1325,12 +1371,13 @@ impl DesktopApp {
             actions.into()
         })
         .width(Length::Shrink)
-        .height(ACTION_HEIGHT)
+        .height(density.control_height)
         .into()
     }
 
     fn terminal_view(&self) -> Element<'_, Message> {
-        let Some(session_id) = self.active_session_id else {
+        let presentation = self.presentation();
+        let Some(session_id) = presentation.selection.active_session_id else {
             return observed_terminal_viewport(centered_message(
                 "Choose a session, then open its terminal.",
             ));
@@ -1365,13 +1412,14 @@ impl DesktopApp {
             "Click to type  ·  drag to select terminal text".to_owned()
         };
         let terminal_font = terminal_font(self.desktop_state.terminal_font);
+        let terminal_palette = presentation.theme.terminal;
         let spans = terminal_spans(
             terminal_display_runs(
                 terminal,
                 self.terminal_focus.is_focused(),
                 self.desktop_state.terminal_cursor,
             ),
-            &self.theme(),
+            terminal_palette,
             terminal_font,
             self.desktop_state.terminal_cursor,
         );
@@ -1415,7 +1463,9 @@ impl DesktopApp {
         .padding([8, 12])
         .width(Fill)
         .height(Fill)
-        .style(move |theme| terminal_surface(theme, self.terminal_focus.is_focused()));
+        .style(move |theme| {
+            terminal_surface(theme, self.terminal_focus.is_focused(), terminal_palette)
+        });
         let viewport = observed_terminal_viewport(
             mouse_area(surface)
                 .on_move(Message::TerminalPointerMoved)
@@ -1456,9 +1506,10 @@ impl DesktopApp {
     }
 
     fn details_view(&self) -> Element<'_, Message> {
+        let selection = self.presentation().selection;
         let mut content = column![text("Selection details").font(UI_SEMIBOLD).size(24)].spacing(12);
-        if let Some(project) = self
-            .selected_project_id
+        if let Some(project) = selection
+            .project_id
             .and_then(|id| self.snapshot.projects.iter().find(|item| item.id == id))
         {
             content = content
@@ -1477,7 +1528,7 @@ impl DesktopApp {
                 ))
                 .push(detail("Path", worktree.canonical_path.clone()));
         }
-        if let Some(session) = self.active_session_id.and_then(|id| self.session(id)) {
+        if let Some(session) = selection.active_session_id.and_then(|id| self.session(id)) {
             content = content
                 .push(rule::horizontal(1))
                 .push(text(&session.display_name).font(UI_SEMIBOLD).size(18))
@@ -1519,13 +1570,13 @@ impl DesktopApp {
                 ));
         }
         let mut actions = row![].spacing(8);
-        if self.selected_project_id.is_some() {
+        if selection.project_id.is_some() {
             actions = actions.push(button("Rename repository").on_press(Message::RenameProject));
         }
-        if self.selected_worktree_id.is_some() {
+        if selection.worktree_id.is_some() {
             actions = actions.push(button("Rename checkout").on_press(Message::RenameWorktree));
         }
-        if let Some(session) = self.active_session_id.and_then(|id| self.session(id)) {
+        if let Some(session) = selection.active_session_id.and_then(|id| self.session(id)) {
             actions = actions.push(self.session_rename_action(session.id));
             if session_can_stop(session.state) {
                 actions = actions.push(
@@ -1568,14 +1619,14 @@ impl DesktopApp {
     fn modal_view<'a>(&'a self, modal: &'a Modal) -> Element<'a, Message> {
         match modal {
             Modal::Settings => self.settings_view(),
-            Modal::Shortcuts => Self::shortcuts_view(),
+            Modal::Shortcuts => Self::shortcuts_view(self.presentation().density),
             Modal::Form(form) => Self::form_view(form),
             Modal::Confirmation(confirmation) => Self::confirmation_view(confirmation),
             Modal::DataRemoval(confirmation) => Self::data_removal_view(confirmation),
         }
     }
 
-    fn shortcuts_view() -> Element<'static, Message> {
+    fn shortcuts_view(density: DensityMetrics) -> Element<'static, Message> {
         container(
             column![
                 row![
@@ -1583,7 +1634,7 @@ impl DesktopApp {
                     space::horizontal(),
                     button("Done")
                         .on_press(Message::CancelModal)
-                        .height(ACTION_HEIGHT)
+                        .height(density.control_height)
                         .padding([6, 12])
                 ]
                 .align_y(Center),
@@ -1614,12 +1665,13 @@ impl DesktopApp {
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
+        let density = self.presentation().density;
         let control_width = Length::Fixed(260.0);
         let appearance = column![
             setting_row(
                 "Theme",
                 pick_list(
-                    THEME_CHOICES,
+                    DesktopTheme::ALL,
                     Some(self.desktop_state.theme),
                     Message::SelectTheme,
                 )
@@ -1662,7 +1714,7 @@ impl DesktopApp {
                 .width(control_width),
             ),
         ]
-        .spacing(10);
+        .spacing(density.region_spacing);
         let update_settings = self.update_settings_view();
         container(
             column![
@@ -1671,7 +1723,7 @@ impl DesktopApp {
                     space::horizontal(),
                     button(text("Done").font(UI_MEDIUM).size(12))
                         .on_press(Message::ToggleSettings)
-                        .height(ACTION_HEIGHT)
+                        .height(density.control_height)
                         .padding([6, 10])
                         .style(chrome_action_style)
                 ]
@@ -2012,6 +2064,7 @@ impl DesktopApp {
     }
 
     fn footer(&self) -> Element<'_, Message> {
+        let density = self.presentation().density;
         let compact = self.desktop_state.window_width < 900;
         let workspace = self
             .active_workspace()
@@ -2047,7 +2100,7 @@ impl DesktopApp {
             footer_separator(),
             footer_item(workspace),
         ]
-        .spacing(9)
+        .spacing(density.region_spacing)
         .align_y(Center);
         if !compact {
             status = status.push(footer_separator()).push(footer_item(&checkout));
@@ -2059,7 +2112,7 @@ impl DesktopApp {
                 .push(footer_item("Ctrl+K shortcuts  ·  Ctrl+] leave terminal"));
         }
         container(status)
-            .height(FOOTER_HEIGHT)
+            .height(density.footer_height)
             .padding([3, 10])
             .width(Fill)
             .style(chrome_surface)
@@ -3653,8 +3706,8 @@ impl DesktopApp {
         if let Some(viewport) = self.terminal_viewport {
             return terminal_grid_dimensions(viewport, self.desktop_state.terminal_font_size);
         }
-        let main_width = match state::layout_mode(self.desktop_state.window_width) {
-            state::LayoutMode::Wide => {
+        let main_width = match self.presentation().layout {
+            PresentationLayout::Wide => {
                 let mut remaining = u32::from(self.desktop_state.window_width);
                 for ratio in self.desktop_state.panel_ratios {
                     let pane = remaining.saturating_mul(u32::from(ratio)) / 1000;
@@ -3662,8 +3715,8 @@ impl DesktopApp {
                 }
                 u16::try_from(remaining).unwrap_or(u16::MAX)
             }
-            state::LayoutMode::Compact => self.desktop_state.window_width.saturating_sub(285),
-            state::LayoutMode::Narrow => self.desktop_state.window_width,
+            PresentationLayout::Compact => self.desktop_state.window_width.saturating_sub(285),
+            PresentationLayout::Narrow => self.desktop_state.window_width,
         };
         let font = u16::from(self.desktop_state.terminal_font_size);
         let columns = (main_width / font.saturating_mul(3).saturating_div(5).max(1)).clamp(1, 500);
@@ -3772,7 +3825,7 @@ impl DesktopApp {
             self.open_sessions.push(session_id);
         }
         self.mark_state_dirty();
-        if state::layout_mode(self.desktop_state.window_width) == state::LayoutMode::Narrow {
+        if self.presentation().layout == PresentationLayout::Narrow {
             self.narrow_main = true;
         }
     }
@@ -3806,11 +3859,11 @@ impl DesktopApp {
     }
 
     fn active_workspace(&self) -> Option<&Workspace> {
+        let workspace_id = self.presentation().selection.workspace_id?;
         self.snapshot
             .workspaces
             .iter()
-            .find(|workspace| workspace.is_open)
-            .or_else(|| self.snapshot.workspaces.first())
+            .find(|workspace| workspace.id == workspace_id)
     }
 
     fn visible_projects(&self) -> Vec<&Project> {
@@ -3862,7 +3915,7 @@ impl DesktopApp {
     }
 
     fn selected_worktree(&self) -> Option<&Worktree> {
-        self.selected_worktree_id.and_then(|id| {
+        self.presentation().selection.worktree_id.and_then(|id| {
             self.snapshot
                 .worktrees
                 .iter()
@@ -3947,7 +4000,11 @@ fn panel<'a>(content: impl Into<Element<'a, Message>>, _width: f32) -> Element<'
         .into()
 }
 
-fn column_heading(label: &str, action: Option<Message>) -> Element<'_, Message> {
+fn column_heading(
+    label: &str,
+    action: Option<Message>,
+    density: DensityMetrics,
+) -> Element<'_, Message> {
     let mut heading = row![
         text(label)
             .font(UI_SEMIBOLD)
@@ -3960,13 +4017,13 @@ fn column_heading(label: &str, action: Option<Message>) -> Element<'_, Message> 
         heading = heading.push(
             button(text("+").font(UI_MEDIUM).size(15))
                 .on_press(action)
-                .height(30)
+                .height(density.control_height)
                 .padding([4, 8])
                 .style(chrome_action_style),
         );
     }
     container(heading)
-        .height(PANEL_HEADER_HEIGHT)
+        .height(density.panel_header_height)
         .padding([4, 7])
         .width(Fill)
         .into()
@@ -3976,12 +4033,8 @@ fn select_button(
     label: &str,
     selected: bool,
     message: Message,
-    density: DesktopDensity,
+    density: DensityMetrics,
 ) -> Element<'static, Message> {
-    let (height, padding) = match density {
-        DesktopDensity::Comfortable => (36, [8, 9]),
-        DesktopDensity::Compact => (30, [5, 8]),
-    };
     let label = label.to_owned();
     let content = container(
         text(label.clone())
@@ -3996,8 +4049,8 @@ fn select_button(
         .on_press(message)
         .style(move |theme, status| list_item_style(theme, status, selected))
         .width(Fill)
-        .height(height)
-        .padding(padding);
+        .height(density.row_height)
+        .padding(density.navigation_padding);
     action.into()
 }
 
@@ -4009,7 +4062,12 @@ const fn checkout_delete_available(is_root_checkout: bool, status: WorktreeStatu
     !is_root_checkout && matches!(status, WorktreeStatus::Active)
 }
 
-fn tab_button(label: &str, tab: MainTab, active: MainTab) -> Element<'_, Message> {
+fn tab_button(
+    label: &str,
+    tab: MainTab,
+    active: MainTab,
+    density: DensityMetrics,
+) -> Element<'_, Message> {
     let selected = tab == active;
     button(
         text(label)
@@ -4018,7 +4076,7 @@ fn tab_button(label: &str, tab: MainTab, active: MainTab) -> Element<'_, Message
             .wrapping(text::Wrapping::None),
     )
     .on_press(Message::SelectMainTab(tab))
-    .height(ACTION_HEIGHT)
+    .height(density.control_height)
     .padding([6, 14])
     .style(move |theme, status| content_tab_style(theme, status, selected))
     .into()
@@ -4028,6 +4086,7 @@ fn compact_panel_button(
     label: &str,
     panel: DesktopPanel,
     active: DesktopPanel,
+    density: DensityMetrics,
 ) -> Element<'_, Message> {
     let selected = panel == active;
     button(
@@ -4037,7 +4096,7 @@ fn compact_panel_button(
             .wrapping(text::Wrapping::None),
     )
     .on_press(Message::SelectCompactPanel(panel))
-    .height(32)
+    .height(density.control_height)
     .padding([5, 9])
     .style(move |theme, status| content_tab_style(theme, status, selected))
     .into()
@@ -4170,31 +4229,31 @@ fn terminal_point_to_cell(
 
 fn terminal_spans(
     runs: Vec<DisplayRun>,
-    theme: &Theme,
+    palette: TerminalPalette,
     terminal_font: Font,
     cursor_style: DesktopTerminalCursor,
 ) -> Vec<text::Span<'static, (), Font>> {
-    let palette = theme.extended_palette();
-    let default_foreground = palette.background.base.text;
-    let default_background = palette.background.base.color;
+    let default_background = theme::color(palette.background);
 
     runs.into_iter()
         .map(|run| {
-            let mut foreground = terminal_color(run.style.foreground, default_foreground);
-            let mut background = terminal_color(run.style.background, default_background);
-            if run.style.inverse {
-                std::mem::swap(&mut foreground, &mut background);
-            }
+            let (foreground, background) = palette.cell_colors(
+                run.style.foreground,
+                run.style.background,
+                run.style.inverse,
+            );
+            let mut foreground = theme::color(foreground);
+            let mut background = theme::color(background);
             if run.style.dim {
                 foreground = foreground.scale_alpha(0.62);
             }
             if run.style.selected {
-                foreground = palette.primary.weak.text;
-                background = palette.primary.weak.color;
+                foreground = theme::color(palette.selection_foreground);
+                background = theme::color(palette.selection_background);
             }
             if run.style.cursor {
                 let (cursor_foreground, cursor_background) =
-                    terminal_cursor_colors(theme, cursor_style);
+                    terminal_cursor_colors(palette, cursor_style);
                 foreground = cursor_foreground;
                 if let Some(cursor_background) = cursor_background {
                     background = cursor_background;
@@ -4220,60 +4279,16 @@ fn terminal_spans(
 }
 
 fn terminal_cursor_colors(
-    theme: &Theme,
+    palette: TerminalPalette,
     cursor_style: DesktopTerminalCursor,
 ) -> (Color, Option<Color>) {
-    let palette = theme.extended_palette();
     match cursor_style {
-        DesktopTerminalCursor::Block => (Color::WHITE, Some(Color::WHITE)),
-        DesktopTerminalCursor::Line => (palette.primary.strong.color, None),
-    }
-}
-
-fn terminal_color(color: vt100::Color, default: Color) -> Color {
-    match color {
-        vt100::Color::Default => default,
-        vt100::Color::Rgb(red, green, blue) => Color::from_rgb8(red, green, blue),
-        vt100::Color::Idx(index) => indexed_terminal_color(index),
-    }
-}
-
-fn indexed_terminal_color(index: u8) -> Color {
-    const ANSI: [(u8, u8, u8); 16] = [
-        (30, 30, 30),
-        (241, 76, 76),
-        (35, 209, 139),
-        (229, 229, 16),
-        (59, 142, 234),
-        (214, 112, 214),
-        (41, 184, 219),
-        (229, 229, 229),
-        (102, 102, 102),
-        (241, 76, 76),
-        (35, 209, 139),
-        (245, 245, 67),
-        (59, 142, 234),
-        (214, 112, 214),
-        (41, 184, 219),
-        (255, 255, 255),
-    ];
-    let (red, green, blue) = match index {
-        0..=15 => ANSI[usize::from(index)],
-        16..=231 => {
-            let offset = index - 16;
-            let levels = [0, 95, 135, 175, 215, 255];
-            (
-                levels[usize::from(offset / 36)],
-                levels[usize::from((offset % 36) / 6)],
-                levels[usize::from(offset % 6)],
-            )
+        DesktopTerminalCursor::Block => {
+            let cursor = theme::color(palette.cursor);
+            (cursor, Some(cursor))
         }
-        232..=255 => {
-            let value = 8 + (index - 232) * 10;
-            (value, value, value)
-        }
-    };
-    Color::from_rgb8(red, green, blue)
+        DesktopTerminalCursor::Line => (theme::color(palette.cursor), None),
+    }
 }
 
 fn observed_terminal_viewport(content: Element<'_, Message>) -> Element<'_, Message> {
@@ -4415,10 +4430,14 @@ fn selected_context_style(theme: &Theme) -> container::Style {
     }
 }
 
-fn terminal_surface(theme: &Theme, focused: bool) -> container::Style {
+fn terminal_surface(
+    theme: &Theme,
+    focused: bool,
+    terminal_palette: TerminalPalette,
+) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
-        background: Some(Background::Color(palette.background.base.color)),
+        background: Some(Background::Color(theme::color(terminal_palette.background))),
         border: Border {
             width: if focused { 2.0 } else { 1.0 },
             radius: 4.0.into(),
@@ -4460,101 +4479,79 @@ fn modal_card(theme: &Theme) -> container::Style {
     }
 }
 
-fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
+fn button_intent_style(
+    presentation: PresentationTheme,
+    intent: ButtonIntent,
+    status: Status,
+) -> button::Style {
+    button_visual_style(presentation.button(intent, control_state(status)), status)
+}
+
+fn iced_button_intent_style(theme: &Theme, intent: ButtonIntent, status: Status) -> button::Style {
+    button_visual_style(
+        button_visual(iced_button_tokens(theme), intent, control_state(status)),
+        status,
+    )
+}
+
+const fn control_state(status: Status) -> ControlState {
+    match status {
+        Status::Active => ControlState::Rest,
+        Status::Hovered => ControlState::Hovered,
+        Status::Pressed => ControlState::Pressed,
+        Status::Disabled => ControlState::Disabled,
+    }
+}
+
+fn iced_button_tokens(theme: &Theme) -> ButtonTokens {
     let palette = theme.extended_palette();
-    let pair = match status {
-        Status::Hovered => palette.background.weak,
-        Status::Pressed => palette.background.neutral,
-        Status::Active | Status::Disabled => palette.background.base,
-    };
+    ButtonTokens {
+        canvas: theme::rgb(palette.background.base.color),
+        surface: theme::rgb(palette.background.weakest.color),
+        surface_raised: theme::rgb(palette.background.weaker.color),
+        surface_sunken: theme::rgb(palette.background.weak.color),
+        border: theme::rgb(palette.background.strong.color),
+        border_strong: theme::rgb(palette.background.stronger.color),
+        text: theme::rgb(palette.background.base.text),
+        text_muted: theme::rgb(palette.secondary.base.text),
+        interaction: theme::rgb(palette.primary.base.color),
+        interaction_text: theme::rgb(palette.primary.base.text),
+        danger: theme::rgb(palette.danger.base.color),
+        danger_surface: theme::rgb(palette.danger.weak.color),
+    }
+}
+
+fn button_visual_style(visual: presentation::ButtonVisual, status: Status) -> button::Style {
     button::Style {
-        background: matches!(status, Status::Hovered | Status::Pressed)
-            .then_some(Background::Color(pair.color)),
-        text_color: pair.text.scale_alpha(if status == Status::Disabled {
-            0.45
-        } else {
-            1.0
-        }),
+        background: Some(Background::Color(theme::color(visual.background))),
+        text_color: theme::color(visual.foreground),
         border: Border {
-            radius: 4.0.into(),
-            ..Border::default()
+            color: theme::color(visual.border),
+            width: if matches!(status, Status::Hovered | Status::Pressed) {
+                2.0
+            } else {
+                1.0
+            },
+            radius: 6.0.into(),
         },
         ..button::Style::default()
     }
+}
+
+fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
+    iced_button_intent_style(theme, ButtonIntent::Secondary, status)
 }
 
 fn primary_action_style(theme: &Theme, status: Status) -> button::Style {
-    let palette = theme.extended_palette();
-    let pair = if status == Status::Pressed {
-        palette.primary.base
-    } else {
-        palette.primary.weak
-    };
-    button::Style {
-        background: Some(Background::Color(pair.color)),
-        text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
-            if status == Status::Disabled {
-                0.45
-            } else {
-                1.0
-            },
-        ),
-        border: Border {
-            radius: 4.0.into(),
-            color: palette.primary.base.color,
-            width: if status == Status::Hovered { 2.0 } else { 1.0 },
-        },
-        ..button::Style::default()
-    }
+    iced_button_intent_style(theme, ButtonIntent::Primary, status)
 }
 
 fn danger_action_style(theme: &Theme, status: Status) -> button::Style {
-    let palette = theme.extended_palette();
-    let pair = if status == Status::Pressed {
-        palette.danger.base
-    } else {
-        palette.danger.weak
-    };
-    button::Style {
-        background: Some(Background::Color(pair.color)),
-        text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
-            if status == Status::Disabled {
-                0.45
-            } else {
-                1.0
-            },
-        ),
-        border: Border {
-            radius: 4.0.into(),
-            color: palette.danger.base.color,
-            width: if status == Status::Hovered { 2.0 } else { 1.0 },
-        },
-        ..button::Style::default()
-    }
+    iced_button_intent_style(theme, ButtonIntent::Danger, status)
 }
 
 fn flat_danger_style(theme: &Theme, status: Status) -> button::Style {
-    let palette = theme.extended_palette();
-    let pair = match status {
-        Status::Hovered | Status::Pressed => palette.danger.weak,
-        Status::Active | Status::Disabled => palette.background.base,
-    };
-    button::Style {
-        background: matches!(status, Status::Hovered | Status::Pressed)
-            .then_some(Background::Color(pair.color)),
-        text_color: contrast_safe_text(pair.color, pair.text).scale_alpha(
-            if status == Status::Disabled {
-                0.45
-            } else {
-                1.0
-            },
-        ),
-        border: Border {
-            radius: 4.0.into(),
-            ..Border::default()
-        },
-        ..button::Style::default()
-    }
+    danger_action_style(theme, status)
 }
 
 fn contrast_safe_text(background: Color, preferred: Color) -> Color {
@@ -5056,13 +5053,15 @@ mod tests {
 
     #[test]
     fn cursor_style_controls_cell_fill() {
-        let theme = theme::resolve(DesktopTheme::Dark, iced::theme::Mode::Dark);
+        let palette =
+            presentation::PresentationTheme::resolve(DesktopTheme::Canopy, SystemAppearance::Dark)
+                .terminal;
         let (block_foreground, block_background) =
-            terminal_cursor_colors(&theme, DesktopTerminalCursor::Block);
-        let (_, line_background) = terminal_cursor_colors(&theme, DesktopTerminalCursor::Line);
+            terminal_cursor_colors(palette, DesktopTerminalCursor::Block);
+        let (_, line_background) = terminal_cursor_colors(palette, DesktopTerminalCursor::Line);
 
-        assert_eq!(block_foreground, Color::WHITE);
-        assert_eq!(block_background, Some(Color::WHITE));
+        assert_eq!(block_foreground, theme::color(palette.cursor));
+        assert_eq!(block_background, Some(theme::color(palette.cursor)));
         assert!(line_background.is_none());
     }
 
@@ -5088,16 +5087,20 @@ mod tests {
     }
 
     #[test]
-    fn appearance_settings_use_bounded_dropdown_choices() {
-        let source = include_str!("lib.rs");
-        let settings = source
-            .split_once("    fn settings_view(&self)")
-            .and_then(|(_, tail)| tail.split_once("    fn form_view("))
-            .map(|(body, _)| body)
-            .expect("settings source");
-
-        assert_eq!(settings.matches("pick_list(").count(), 5);
-        assert!(!settings.contains("slider("));
+    fn appearance_settings_expose_bounded_behavioral_choices() {
+        assert_eq!(
+            &DesktopTheme::ALL[..4],
+            &[
+                DesktopTheme::System,
+                DesktopTheme::Grove,
+                DesktopTheme::Canopy,
+                DesktopTheme::Midnight,
+            ]
+        );
+        assert_eq!(DesktopTheme::ALL.len(), 11);
+        assert_eq!(DENSITY_CHOICES.len(), 2);
+        assert_eq!(TERMINAL_FONT_CHOICES.len(), 4);
+        assert_eq!(TERMINAL_CURSOR_CHOICES.len(), 2);
         assert_eq!(TERMINAL_FONT_SIZE_CHOICES[0], MIN_TERMINAL_FONT_SIZE);
         assert_eq!(
             TERMINAL_FONT_SIZE_CHOICES[TERMINAL_FONT_SIZE_CHOICES.len() - 1],
@@ -5122,7 +5125,10 @@ mod tests {
 
     #[test]
     fn active_navigation_tabs_have_a_clear_persistent_accent() {
-        let theme = theme::resolve(DesktopTheme::Dark, iced::theme::Mode::Dark);
+        let theme = theme::resolve(presentation::PresentationTheme::resolve(
+            DesktopTheme::Canopy,
+            SystemAppearance::Dark,
+        ));
         let active = content_tab_style(&theme, Status::Active, true);
         let inactive = content_tab_style(&theme, Status::Active, false);
 
@@ -5141,8 +5147,9 @@ mod tests {
     #[test]
     fn custom_button_styles_remain_readable_and_have_distinct_hover_states() {
         let choices = [
-            ("light", DesktopTheme::Light, iced::theme::Mode::Light),
-            ("dark", DesktopTheme::Dark, iced::theme::Mode::Dark),
+            ("grove", DesktopTheme::Grove, iced::theme::Mode::Light),
+            ("canopy", DesktopTheme::Canopy, iced::theme::Mode::Dark),
+            ("midnight", DesktopTheme::Midnight, iced::theme::Mode::Dark),
             ("nord", DesktopTheme::Nord, iced::theme::Mode::Dark),
             (
                 "tokyo night",
@@ -5173,7 +5180,11 @@ mod tests {
         ];
 
         for (theme_name, choice, mode) in choices {
-            let theme = theme::resolve(choice, mode);
+            let system = match mode {
+                iced::theme::Mode::Light => SystemAppearance::Light,
+                iced::theme::Mode::None | iced::theme::Mode::Dark => SystemAppearance::Dark,
+            };
+            let theme = theme::resolve(presentation::PresentationTheme::resolve(choice, system));
             let styles = [
                 ("chrome active", chrome_action_style(&theme, Status::Active)),
                 ("chrome hover", chrome_action_style(&theme, Status::Hovered)),
@@ -5230,6 +5241,34 @@ mod tests {
                 "hover must be visible without changing text contrast"
             );
             assert_session_tab_contrast(theme_name, &theme);
+        }
+    }
+
+    #[test]
+    fn iced_button_intents_match_the_presentation_contract() {
+        for choice in DesktopTheme::ALL {
+            let presentation =
+                presentation::PresentationTheme::resolve(choice, SystemAppearance::Dark);
+            let theme = theme::resolve(presentation);
+            for intent in [
+                ButtonIntent::Primary,
+                ButtonIntent::Secondary,
+                ButtonIntent::Quiet,
+                ButtonIntent::Danger,
+            ] {
+                for status in [
+                    Status::Active,
+                    Status::Hovered,
+                    Status::Pressed,
+                    Status::Disabled,
+                ] {
+                    assert_eq!(
+                        iced_button_intent_style(&theme, intent, status),
+                        button_intent_style(presentation, intent, status),
+                        "{choice} {intent:?} {status:?}"
+                    );
+                }
+            }
         }
     }
 
