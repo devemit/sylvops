@@ -1,0 +1,50 @@
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = "Stop"
+$repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$releaseDirectory = Join-Path $repositoryRoot "target\release"
+$distDirectory = Join-Path $repositoryRoot "dist"
+$packageDirectory = Join-Path $distDirectory "sylvops-windows-x86_64-preview"
+$archivePath = Join-Path $distDirectory "sylvops-windows-x86_64.zip"
+
+& cargo build --release --locked -p sylvops-cli
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile SylvOps with the native MSVC toolchain."
+}
+
+if (Test-Path -LiteralPath $packageDirectory) {
+    Remove-Item -LiteralPath $packageDirectory -Recurse -Force
+}
+New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $releaseDirectory "sylvops.exe") -Destination $packageDirectory -Force
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "packaging\windows\Start-SylvOps.ps1") -Destination $packageDirectory -Force
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "packaging\windows\Start SylvOps.cmd") -Destination $packageDirectory -Force
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "packaging\windows\UNSIGNED-PREVIEW.txt") -Destination $packageDirectory -Force
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") -Destination $packageDirectory -Force
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $packageDirectory -Force
+Compress-Archive -Path (Join-Path $packageDirectory "*") -DestinationPath $archivePath -Force
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
+try {
+    $actual = @($archive.Entries | Where-Object { -not [string]::IsNullOrEmpty($_.Name) } | ForEach-Object { $_.FullName } | Sort-Object)
+}
+finally {
+    $archive.Dispose()
+}
+$expected = @(
+    'LICENSE',
+    'README.md',
+    'Start SylvOps.cmd',
+    'Start-SylvOps.ps1',
+    'sylvops.exe',
+    'UNSIGNED-PREVIEW.txt'
+) | Sort-Object
+$difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
+if ($difference.Count -ne 0) {
+    throw "Unsigned preview archive contents differ from the locked manifest: $($difference | Out-String)"
+}
+
+Write-Host "Created $archivePath"
+

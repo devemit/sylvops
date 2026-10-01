@@ -1,0 +1,200 @@
+name: Unsigned Preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      preview_tag:
+        description: "Preview tag such as v0.1.0-preview.1"
+        required: true
+        type: string
+
+env:
+  PREVIEW_TAG: ${{ inputs.preview_tag }}
+
+concurrency:
+  group: unsigned-preview-promotion
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  validate-preview:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify preview source and unused tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -ne "refs/heads/$env:DEFAULT_BRANCH") {
+            throw "Unsigned previews must be promoted from the repository default branch."
+          }
+          $cargo = Get-Content -Raw -LiteralPath Cargo.toml
+          $match = [regex]::Match($cargo, '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"([^"]+)"')
+          if (-not $match.Success) { throw 'Could not read the workspace version.' }
+          $version = [regex]::Escape($match.Groups[1].Value)
+          if ($env:PREVIEW_TAG -notmatch "^v$version-preview\.[1-9][0-9]*$") {
+            throw "Preview tag '$env:PREVIEW_TAG' must match v$($match.Groups[1].Value)-preview.N."
+          }
+          $release = @(& gh release view $env:PREVIEW_TAG --repo $env:GITHUB_REPOSITORY 2>&1)
+          if ($LASTEXITCODE -eq 0) { throw "GitHub release $env:PREVIEW_TAG already exists." }
+          $tag = @(& git ls-remote --exit-code --tags origin "refs/tags/$env:PREVIEW_TAG" 2>&1)
+          if ($LASTEXITCODE -eq 0) { throw "Git tag $env:PREVIEW_TAG already exists." }
+          if ($LASTEXITCODE -ne 2) { throw "Could not query Git tag $env:PREVIEW_TAG`: $($tag -join [Environment]::NewLine)" }
+          ./scripts/validate-release.ps1 -ExpectedCommit $env:GITHUB_SHA
+
+  package-windows:
+    needs: validate-preview
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build unsigned portable Windows archive
+        shell: pwsh
+        run: ./scripts/package-windows-preview.ps1
+      - name: Verify application version
+        shell: pwsh
+        run: |
+          $expected = "sylvops $($env:PREVIEW_TAG -replace '^v|-preview\.[0-9]+$', '')"
+          $actual = (& target/release/sylvops.exe --version).Trim()
+          if ($actual -ne $expected) { throw "Application version '$actual' does not match '$expected'." }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-preview-windows-${{ github.sha }}
+          path: dist/sylvops-windows-x86_64.zip
+          if-no-files-found: error
+
+  package-linux:
+    needs: validate-preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install Linux packaging prerequisites
+        run: |
+          timeout --signal=TERM --kill-after=5 300 sudo --non-interactive apt-get update
+          timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes patchelf
+      - name: Install pinned cargo-packager
+        run: |
+          packager_version="$(cat packaging/cargo-packager.version)"
+          cargo install cargo-packager --version "$packager_version" --locked
+      - name: Build release binary and portable archive
+        run: |
+          cargo build --release --locked -p sylvops-cli --target x86_64-unknown-linux-gnu
+          expected="sylvops ${PREVIEW_TAG#v}"
+          expected="${expected%-preview.*}"
+          actual="$(target/x86_64-unknown-linux-gnu/release/sylvops --version)"
+          test "$actual" = "$expected"
+          mkdir -p dist package
+          cp target/x86_64-unknown-linux-gnu/release/sylvops README.md LICENSE package/
+          tar -C package -czf dist/sylvops-linux-x86_64.tar.gz sylvops README.md LICENSE
+      - name: Build AppImage and Debian package
+        run: ./scripts/package-linux.sh --skip-build
+      - name: Install desktop smoke test dependencies
+        run: timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes xvfb x11-utils libgtk-3-bin desktop-file-utils libfuse2 libxdo3 libxkbcommon-x11-0
+      - name: Verify unsigned Linux packages
+        run: |
+          version="${PREVIEW_TAG#v}"
+          version="${version%-preview.*}"
+          ./scripts/test-linux-packages.sh \
+            --appimage dist/sylvops-linux-x86_64.AppImage \
+            --deb dist/sylvops-linux-x86_64.deb \
+            --expected-version "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-preview-linux-${{ github.sha }}
+          path: |
+            dist/sylvops-linux-x86_64.tar.gz
+            dist/sylvops-linux-x86_64.AppImage
+            dist/sylvops-linux-x86_64.deb
+          if-no-files-found: error
+
+  stage-preview:
+    needs: [package-windows, package-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          pattern: unsigned-preview-*
+          merge-multiple: true
+      - name: Restore AppImage executable permission
+        run: chmod 755 dist/sylvops-linux-x86_64.AppImage
+      - name: Verify exact preview bundle and create checksums
+        run: |
+          expected=(
+            sylvops-linux-x86_64.AppImage
+            sylvops-linux-x86_64.deb
+            sylvops-linux-x86_64.tar.gz
+            sylvops-windows-x86_64.zip
+          )
+          printf '%s\n' "${expected[@]}" | sort > "$RUNNER_TEMP/expected-preview-files.txt"
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/actual-preview-files.txt"
+          diff -u "$RUNNER_TEMP/expected-preview-files.txt" "$RUNNER_TEMP/actual-preview-files.txt"
+          cat > dist/UNSIGNED-PREVIEW.txt <<EOF
+          SylvOps ${PREVIEW_TAG} is an unsigned testing preview, not an official signed application release.
+
+          Included: Windows x86_64 portable ZIP, Linux x86_64 portable archive, AppImage, and Debian package.
+          Excluded: macOS packages and the signed native Windows installer.
+          Windows may identify the executable as an unknown publisher. Do not bypass operating-system security warnings.
+          Preview builds do not receive signed in-app updates. Install a later preview explicitly or build from source.
+          EOF
+          (
+            cd dist
+            sha256sum UNSIGNED-PREVIEW.txt sylvops-* > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-preview-bundle-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/SHA256SUMS
+            dist/UNSIGNED-PREVIEW.txt
+            dist/sylvops-*
+
+  publish-preview:
+    needs: stage-preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: unsigned-preview-bundle-${{ github.sha }}
+          path: dist
+      - name: Verify checksums and publish GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (
+            cd dist
+            sha256sum --check SHA256SUMS
+          )
+          if gh release view "$PREVIEW_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub release $PREVIEW_TAG already exists." >&2
+            exit 1
+          fi
+          gh release create "$PREVIEW_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "SylvOps ${PREVIEW_TAG#v} (unsigned preview)" \
+            --notes-file dist/UNSIGNED-PREVIEW.txt \
+            --prerelease

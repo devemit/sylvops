@@ -10,6 +10,32 @@ Codex is optional and separately installed and authenticated. Install the Codex 
 
 Download release files only from the [SylvOps GitHub Releases](https://github.com/devemit/sylvops/releases) page. Keep the release's `SHA256SUMS` beside the downloaded package and verify the named file before opening it. Every asset also has GitHub build-provenance attestations.
 
+## Free unsigned previews
+
+Unsigned previews are testing builds, not official signed application releases. They contain a Windows x86_64 portable ZIP and Linux x86_64 portable archive, AppImage, and Debian package. They do not contain macOS packages or a native Windows installer, and they do not receive signed in-app updates.
+
+To install `v0.1.0-preview.1` on Windows from PowerShell, download the matching installer script first so it can be inspected before execution:
+
+```powershell
+$tag = 'v0.1.0-preview.1'; $script = Join-Path $env:TEMP 'install-sylvops.ps1'; Invoke-WebRequest "https://raw.githubusercontent.com/devemit/sylvops/$tag/scripts/install.ps1" -OutFile $script; & $script -Version $tag.TrimStart('v')
+```
+
+Launch the portable installation explicitly:
+
+```powershell
+& "$env:LOCALAPPDATA\SylvOps\bin\sylvops.exe" up C:\path\to\repository
+```
+
+Windows may identify the executable as coming from an unknown publisher. Do not bypass operating-system security warnings. The preview ZIP includes `UNSIGNED-PREVIEW.txt`; verify `SHA256SUMS`, inspect the downloaded script, or build from source when trust cannot be established.
+
+On Linux x86_64:
+
+```sh
+tag=v0.1.0-preview.1; curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent.com/devemit/sylvops/$tag/scripts/install.sh" --output /tmp/install-sylvops.sh; SYLVOPS_VERSION="${tag#v}" sh /tmp/install-sylvops.sh
+```
+
+The manual **Unsigned Preview** GitHub Actions workflow publishes these files as a non-latest GitHub testing release after the complete CI gate passes. The signed `v0.1.0` workflow remains separate and still fails closed unless its protected publisher credentials are configured.
+
 ## Install on Windows
 
 Windows packages support x86_64 Windows 10 version 1809 or newer and Windows 11.
