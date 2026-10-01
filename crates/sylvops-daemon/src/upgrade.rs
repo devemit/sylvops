@@ -2115,7 +2115,7 @@ mod tests {
                 active_sessions: active.clone()
             }
         );
-        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());
 
         let installed = coordinator.install(&active, true).await.unwrap();
         assert_eq!(installed, InstallDisposition::RolledBack);

@@ -2040,7 +2040,7 @@ mod tests {
         let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
         let snapshot = database.snapshot().await.unwrap();
         assert_eq!(snapshot.revision, 1);
-        assert!(snapshot.workspaces.is_empty());
+        assert_eq!(snapshot.workspaces, Vec::new());
         database.shutdown().await.unwrap();
     }
 

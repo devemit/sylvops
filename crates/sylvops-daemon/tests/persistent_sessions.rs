@@ -81,7 +81,7 @@ async fn exercise_persistent_session() {
         .await
         .unwrap();
     let first_output = collect_until(&mut events, session.id, "SYLVOPS_E2E").await;
-    assert!(!first_output.is_empty());
+    assert_ne!(first_output, Vec::<u8>::new());
     first
         .request(&ClientRequest::DetachSession {
             session_id: session.id,
@@ -102,7 +102,7 @@ async fn exercise_persistent_session() {
         .await
         .unwrap();
     let replay = collect_until(&mut replay_events, session.id, "SYLVOPS_E2E").await;
-    assert!(!replay.is_empty());
+    assert_ne!(replay, Vec::<u8>::new());
     second
         .request(&ClientRequest::StopSession {
             session_id: session.id,

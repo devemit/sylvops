@@ -132,7 +132,7 @@ async fn large_output_is_bounded_and_reports_eviction() {
         .await
         .expect("attach after eviction");
     assert!(attachment.replay.output_gap);
-    assert!(attachment.replay.chunks.is_empty());
+    assert_eq!(attachment.replay.chunks, Vec::new());
     assert!(attachment.replay.terminal_snapshot.is_some());
 }
 
