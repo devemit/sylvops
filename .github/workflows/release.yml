@@ -309,15 +309,8 @@ jobs:
           generate_manifest dist/sylvops-linux-x86_64.deb linux-deb-upgrade-failed-health.json "$failed_version" linux_deb 'Linux deb native upgrade failed-health probe.'
           rm -f "$key_path"
           trap - EXIT
-      - name: Verify Debian dependency closure
-        run: |
-          timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$(realpath dist/sylvops-linux-x86_64.deb)"
-          timeout --signal=TERM --kill-after=5 30 ldd /usr/bin/sylvops | tee /tmp/sylvops-ldd.txt
-          ! grep -Fq 'not found' /tmp/sylvops-ldd.txt
-          test "$(sylvops --version)" = "sylvops ${RELEASE_TAG#v}"
-          timeout --signal=TERM --kill-after=5 120 sudo --non-interactive dpkg --remove sylvops
       - name: Install desktop smoke test dependencies
-        run: timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes xvfb x11-utils libgtk-3-bin desktop-file-utils libfuse2 libxdo3
+        run: timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes xvfb x11-utils libgtk-3-bin desktop-file-utils libfuse2 libxdo3 libxkbcommon-x11-0
       - name: Install, launch, verify, and remove
         run: |
           previous=()

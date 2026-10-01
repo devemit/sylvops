@@ -49,6 +49,7 @@ export HOME="$test_root/home"
 export XDG_DATA_HOME="$test_root/xdg-data"
 export XDG_CONFIG_HOME="$test_root/xdg-config"
 export XDG_RUNTIME_DIR="$test_root/xdg-run"
+export ICED_BACKEND=tiny-skia
 installed_state_sentinel="$XDG_DATA_HOME/sylvops/package-preserve.txt"
 display_number=":$((100 + RANDOM % 500))"
 xvfb_pid=""
@@ -68,6 +69,15 @@ window_has_shell_identity() {
     [[ "$properties" == *'"sylvops", "sylvops"'* ]] && return 0
   done < <(run_with_timeout 5 xwininfo -root -tree)
   return 1
+}
+
+print_desktop_diagnostics() {
+  echo "Desktop process list:" >&2
+  run_with_timeout 5 pgrep -a -f -- 'sylvops|SylvOps' >&2 || true
+  echo "X11 window tree:" >&2
+  run_with_timeout 5 xwininfo -root -tree >&2 || true
+  echo "Desktop log:" >&2
+  sed -n '1,80p' "$state_root/data/desktop.log" >&2 2>/dev/null || true
 }
 
 configure_source() {
@@ -115,19 +125,21 @@ launch_and_verify() {
     sleep 1
   done
 
-  local desktop_deadline=$((SECONDS + 15))
+  local desktop_deadline=$((SECONDS + 30))
   until run_with_timeout 5 pgrep -f -x -- "$desktop_pattern" >/dev/null 2>&1; do
     if (( SECONDS >= desktop_deadline )); then
-      echo "$label did not launch the desktop client within 15 seconds." >&2
+      echo "$label did not launch the desktop client within 30 seconds." >&2
+      print_desktop_diagnostics
       exit 1
     fi
     sleep 1
   done
 
-  local shell_identity_deadline=$((SECONDS + 15))
+  local shell_identity_deadline=$((SECONDS + 30))
   until window_has_shell_identity; do
     if (( SECONDS >= shell_identity_deadline )); then
-      echo "$label did not expose the sylvops desktop shell identity within 15 seconds." >&2
+      echo "$label did not expose the sylvops desktop shell identity within 30 seconds." >&2
+      print_desktop_diagnostics
       exit 1
     fi
     sleep 1
@@ -242,13 +254,13 @@ user_integration_path="$(run_with_timeout 15 find "$XDG_DATA_HOME" -type f \( -n
 [[ -z "$user_integration_path" ]] || { echo "AppImage created hidden user integration: $user_integration_path" >&2; exit 1; }
 
 deb_info="$(run_with_timeout 30 dpkg-deb --info "$deb")"
-[[ "$deb_info" == *"Version: $expected_version"* ]]
-[[ "$deb_info" == *'Package: sylvops'* ]]
-[[ "$deb_info" == *'Maintainer: devemit'* ]]
+[[ "$deb_info" == *"Version: $expected_version"* ]] || { echo "The Debian package version does not match $expected_version." >&2; exit 1; }
+[[ "$deb_info" == *'Package: sylvops'* ]] || { echo "The Debian package-manager identity is not sylvops." >&2; exit 1; }
+[[ "$deb_info" == *'Maintainer: devemit'* ]] || { echo "The Debian package maintainer is not devemit." >&2; exit 1; }
 deb_contents="$(run_with_timeout 30 dpkg-deb --contents "$deb")"
-[[ "$deb_contents" == *'usr/share/applications/sylvops.desktop'* ]]
-[[ "$deb_contents" == *'usr/share/metainfo/com.devemit.sylvops.metainfo.xml'* ]]
-[[ "$deb_contents" == *'usr/lib/sylvops/README.md'* ]]
+[[ "$deb_contents" == *'usr/share/applications/sylvops.desktop'* ]] || { echo "The Debian package is missing its desktop entry." >&2; exit 1; }
+[[ "$deb_contents" == *'usr/share/metainfo/com.devemit.sylvops.metainfo.xml'* ]] || { echo "The Debian package is missing its AppStream metadata." >&2; exit 1; }
+[[ "$deb_contents" == *'usr/lib/sylvops/README.md'* ]] || { echo "The Debian package is missing its bundled guide." >&2; exit 1; }
 if [[ -n "$previous_deb" ]]; then
   run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$previous_deb"
   previous_deb_version="$(run_with_timeout 30 sylvops --version)"

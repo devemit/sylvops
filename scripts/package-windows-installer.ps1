@@ -49,6 +49,7 @@ Copy-Item -LiteralPath (Resolve-Path -LiteralPath $InputBinaryPath).Path -Destin
 
 $outputDirectory = Join-Path $repositoryRoot 'dist\windows-installer'
 $expectedOutputRoot = Join-Path $repositoryRoot 'dist'
+New-Item -ItemType Directory -Path $expectedOutputRoot -Force | Out-Null
 $resolvedOutputParent = (Resolve-Path -LiteralPath (Split-Path -Parent $outputDirectory)).Path
 if ($resolvedOutputParent -ne $expectedOutputRoot) {
     throw "Refusing to clean unexpected installer output directory: $outputDirectory"

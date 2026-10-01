@@ -352,6 +352,11 @@ foreach ($iconPath in @('packaging\icons\sylvops.png', 'packaging\icons\sylvops.
     Assert-ReleaseCondition (Test-Path -LiteralPath $resolvedIconPath -PathType Leaf) "Application icon is missing: $iconPath"
     Assert-ReleaseCondition ((Get-Item -LiteralPath $resolvedIconPath).Length -gt 0) "Application icon is empty: $iconPath"
 }
+$pngIconBytes = [IO.File]::ReadAllBytes((Join-Path $root 'packaging\icons\sylvops.png'))
+Assert-ReleaseCondition ($pngIconBytes.Length -ge 24) "The PNG application icon is malformed."
+$pngIconWidth = [Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($pngIconBytes, 16))
+$pngIconHeight = [Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($pngIconBytes, 20))
+Assert-ReleaseCondition ($pngIconWidth -eq 512 -and $pngIconHeight -eq 512) "The PNG application icon must be 512x512 for macOS ICNS generation."
 
 $packagerVersionPath = Join-Path $root 'packaging\cargo-packager.version'
 Assert-ReleaseCondition (Test-Path -LiteralPath $packagerVersionPath -PathType Leaf) "The cargo-packager version pin is missing."
@@ -370,6 +375,10 @@ $windowsInstallerSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 's
 foreach ($requiredText in @('installedGuidePath', '## Install on Windows', '## First run', '## Troubleshooting')) {
     Assert-ReleaseCondition ($windowsInstallerSmokeScript.Contains($requiredText)) "The Windows installer smoke test is missing bundled-guide validation: $requiredText"
 }
+$windowsInstallerPackageScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\package-windows-installer.ps1')
+$createWindowsOutputRoot = $windowsInstallerPackageScript.IndexOf('New-Item -ItemType Directory -Path $expectedOutputRoot -Force')
+$resolveWindowsOutputRoot = $windowsInstallerPackageScript.IndexOf('$resolvedOutputParent = (Resolve-Path -LiteralPath (Split-Path -Parent $outputDirectory)).Path')
+Assert-ReleaseCondition ($createWindowsOutputRoot -ge 0 -and $createWindowsOutputRoot -lt $resolveWindowsOutputRoot) "The Windows installer script must create its output root before resolving it."
 
 $macosPackagerConfigPath = Join-Path $root 'packaging\macos\Packager.toml'
 Assert-ReleaseCondition (Test-Path -LiteralPath $macosPackagerConfigPath -PathType Leaf) "The macOS packager configuration is missing."
@@ -379,9 +388,11 @@ foreach ($requiredSetting in @(
     "version = `"$version`"",
     "identifier = `"$applicationId`"",
     'formats = ["app"]',
-    'packaging/icons/sylvops.png',
-    'entitlements = "packaging/macos/entitlements.plist"',
-    'resources = [{ src = "README.md", target = "README.md" }]'
+    'out-dir = "../../dist/macos-package"',
+    'binaries-dir = "../../target/macos-installer-input"',
+    'icons = ["../icons/sylvops.png"]',
+    'entitlements = "entitlements.plist"',
+    'resources = [{ src = "../../README.md", target = "README.md" }]'
 )) {
     Assert-ReleaseCondition ($macosPackagerConfig.Contains($requiredSetting)) "The macOS packager configuration is missing the locked setting: $requiredSetting"
 }
@@ -399,11 +410,11 @@ foreach ($requiredText in @('run_with_timeout', '--options runtime', 'Developer 
     Assert-ReleaseCondition ($macosPackageScript.Contains($requiredText)) "The macOS package script is missing a release control: $requiredText"
 }
 $macosSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-package.sh')
-foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'CFBundleIdentifier', 'TeamIdentifier', 'package-preserve.txt', 'show-ref --verify', 'Contents/Resources/README.md', '## Install on macOS', '## First run', '## Troubleshooting')) {
+foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -n "$installed_app"', '--stdout "$launch_stdout"', '--stderr "$launch_stderr"', 'CFBundleIdentifier', 'TeamIdentifier', '/tmp/sylvops-macos.', 'pwd -P', 'daemon.log', 'desktop.log', 'package-preserve.txt', 'show-ref --verify', 'Contents/Resources/README.md', '## Install on macOS', '## First run', '## Troubleshooting')) {
     Assert-ReleaseCondition ($macosSmokeScript.Contains($requiredText)) "The macOS package smoke test is missing an acceptance check: $requiredText"
 }
 $macosUpgradeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-native-upgrade.sh')
-foreach ($requiredText in @('update-helper', 'stapler validate', 'spctl --assess', 'TeamIdentifier', 'helper_interrupted', 'health_check_failed', 'rollback_attempts')) {
+foreach ($requiredText in @('update-helper', 'stapler validate', 'spctl --assess', 'TeamIdentifier', '/tmp/sylvops-macos-upgrade.', 'pwd -P', 'helper_interrupted', 'health_check_failed', 'rollback_attempts')) {
     Assert-ReleaseCondition ($macosUpgradeScript.Contains($requiredText)) "The macOS native-upgrade test is missing an acceptance check: $requiredText"
 }
 
@@ -417,11 +428,14 @@ foreach ($requiredSetting in @(
     "publisher = `"$publisher`"",
     "authors = [`"$publisher`"]",
     'formats = ["appimage", "deb"]',
-    'packaging/icons/sylvops.png',
+    'out-dir = "../../dist/linux-package"',
+    'binaries-dir = "../../target/linux-installer-input"',
+    'icons = ["../icons/sylvops.png"]',
     'generate-desktop-entry = true',
-    'desktop-template = "packaging/linux/sylvops.desktop.hbs"',
+    'desktop-template = "sylvops.desktop.hbs"',
     'usr/share/metainfo/com.devemit.sylvops.metainfo.xml',
-    'resources = [{ src = "README.md", target = "README.md" }]',
+    'resources = [{ src = "../../README.md", target = "README.md" }]',
+    'package-name = "sylvops"',
     'dpkg-repack',
     'policykit-1'
 )) {
@@ -458,7 +472,7 @@ foreach ($requiredText in @('run_with_timeout', 'x86_64-unknown-linux-gnu', 'car
 $linuxSmokeScriptPath = Join-Path $root 'scripts\test-linux-packages.sh'
 Assert-ReleaseCondition (Test-Path -LiteralPath $linuxSmokeScriptPath -PathType Leaf) "The Linux package smoke test is missing."
 $linuxSmokeScript = Get-Content -Raw -LiteralPath $linuxSmokeScriptPath
-foreach ($requiredText in @('run_with_timeout', 'run_with_timeout 10 realpath --', 'APPIMAGE_EXTRACT_AND_RUN=1', '--appimage-extract', '--previous-appimage', '--previous-deb', '--allow-downgrades', 'run_with_timeout 30 dpkg-deb --info', 'run_with_timeout 30 dpkg-deb --contents', 'run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install', 'run_with_timeout 30 ldd /usr/bin/sylvops', 'run_with_timeout 30 dpkg-query -L sylvops', 'gtk-launch sylvops', 'desktop-file-validate', 'daemon status', 'pgrep -f', 'run_with_timeout 120 sudo --non-interactive dpkg --remove', 'package-preserve.txt', 'show-ref --verify', 'user_integration_path', 'usr/share/applications/sylvops.desktop', 'usr/share/metainfo/com.devemit.sylvops.metainfo.xml', 'apps/sylvops\.png')) {
+foreach ($requiredText in @('run_with_timeout', 'run_with_timeout 10 realpath --', 'APPIMAGE_EXTRACT_AND_RUN=1', 'ICED_BACKEND=tiny-skia', '--appimage-extract', '--previous-appimage', '--previous-deb', '--allow-downgrades', 'run_with_timeout 30 dpkg-deb --info', 'run_with_timeout 30 dpkg-deb --contents', 'run_with_timeout 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install', 'run_with_timeout 30 ldd /usr/bin/sylvops', 'run_with_timeout 30 dpkg-query -L sylvops', 'gtk-launch sylvops', 'desktop-file-validate', 'daemon status', 'pgrep -f', 'run_with_timeout 120 sudo --non-interactive dpkg --remove', 'package-preserve.txt', 'show-ref --verify', 'user_integration_path', 'usr/share/applications/sylvops.desktop', 'usr/share/metainfo/com.devemit.sylvops.metainfo.xml', 'apps/sylvops\.png')) {
     Assert-ReleaseCondition ($linuxSmokeScript.Contains($requiredText)) "The Linux package smoke test is missing an acceptance check: $requiredText"
 }
 
@@ -600,6 +614,7 @@ Assert-ReleaseCondition ($release.Contains('macos-upgrade-invalid-trust.json')) 
 Assert-ReleaseCondition ($release.Contains('macos-upgrade-failed-health.json')) "Release packaging does not exercise a signed macOS failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('scripts/package-linux.sh')) "Release packaging does not build the AppImage and deb packages."
 Assert-ReleaseCondition ($release.Contains('scripts/test-linux-packages.sh')) "Release packaging does not run the native Linux package smoke test."
+Assert-ReleaseCondition ($release.Contains('libxkbcommon-x11-0')) "Release packaging does not install the X11 keyboard runtime required by the desktop smoke test."
 Assert-ReleaseCondition ($release.Contains('scripts/test-linux-native-upgrade.sh')) "Release packaging does not run the native Linux N-1 upgrade test."
 Assert-ReleaseCondition ($release.Contains('linux-appimage-upgrade-failed-health.json')) "Release packaging does not exercise signed AppImage failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('linux-deb-upgrade-failed-health.json')) "Release packaging does not exercise signed deb failed-health rollback."
@@ -631,6 +646,7 @@ Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-macos.sh')) "
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-macos-package.sh')) "CI does not install, launch, verify, and remove the macOS package."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('linux-package')) "CI is missing the native Linux package job."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('xvfb')) "CI does not provide a virtual display for the Linux desktop launch test."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('libxkbcommon-x11-0')) "CI does not install the X11 keyboard runtime required by the Linux desktop launch test."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-linux.sh')) "CI does not exercise the production Linux packaging script."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-linux-packages.sh')) "CI does not install, launch, verify, and remove the Linux packages."
 

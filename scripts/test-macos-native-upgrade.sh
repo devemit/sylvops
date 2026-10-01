@@ -157,7 +157,8 @@ success_manifest="$(cd "$(dirname "$success_manifest")" && pwd -P)/$(basename "$
 invalid_trust_manifest="$(cd "$(dirname "$invalid_trust_manifest")" && pwd -P)/$(basename "$invalid_trust_manifest")"
 failed_health_manifest="$(cd "$(dirname "$failed_health_manifest")" && pwd -P)/$(basename "$failed_health_manifest")"
 
-test_root="$(mktemp -d "${TMPDIR:-/tmp}/sylvops-macos-native-upgrade.XXXXXX")"
+test_root="$(mktemp -d "/tmp/sylvops-macos-upgrade.XXXXXX")"
+test_root="$(cd "$test_root" && pwd -P)"
 previous_mount="$test_root/previous-mounted"
 install_directory="$test_root/Applications"
 installed_app="$install_directory/SylvOps.app"

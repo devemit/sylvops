@@ -6,14 +6,14 @@ publisher = "devemit"
 description = "Local-first mission control for coding-agent sessions"
 long-description = "A native desktop application for supervising coding-agent sessions in real Git worktrees."
 homepage = "https://github.com/devemit/sylvops"
-license-file = "LICENSE"
+license-file = "../../LICENSE"
 formats = ["app"]
-out-dir = "dist/macos-package"
-binaries-dir = "target/macos-installer-input"
+out-dir = "../../dist/macos-package"
+binaries-dir = "../../target/macos-installer-input"
 binaries = [{ path = "sylvops", main = true }]
-icons = ["packaging/icons/sylvops.png"]
-resources = [{ src = "README.md", target = "README.md" }]
+icons = ["../icons/sylvops.png"]
+resources = [{ src = "../../README.md", target = "README.md" }]
 
 [macos]
 minimum-system-version = "13.0"
-entitlements = "packaging/macos/entitlements.plist"
+entitlements = "entitlements.plist"

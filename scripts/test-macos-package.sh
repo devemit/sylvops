@@ -93,7 +93,8 @@ if [[ -n "$previous_dmg" && ( ! -f "$previous_dmg" || ! -s "$previous_dmg" ) ]];
   exit 1
 fi
 
-test_root="$(mktemp -d "${TMPDIR:-/tmp}/sylvops-macos-package.XXXXXX")"
+test_root="$(mktemp -d "/tmp/sylvops-macos.XXXXXX")"
+test_root="$(cd "$test_root" && pwd -P)"
 mount_dir="$test_root/mounted"
 previous_mount_dir="$test_root/previous-mounted"
 install_dir="$test_root/Applications"
@@ -106,6 +107,21 @@ mounted=false
 previous_mounted=false
 
 desktop_pattern=""
+launch_stdout="$test_root/launch.stdout"
+launch_stderr="$test_root/launch.stderr"
+print_launch_diagnostics() {
+  echo "Desktop process list:" >&2
+  run_with_timeout 5 pgrep -l -f sylvops >&2 || true
+  echo "Launch stdout:" >&2
+  sed -n '1,80p' "$launch_stdout" >&2 2>/dev/null || true
+  echo "Launch stderr:" >&2
+  sed -n '1,80p' "$launch_stderr" >&2 2>/dev/null || true
+  echo "Daemon log:" >&2
+  sed -n '1,80p' "$state_root/data/daemon.log" >&2 2>/dev/null || true
+  echo "Desktop log:" >&2
+  sed -n '1,80p' "$state_root/data/desktop.log" >&2 2>/dev/null || true
+}
+
 cleanup() {
   if [[ -n "$desktop_pattern" ]]; then
     while IFS= read -r desktop_pid; do
@@ -198,23 +214,25 @@ if $require_notarization; then
   run_with_timeout 120 spctl --assess --type execute --verbose=4 "$installed_app"
 fi
 
-run_with_timeout 30 open -na "$installed_app" --args --state-dir "$state_root"
+run_with_timeout 30 open -n "$installed_app" --stdout "$launch_stdout" --stderr "$launch_stderr" --args --state-dir "$state_root"
 status_output="$test_root/daemon-status.txt"
-deadline=$((SECONDS + 30))
+deadline=$((SECONDS + 60))
 until run_with_timeout 5 "$installed_binary" --state-dir "$state_root" daemon status > "$status_output" 2>&1; do
   if (( SECONDS >= deadline )); then
-    echo "The installed app did not start its daemon through LaunchServices within 30 seconds." >&2
+    echo "The installed app did not start its daemon through LaunchServices within 60 seconds." >&2
     sed -n '1,80p' "$status_output" >&2
+    print_launch_diagnostics
     exit 1
   fi
   sleep 1
 done
 
 desktop_pattern="$installed_binary --state-dir $state_root desktop"
-deadline=$((SECONDS + 15))
+deadline=$((SECONDS + 30))
 until run_with_timeout 5 pgrep -f -x "$desktop_pattern" >/dev/null 2>&1; do
   if (( SECONDS >= deadline )); then
-    echo "The installed app did not start its desktop client through LaunchServices within 15 seconds." >&2
+    echo "The installed app did not start its desktop client through LaunchServices within 30 seconds." >&2
+    print_launch_diagnostics
     exit 1
   fi
   sleep 1

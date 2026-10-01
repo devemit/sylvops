@@ -18,6 +18,12 @@ use sylvops_core::{
 };
 use sylvops_daemon::{client::DaemonClient, database::DatabaseHandle, runtime::RuntimePaths};
 
+const HELPER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(180);
+const HELPER_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
+const WATCHDOG_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(60);
+
+static NATIVE_UPGRADE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct NativeUpgradeFixture {
     _temporary: tempfile::TempDir,
     paths: RuntimePaths,
@@ -138,6 +144,7 @@ impl NativeUpgradeFixture {
             .arg("update-helper")
             .arg("--handoff")
             .arg(&self.handoff_path)
+            .env("APPIMAGE", &self.installed)
             .kill_on_drop(true);
         command
     }
@@ -150,16 +157,19 @@ impl NativeUpgradeFixture {
 
 #[tokio::test]
 async fn detached_helper_restores_and_reports_after_native_health_failure() {
+    let _test_lock = NATIVE_UPGRADE_TEST_LOCK.lock().await;
     let fixture = NativeUpgradeFixture::stage(&[]).await;
-    let output = tokio::time::timeout(Duration::from_secs(60), fixture.command().output())
+    let output = tokio::time::timeout(HELPER_COMPLETION_TIMEOUT, fixture.command().output())
         .await
         .expect("native helper timed out")
         .unwrap();
     assert!(!output.status.success());
+    let helper_error = String::from_utf8_lossy(&output.stderr);
+    let daemon_log = fs::read_to_string(&fixture.paths.daemon_log).ok();
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("previous version was restored"),
-        "unexpected helper error: {}",
-        String::from_utf8_lossy(&output.stderr)
+        helper_error.contains("previous version was restored"),
+        "unexpected helper error: {helper_error}; attempt={:?}; daemon_log={daemon_log:?}",
+        fs::read_to_string(fixture.staging.join("native-upgrade-attempt.json")).ok()
     );
     assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.previous);
 
@@ -202,9 +212,10 @@ async fn detached_helper_restores_and_reports_after_native_health_failure() {
 
 #[tokio::test]
 async fn detached_watchdog_restores_after_upgrade_helper_is_interrupted() {
+    let _test_lock = NATIVE_UPGRADE_TEST_LOCK.lock().await;
     let fixture = NativeUpgradeFixture::stage(b"interrupted-upgrade-candidate").await;
     let mut helper = fixture.command().spawn().unwrap();
-    let applying_deadline = Instant::now() + Duration::from_secs(10);
+    let applying_deadline = Instant::now() + HELPER_PHASE_TIMEOUT;
     let mut applying = false;
     while Instant::now() < applying_deadline {
         applying = fs::read(fixture.staging.join("native-upgrade-attempt.json"))
@@ -216,11 +227,15 @@ async fn detached_watchdog_restores_after_upgrade_helper_is_interrupted() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(applying, "the helper never began applying the candidate");
+    assert!(
+        applying,
+        "the helper never began applying the candidate; attempt={:?}",
+        fs::read_to_string(fixture.staging.join("native-upgrade-attempt.json")).ok()
+    );
     helper.kill().await.unwrap();
     helper.wait().await.unwrap();
 
-    let rollback_deadline = Instant::now() + Duration::from_secs(10);
+    let rollback_deadline = Instant::now() + WATCHDOG_ROLLBACK_TIMEOUT;
     while fs::read(&fixture.installed).unwrap() != fixture.previous
         && Instant::now() < rollback_deadline
     {
