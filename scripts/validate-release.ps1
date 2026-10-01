@@ -489,9 +489,15 @@ Assert-ReleaseCondition ($quickstart -match "(?m)^SYLVOPS $([regex]::Escape($ver
 $windowsInstallScriptText = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\install.ps1')
 $windowsDefault = '[string]$Version = "{0}"' -f $version
 Assert-ReleaseCondition ($windowsInstallScriptText.Contains($windowsDefault)) "Windows install script default does not match workspace version $version."
+foreach ($requiredText in @('-preview\.', 'Get-AuthenticodeSignature', 'unsigned testing preview', 'do not bypass the warning', 'sylvops up .')) {
+    Assert-ReleaseCondition ($windowsInstallScriptText.Contains($requiredText)) "Windows install script is missing preview-aware trust guidance: $requiredText"
+}
 
 $unixInstallScriptText = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\install.sh')
 Assert-ReleaseCondition ($unixInstallScriptText.Contains("SYLVOPS_VERSION:-$version")) "Unix install script default does not match workspace version $version."
+foreach ($requiredText in @('-preview\.', 'sha256sum', 'macOS packages are not published for unsigned previews', 'sylvops up .')) {
+    Assert-ReleaseCondition ($unixInstallScriptText.Contains($requiredText)) "Unix install script is missing preview-aware installation guidance: $requiredText"
+}
 
 $lock = Get-Content -Raw -LiteralPath (Join-Path $root 'Cargo.lock')
 $workspacePackages = [regex]::Matches($lock, '(?ms)^\[\[package\]\]\r?\nname = "(sylvops-[^"]+)"\r?\nversion = "([^"]+)"')

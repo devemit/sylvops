@@ -36,6 +36,8 @@ tag=v0.1.0-preview.1; curl --fail --location --proto '=https' --tlsv1.2 "https:/
 
 The manual **Unsigned Preview** GitHub Actions workflow publishes these files as a non-latest GitHub testing release after the complete CI gate passes. The signed `v0.1.0` workflow remains separate and still fails closed unless its protected publisher credentials are configured.
 
+The signed Windows and macOS instructions below apply only to an official application release. For an unsigned preview, use the commands in this section and the files attached to that exact preview tag.
+
 ## Install on Windows
 
 Windows packages support x86_64 Windows 10 version 1809 or newer and Windows 11.
@@ -128,7 +130,7 @@ Expand-Archive -LiteralPath ".\$archive" -DestinationPath .\sylvops-portable
 .\sylvops-portable\sylvops.exe up C:\path\to\repository
 ```
 
-The Windows ZIP also includes `Start-SylvOps.ps1`, `Start SylvOps.cmd`, `QUICKSTART.txt`, and this `README.md`.
+The official signed-release Windows ZIP includes `Start-SylvOps.ps1`, `Start SylvOps.cmd`, `QUICKSTART.txt`, and this `README.md`. The unsigned-preview ZIP includes the launchers, `UNSIGNED-PREVIEW.txt`, and this `README.md`, but deliberately omits signed-release instructions.
 
 On macOS Apple silicon, use the following commands; substitute `sylvops-macos-x86_64.tar.gz` on an Intel Mac:
 
@@ -165,6 +167,8 @@ The first Codex session is created only after the visible action in step 3; Sylv
 
 ## Updates and rollback
 
+These update controls apply only to official signed application releases. Unsigned previews fail closed for signed-update discovery and must be replaced by explicitly installing a later preview or building a newer revision from source.
+
 In **Settings -> Application updates**, choose **Check now**, then **Download verified upgrade**, then **Install update**. The desktop shows the target version, byte length, and bounded release notes. Periodic checks are on by default at a bounded 24-hour interval and can be disabled with **Periodic checks: Off**. Checks read signed metadata; downloads and installation always require visible user actions.
 
 The equivalent CLI flow is:
@@ -185,6 +189,7 @@ Before replacement, SylvOps retains the previous package and a compatible databa
 Normal uninstall removes application files and OS integration but preserves configuration, session data, repositories, worktrees, and branches:
 
 - Windows: open **Installed apps**, uninstall **SylvOps**, or run `%LOCALAPPDATA%\Programs\SylvOps\uninstall.exe`.
+- Windows unsigned preview: stop SylvOps, then remove `%LOCALAPPDATA%\SylvOps\bin\sylvops.exe`; no Start Menu or uninstall registration was created.
 - macOS: remove `/Applications/SylvOps.app` (or the Applications location chosen during installation).
 - Debian or Ubuntu: run `sudo apt remove sylvops`.
 - AppImage or portable archive: remove the downloaded file or extracted application directory.
@@ -209,7 +214,7 @@ The exact phrase is required. The daemon refuses removal while sessions are acti
 - **Provider discovery:** run `sylvops provider probe codex`. A missing executable and a login-required result are distinct. Install or sign in to Codex outside SylvOps; SylvOps never performs either action.
 - **Daemon startup:** launch the installed application or run `sylvops daemon start`, then `sylvops daemon status`. If startup still fails, run `sylvops doctor` from the same installation.
 - **Mixed versions:** compare `sylvops --version` with the daemon version printed by `sylvops daemon status` or `sylvops doctor`. If they differ, run `sylvops daemon stop`, then reopen the intended installed application. For a portable copy, invoke that copy explicitly so an older executable on `PATH` is not selected.
-- **Package verification:** never open a file that fails `SHA256SUMS`. Windows must also report a valid Authenticode signature, macOS must pass `codesign`, `stapler`, and Gatekeeper checks, and an installed Debian package can be checked with `sudo dpkg --verify sylvops`.
+- **Package verification:** never open a file that fails `SHA256SUMS`. Official Windows releases must also report a valid Authenticode signature, while an unsigned preview makes no publisher-trust claim and must display its warning. Official macOS packages must pass `codesign`, `stapler`, and Gatekeeper checks. An installed Debian package can be checked with `sudo dpkg --verify sylvops`.
 - **Upgrade failure:** run `sylvops update status`. A failed health check should report that the previous version was restored; the same failed target is not retried in a loop.
 - **Diagnostics:** `sylvops doctor` checks local state, Git, daemon version/protocol/database health, provider availability, and PTY lifecycle. Its process output is bounded and redacted: it does not print credentials or environment values. Share only the version, platform, categorical status, and redacted logs.
 
@@ -229,7 +234,7 @@ The executable is written to `target/release/sylvops` (`sylvops.exe` on Windows)
 ./target/release/sylvops up .
 ```
 
-On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the unsigned portable Windows ZIP with `powershell -File scripts/package-windows.ps1`; native Windows, macOS, and Linux package workflows are documented in [docs/development/releasing.md](docs/development/releasing.md). Generated packages are intentionally excluded from Git.
+On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the ordinary portable ZIP with `powershell -File scripts/package-windows.ps1` or the warning-bearing unsigned-preview ZIP with `powershell -File scripts/package-windows-preview.ps1`; native Windows, macOS, and Linux package workflows are documented in [docs/development/releasing.md](docs/development/releasing.md). Generated packages are intentionally excluded from Git.
 
 The repository now contains a **cross-platform application-release baseline**. It includes:
 
