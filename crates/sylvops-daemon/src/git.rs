@@ -925,7 +925,7 @@ mod tests {
         );
         assert!(registration.branch.is_some());
         assert!(registration.remote_url.is_none());
-        assert!(!registration.base_commit.is_empty());
+        assert_ne!(registration.base_commit, "");
     }
 
     #[tokio::test]

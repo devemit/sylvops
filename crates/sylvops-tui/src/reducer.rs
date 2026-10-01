@@ -158,18 +158,18 @@ mod tests {
             reduce(&mut app, Action::Resume),
             vec![Effect::Resume(resumable_id)]
         );
-        assert!(reduce(&mut app, Action::Resume).is_empty());
+        assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
 
         app.resume_pending = None;
         app.snapshot.sessions[0].external_session_id = None;
-        assert!(reduce(&mut app, Action::Resume).is_empty());
+        assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
         app.snapshot.sessions[0].external_session_id = Some("verified-id".into());
         app.snapshot.sessions[0].state = SessionState::Terminated;
-        assert!(reduce(&mut app, Action::Resume).is_empty());
+        assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
 
         app.snapshot.sessions[0].state = SessionState::FinishedSeen;
         app.snapshot.sessions[0].provider_kind = ProviderKind::Shell;
-        assert!(reduce(&mut app, Action::Resume).is_empty());
+        assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
 
         app.snapshot.sessions[0].provider_kind = ProviderKind::Codex;
         let mut successor = app.snapshot.sessions[0].clone();
@@ -177,6 +177,6 @@ mod tests {
         successor.created_at = 2;
         successor.state = SessionState::Running;
         app.snapshot.sessions.push(successor);
-        assert!(reduce(&mut app, Action::Resume).is_empty());
+        assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
     }
 }
