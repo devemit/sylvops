@@ -410,7 +410,7 @@ foreach ($requiredText in @('run_with_timeout', '--options runtime', 'Developer 
     Assert-ReleaseCondition ($macosPackageScript.Contains($requiredText)) "The macOS package script is missing a release control: $requiredText"
 }
 $macosSmokeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-package.sh')
-foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'CFBundleIdentifier', 'TeamIdentifier', 'package-preserve.txt', 'show-ref --verify', 'Contents/Resources/README.md', '## Install on macOS', '## First run', '## Troubleshooting')) {
+foreach ($requiredText in @('run_with_timeout', 'spctl --assess', 'open -na', 'CFBundleIdentifier', 'TeamIdentifier', 'pwd -P', 'desktop.log', 'package-preserve.txt', 'show-ref --verify', 'Contents/Resources/README.md', '## Install on macOS', '## First run', '## Troubleshooting')) {
     Assert-ReleaseCondition ($macosSmokeScript.Contains($requiredText)) "The macOS package smoke test is missing an acceptance check: $requiredText"
 }
 $macosUpgradeScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\test-macos-native-upgrade.sh')
@@ -613,6 +613,7 @@ Assert-ReleaseCondition ($release.Contains('macos-upgrade-invalid-trust.json')) 
 Assert-ReleaseCondition ($release.Contains('macos-upgrade-failed-health.json')) "Release packaging does not exercise a signed macOS failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('scripts/package-linux.sh')) "Release packaging does not build the AppImage and deb packages."
 Assert-ReleaseCondition ($release.Contains('scripts/test-linux-packages.sh')) "Release packaging does not run the native Linux package smoke test."
+Assert-ReleaseCondition ($release.Contains('libxkbcommon-x11-0')) "Release packaging does not install the X11 keyboard runtime required by the desktop smoke test."
 Assert-ReleaseCondition ($release.Contains('scripts/test-linux-native-upgrade.sh')) "Release packaging does not run the native Linux N-1 upgrade test."
 Assert-ReleaseCondition ($release.Contains('linux-appimage-upgrade-failed-health.json')) "Release packaging does not exercise signed AppImage failed-health rollback."
 Assert-ReleaseCondition ($release.Contains('linux-deb-upgrade-failed-health.json')) "Release packaging does not exercise signed deb failed-health rollback."
@@ -644,6 +645,7 @@ Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-macos.sh')) "
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-macos-package.sh')) "CI does not install, launch, verify, and remove the macOS package."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('linux-package')) "CI is missing the native Linux package job."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('xvfb')) "CI does not provide a virtual display for the Linux desktop launch test."
+Assert-ReleaseCondition ($ciInstallerJob.Contains('libxkbcommon-x11-0')) "CI does not install the X11 keyboard runtime required by the Linux desktop launch test."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/package-linux.sh')) "CI does not exercise the production Linux packaging script."
 Assert-ReleaseCondition ($ciInstallerJob.Contains('scripts/test-linux-packages.sh')) "CI does not install, launch, verify, and remove the Linux packages."
 

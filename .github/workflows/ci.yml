@@ -82,7 +82,7 @@ jobs:
       - name: Build AppImage and deb packages
         run: ./scripts/package-linux.sh
       - name: Install desktop smoke test dependencies
-        run: timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes xvfb x11-utils libgtk-3-bin desktop-file-utils libfuse2 libxdo3
+        run: timeout --signal=TERM --kill-after=5 300 sudo --non-interactive env DEBIAN_FRONTEND=noninteractive apt-get install --yes xvfb x11-utils libgtk-3-bin desktop-file-utils libfuse2 libxdo3 libxkbcommon-x11-0
       - name: Install, launch, verify, and remove
         run: |
           expected_version="$(awk '/^\[workspace.package\]/{workspace_package=1; next} workspace_package && /^version = /{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"

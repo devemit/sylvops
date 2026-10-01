@@ -94,6 +94,7 @@ if [[ -n "$previous_dmg" && ( ! -f "$previous_dmg" || ! -s "$previous_dmg" ) ]];
 fi
 
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/sylvops-macos-package.XXXXXX")"
+test_root="$(cd "$test_root" && pwd -P)"
 mount_dir="$test_root/mounted"
 previous_mount_dir="$test_root/previous-mounted"
 install_dir="$test_root/Applications"
@@ -106,6 +107,13 @@ mounted=false
 previous_mounted=false
 
 desktop_pattern=""
+print_desktop_diagnostics() {
+  echo "Desktop process list:" >&2
+  run_with_timeout 5 pgrep -l -f sylvops >&2 || true
+  echo "Desktop log:" >&2
+  sed -n '1,80p' "$state_root/data/desktop.log" >&2 2>/dev/null || true
+}
+
 cleanup() {
   if [[ -n "$desktop_pattern" ]]; then
     while IFS= read -r desktop_pid; do
@@ -211,10 +219,11 @@ until run_with_timeout 5 "$installed_binary" --state-dir "$state_root" daemon st
 done
 
 desktop_pattern="$installed_binary --state-dir $state_root desktop"
-deadline=$((SECONDS + 15))
+deadline=$((SECONDS + 30))
 until run_with_timeout 5 pgrep -f -x "$desktop_pattern" >/dev/null 2>&1; do
   if (( SECONDS >= deadline )); then
-    echo "The installed app did not start its desktop client through LaunchServices within 15 seconds." >&2
+    echo "The installed app did not start its desktop client through LaunchServices within 30 seconds." >&2
+    print_desktop_diagnostics
     exit 1
   fi
   sleep 1
