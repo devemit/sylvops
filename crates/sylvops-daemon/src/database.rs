@@ -42,6 +42,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "session_resumptions",
         include_str!("../migrations/0003_session_resumptions.sql"),
     ),
+    (
+        4,
+        "desktop_signature_themes",
+        include_str!("../migrations/0004_desktop_signature_themes.sql"),
+    ),
 ];
 
 #[derive(Clone, Debug)]
@@ -2289,6 +2294,74 @@ mod tests {
         assert_eq!(state.terminal_font, DesktopTerminalFont::System);
         assert_eq!(state.terminal_cursor, DesktopTerminalCursor::Block);
         database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_light_and_dark_desktop_themes_persist_as_signature_themes() {
+        for (legacy, expected, canonical) in [
+            ("light", DesktopTheme::Grove, "grove"),
+            ("dark", DesktopTheme::Canopy, "canopy"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state.db");
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(MIGRATIONS[0].2).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE schema_migrations (\
+                     version INTEGER PRIMARY KEY, \
+                     name TEXT NOT NULL, \
+                     applied_at INTEGER NOT NULL, \
+                     checksum TEXT NOT NULL\
+                     ) STRICT;",
+                )
+                .unwrap();
+            for &(version, name, source) in &MIGRATIONS[..3] {
+                if version > 1 {
+                    connection.execute_batch(source).unwrap();
+                }
+                connection
+                    .execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at, checksum) \
+                         VALUES (?1, ?2, 1, ?3)",
+                        params![version, name, checksum(source)],
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "INSERT INTO ui_state(client_scope, key, value_json, updated_at) \
+                     VALUES ('desktop', 'navigation.v1', ?1, 1)",
+                    [format!(r#"{{"theme":"{legacy}"}}"#)],
+                )
+                .unwrap();
+            drop(connection);
+
+            let database = DatabaseHandle::open(&path).unwrap();
+            let state = database.desktop_state().await.unwrap().unwrap();
+            assert_eq!(state.theme, expected);
+            database.shutdown().await.unwrap();
+
+            let connection = Connection::open(&path).unwrap();
+            let stored: String = connection
+                .query_row(
+                    "SELECT value_json FROM ui_state \
+                     WHERE client_scope = 'desktop' AND key = 'navigation.v1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+            assert_eq!(stored["theme"], canonical);
+            let migration_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 4",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(migration_count, 1);
+        }
     }
 
     #[tokio::test]

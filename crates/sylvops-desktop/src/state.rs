@@ -1,25 +1,5 @@
 use sylvops_core::ui::{DesktopPanel, DesktopState};
 
-pub(crate) const WIDE_BREAKPOINT: u16 = 1180;
-pub(crate) const COMPACT_BREAKPOINT: u16 = 820;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LayoutMode {
-    Wide,
-    Compact,
-    Narrow,
-}
-
-pub(crate) fn layout_mode(width: u16) -> LayoutMode {
-    if width >= WIDE_BREAKPOINT {
-        LayoutMode::Wide
-    } else if width >= COMPACT_BREAKPOINT {
-        LayoutMode::Compact
-    } else {
-        LayoutMode::Narrow
-    }
-}
-
 pub(crate) fn reset_layout(state: &mut DesktopState) {
     let defaults = DesktopState::default();
     state.panel_ratios = defaults.panel_ratios;
@@ -43,14 +23,6 @@ pub(crate) fn panel_ratios_fit(width: u16, ratios: [u16; 3]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn layout_breakpoints_are_stable() {
-        assert_eq!(layout_mode(1179), LayoutMode::Compact);
-        assert_eq!(layout_mode(1180), LayoutMode::Wide);
-        assert_eq!(layout_mode(819), LayoutMode::Narrow);
-        assert_eq!(layout_mode(820), LayoutMode::Compact);
-    }
 
     #[test]
     fn reset_layout_preserves_user_context() {

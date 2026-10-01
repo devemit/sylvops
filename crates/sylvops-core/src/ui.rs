@@ -40,8 +40,11 @@ pub struct TuiState {
 pub enum DesktopTheme {
     #[default]
     System,
-    Light,
-    Dark,
+    #[serde(alias = "light")]
+    Grove,
+    #[serde(alias = "dark")]
+    Canopy,
+    Midnight,
     Nord,
     TokyoNight,
     Catppuccin,
@@ -49,6 +52,22 @@ pub enum DesktopTheme {
     GruvboxDark,
     SolarizedLight,
     SolarizedDark,
+}
+
+impl DesktopTheme {
+    pub const ALL: [Self; 11] = [
+        Self::System,
+        Self::Grove,
+        Self::Canopy,
+        Self::Midnight,
+        Self::Nord,
+        Self::TokyoNight,
+        Self::Catppuccin,
+        Self::Dracula,
+        Self::GruvboxDark,
+        Self::SolarizedLight,
+        Self::SolarizedDark,
+    ];
 }
 
 /// Terminal typeface preference. Named fonts intentionally fall back through
@@ -93,8 +112,9 @@ impl fmt::Display for DesktopTheme {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::System => "System",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
+            Self::Grove => "Grove",
+            Self::Canopy => "Canopy",
+            Self::Midnight => "Midnight",
             Self::Nord => "Nord",
             Self::TokyoNight => "Tokyo Night",
             Self::Catppuccin => "Catppuccin",
@@ -236,6 +256,9 @@ mod tests {
 
     #[test]
     fn appearance_choices_have_stable_user_facing_labels() {
+        assert_eq!(DesktopTheme::Grove.to_string(), "Grove");
+        assert_eq!(DesktopTheme::Canopy.to_string(), "Canopy");
+        assert_eq!(DesktopTheme::Midnight.to_string(), "Midnight");
         assert_eq!(DesktopTheme::TokyoNight.to_string(), "Tokyo Night");
         assert_eq!(
             DesktopTerminalFont::JetBrainsMono.to_string(),
@@ -243,5 +266,39 @@ mod tests {
         );
         assert_eq!(DesktopTerminalCursor::Line.to_string(), "Line");
         assert_eq!(DesktopDensity::Compact.to_string(), "Compact");
+    }
+
+    #[test]
+    fn legacy_light_and_dark_preferences_migrate_to_signature_themes() {
+        let light: DesktopState = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
+        let dark: DesktopState = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+
+        assert_eq!(light.theme, DesktopTheme::Grove);
+        assert_eq!(dark.theme, DesktopTheme::Canopy);
+        assert_eq!(
+            serde_json::to_value(light).unwrap()["theme"],
+            serde_json::json!("grove")
+        );
+        assert_eq!(
+            serde_json::to_value(dark).unwrap()["theme"],
+            serde_json::json!("canopy")
+        );
+    }
+
+    #[test]
+    fn previous_named_theme_preferences_remain_readable() {
+        for name in [
+            "nord",
+            "tokyo_night",
+            "catppuccin",
+            "dracula",
+            "gruvbox_dark",
+            "solarized_light",
+            "solarized_dark",
+        ] {
+            let encoded = format!(r#"{{"theme":"{name}"}}"#);
+            let state: DesktopState = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(serde_json::to_value(state).unwrap()["theme"], name);
+        }
     }
 }
