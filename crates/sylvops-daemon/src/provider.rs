@@ -849,7 +849,7 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(spec.arguments.all(), [OsString::from("/D")]);
         #[cfg(unix)]
-        assert_eq!(spec.arguments.all(), []);
+        assert_eq!(spec.arguments.all(), Vec::<OsString>::new());
     }
 
     #[test]
