@@ -156,11 +156,11 @@ This starts the daemon, creates or reuses the `Local` workspace, registers the r
 
 ## First run
 
-The desktop supports first launch without a repository and guides the complete `Workspace -> Project/root Worktree -> Session` hierarchy:
+The desktop supports first launch without a repository through an in-context checklist spanning `Workspace -> Project/root Worktree -> Session`. Completed steps remain visibly marked while the current step opens the focused form it needs:
 
 1. Create a **Workspace**, a local group of repositories to supervise together.
 2. Choose an existing Git repository. SylvOps registers it as a **Project** and records its current checkout as the root **Worktree**; it does not copy or move the repository.
-3. Choose the root Worktree (or later create a managed Worktree), select **Codex**, and choose **Start Codex**. If discovery reports that Codex is missing or logged out, install or authenticate Codex outside SylvOps, choose **Retry discovery**, and retry. **Shell** remains available without Codex.
+3. Choose the root Worktree (or later create a managed Worktree), then choose **Start shell** or select Codex and choose **Start Codex**. If discovery reports that Codex is missing or logged out, install or authenticate Codex outside SylvOps and choose **Check again**. Shell remains available without Codex.
 4. Choose **Open terminal** to attach. Closing or detaching the desktop does not stop the daemon-owned session.
 
 The first Codex session is created only after the visible action in step 3; SylvOps never launches an agent just because the application opened.
@@ -169,7 +169,7 @@ The first Codex session is created only after the visible action in step 3; Sylv
 
 These update controls apply only to official signed application releases. Unsigned previews fail closed for signed-update discovery and must be replaced by explicitly installing a later preview or building a newer revision from source.
 
-In **Settings -> Application updates**, choose **Check now**, then **Download verified upgrade**, then **Install update**. The desktop shows the target version, byte length, and bounded release notes. Periodic checks are on by default at a bounded 24-hour interval and can be disabled with **Periodic checks: Off**. Checks read signed metadata; downloads and installation always require visible user actions.
+In **Settings -> Updates**, choose **Check again**, then **Download verified upgrade**, then **Install update**. The desktop shows the target version, human-readable download size, and bounded release notes; exact bytes are available under **Technical details** with a bounded copy action. Periodic checks are on by default at a bounded 24-hour interval and can be disabled with **Periodic checks: Off**. Checks read signed metadata; downloads and installation always require visible user actions.
 
 The equivalent CLI flow is:
 
@@ -275,10 +275,12 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 ### Desktop essentials
 
 - `sylvops` or `sylvops up [PATH]` opens the native window; closing it leaves daemon-owned sessions running.
-- The top bar switches workspaces. Projects, worktrees, and sessions stay visible beside the large Terminal/Changes/Details area.
+- The top bar switches workspaces. A collapsible Repository -> Checkout -> Session Explorer stays beside the large Terminal/Changes/Details area and becomes a dedicated narrow view below 820 px.
 - Select a session, click **Open terminal**, and interact normally. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
 - The footer always shows the version, workspace, branch, current view, daemon connectivity, and key hints.
-- Settings use compact dropdowns for ten built-in themes, comfortable/compact density, four terminal typefaces, 10–22 px text sizing, and Block/Line terminal cursors. New interactive sessions ask only for a provider and optional display name; advanced Codex model, effort, and initial-prompt options remain available from the CLI. The terminal TUI remains available as a keyboard-first alternative.
+- Settings is a scrollable right-side sheet on wide and compact windows and a full-window view on narrow windows. Appearance offers immediate preview cards for System, Grove, Canopy, and Midnight, with seven Classic themes in an expandable secondary group; density, terminal typeface, 10–22 px text sizing, and Block/Line cursor remain bounded controls.
+- Details shows dates in the operating-system locale and timezone and labels repository locations **Path**. IDs, raw timestamps, process/transport terms, and exact quantities stay under expandable **Technical details** with bounded copy actions. Session-record retention and non-persisted terminal output are described separately.
+- Important actions keep visible text, including **Start shell**, **Start Codex**, **Check again**, **Open terminal**, **Leave terminal**, **Stop session**, and **Delete checkout**. The terminal TUI remains available as a keyboard-first alternative.
 
 ## Current commands
 

@@ -2,6 +2,7 @@
 
 mod bridge;
 mod forms;
+mod icons;
 mod presentation;
 mod state;
 mod terminal;
@@ -15,7 +16,10 @@ use std::{
 };
 
 use bridge::{Bridge, BridgeEvent, Operation};
-use forms::{Confirmation, DataRemovalConfirmation, FormModal, Modal};
+use chrono::{DateTime, Local, Locale};
+use forms::{
+    Confirmation, DataRemovalConfirmation, FirstRunStepState, FormModal, Modal, first_run_steps,
+};
 use iced::{
     Background, Border, Center, Color, Element, Fill, Font, Length, Point, Subscription, Task,
     Theme,
@@ -31,13 +35,15 @@ use iced::{
     window,
 };
 use iced::{font, font::Weight, widget::button::Status};
+use icons::{LineIcon, line_icon};
 use presentation::{
     ActiveTerminalAction, ButtonIntent, ButtonTokens, ControlState, DensityMetrics,
     DesktopPresentation, ExplorerAction, ExplorerAttention, ExplorerIntent, ExplorerKey,
     ExplorerMode, ExplorerNodeId, InteractionState as PresentationInteraction, PresentationInput,
-    PresentationLayout, PresentationTheme, SessionIndicator, SystemAppearance, TerminalPalette,
-    Viewport, WorkspaceNavigation, button_visual, session_state_can_replay as session_can_replay,
-    session_state_can_stop as session_can_stop, session_state_label,
+    PresentationLayout, PresentationTheme, SessionIndicator, SettingsMode, SystemAppearance,
+    TerminalPalette, Viewport, WorkspaceNavigation, button_visual,
+    session_state_can_replay as session_can_replay, session_state_can_stop as session_can_stop,
+    session_state_label,
 };
 use sylvops_core::{
     domain::{
@@ -87,11 +93,19 @@ const TERMINAL_FONT_CHOICES: [DesktopTerminalFont; 4] = [
 const TERMINAL_CURSOR_CHOICES: [DesktopTerminalCursor; 2] =
     [DesktopTerminalCursor::Block, DesktopTerminalCursor::Line];
 const TERMINAL_FONT_SIZE_CHOICES: [u8; 13] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
-#[cfg(windows)]
+const FEATURED_THEME_COUNT: usize = 4;
+const CHECK_AGAIN_LABEL: &str = "Check again";
+const STOP_SESSION_LABEL: &str = "Stop session";
+const DELETE_CHECKOUT_LABEL: &str = "Delete checkout";
+const MAX_TECHNICAL_COPY_CHARS: usize = 4_096;
+const MAX_USER_DIAGNOSTIC_CHARS: usize = 1_024;
+#[cfg(test)]
+const UI_FONT: Font = Font::DEFAULT;
+#[cfg(all(not(test), windows))]
 const UI_FONT: Font = Font::with_name("Segoe UI");
-#[cfg(target_os = "macos")]
+#[cfg(all(not(test), target_os = "macos"))]
 const UI_FONT: Font = Font::with_name("SF Pro Text");
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(all(not(test), not(windows), not(target_os = "macos")))]
 const UI_FONT: Font = Font::DEFAULT;
 #[cfg(windows)]
 const SYSTEM_TERMINAL_FONT: Font = Font::with_name("Consolas");
@@ -221,10 +235,26 @@ struct DesktopApp {
     window_mode: window::Mode,
     update_status: UpgradeStatus,
     install_request: InstallRequestState,
+    modal_focus: ModalFocus,
+    disclosures: DisclosureState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DisclosureState {
+    classic_themes: bool,
+    technical_details: bool,
+    settings_theme_focus: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum InstallRequestState {
+    #[default]
+    Idle,
+    Pending,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ModalFocus {
     #[default]
     Idle,
     Pending,
@@ -373,6 +403,9 @@ enum Message {
     Stop,
     Refresh,
     ToggleSettings,
+    ToggleClassicThemes,
+    ToggleTechnicalDetails,
+    CopyTechnicalValue(String),
     ToggleFullscreen,
     SelectTheme(DesktopTheme),
     SelectDensity(DesktopDensity),
@@ -448,6 +481,8 @@ impl DesktopApp {
             window_mode: window::Mode::Windowed,
             update_status: UpgradeStatus::Idle,
             install_request: InstallRequestState::Idle,
+            modal_focus: ModalFocus::Idle,
+            disclosures: DisclosureState::default(),
         }
     }
 
@@ -457,6 +492,10 @@ impl DesktopApp {
             Message::Tick => {
                 self.process_bridge_events();
                 self.flush_timers();
+                if self.modal_focus == ModalFocus::Pending {
+                    self.modal_focus = ModalFocus::Idle;
+                    return widget::operation::focus_next();
+                }
                 if let (Some((width, height)), Some(window_id)) =
                     (self.restore_window_size, self.window_id)
                 {
@@ -572,7 +611,12 @@ impl DesktopApp {
             Message::NewWorkspace => {
                 self.inline_session_rename = None;
                 self.terminal_focus = TerminalFocus::Unfocused;
-                self.modal = Some(Modal::Form(FormModal::new(Form::workspace())));
+                self.modal = Some(Modal::Form(if self.snapshot.workspaces.is_empty() {
+                    FormModal::first_run(Form::workspace())
+                } else {
+                    FormModal::new(Form::workspace())
+                }));
+                self.modal_focus = ModalFocus::Pending;
             }
             Message::NewProject => self.open_project_form(),
             Message::RenameProject => self.open_project_rename_form(),
@@ -621,13 +665,25 @@ impl DesktopApp {
             Message::Stop => self.open_stop_confirmation(),
             Message::Refresh => self.request_snapshot(),
             Message::ToggleSettings => {
-                self.inline_session_rename = None;
-                self.terminal_focus = TerminalFocus::Unfocused;
-                self.modal = if matches!(self.modal, Some(Modal::Settings)) {
-                    None
+                if matches!(self.modal, Some(Modal::Settings)) {
+                    self.modal = None;
                 } else {
-                    Some(Modal::Settings)
-                };
+                    self.open_settings();
+                }
+            }
+            Message::ToggleClassicThemes => {
+                self.disclosures.classic_themes = !self.disclosures.classic_themes;
+                self.disclosures.settings_theme_focus = self
+                    .disclosures
+                    .settings_theme_focus
+                    .min(theme_gallery_len(self.disclosures.classic_themes).saturating_sub(1));
+            }
+            Message::ToggleTechnicalDetails => {
+                self.disclosures.technical_details = !self.disclosures.technical_details;
+            }
+            Message::CopyTechnicalValue(value) => {
+                self.success = Some(("Copied technical detail.".into(), Instant::now()));
+                return clipboard::write(bounded_technical_copy(&value));
             }
             Message::CheckForUpdate => {
                 self.send_request(Operation::CheckForUpdate, ClientRequest::CheckForUpdate);
@@ -662,6 +718,7 @@ impl DesktopApp {
             }
             Message::SelectTheme(theme) => {
                 self.desktop_state.theme = theme;
+                self.disclosures.settings_theme_focus = theme_gallery_index(theme);
                 self.mark_state_dirty();
             }
             Message::SelectDensity(density) => {
@@ -778,12 +835,21 @@ impl DesktopApp {
         let top = self.top_bar();
         let mission_control = self.mission_control();
         let body: Element<'_, Message> = if let Some(modal) = &self.modal {
-            let overlay = container(self.modal_view(modal))
-                .width(Fill)
-                .height(Fill)
-                .center_x(Fill)
-                .center_y(Fill)
-                .style(modal_scrim);
+            let overlay = if matches!(modal, Modal::Settings) {
+                container(self.modal_view(modal))
+                    .width(Fill)
+                    .height(Fill)
+                    .align_x(iced::alignment::Horizontal::Right)
+                    .align_y(Vertical::Center)
+                    .style(modal_scrim)
+            } else {
+                container(self.modal_view(modal))
+                    .width(Fill)
+                    .height(Fill)
+                    .center_x(Fill)
+                    .center_y(Fill)
+                    .style(modal_scrim)
+            };
             let overlay: Element<'_, Message> = if matches!(modal, Modal::Settings) {
                 mouse_area(overlay).on_press(Message::ToggleSettings).into()
             } else {
@@ -793,14 +859,13 @@ impl DesktopApp {
         } else {
             mission_control
         };
-        let mut content = column![top, rule::horizontal(1), body]
-            .width(Fill)
-            .height(Fill);
+        let mut content = column![top, rule::horizontal(1)].width(Fill).height(Fill);
         if let Some(error) = &self.error {
             let presentation_theme = self.presentation().theme;
             content = content.push(
                 container(
                     row![
+                        text("Action failed").font(UI_SEMIBOLD).style(text::danger),
                         text(error).style(text::danger),
                         space::horizontal(),
                         button("Dismiss").on_press(Message::ClearError).style(
@@ -813,6 +878,7 @@ impl DesktopApp {
                             }
                         )
                     ]
+                    .spacing(10)
                     .align_y(Center),
                 )
                 .padding([8, 12]),
@@ -824,7 +890,10 @@ impl DesktopApp {
                     .width(Fill),
             );
         }
-        content = content.push(rule::horizontal(1)).push(self.footer());
+        content = content
+            .push(body)
+            .push(rule::horizontal(1))
+            .push(self.footer());
         let content: Element<'_, Message> = container(content).width(Fill).height(Fill).into();
         if self.inline_session_rename.is_some() {
             mouse_area(content)
@@ -852,7 +921,7 @@ impl DesktopApp {
         );
         let brand = container(
             row![
-                text("✦").size(16).style(text::primary),
+                line_icon(LineIcon::Brand, 16),
                 text("SylvOps").font(UI_SEMIBOLD).size(15)
             ]
             .spacing(7)
@@ -961,7 +1030,7 @@ impl DesktopApp {
         }
         workspace_tabs = workspace_tabs.push(
             button(
-                text(if compact { "+" } else { "+ Workspace" })
+                text(if compact { "New" } else { "New workspace" })
                     .font(UI_MEDIUM)
                     .size(if compact { 16.0 } else { UI_META_SIZE }),
             )
@@ -979,18 +1048,16 @@ impl DesktopApp {
             .into()
     }
 
-    fn refresh_button(&self, compact: bool) -> Element<'static, Message> {
+    fn refresh_button(&self, _compact: bool) -> Element<'static, Message> {
         let control_height = self.presentation().density.control_height;
         let can_refresh =
             matches!(self.connection, ConnectionState::Connected) && !self.snapshot_pending;
         let label = if self.snapshot_pending {
-            if compact { "…" } else { "Refreshing…" }
-        } else if compact {
-            "↻"
+            "Refreshing…"
         } else {
             "Refresh"
         };
-        button(text(label).size(if compact { 17 } else { 12 }))
+        button(text(label).size(12))
             .on_press_maybe(can_refresh.then_some(Message::Refresh))
             .height(control_height)
             .padding([5, 10])
@@ -1076,7 +1143,7 @@ impl DesktopApp {
                 .size(UI_META_SIZE)
                 .style(text::secondary),
             space::horizontal(),
-            button(text("+ Repository").font(UI_MEDIUM).size(UI_META_SIZE))
+            button(text("Add repository").font(UI_MEDIUM).size(UI_META_SIZE))
                 .on_press(Message::NewProject)
                 .height(density.control_height)
                 .padding([4, 8])
@@ -1141,41 +1208,58 @@ impl DesktopApp {
         let is_selected = selected == Some(row.id);
         let is_hovered = self.hovered_explorer_node == Some(row.id);
         let disclosure: Element<'static, Message> = if row.expandable {
-            button(text(if row.expanded { "▾" } else { "▸" }).size(UI_TEXT_SIZE))
-                .on_press(Message::ToggleExplorerNode(row.id))
-                .height(density.row_height)
-                .width(Length::Fixed(24.0))
-                .padding(0)
-                .style(chrome_action_style)
-                .into()
+            button(line_icon(
+                if row.expanded {
+                    LineIcon::ChevronDown
+                } else {
+                    LineIcon::ChevronRight
+                },
+                15,
+            ))
+            .on_press(Message::ToggleExplorerNode(row.id))
+            .height(density.row_height)
+            .width(Length::Fixed(24.0))
+            .padding(0)
+            .style(chrome_action_style)
+            .into()
         } else {
             space::horizontal().width(Length::Fixed(24.0)).into()
         };
-        let detail = if let Some(attention) = row.attention {
-            format!(
-                "{} {}{}",
-                explorer_attention_symbol(attention),
-                explorer_attention_label(attention),
-                if row.detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {}", row.detail)
-                }
-            )
+        let detail: Element<'static, Message> = if let Some(attention) = row.attention {
+            let label = if row.detail.is_empty() {
+                explorer_attention_label(attention).to_owned()
+            } else {
+                format!("{} · {}", explorer_attention_label(attention), row.detail)
+            };
+            row![
+                line_icon(explorer_attention_icon(attention), 13),
+                text(label).size(UI_META_SIZE).style(text::secondary),
+            ]
+            .spacing(4)
+            .align_y(Center)
+            .into()
         } else if let Some(indicator) = row.indicator {
-            format!("{} {}", session_indicator_symbol(indicator), row.detail)
+            row![
+                line_icon(session_indicator_icon(indicator), 13),
+                text(row.detail.clone())
+                    .size(UI_META_SIZE)
+                    .style(text::secondary),
+            ]
+            .spacing(4)
+            .align_y(Center)
+            .into()
         } else {
-            row.detail.clone()
+            text(row.detail.clone())
+                .size(UI_META_SIZE)
+                .style(text::secondary)
+                .into()
         };
         let labels = column![
             text(row.label.clone())
                 .font(if is_selected { UI_MEDIUM } else { UI_FONT })
                 .size(UI_TEXT_SIZE)
                 .wrapping(text::Wrapping::None),
-            text(detail)
-                .size(UI_META_SIZE)
-                .style(text::secondary)
-                .wrapping(text::Wrapping::None),
+            detail,
         ]
         .spacing(1)
         .width(Fill);
@@ -1318,7 +1402,7 @@ impl DesktopApp {
                         .height(density.row_height)
                         .padding([5, 9])
                         .style(move |theme, status| { tab_label_style(theme, status, active) }),
-                        button(text("×").size(15))
+                        button(line_icon(LineIcon::Close, 15))
                             .on_press(Message::CloseSessionTab(session_id))
                             .height(density.row_height)
                             .padding([4, 8])
@@ -1416,7 +1500,7 @@ impl DesktopApp {
             }
             if can_stop {
                 actions = actions.push(
-                    button(text("Stop").font(UI_MEDIUM).size(UI_META_SIZE))
+                    button(text(STOP_SESSION_LABEL).font(UI_MEDIUM).size(UI_META_SIZE))
                         .on_press(Message::Stop)
                         .height(density.control_height)
                         .padding([6, 9])
@@ -1445,7 +1529,7 @@ impl DesktopApp {
             } else if !compact {
                 actions = actions.push(
                     container(
-                        text(format!("History retained · {state_label}"))
+                        text(format!("Session record retained · {state_label}"))
                             .size(UI_META_SIZE)
                             .wrapping(text::Wrapping::None)
                             .style(text::secondary),
@@ -1592,30 +1676,69 @@ impl DesktopApp {
         .into()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn details_view(&self) -> Element<'_, Message> {
         let selection = self.presentation().selection;
         let mut content = column![text("Selection details").font(UI_SEMIBOLD).size(24)].spacing(12);
+        let mut technical = column![].spacing(8);
+        let mut has_technical_details = false;
         if let Some(project) = selection
             .project_id
             .and_then(|id| self.snapshot.projects.iter().find(|item| item.id == id))
         {
+            has_technical_details = true;
             content = content
                 .push(detail("Repository", project.name.clone()))
+                .push(detail("Path", project.canonical_repository_path.clone()))
                 .push(detail(
-                    "Repository",
-                    project.canonical_repository_path.clone(),
+                    "Last activity",
+                    optional_human_timestamp(Some(project.last_activity_at), "Not recorded"),
+                ));
+            technical = technical
+                .push(technical_detail("Repository ID", project.id.to_string()))
+                .push(technical_detail(
+                    "Workspace ID",
+                    project.workspace_id.to_string(),
+                ))
+                .push(technical_detail(
+                    "Created (raw ms)",
+                    project.created_at.to_string(),
+                ))
+                .push(technical_detail(
+                    "Last activity (raw ms)",
+                    project.last_activity_at.to_string(),
                 ));
         }
         if let Some(worktree) = self.selected_worktree() {
+            has_technical_details = true;
             content = content
                 .push(detail("Checkout", worktree.name.clone()))
                 .push(detail(
                     "Branch",
                     worktree.branch.clone().unwrap_or_else(|| "Detached".into()),
                 ))
-                .push(detail("Path", worktree.canonical_path.clone()));
+                .push(detail("Path", worktree.canonical_path.clone()))
+                .push(detail(
+                    "Created",
+                    optional_human_timestamp(Some(worktree.created_at), "Not recorded"),
+                ));
+            technical = technical
+                .push(technical_detail("Checkout ID", worktree.id.to_string()))
+                .push(technical_detail(
+                    "Project ID",
+                    worktree.project_id.to_string(),
+                ))
+                .push(technical_detail(
+                    "Base commit",
+                    worktree.base_commit.clone(),
+                ))
+                .push(technical_detail(
+                    "Created (raw ms)",
+                    worktree.created_at.to_string(),
+                ));
         }
         if let Some(session) = selection.active_session_id.and_then(|id| self.session(id)) {
+            has_technical_details = true;
             content = content
                 .push(rule::horizontal(1))
                 .push(text(&session.display_name).font(UI_SEMIBOLD).size(18))
@@ -1623,12 +1746,12 @@ impl DesktopApp {
                 .push(detail("State", session_state_label(session.state).into()))
                 .push(detail("Working directory", session.cwd.clone()))
                 .push(detail(
-                    "Started (Unix ms)",
-                    optional_number(session.started_at, "Not started"),
+                    "Started",
+                    optional_human_timestamp(session.started_at, "Not started"),
                 ))
                 .push(detail(
-                    "Ended (Unix ms)",
-                    optional_number(session.ended_at, "Not ended"),
+                    "Ended",
+                    optional_human_timestamp(session.ended_at, "Not ended"),
                 ))
                 .push(detail(
                     "Exit code",
@@ -1642,18 +1765,56 @@ impl DesktopApp {
                         .unwrap_or_else(|| "None".into()),
                 ))
                 .push(detail(
-                    "Terminal output",
-                    "Memory-only; unavailable after a daemon restart".into(),
+                    "Session record",
+                    "Retained after the process ends until user data is removed.".into(),
                 ))
                 .push(detail(
-                    "Controller",
-                    self.terminals
-                        .get(&session.id)
-                        .map_or_else(|| "Detached".into(), |terminal| terminal.role.to_string()),
+                    "Terminal output",
+                    "Available while the daemon is running; not persisted across daemon restart."
+                        .into(),
                 ))
                 .push(detail(
                     "Resume",
                     session_resume_label(session, &self.snapshot.sessions).into(),
+                ));
+            technical = technical
+                .push(technical_detail("Session ID", session.id.to_string()))
+                .push(technical_detail(
+                    "Checkout ID",
+                    session.worktree_id.to_string(),
+                ))
+                .push(technical_detail(
+                    "Process ID",
+                    optional_number(session.process_id, "Not running"),
+                ))
+                .push(technical_detail(
+                    "Provider session ID",
+                    session
+                        .external_session_id
+                        .clone()
+                        .unwrap_or_else(|| "Not recorded".into()),
+                ))
+                .push(technical_detail(
+                    "Started (raw ms)",
+                    optional_number(session.started_at, "Not started"),
+                ))
+                .push(technical_detail(
+                    "Ended (raw ms)",
+                    optional_number(session.ended_at, "Not ended"),
+                ))
+                .push(technical_detail(
+                    "Last output sequence",
+                    session.last_seen_output_sequence.to_string(),
+                ))
+                .push(technical_detail(
+                    "Terminal controller",
+                    self.terminals
+                        .get(&session.id)
+                        .map_or_else(|| "Detached".into(), |terminal| terminal.role.to_string()),
+                ))
+                .push(technical_detail(
+                    "Transport",
+                    "Authenticated local IPC with daemon-owned PTY".into(),
                 ));
         }
         let mut actions = row![].spacing(8);
@@ -1667,7 +1828,7 @@ impl DesktopApp {
             actions = actions.push(self.session_rename_action(session.id));
             if session_can_stop(session.state) {
                 actions = actions.push(
-                    button("Stop session")
+                    button(STOP_SESSION_LABEL)
                         .on_press(Message::Stop)
                         .style(flat_danger_style),
                 );
@@ -1675,13 +1836,27 @@ impl DesktopApp {
         }
         if self.selected_worktree().is_some_and(worktree_can_delete) {
             actions = actions.push(
-                button("Delete checkout")
+                button(DELETE_CHECKOUT_LABEL)
                     .on_press(Message::RemoveSelectedWorktree)
                     .style(flat_danger_style),
             );
         }
         content = content.push(rule::horizontal(1)).push(actions);
-        container(content)
+        if has_technical_details {
+            content = content.push(rule::horizontal(1)).push(
+                button(if self.disclosures.technical_details {
+                    "Technical details — hide"
+                } else {
+                    "Technical details — show"
+                })
+                .on_press(Message::ToggleTechnicalDetails)
+                .style(chrome_action_style),
+            );
+            if self.disclosures.technical_details {
+                content = content.push(technical);
+            }
+        }
+        container(scrollable(content).height(Fill))
             .padding(20)
             .width(Fill)
             .height(Fill)
@@ -1730,6 +1905,7 @@ impl DesktopApp {
                 detail("Enter", "Open the selected session".into()),
                 detail("1 / 2 / 3", "Terminal / Changes / Details".into()),
                 detail("N / R / D", "New / rename / stop or remove".into()),
+                detail("Ctrl+,", "Open Settings".into()),
                 detail("O / G", "Open terminal / show Git changes".into()),
                 detail(
                     "Wheel / Shift+PageUp",
@@ -1752,18 +1928,11 @@ impl DesktopApp {
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
-        let density = self.presentation().density;
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let settings_mode = presentation.layout.settings_mode();
         let control_width = Length::Fixed(260.0);
-        let appearance = column![
-            setting_row(
-                "Theme",
-                pick_list(
-                    DesktopTheme::ALL,
-                    Some(self.desktop_state.theme),
-                    Message::SelectTheme,
-                )
-                .width(control_width),
-            ),
+        let appearance_controls = column![
             setting_row(
                 "Density",
                 pick_list(
@@ -1802,23 +1971,30 @@ impl DesktopApp {
             ),
         ]
         .spacing(density.region_spacing);
+        let appearance = self.appearance_theme_gallery();
         let update_settings = self.update_settings_view();
-        container(
-            column![
-                row![
-                    text("Settings").font(UI_SEMIBOLD).size(24),
-                    space::horizontal(),
-                    button(text("Done").font(UI_MEDIUM).size(12))
-                        .on_press(Message::ToggleSettings)
-                        .height(density.control_height)
-                        .padding([6, 10])
-                        .style(chrome_action_style)
-                ]
-                .align_y(Center),
+        let settings = column![
+            row![
+                text("Settings").font(UI_SEMIBOLD).size(24),
+                space::horizontal(),
+                button(text("Done").font(UI_MEDIUM).size(12))
+                    .on_press(Message::ToggleSettings)
+                    .height(density.control_height)
+                    .padding([6, 10])
+                    .style(chrome_action_style)
+            ]
+            .align_y(Center),
+            text("Keyboard: U advances updates · P toggles periodic checks · R resets layout · D opens data removal · Esc closes Settings")
+                .size(UI_META_SIZE)
+                .style(text::secondary),
+            rule::horizontal(1),
+            scrollable(
+                column![
                 text("Appearance").font(UI_SEMIBOLD).size(16),
                 text("Appearance changes apply immediately and persist locally for this desktop.")
                     .style(text::secondary),
                 appearance,
+                appearance_controls,
                 button("Reset layout")
                     .on_press(Message::ResetLayout)
                     .style(chrome_action_style),
@@ -1826,17 +2002,104 @@ impl DesktopApp {
                 update_settings,
                 rule::horizontal(1),
                 text("Safety").font(UI_SEMIBOLD).size(16),
-                text("The desktop remains an IPC client. The daemon still owns PTYs, Git mutations, process cleanup, and audit events.")
+                text("Protected background services remain in control of sessions, repository changes, cleanup, and audit history.")
                     .style(text::secondary),
                 button("Remove SylvOps user data…")
                     .on_press(Message::OpenDataRemoval)
                     .style(danger_action_style),
+                ]
+                .spacing(16)
+                .padding([8, 6]),
+            )
+            .height(Fill),
+        ]
+        .spacing(12);
+        let mut surface = container(settings).padding(22).height(Fill);
+        surface = match settings_mode {
+            SettingsMode::SideSheet => surface.width(Length::Fixed(600.0)).style(modal_card),
+            SettingsMode::FullWindow => surface.width(Fill).style(workspace_surface),
+        };
+        surface.into()
+    }
+
+    fn appearance_theme_gallery(&self) -> Element<'_, Message> {
+        let density = self.presentation().density;
+        let mut featured = row![].spacing(density.region_spacing);
+        for choice in DesktopTheme::ALL.into_iter().take(FEATURED_THEME_COUNT) {
+            featured = featured.push(self.theme_preview_card(choice));
+        }
+        let disclosure = if self.disclosures.classic_themes {
+            "Classic themes — hide"
+        } else {
+            "Classic themes — show 7"
+        };
+        let mut gallery = column![
+            featured,
+            text("Keyboard: Tab or arrow keys move the preview focus; Enter applies; C toggles Classic themes.")
+                .size(UI_META_SIZE)
+                .style(text::secondary),
+            button(disclosure)
+                .on_press(Message::ToggleClassicThemes)
+                .style(chrome_action_style),
+        ]
+        .spacing(density.region_spacing);
+        if self.disclosures.classic_themes {
+            let mut classic = row![].spacing(density.region_spacing);
+            for choice in DesktopTheme::ALL.into_iter().skip(FEATURED_THEME_COUNT) {
+                let selected = self.desktop_state.theme == choice;
+                let focused = self.disclosures.settings_theme_focus == theme_gallery_index(choice);
+                classic = classic.push(
+                    button(text(choice.to_string()).wrapping(text::Wrapping::None))
+                        .on_press(Message::SelectTheme(choice))
+                        .height(density.control_height)
+                        .padding([5, 9])
+                        .style(move |theme, status| {
+                            theme_preview_style(theme, status, selected, focused)
+                        }),
+                );
+            }
+            gallery = gallery.push(
+                scrollable(classic)
+                    .direction(scrollable::Direction::Horizontal(
+                        scrollable::Scrollbar::default(),
+                    ))
+                    .height(density.control_height + 12),
+            );
+        }
+        gallery.into()
+    }
+
+    fn theme_preview_card(&self, choice: DesktopTheme) -> Element<'static, Message> {
+        let system_appearance = match self.system_theme {
+            iced::theme::Mode::Light => SystemAppearance::Light,
+            iced::theme::Mode::None | iced::theme::Mode::Dark => SystemAppearance::Dark,
+        };
+        let preview = PresentationTheme::resolve(choice, system_appearance);
+        let selected = self.desktop_state.theme == choice;
+        let focused = self.disclosures.settings_theme_focus == theme_gallery_index(choice);
+        let subtitle = if choice == DesktopTheme::System {
+            format!("Uses {}", preview.label)
+        } else {
+            "Signature theme".to_owned()
+        };
+        button(
+            column![
+                row![
+                    theme_swatch(preview.tokens.canvas),
+                    theme_swatch(preview.tokens.surface),
+                    theme_swatch(preview.tokens.interaction),
+                ]
+                .spacing(3),
+                text(choice.to_string()).font(UI_MEDIUM).size(UI_META_SIZE),
+                text(subtitle).size(11).style(text::secondary),
             ]
-            .spacing(16),
+            .spacing(5),
         )
-        .padding(22)
-        .width(Length::Fixed(560.0))
-        .style(modal_card)
+        .on_press(Message::SelectTheme(choice))
+        .width(Length::Fixed(126.0))
+        .height(74)
+        .padding([8, 9])
+        .style(move |theme, status| theme_preview_style(theme, status, selected, focused))
         .into()
     }
 
@@ -1847,18 +2110,34 @@ impl DesktopApp {
                     .style(text::secondary)
                     .into()
             }
-            UpgradeStatus::Available { release } => column![
-                text(format!(
-                    "SylvOps {} is available ({} bytes).",
-                    release.target_version, release.byte_length
-                )),
-                text(&release.release_notes).style(text::secondary),
-                button("Download verified upgrade")
-                    .on_press(Message::DownloadUpdate)
+            UpgradeStatus::Available { release } => {
+                let mut details = column![
+                    text(format!(
+                        "SylvOps {} is available ({} download).",
+                        release.target_version,
+                        human_byte_size(release.byte_length)
+                    )),
+                    text(&release.release_notes).style(text::secondary),
+                    button("Download verified upgrade")
+                        .on_press(Message::DownloadUpdate)
+                        .style(chrome_action_style),
+                    button(if self.disclosures.technical_details {
+                        "Technical details — hide"
+                    } else {
+                        "Technical details — show"
+                    })
+                    .on_press(Message::ToggleTechnicalDetails)
                     .style(chrome_action_style),
-            ]
-            .spacing(8)
-            .into(),
+                ]
+                .spacing(8);
+                if self.disclosures.technical_details {
+                    details = details.push(technical_detail(
+                        "Exact download size",
+                        format!("{} bytes", release.byte_length),
+                    ));
+                }
+                details.into()
+            }
             UpgradeStatus::Downloading { release } => text(format!(
                 "Downloading and verifying SylvOps {}…",
                 release.target_version
@@ -1886,7 +2165,9 @@ impl DesktopApp {
             ))
             .style(text::danger)
             .into(),
-            UpgradeStatus::Failed { message } => text(message).style(text::danger).into(),
+            UpgradeStatus::Failed { message } => text(bounded_redacted_diagnostic(message))
+                .style(text::danger)
+                .into(),
             UpgradeStatus::Idle => text("No update check has run in this desktop session.")
                 .style(text::secondary)
                 .into(),
@@ -1897,11 +2178,11 @@ impl DesktopApp {
             "Periodic checks: Off"
         };
         column![
-            text("Application updates").font(UI_SEMIBOLD).size(16),
+            text("Updates").font(UI_SEMIBOLD).size(16),
             text("Checks read bounded signed GitHub release metadata. Downloads and installation always require visible actions.")
                 .style(text::secondary),
             row![
-                button("Check now")
+                button(CHECK_AGAIN_LABEL)
                     .on_press(Message::CheckForUpdate)
                     .style(chrome_action_style),
                 button(periodic_label)
@@ -1918,10 +2199,8 @@ impl DesktopApp {
     fn form_view(modal: &FormModal) -> Element<'_, Message> {
         let form = &modal.form;
         let mut fields = column![].spacing(10);
-        if modal.first_run
-            && let Some(guidance) = first_run_guidance(form.kind)
-        {
-            fields = fields.push(text(guidance).style(text::secondary));
+        if modal.first_run {
+            fields = fields.push(first_run_checklist(form.kind));
         }
         if form.is_session() {
             fields = fields.push(Self::provider_picker(
@@ -2008,7 +2287,7 @@ impl DesktopApp {
             },
         );
         let recovery = provider.map_or_else(
-            || "The daemon returned no providers. Check again to retry discovery.".into(),
+            || "The daemon returned no providers. Check again to repeat discovery.".into(),
             provider_recovery_message,
         );
         let selected = provider.map(|provider| provider.kind);
@@ -2033,7 +2312,7 @@ impl DesktopApp {
                 button(if checking_selected {
                     "Checking…"
                 } else {
-                    "Retry discovery"
+                    CHECK_AGAIN_LABEL
                 })
                 .on_press_maybe(
                     (!checking_selected && !form_pending).then_some(Message::ProbeProvider),
@@ -2046,6 +2325,9 @@ impl DesktopApp {
         };
         column![
             text("Session type").font(UI_MEDIUM).size(UI_META_SIZE),
+            text("Keyboard: Alt+S selects Shell · Alt+C selects Codex · Alt+R runs Check again")
+                .size(UI_META_SIZE)
+                .style(text::secondary),
             choices,
             row![text(provider_text).width(Fill),]
                 .spacing(8)
@@ -2059,9 +2341,9 @@ impl DesktopApp {
     fn confirmation_view(confirmation: &Confirmation) -> Element<'_, Message> {
         let (title, explanation) = match confirmation {
             Confirmation::StopSession { session_name, cwd } => (
-                "Stop session",
+                STOP_SESSION_LABEL,
                 format!(
-                    "Stop “{session_name}” in {cwd} and terminate its complete process tree? Its history remains available."
+                    "Stop “{session_name}” in {cwd} and everything it started? Its Session record remains available."
                 ),
             ),
             Confirmation::RemoveWorktree {
@@ -2069,7 +2351,7 @@ impl DesktopApp {
                 canonical_path,
                 ..
             } => (
-                "Delete clean checkout",
+                DELETE_CHECKOUT_LABEL,
                 format!(
                     "Delete checkout “{name}” at {canonical_path}? The checkout directory is removed without force; the Git branch is preserved."
                 ),
@@ -2080,7 +2362,7 @@ impl DesktopApp {
             } => (
                 "Stop sessions and install update",
                 format!(
-                    "Install SylvOps {version}? The following active sessions and their complete process trees will stop: {}.",
+                    "Install SylvOps {version}? The following active sessions and everything they started will stop: {}.",
                     active_sessions
                         .iter()
                         .map(|session| session.name.as_str())
@@ -2093,12 +2375,15 @@ impl DesktopApp {
             column![
                 text(title).font(UI_SEMIBOLD).size(22),
                 text(explanation),
+                text(format!("Press Enter to {title}; press Escape to cancel."))
+                    .size(UI_META_SIZE)
+                    .style(text::secondary),
                 row![
                     space::horizontal(),
                     button("Cancel").on_press(Message::CancelModal),
-                    button("Confirm")
+                    button(title)
                         .on_press(Message::ConfirmAction)
-                        .style(danger_action_style),
+                        .style(focused_danger_action_style),
                 ]
                 .spacing(8),
             ]
@@ -2123,7 +2408,8 @@ impl DesktopApp {
                 )
                 .on_input_maybe(
                     (!confirmation.pending).then_some(Message::DataRemovalConfirmationInput),
-                ),
+                )
+                .on_submit_maybe(confirmation.can_submit().then_some(Message::SubmitDataRemoval)),
                 row![
                     space::horizontal(),
                     button("Cancel")
@@ -2167,15 +2453,15 @@ impl DesktopApp {
             },
         );
         let connection: Element<'_, Message> = match self.connection {
-            ConnectionState::Connecting => text("● Connecting")
+            ConnectionState::Connecting => text("Connecting")
                 .size(FOOTER_TEXT_SIZE)
                 .style(text::warning)
                 .into(),
-            ConnectionState::Connected => text("● Connected")
+            ConnectionState::Connected => text("Connected")
                 .size(FOOTER_TEXT_SIZE)
                 .style(text::success)
                 .into(),
-            ConnectionState::Disconnected => text("● Disconnected")
+            ConnectionState::Disconnected => text("Disconnected")
                 .size(FOOTER_TEXT_SIZE)
                 .style(text::danger)
                 .into(),
@@ -2231,6 +2517,7 @@ impl DesktopApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_bridge_event(&mut self, event: BridgeEvent) {
         match event {
             BridgeEvent::Connected {
@@ -2248,6 +2535,7 @@ impl DesktopApp {
                 self.restore_selection();
                 if self.snapshot.workspaces.is_empty() {
                     self.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
+                    self.modal_focus = ModalFocus::Pending;
                 }
             }
             BridgeEvent::Daemon(event) => self.handle_daemon_event(event),
@@ -2258,6 +2546,7 @@ impl DesktopApp {
                 self.handle_response(operation, response);
             }
             BridgeEvent::Error { operation, message } => {
+                let message = bounded_redacted_diagnostic(&message);
                 if let Some(Operation::Resume(session_id)) = operation {
                     self.resume_pending.remove(&session_id);
                 }
@@ -2271,7 +2560,7 @@ impl DesktopApp {
                     if let Some(Modal::DataRemoval(confirmation)) = &mut self.modal {
                         confirmation.pending = false;
                     }
-                    self.error = Some(message);
+                    self.error = Some(contextual_error(operation, &message));
                     return;
                 }
                 if matches!(&operation, Some(Operation::ProbeProvider(_))) {
@@ -2279,7 +2568,7 @@ impl DesktopApp {
                         modal.provider_probe = None;
                         modal.form.submission_error = Some(message);
                     } else {
-                        self.error = Some(message);
+                        self.error = Some(contextual_error(operation, &message));
                     }
                     return;
                 }
@@ -2305,7 +2594,7 @@ impl DesktopApp {
                     modal.pending = false;
                     modal.form.submission_error = Some(message);
                 } else {
-                    self.error = Some(message);
+                    self.error = Some(contextual_error(operation, &message));
                 }
             }
             BridgeEvent::DataRemovalFinished(result) => match result {
@@ -2318,6 +2607,7 @@ impl DesktopApp {
                     self.closing_since = Some(Instant::now());
                 }
                 Err(message) => {
+                    let message = bounded_redacted_diagnostic(&message);
                     self.connection = ConnectionState::Disconnected;
                     self.modal = None;
                     self.error = Some(format!(
@@ -2562,6 +2852,9 @@ impl DesktopApp {
                 } else {
                     None
                 };
+                if first_run {
+                    self.modal_focus = ModalFocus::Pending;
+                }
                 self.request_snapshot();
             }
             (
@@ -2584,6 +2877,9 @@ impl DesktopApp {
                 } else {
                     None
                 };
+                if first_run {
+                    self.modal_focus = ModalFocus::Pending;
+                }
                 self.mark_state_dirty();
                 self.request_snapshot();
             }
@@ -2698,6 +2994,7 @@ impl DesktopApp {
                 );
             }
             (operation, DaemonResponse::Error(failure)) => {
+                let message = bounded_redacted_diagnostic(&failure.message);
                 if let Operation::Resume(session_id) = operation {
                     self.resume_pending.remove(&session_id);
                 }
@@ -2705,15 +3002,15 @@ impl DesktopApp {
                     if let Some(Modal::DataRemoval(confirmation)) = &mut self.modal {
                         confirmation.pending = false;
                     }
-                    self.error = Some(failure.message);
+                    self.error = Some(contextual_error(Some(operation), &message));
                     return;
                 }
                 if matches!(operation, Operation::ProbeProvider(_)) {
                     if let Some(Modal::Form(modal)) = &mut self.modal {
                         modal.provider_probe = None;
-                        modal.form.submission_error = Some(failure.message);
+                        modal.form.submission_error = Some(message);
                     } else {
-                        self.error = Some(format!("{operation:?}: {}", failure.message));
+                        self.error = Some(contextual_error(Some(operation), &message));
                     }
                     return;
                 }
@@ -2729,22 +3026,23 @@ impl DesktopApp {
                 );
                 if form_operation && let Some(Modal::Form(modal)) = &mut self.modal {
                     modal.pending = false;
-                    modal.form.submission_error = Some(failure.message);
+                    modal.form.submission_error = Some(message);
                 } else {
-                    self.error = Some(format!("{operation:?}: {}", failure.message));
+                    self.error = Some(contextual_error(Some(operation), &message));
                 }
             }
-            (operation, response) => {
-                self.error = Some(format!(
-                    "unexpected response for {operation:?}: {response:?}"
-                ));
+            (_operation, _response) => {
+                self.error = Some(
+                    "The background service returned an unexpected response. Check again or restart SylvOps."
+                        .into(),
+                );
             }
         }
     }
 
     fn send_request(&mut self, operation: Operation, request: ClientRequest) {
         if !self.bridge.request(operation, request) {
-            self.error = Some("The desktop IPC command queue is busy. Try again.".into());
+            self.error = Some("The background service is busy. Try again.".into());
         }
     }
 
@@ -2761,7 +3059,7 @@ impl DesktopApp {
             InstallRequestState::Idle
         };
         if self.install_request == InstallRequestState::Idle {
-            self.error = Some("The desktop IPC command queue is busy. Try again.".into());
+            self.error = Some("The background service is busy. Try again.".into());
         }
     }
 
@@ -2771,7 +3069,7 @@ impl DesktopApp {
         };
         if !self.bridge.request(Operation::Resume(session_id), request) {
             self.resume_pending.remove(&session_id);
-            self.error = Some("The desktop IPC command queue is busy. Try again.".into());
+            self.error = Some("The background service is busy. Try again.".into());
         }
     }
 
@@ -2825,6 +3123,7 @@ impl DesktopApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_keyboard(&mut self, event: keyboard::Event) {
         let keyboard::Event::KeyPressed {
             key,
@@ -2835,7 +3134,10 @@ impl DesktopApp {
         else {
             return;
         };
-        if self.handle_transient_keyboard(&key) {
+        if self.handle_global_shortcut(&key, modifiers) {
+            return;
+        }
+        if self.handle_transient_keyboard(&key, modifiers) {
             return;
         }
         if self.terminal_focus.is_focused() {
@@ -2929,8 +3231,88 @@ impl DesktopApp {
         }
     }
 
-    fn handle_transient_keyboard(&mut self, key: &Key) -> bool {
-        if self.modal.is_some() {
+    fn handle_transient_keyboard(&mut self, key: &Key, modifiers: keyboard::Modifiers) -> bool {
+        if matches!(self.modal, Some(Modal::Settings)) {
+            match key.as_ref() {
+                Key::Named(Named::Escape) => self.modal = None,
+                Key::Named(Named::Tab | Named::ArrowRight | Named::ArrowDown) => {
+                    let count = theme_gallery_len(self.disclosures.classic_themes);
+                    if modifiers.shift() {
+                        self.disclosures.settings_theme_focus = self
+                            .disclosures
+                            .settings_theme_focus
+                            .checked_sub(1)
+                            .unwrap_or(count.saturating_sub(1));
+                    } else {
+                        self.disclosures.settings_theme_focus =
+                            (self.disclosures.settings_theme_focus + 1) % count;
+                    }
+                }
+                Key::Named(Named::ArrowLeft | Named::ArrowUp) => {
+                    let count = theme_gallery_len(self.disclosures.classic_themes);
+                    self.disclosures.settings_theme_focus = self
+                        .disclosures
+                        .settings_theme_focus
+                        .checked_sub(1)
+                        .unwrap_or(count.saturating_sub(1));
+                }
+                Key::Named(Named::Enter | Named::Space) => {
+                    if let Some(theme) = theme_gallery_choice(
+                        self.disclosures.settings_theme_focus,
+                        self.disclosures.classic_themes,
+                    ) {
+                        self.desktop_state.theme = theme;
+                        self.mark_state_dirty();
+                    }
+                }
+                Key::Character(value) if value.eq_ignore_ascii_case("c") => {
+                    self.disclosures.classic_themes = !self.disclosures.classic_themes;
+                    let count = theme_gallery_len(self.disclosures.classic_themes);
+                    self.disclosures.settings_theme_focus = self
+                        .disclosures
+                        .settings_theme_focus
+                        .min(count.saturating_sub(1));
+                }
+                Key::Character(value) if value.eq_ignore_ascii_case("u") => {
+                    match &self.update_status {
+                        UpgradeStatus::Available { .. } => self
+                            .send_request(Operation::DownloadUpdate, ClientRequest::DownloadUpdate),
+                        UpgradeStatus::Staged { .. } => self.send_install_request(Vec::new()),
+                        _ => self
+                            .send_request(Operation::CheckForUpdate, ClientRequest::CheckForUpdate),
+                    }
+                }
+                Key::Character(value) if value.eq_ignore_ascii_case("p") => {
+                    self.desktop_state.periodic_update_checks =
+                        !self.desktop_state.periodic_update_checks;
+                    self.mark_state_dirty();
+                }
+                Key::Character(value) if value.eq_ignore_ascii_case("r") => {
+                    state::reset_layout(&mut self.desktop_state);
+                    for (index, split) in self.pane_splits.iter().copied().enumerate() {
+                        self.panes.resize(
+                            split,
+                            f32::from(self.desktop_state.panel_ratios[index]) / 1000.0,
+                        );
+                    }
+                    self.mark_state_dirty();
+                }
+                Key::Character(value) if value.eq_ignore_ascii_case("d") => {
+                    self.open_data_removal_confirmation();
+                }
+                _ => {}
+            }
+            true
+        } else if matches!(self.modal, Some(Modal::Confirmation(_))) {
+            match key {
+                Key::Named(Named::Escape) => self.modal = None,
+                Key::Named(Named::Enter) => self.confirm_action(),
+                _ => {}
+            }
+            true
+        } else if self.handle_session_form_shortcut(key, modifiers) {
+            true
+        } else if self.modal.is_some() {
             if matches!(key, Key::Named(Named::Escape)) {
                 self.modal = None;
             }
@@ -2945,6 +3327,41 @@ impl DesktopApp {
         }
     }
 
+    fn handle_global_shortcut(&mut self, key: &Key, modifiers: keyboard::Modifiers) -> bool {
+        if self.modal.is_none() && is_open_settings_shortcut(key, modifiers) {
+            self.open_settings();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn handle_session_form_shortcut(&mut self, key: &Key, modifiers: keyboard::Modifiers) -> bool {
+        if !matches!(self.modal, Some(Modal::Form(ref modal)) if modal.form.is_session()) {
+            return false;
+        }
+        if matches!(key, Key::Named(Named::Escape)) {
+            self.modal = None;
+            return true;
+        }
+        if !modifiers.alt() {
+            return true;
+        }
+        match key.as_ref() {
+            Key::Character(value) if value.eq_ignore_ascii_case("s") => {
+                self.select_provider(ProviderKind::Shell);
+            }
+            Key::Character(value) if value.eq_ignore_ascii_case("c") => {
+                self.select_provider(ProviderKind::Codex);
+            }
+            Key::Character(value) if value.eq_ignore_ascii_case("r") => {
+                self.probe_selected_provider();
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn select_main_tab(&mut self, tab: MainTab) {
         self.unfocus_terminal();
         if self.main_tab == tab {
@@ -2955,6 +3372,15 @@ impl DesktopApp {
             self.load_diff();
         }
         self.mark_state_dirty();
+    }
+
+    fn open_settings(&mut self) {
+        self.inline_session_rename = None;
+        self.terminal_focus = TerminalFocus::Unfocused;
+        self.disclosures.classic_themes =
+            theme_gallery_index(self.desktop_state.theme) >= FEATURED_THEME_COUNT;
+        self.disclosures.settings_theme_focus = theme_gallery_index(self.desktop_state.theme);
+        self.modal = Some(Modal::Settings);
     }
 
     fn navigate_explorer(&mut self, key: ExplorerKey) {
@@ -3080,10 +3506,24 @@ impl DesktopApp {
         self.inline_session_rename = None;
         let Some(workspace_id) = self.active_workspace().map(|workspace| workspace.id) else {
             self.error = Some("Create a workspace before registering a repository.".into());
-            self.modal = Some(Modal::Form(FormModal::new(Form::workspace())));
+            self.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
+            self.modal_focus = ModalFocus::Pending;
             return;
         };
-        self.modal = Some(Modal::Form(FormModal::new(Form::repository(workspace_id))));
+        let form = Form::repository(workspace_id);
+        self.modal = Some(Modal::Form(
+            if self
+                .snapshot
+                .projects
+                .iter()
+                .all(|project| project.workspace_id != workspace_id)
+            {
+                FormModal::first_run(form)
+            } else {
+                FormModal::new(form)
+            },
+        ));
+        self.modal_focus = ModalFocus::Pending;
     }
 
     fn open_worktree_form(&mut self) {
@@ -3093,6 +3533,7 @@ impl DesktopApp {
             return;
         };
         self.modal = Some(Modal::Form(FormModal::new(Form::worktree(project_id))));
+        self.modal_focus = ModalFocus::Pending;
     }
 
     fn open_session_form(&mut self) {
@@ -3101,10 +3542,13 @@ impl DesktopApp {
             self.error = Some("Select a checkout before starting a session.".into());
             return;
         };
-        self.modal = Some(Modal::Form(FormModal::new(Form::session(
-            worktree_id,
-            self.providers.clone(),
-        ))));
+        let form = Form::session(worktree_id, self.providers.clone());
+        self.modal = Some(Modal::Form(if self.snapshot.sessions.is_empty() {
+            FormModal::first_run(form)
+        } else {
+            FormModal::new(form)
+        }));
+        self.modal_focus = ModalFocus::Pending;
         self.probe_provider(ProviderKind::Codex);
     }
 
@@ -3121,6 +3565,7 @@ impl DesktopApp {
             &project.name,
             FormKind::RenameProject(project.id),
         ))));
+        self.modal_focus = ModalFocus::Pending;
     }
 
     fn open_worktree_rename_form(&mut self) {
@@ -3133,6 +3578,7 @@ impl DesktopApp {
             &worktree.name,
             FormKind::RenameWorktree(worktree.id),
         ))));
+        self.modal_focus = ModalFocus::Pending;
     }
 
     fn begin_session_rename(&mut self, session_id: SessionId) -> Task<Message> {
@@ -3167,7 +3613,7 @@ impl DesktopApp {
             ClientRequest::RenameSession { session_id, name },
         ) && let Some(rename) = &mut self.inline_session_rename
         {
-            rename.fail("The desktop IPC command queue is busy. Try again.".into());
+            rename.fail("The background service is busy. Try again.".into());
         }
     }
 
@@ -3250,8 +3696,7 @@ impl DesktopApp {
         ) && let Some(Modal::Form(modal)) = &mut self.modal
         {
             modal.provider_probe = None;
-            modal.form.submission_error =
-                Some("The desktop IPC command queue is busy. Try again.".into());
+            modal.form.submission_error = Some("The background service is busy. Try again.".into());
         }
     }
 
@@ -3387,6 +3832,7 @@ impl DesktopApp {
 
     fn open_data_removal_confirmation(&mut self) {
         self.modal = Some(Modal::DataRemoval(DataRemovalConfirmation::default()));
+        self.modal_focus = ModalFocus::Pending;
     }
 
     fn submit_data_removal(&mut self) {
@@ -4098,6 +4544,128 @@ fn optional_number<T: ToString>(value: Option<T>, fallback: &str) -> String {
     value.map_or_else(|| fallback.to_owned(), |value| value.to_string())
 }
 
+fn human_readable_timestamp(timestamp_millis: i64) -> Option<String> {
+    let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
+    human_readable_timestamp_for_locale(timestamp_millis, &locale)
+}
+
+fn human_readable_timestamp_for_locale(timestamp_millis: i64, locale: &str) -> Option<String> {
+    let locale = chrono_locale(locale);
+    DateTime::from_timestamp_millis(timestamp_millis).map(|timestamp| {
+        timestamp
+            .with_timezone(&Local)
+            .format_localized("%x %X %Z", locale)
+            .to_string()
+    })
+}
+
+fn chrono_locale(locale: &str) -> Locale {
+    locale
+        .split('.')
+        .next()
+        .unwrap_or(locale)
+        .replace('-', "_")
+        .parse()
+        .unwrap_or(Locale::en_US)
+}
+
+fn optional_human_timestamp(value: Option<i64>, fallback: &str) -> String {
+    value
+        .and_then(human_readable_timestamp)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn bounded_technical_copy(value: &str) -> String {
+    value.chars().take(MAX_TECHNICAL_COPY_CHARS).collect()
+}
+
+fn bounded_redacted_diagnostic(message: &str) -> String {
+    let normalized: String = message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let lowercase = normalized.to_ascii_lowercase();
+    if [
+        "password",
+        "token",
+        "secret",
+        "authorization",
+        "bearer",
+        "api_key",
+        "api-key",
+        "apikey",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+    {
+        return "Diagnostic contained sensitive data and was [redacted].".into();
+    }
+    normalized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_USER_DIAGNOSTIC_CHARS)
+        .collect()
+}
+
+fn contextual_error(operation: Option<Operation>, message: &str) -> String {
+    let context = operation.map_or("Action", operation_error_context);
+    bounded_redacted_diagnostic(&format!("{context}: {message}"))
+}
+
+const fn operation_error_context(operation: Operation) -> &'static str {
+    match operation {
+        Operation::RefreshSnapshot => "Refresh",
+        Operation::ProbeProvider(_) => "Provider check",
+        Operation::CreateWorkspace => "Create workspace",
+        Operation::OpenWorkspace(_) => "Open workspace",
+        Operation::RegisterProject => "Add repository",
+        Operation::CreateWorktree => "Create checkout",
+        Operation::CreateSession(_) => "Start session",
+        Operation::Resume(_) => "Resume session",
+        Operation::RenameProject => "Rename repository",
+        Operation::RenameWorktree => "Rename checkout",
+        Operation::RenameSession => "Rename session",
+        Operation::InspectRemoval(_) | Operation::RemoveWorktree => "Delete checkout",
+        Operation::Attach(_) => "Open terminal",
+        Operation::Detach(_) => "Leave terminal",
+        Operation::Stop(_) => "Stop session",
+        Operation::Resize => "Resize terminal",
+        Operation::LoadDiff(_) => "Load changes",
+        Operation::Input(_) => "Terminal input",
+        Operation::SaveDesktopState => "Save desktop preferences",
+        Operation::CheckForUpdate => "Check for updates",
+        Operation::GetUpdateStatus => "Load update status",
+        Operation::DownloadUpdate => "Download update",
+        Operation::InstallUpdate => "Install update",
+        Operation::PrepareDataRemoval => "Remove SylvOps user data",
+    }
+}
+
+fn human_byte_size(bytes: u64) -> String {
+    const KIB: u64 = 1_024;
+    const MIB: u64 = KIB * 1_024;
+    const GIB: u64 = MIB * 1_024;
+    let (unit, suffix) = if bytes >= GIB {
+        (GIB, "GiB")
+    } else if bytes >= MIB {
+        (MIB, "MiB")
+    } else if bytes >= KIB {
+        (KIB, "KiB")
+    } else {
+        return format!("{bytes} B");
+    };
+    let tenths = bytes.saturating_mul(10) / unit;
+    format!("{}.{:01} {suffix}", tenths / 10, tenths % 10)
+}
+
 fn session_resume_label(session: &Session, sessions: &[Session]) -> &'static str {
     if session_can_resume(session, sessions) {
         "Available"
@@ -4149,11 +4717,11 @@ const fn checkout_delete_available(is_root_checkout: bool, status: WorktreeStatu
     !is_root_checkout && matches!(status, WorktreeStatus::Active)
 }
 
-const fn explorer_attention_symbol(attention: ExplorerAttention) -> &'static str {
+const fn explorer_attention_icon(attention: ExplorerAttention) -> LineIcon {
     match attention {
-        ExplorerAttention::Finished => "✓",
-        ExplorerAttention::NeedsFeedback => "!",
-        ExplorerAttention::Failed => "×",
+        ExplorerAttention::Finished => LineIcon::Finished,
+        ExplorerAttention::NeedsFeedback => LineIcon::NeedsFeedback,
+        ExplorerAttention::Failed => LineIcon::Failed,
     }
 }
 
@@ -4165,26 +4733,26 @@ const fn explorer_attention_label(attention: ExplorerAttention) -> &'static str 
     }
 }
 
-const fn session_indicator_symbol(indicator: SessionIndicator) -> &'static str {
+const fn session_indicator_icon(indicator: SessionIndicator) -> LineIcon {
     match indicator {
-        SessionIndicator::Ready => "○",
-        SessionIndicator::Working => "▶",
-        SessionIndicator::NeedsFeedback => "!",
-        SessionIndicator::Finished => "✓",
-        SessionIndicator::Failed => "×",
-        SessionIndicator::Stopped => "■",
-        SessionIndicator::Disconnected => "◇",
+        SessionIndicator::Ready => LineIcon::Ready,
+        SessionIndicator::Working => LineIcon::Working,
+        SessionIndicator::NeedsFeedback => LineIcon::NeedsFeedback,
+        SessionIndicator::Finished => LineIcon::Finished,
+        SessionIndicator::Failed => LineIcon::Failed,
+        SessionIndicator::Stopped => LineIcon::Stopped,
+        SessionIndicator::Disconnected => LineIcon::Disconnected,
     }
 }
 
 const fn explorer_action_label(action: ExplorerAction) -> &'static str {
     match action {
-        ExplorerAction::CreateCheckout(_) => "+ Checkout",
+        ExplorerAction::CreateCheckout(_) => "New checkout",
         ExplorerAction::RenameRepository(_)
         | ExplorerAction::RenameCheckout(_)
         | ExplorerAction::RenameSession(_) => "Rename",
-        ExplorerAction::CreateSession(_) => "+ Session",
-        ExplorerAction::DeleteCheckout(_) => "Delete",
+        ExplorerAction::CreateSession(_) => "Start session",
+        ExplorerAction::DeleteCheckout(_) => DELETE_CHECKOUT_LABEL,
         ExplorerAction::OpenSession(_) => "Open",
     }
 }
@@ -4227,7 +4795,7 @@ fn form_submit_label(form: &Form, pending: bool, selected_provider_checking: boo
         FormKind::CreateWorktree(_) => "Create checkout",
         FormKind::CreateSession(_) => match form.provider().map(|provider| provider.kind) {
             Some(ProviderKind::Codex) => "Start Codex",
-            Some(ProviderKind::Shell) => "Open Shell",
+            Some(ProviderKind::Shell) => "Start shell",
             Some(_) | None => "Start session",
         },
         FormKind::RenameProject(_) | FormKind::RenameWorktree(_) | FormKind::RenameSession(_) => {
@@ -4236,22 +4804,53 @@ fn form_submit_label(form: &Form, pending: bool, selected_provider_checking: boo
     }
 }
 
-fn first_run_guidance(kind: FormKind) -> Option<&'static str> {
-    match kind {
-        FormKind::CreateWorkspace => Some(
-            "Step 1 of 3 · A Workspace is a local group of repositories you supervise together.",
-        ),
-        FormKind::RegisterProject(_) => Some(
-            "Step 2 of 3 · Add an existing Git Repository. SylvOps records it as a Project and registers its current checkout as the root Worktree.",
-        ),
-        FormKind::CreateSession(_) => Some(
-            "Step 3 of 3 · Choose a Checkout (the root or a managed Worktree), then start a Shell or Codex Session inside it.",
-        ),
-        FormKind::CreateWorktree(_)
-        | FormKind::RenameProject(_)
-        | FormKind::RenameWorktree(_)
-        | FormKind::RenameSession(_) => None,
+fn first_run_checklist(kind: FormKind) -> Element<'static, Message> {
+    let Some(steps) = first_run_steps(kind) else {
+        return space::vertical().height(0).into();
+    };
+    let mut checklist = column![
+        text("Get started").font(UI_SEMIBOLD).size(16),
+        text("Create a workspace, add a repository, then start a session")
+            .size(UI_META_SIZE)
+            .style(text::secondary),
+    ]
+    .spacing(7);
+    for (index, step) in steps.into_iter().enumerate() {
+        let status = match step.state {
+            FirstRunStepState::Complete => "Done",
+            FirstRunStepState::Current => "Current",
+            FirstRunStepState::Upcoming => "Next",
+        };
+        let mut content = column![
+            row![
+                text(format!("{}. {}", index + 1, step.title)).font(UI_MEDIUM),
+                space::horizontal(),
+                text(status).size(UI_META_SIZE).style(text::secondary),
+            ]
+            .align_y(Center),
+        ];
+        if step.state == FirstRunStepState::Current {
+            content = content.push(
+                text(step.description)
+                    .size(UI_META_SIZE)
+                    .style(text::secondary),
+            );
+        }
+        let is_current = step.state == FirstRunStepState::Current;
+        checklist = checklist.push(
+            container(content.spacing(4))
+                .width(Fill)
+                .padding([7, 9])
+                .style(move |theme| {
+                    if is_current {
+                        selected_context_style(theme)
+                    } else {
+                        container::Style::default()
+                    }
+                }),
+        );
     }
+    checklist.into()
 }
 
 fn provider_recovery_message(provider: &ProviderHealth) -> String {
@@ -4259,10 +4858,12 @@ fn provider_recovery_message(provider: &ProviderHealth) -> String {
         let diagnostic = provider
             .diagnostic
             .as_deref()
-            .map_or_else(String::new, |message| format!(" ({message})"));
+            .map_or_else(String::new, |message| {
+                format!(" ({})", bounded_redacted_diagnostic(message))
+            });
         return match provider.kind {
             ProviderKind::Codex => format!(
-                "Codex is unavailable{diagnostic}. Install Codex, then retry discovery. Shell remains available now."
+                "Codex is unavailable{diagnostic}. Install Codex, then check again. Shell remains available now."
             ),
             _ => format!(
                 "{} is unavailable{diagnostic}. Fix its local configuration, then check again.",
@@ -4271,7 +4872,8 @@ fn provider_recovery_message(provider: &ProviderHealth) -> String {
         };
     }
     if provider.kind == ProviderKind::Codex && !provider.authenticated {
-        return "Sign in to Codex on this computer, then retry discovery. Shell remains available now.".into();
+        return "Sign in to Codex on this computer, then check again. Shell remains available now."
+            .into();
     }
     format!("{} is ready.", provider.kind)
 }
@@ -4650,6 +5252,13 @@ fn danger_action_style(theme: &Theme, status: Status) -> button::Style {
     iced_button_intent_style(theme, ButtonIntent::Danger, status)
 }
 
+fn focused_danger_action_style(theme: &Theme, status: Status) -> button::Style {
+    let mut style = danger_action_style(theme, status);
+    style.border.width = 2.0;
+    style.border.color = theme.extended_palette().danger.strong.color;
+    style
+}
+
 fn flat_danger_style(theme: &Theme, status: Status) -> button::Style {
     danger_action_style(theme, status)
 }
@@ -4781,6 +5390,20 @@ fn content_tab_style(theme: &Theme, status: Status, selected: bool) -> button::S
     }
 }
 
+fn theme_preview_style(
+    theme: &Theme,
+    status: Status,
+    selected: bool,
+    focused: bool,
+) -> button::Style {
+    let mut style = content_tab_style(theme, status, selected);
+    if focused {
+        style.border.width = 2.0;
+        style.border.color = theme.extended_palette().primary.strong.color;
+    }
+    style
+}
+
 fn session_tab_group_style(theme: &Theme, selected: bool) -> container::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
@@ -4874,6 +5497,44 @@ fn setting_row<'a>(
     .into()
 }
 
+fn theme_gallery_index(theme: DesktopTheme) -> usize {
+    DesktopTheme::ALL
+        .iter()
+        .position(|choice| *choice == theme)
+        .unwrap_or_default()
+}
+
+const fn theme_gallery_len(classic_themes_expanded: bool) -> usize {
+    if classic_themes_expanded {
+        DesktopTheme::ALL.len()
+    } else {
+        FEATURED_THEME_COUNT
+    }
+}
+
+fn theme_gallery_choice(index: usize, classic_themes_expanded: bool) -> Option<DesktopTheme> {
+    (index < theme_gallery_len(classic_themes_expanded))
+        .then(|| DesktopTheme::ALL.get(index).copied())
+        .flatten()
+}
+
+fn theme_swatch(color: presentation::Rgb) -> Element<'static, Message> {
+    let color = theme::color(color);
+    container(space::horizontal())
+        .width(Fill)
+        .height(18)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(color)),
+            border: Border {
+                width: 1.0,
+                radius: 3.0.into(),
+                color,
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 fn detail(label: &str, value: String) -> Element<'_, Message> {
     row![
         text(label)
@@ -4881,6 +5542,22 @@ fn detail(label: &str, value: String) -> Element<'_, Message> {
             .style(text::secondary),
         text(value)
     ]
+    .align_y(Vertical::Center)
+    .into()
+}
+
+fn technical_detail(label: &'static str, value: String) -> Element<'static, Message> {
+    let copy_value = value.clone();
+    row![
+        text(label)
+            .width(Length::Fixed(170.0))
+            .style(text::secondary),
+        text(value).width(Fill),
+        button("Copy")
+            .on_press(Message::CopyTechnicalValue(copy_value))
+            .style(chrome_action_style),
+    ]
+    .spacing(10)
     .align_y(Vertical::Center)
     .into()
 }
@@ -4907,28 +5584,23 @@ fn retain_inline_session_rename(
     }
 }
 
-const fn active_terminal_action_label(action: ActiveTerminalAction, compact: bool) -> &'static str {
+const fn active_terminal_action_label(
+    action: ActiveTerminalAction,
+    _compact: bool,
+) -> &'static str {
     match action {
-        ActiveTerminalAction::Open => {
-            if compact {
-                "Open"
-            } else {
-                "Open terminal"
-            }
-        }
-        ActiveTerminalAction::Leave => {
-            if compact {
-                "Leave"
-            } else {
-                "Leave terminal"
-            }
-        }
+        ActiveTerminalAction::Open => "Open terminal",
+        ActiveTerminalAction::Leave => "Leave terminal",
         ActiveTerminalAction::ViewOutput => "View output",
     }
 }
 
 fn is_open_terminal_shortcut(value: &str) -> bool {
     value.eq_ignore_ascii_case("o") || value.eq_ignore_ascii_case("a")
+}
+
+fn is_open_settings_shortcut(key: &Key, modifiers: keyboard::Modifiers) -> bool {
+    modifiers.control() && matches!(key.as_ref(), Key::Character(value) if value == ",")
 }
 
 #[cfg(test)]
@@ -4991,7 +5663,7 @@ mod tests {
         let mut first = session(SessionState::Running, None);
         first.worktree_id = worktree_id;
         first.display_name = "First".into();
-        let mut second = session(SessionState::Running, None);
+        let mut second = session(SessionState::NeedsFeedback, None);
         second.worktree_id = worktree_id;
         second.display_name = "Second".into();
         app.snapshot.workspaces.push(Workspace {
@@ -5051,6 +5723,37 @@ mod tests {
         distinct_colors: usize,
         checksum: u64,
     }
+
+    #[cfg(windows)]
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
+        7_107_229_671_282_305_294,
+        13_160_029_486_440_365_148,
+        12_595_225_999_725_143_477,
+        10_690_701_397_139_567_330,
+        17_172_813_117_231_753_177,
+        15_622_382_180_314_406_653,
+        17_977_078_488_199_035_880,
+    ];
+    #[cfg(target_os = "macos")]
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
+        12_016_516_532_157_958_497,
+        10_938_616_273_572_432_211,
+        13_458_278_289_795_482_825,
+        14_093_829_066_763_877_856,
+        3_626_425_705_574_108_520,
+        45_188_728_839_142_635,
+        9_942_103_752_259_472_644,
+    ];
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
+        10_802_420_735_386_369_826,
+        2_034_064_434_892_050_200,
+        15_635_314_370_791_741_553,
+        11_588_738_413_117_789_024,
+        17_079_586_721_189_910_918,
+        2_991_030_526_025_802_914,
+        4_597_883_597_611_191_495,
+    ];
 
     async fn render_desktop_baseline(
         app: &DesktopApp,
@@ -5240,12 +5943,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canopy_rendered_baselines_cover_wide_compact_and_narrow_explorer_shells() {
+    async fn rendered_visual_acceptance_baselines_cover_polished_workflows() {
         let (mut app, _, _, _, _) = desktop_hierarchy();
 
         app.desktop_state.window_width = 1_440;
         app.desktop_state.window_height = 900;
-        let wide = render_desktop_baseline(&app, 1_440, 900).await;
+        let canopy_attention = render_desktop_baseline(&app, 1_440, 900).await;
 
         app.desktop_state.window_width = 900;
         app.desktop_state.window_height = 700;
@@ -5255,22 +5958,70 @@ mod tests {
         app.desktop_state.window_height = 480;
         app.narrow_main = false;
         let narrow_explorer = render_desktop_baseline(&app, 680, 480).await;
-        app.narrow_main = true;
-        let narrow_active = render_desktop_baseline(&app, 680, 480).await;
+        app.modal = Some(Modal::Settings);
+        let narrow_settings = render_desktop_baseline(&app, 680, 480).await;
+
+        app.desktop_state.window_width = 900;
+        app.desktop_state.window_height = 700;
+        app.disclosures.classic_themes = true;
+        let theme_gallery = render_desktop_baseline(&app, 900, 700).await;
+
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-first-run-baseline-{}",
+            SessionId::new()
+        ));
+        let mut first_run = DesktopApp::new(
+            RuntimePaths::discover(Some(&runtime_root)).expect("first-run runtime paths"),
+        );
+        first_run.connection = ConnectionState::Connected;
+        first_run.desktop_state.theme = DesktopTheme::Grove;
+        first_run.desktop_state.window_width = 1_440;
+        first_run.desktop_state.window_height = 900;
+        first_run.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
+        let grove_first_run = render_desktop_baseline(&first_run, 1_440, 900).await;
+
+        app.modal = Some(Modal::Confirmation(Confirmation::StopSession {
+            session_name: "First".into(),
+            cwd: "C:/repo".into(),
+        }));
+        app.error = Some("The session could not be stopped. Check its current state.".into());
+        let confirmation_error = render_desktop_baseline(&app, 900, 700).await;
 
         assert_eq!(
             [
-                wide.layout_nodes,
+                canopy_attention.layout_nodes,
                 compact.layout_nodes,
                 narrow_explorer.layout_nodes,
-                narrow_active.layout_nodes,
+                narrow_settings.layout_nodes,
+                theme_gallery.layout_nodes,
+                grove_first_run.layout_nodes,
+                confirmation_error.layout_nodes,
             ],
-            [119, 121, 81, 72]
+            [127, 129, 89, 183, 239, 110, 149]
         );
-        for baseline in [&wide, &compact, &narrow_explorer, &narrow_active] {
+        let baselines = [
+            &canopy_attention,
+            &compact,
+            &narrow_explorer,
+            &narrow_settings,
+            &theme_gallery,
+            &grove_first_run,
+            &confirmation_error,
+        ];
+        for baseline in baselines {
             assert!(baseline.distinct_colors >= 8, "{baseline:?}");
         }
-        assert_ne!(narrow_explorer.checksum, narrow_active.checksum);
+        let unique_checksums = baselines
+            .map(|baseline| baseline.checksum)
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_checksums.len(), baselines.len());
+        if std::env::var_os("CI").is_some() {
+            assert_eq!(
+                baselines.map(|baseline| baseline.checksum),
+                APPROVED_VISUAL_CHECKSUMS
+            );
+        }
     }
 
     #[test]
@@ -5311,15 +6062,15 @@ mod tests {
     #[test]
     fn appearance_settings_expose_bounded_behavioral_choices() {
         assert_eq!(
-            &DesktopTheme::ALL[..4],
-            &[
+            DesktopTheme::ALL[..FEATURED_THEME_COUNT],
+            [
                 DesktopTheme::System,
                 DesktopTheme::Grove,
                 DesktopTheme::Canopy,
                 DesktopTheme::Midnight,
             ]
         );
-        assert_eq!(DesktopTheme::ALL.len(), 11);
+        assert_eq!(DesktopTheme::ALL.len() - FEATURED_THEME_COUNT, 7);
         assert_eq!(DENSITY_CHOICES.len(), 2);
         assert_eq!(TERMINAL_FONT_CHOICES.len(), 4);
         assert_eq!(TERMINAL_CURSOR_CHOICES.len(), 2);
@@ -5328,6 +6079,63 @@ mod tests {
             TERMINAL_FONT_SIZE_CHOICES[TERMINAL_FONT_SIZE_CHOICES.len() - 1],
             MAX_TERMINAL_FONT_SIZE
         );
+    }
+
+    #[test]
+    fn appearance_preview_cards_are_keyboard_navigable_with_visible_focus_state() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-theme-keyboard-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        app.modal = Some(Modal::Settings);
+
+        assert!(app.handle_transient_keyboard(
+            &Key::Named(Named::ArrowRight),
+            keyboard::Modifiers::default(),
+        ));
+        assert_eq!(app.disclosures.settings_theme_focus, 1);
+        assert!(
+            app.handle_transient_keyboard(
+                &Key::Named(Named::Enter),
+                keyboard::Modifiers::default(),
+            )
+        );
+        assert_eq!(app.desktop_state.theme, DesktopTheme::Grove);
+
+        let theme = app.theme();
+        let focused = theme_preview_style(&theme, Status::Active, false, true);
+        let unfocused = theme_preview_style(&theme, Status::Active, false, false);
+        assert!(focused.border.width > unfocused.border.width);
+        assert!(is_open_settings_shortcut(
+            &Key::Character(",".into()),
+            keyboard::Modifiers::CTRL,
+        ));
+    }
+
+    #[test]
+    fn destructive_confirmation_accepts_enter_and_escape_from_the_keyboard() {
+        let (mut app, _, _, _, _) = desktop_hierarchy();
+        app.open_stop_confirmation();
+        assert!(matches!(app.modal, Some(Modal::Confirmation(_))));
+
+        assert!(
+            app.handle_transient_keyboard(
+                &Key::Named(Named::Enter),
+                keyboard::Modifiers::default(),
+            )
+        );
+        assert!(app.modal.is_none());
+
+        app.open_stop_confirmation();
+        assert!(
+            app.handle_transient_keyboard(
+                &Key::Named(Named::Escape),
+                keyboard::Modifiers::default(),
+            )
+        );
+        assert!(app.modal.is_none());
     }
 
     #[test]
@@ -5343,6 +6151,41 @@ mod tests {
         assert!(create_session.contains("model: None"));
         assert!(create_session.contains("effort: None"));
         assert!(create_session.contains("initial_prompt: None"));
+    }
+
+    #[test]
+    fn session_provider_and_recovery_controls_have_keyboard_paths() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-provider-keyboard-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        app.modal = Some(Modal::Form(FormModal::new(Form::session(
+            WorktreeId::new(),
+            vec![
+                provider_health(ProviderKind::Shell, true, true),
+                provider_health(ProviderKind::Codex, true, true),
+            ],
+        ))));
+
+        assert!(
+            app.handle_transient_keyboard(&Key::Character("c".into()), keyboard::Modifiers::ALT,)
+        );
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form(FormModal { ref form, .. }))
+                if form.provider().is_some_and(|provider| provider.kind == ProviderKind::Codex)
+        ));
+        assert!(app.handle_transient_keyboard(
+            &Key::Character("s".into()),
+            keyboard::Modifiers::default(),
+        ));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form(FormModal { ref form, .. }))
+                if form.provider().is_some_and(|provider| provider.kind == ProviderKind::Codex)
+        ));
     }
 
     #[test]
@@ -5550,6 +6393,62 @@ mod tests {
     }
 
     #[test]
+    fn details_format_dates_for_people_and_bound_technical_copy_payloads() {
+        let formatted =
+            human_readable_timestamp(1_700_000_000_000).expect("a valid millisecond timestamp");
+        assert!(formatted.contains("2023"));
+        assert!(!formatted.contains("1700000000000"));
+        assert_ne!(
+            human_readable_timestamp_for_locale(1_700_000_000_000, "en-US"),
+            human_readable_timestamp_for_locale(1_700_000_000_000, "de-DE")
+        );
+        assert_eq!(chrono_locale("mk-MK"), Locale::mk_MK);
+        assert_eq!(chrono_locale("en_US.UTF-8"), Locale::en_US);
+
+        let oversized = "x".repeat(MAX_TECHNICAL_COPY_CHARS + 10);
+        let bounded = bounded_technical_copy(&oversized);
+        assert_eq!(bounded.chars().count(), MAX_TECHNICAL_COPY_CHARS);
+        assert_eq!(human_byte_size(1_536), "1.5 KiB");
+    }
+
+    #[test]
+    fn diagnostics_are_bounded_single_line_and_redact_secret_assignments() {
+        for message in [
+            "provider failed\ntoken=super-secret".to_owned(),
+            "provider failed password = hunter2".to_owned(),
+            "Authorization: Bearer sk-secret".to_owned(),
+        ] {
+            let diagnostic = bounded_redacted_diagnostic(&message);
+            assert!(!diagnostic.contains("super-secret"));
+            assert!(!diagnostic.contains("hunter2"));
+            assert!(!diagnostic.contains("sk-secret"));
+            assert!(!diagnostic.contains('\n'));
+            assert!(diagnostic.contains("[redacted]"));
+        }
+
+        let oversized = "x".repeat(MAX_USER_DIAGNOSTIC_CHARS + 20);
+        assert_eq!(
+            bounded_redacted_diagnostic(&oversized).chars().count(),
+            MAX_USER_DIAGNOSTIC_CHARS
+        );
+    }
+
+    #[test]
+    fn copying_technical_details_does_not_dismiss_an_unrelated_error() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-copy-error-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+        app.error = Some("Keep this visible".into());
+
+        let _ = app.update(Message::CopyTechnicalValue("bounded value".into()));
+
+        assert_eq!(app.error.as_deref(), Some("Keep this visible"));
+    }
+
+    #[test]
     fn inactive_session_actions_are_safe_and_explicit() {
         assert!(session_can_stop(SessionState::Running));
         assert!(!session_can_stop(SessionState::Terminated));
@@ -5697,14 +6596,14 @@ mod tests {
     }
 
     #[test]
-    fn terminal_actions_use_short_single_line_labels_when_space_is_tight() {
+    fn terminal_actions_keep_standardized_labels_at_every_width() {
         assert_eq!(
             active_terminal_action_label(ActiveTerminalAction::Open, false),
             "Open terminal"
         );
         assert_eq!(
             active_terminal_action_label(ActiveTerminalAction::Open, true),
-            "Open"
+            "Open terminal"
         );
         assert_eq!(
             active_terminal_action_label(ActiveTerminalAction::Leave, false),
@@ -5712,7 +6611,7 @@ mod tests {
         );
         assert_eq!(
             active_terminal_action_label(ActiveTerminalAction::Leave, true),
-            "Leave"
+            "Leave terminal"
         );
         assert_eq!(
             active_terminal_action_label(ActiveTerminalAction::ViewOutput, true),
@@ -5737,18 +6636,43 @@ mod tests {
 
     #[test]
     fn first_run_copy_explains_the_hierarchy_in_order() {
-        assert!(
-            first_run_guidance(FormKind::CreateWorkspace)
-                .is_some_and(|message| message.contains("Workspace"))
+        let steps = first_run_steps(FormKind::CreateWorkspace).unwrap();
+        assert_eq!(
+            steps.map(|step| step.title),
+            ["Create workspace", "Add repository", "Start session"]
         );
-        assert!(
-            first_run_guidance(FormKind::RegisterProject(WorkspaceId::new()))
-                .is_some_and(|message| message.contains("Project") && message.contains("Worktree"))
-        );
-        assert!(
-            first_run_guidance(FormKind::CreateSession(WorktreeId::new()))
-                .is_some_and(|message| message.contains("Worktree") && message.contains("Session"))
-        );
+        assert!(steps[0].description.contains("repositories"));
+        assert!(steps[1].description.contains("root checkout"));
+        assert!(steps[2].description.contains("Shell or Codex"));
+    }
+
+    #[test]
+    fn cancelled_first_run_can_resume_from_the_empty_state() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "sylvops-desktop-first-run-resume-test-{}",
+            SessionId::new()
+        ));
+        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
+        let mut app = DesktopApp::new(paths);
+
+        let _ = app.update(Message::NewWorkspace);
+        assert_eq!(app.modal_focus, ModalFocus::Pending);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form(FormModal {
+                first_run: true,
+                ..
+            }))
+        ));
+        let _ = app.update(Message::CancelModal);
+        let _ = app.update(Message::NewWorkspace);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form(FormModal {
+                first_run: true,
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -5757,11 +6681,12 @@ mod tests {
             provider_recovery_message(&provider_health(ProviderKind::Codex, false, false));
         assert!(unavailable.contains("Install Codex"));
         assert!(unavailable.contains("Shell remains available"));
+        assert_eq!(CHECK_AGAIN_LABEL, "Check again");
 
         let unauthenticated =
             provider_recovery_message(&provider_health(ProviderKind::Codex, true, false));
         assert!(unauthenticated.contains("Sign in to Codex"));
-        assert!(unauthenticated.contains("retry discovery"));
+        assert!(unauthenticated.contains("check again"));
     }
 
     #[test]
@@ -5787,7 +6712,7 @@ mod tests {
                 false,
                 false,
             ),
-            "Open Shell"
+            "Start shell"
         );
     }
 
@@ -5805,30 +6730,6 @@ mod tests {
 
         let _ = app.update(Message::CancelModal);
         assert!(app.modal.is_none());
-    }
-
-    #[test]
-    fn desktop_data_removal_becomes_irreversible_only_after_exact_confirmation() {
-        let runtime_root = std::env::temp_dir().join(format!(
-            "sylvops-desktop-data-removal-submit-test-{}",
-            SessionId::new()
-        ));
-        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
-        let mut app = DesktopApp::new(paths);
-
-        app.open_data_removal_confirmation();
-        let _ = app.update(Message::DataRemovalConfirmationInput(
-            sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION.into(),
-        ));
-        let _ = app.update(Message::SubmitDataRemoval);
-
-        assert!(matches!(
-            app.modal,
-            Some(Modal::DataRemoval(DataRemovalConfirmation {
-                pending: true,
-                ..
-            }))
-        ));
     }
 
     #[test]
