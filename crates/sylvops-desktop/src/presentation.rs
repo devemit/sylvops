@@ -1672,12 +1672,18 @@ mod tests {
             },
         });
 
-        assert!(presentation.navigator.repositories[0].actions.is_empty());
+        assert_eq!(
+            presentation.navigator.repositories[0].actions,
+            Vec::<NavigatorAction>::new()
+        );
         assert_eq!(
             presentation.navigator.checkouts[0].actions,
             vec![NavigatorAction::DeleteCheckout(fixture.worktree_id)]
         );
-        assert!(presentation.navigator.sessions[0].actions.is_empty());
+        assert_eq!(
+            presentation.navigator.sessions[0].actions,
+            Vec::<NavigatorAction>::new()
+        );
     }
 
     #[test]
