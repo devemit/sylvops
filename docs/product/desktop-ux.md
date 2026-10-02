@@ -24,6 +24,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 - Workspace tabs are full-height segments separated by vertical rules. Selected tabs and rows use a restrained theme tint, a contrast-safe accent outline, and stronger type instead of saturated text backgrounds; inactive controls remain transparent until hover or press.
 - A session label and its close action are one visual group.
 - Session navigator rows use `Name · State`; open-session tabs show only the name and never prepend a status glyph.
+- Explorer rows visibly identify their level as Repository, Checkout, or Session and use simple nested spacing plus restrained tonal surfaces. The Explorer header explains the containment order instead of relying on indentation alone.
 - Double-clicking a session row or pressing `R` focuses its inline rename editor. Enter saves through the daemon; Escape or clicking away cancels before submission. The editor has no redundant Save or Cancel buttons. Validation and IPC errors preserve the entered value.
 - Navigator interaction clears terminal keyboard focus without detaching the session. Long single-line navigation labels stay clipped inside their controls. SylvOps does not show hover tooltips; important meaning must be visible in the interface or available through the shortcuts panel.
 - An active managed checkout exposes `Delete checkout` on its selected row. The existing state-bound confirmation still refuses root, external, dirty, missing, invalid, or live-session removal and preserves the Git branch.
@@ -34,7 +35,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 - Appearance uses keyboard-reachable preview cards for System, Grove, Canopy, and Midnight. Nord, Tokyo Night, Catppuccin, Dracula, Gruvbox Dark, Solarized Light, and Solarized Dark remain in an expandable Classic group. Preview selection persists without Apply or Cancel semantics. Density, terminal typeface, text size, and cursor remain aligned bounded controls; missing named fonts fall back through the renderer.
 - One application-owned single-stroke icon family supplies brand, disclosure, close, and status marks. Ambiguous, important, and destructive actions retain visible text.
 - The desktop and TUI new-session forms expose the provider picker and optional display name only. Model, effort, and initial prompt remain supported by the CLI and protocol but are not interactive-form settings.
-- The footer contains version, current workspace/checkout context, connection health, and essential shortcuts. Internal enum names and keyboard-panel debug state are not user-facing status.
+- The footer presents the actual build identity (including an unsigned-preview or release tag when supplied at build time), local-daemon health beside the version, responsive Workspace/Repository/Checkout/Session context, the active content view, and essential shortcuts. Internal enum names and keyboard-panel debug state are not user-facing status.
 
 ## Embedded terminal baseline
 

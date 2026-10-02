@@ -39,9 +39,9 @@ use icons::{LineIcon, line_icon};
 use presentation::{
     ActiveTerminalAction, ButtonIntent, ButtonTokens, ControlState, DensityMetrics,
     DesktopPresentation, ExplorerAction, ExplorerAttention, ExplorerIntent, ExplorerKey,
-    ExplorerMode, ExplorerNodeId, InteractionState as PresentationInteraction, PresentationInput,
-    PresentationLayout, PresentationTheme, SessionIndicator, SettingsMode, SystemAppearance,
-    TerminalPalette, Viewport, WorkspaceNavigation, button_visual,
+    ExplorerMode, ExplorerNodeId, ExplorerNodeKind, InteractionState as PresentationInteraction,
+    PresentationInput, PresentationLayout, PresentationTheme, SessionIndicator, SettingsMode,
+    SystemAppearance, TerminalPalette, Viewport, WorkspaceNavigation, button_visual,
     session_state_can_replay as session_can_replay, session_state_can_stop as session_can_stop,
     session_state_label,
 };
@@ -266,7 +266,7 @@ enum DesktopPane {
     Main,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionState {
     Connecting,
     Connected,
@@ -943,14 +943,18 @@ impl DesktopApp {
         let actions = actions
             .push(self.refresh_button(compact))
             .push(
-                button(text(fullscreen_label).font(UI_MEDIUM).size(UI_META_SIZE))
-                    .on_press(Message::ToggleFullscreen)
-                    .height(density.control_height)
-                    .padding([6, 11])
-                    .style(chrome_action_style),
+                button(centered_button_label(
+                    fullscreen_label,
+                    UI_META_SIZE,
+                    UI_MEDIUM,
+                ))
+                .on_press(Message::ToggleFullscreen)
+                .height(density.control_height)
+                .padding([6, 11])
+                .style(chrome_action_style),
             )
             .push(
-                button(text("Settings").font(UI_MEDIUM).size(UI_META_SIZE))
+                button(centered_button_label("Settings", UI_META_SIZE, UI_MEDIUM))
                     .on_press(Message::ToggleSettings)
                     .height(density.control_height)
                     .padding([6, 11])
@@ -971,7 +975,7 @@ impl DesktopApp {
     fn workspace_navigation(
         &self,
         presentation: &DesktopPresentation,
-        compact: bool,
+        _compact: bool,
     ) -> Element<'static, Message> {
         let density = presentation.density;
         if presentation.workspace_navigation == WorkspaceNavigation::LabeledSwitcher {
@@ -995,11 +999,15 @@ impl DesktopApp {
                 ))
                 .placeholder("Choose workspace")
                 .width(Fill),
-                button(text("+").font(UI_MEDIUM).size(16))
-                    .on_press(Message::NewWorkspace)
-                    .height(density.control_height)
-                    .padding([5, 10])
-                    .style(chrome_action_style),
+                button(centered_button_label(
+                    workspace_add_label(),
+                    16.0,
+                    UI_MEDIUM,
+                ))
+                .on_press(Message::NewWorkspace)
+                .height(density.control_height)
+                .padding([5, 10])
+                .style(chrome_action_style),
             ]
             .spacing(5)
             .align_y(Center)
@@ -1014,10 +1022,12 @@ impl DesktopApp {
             }
             let active = workspace.is_open;
             let action = button(
-                text(workspace.name.clone())
-                    .font(if active { UI_SEMIBOLD } else { UI_FONT })
-                    .size(UI_TEXT_SIZE)
-                    .wrapping(text::Wrapping::None),
+                centered_button_label(
+                    workspace.name.clone(),
+                    UI_TEXT_SIZE,
+                    if active { UI_SEMIBOLD } else { UI_FONT },
+                )
+                .wrapping(text::Wrapping::None),
             )
             .on_press(Message::SelectWorkspace(workspace.id))
             .height(density.control_height)
@@ -1029,11 +1039,11 @@ impl DesktopApp {
             workspace_tabs = workspace_tabs.push(rule::vertical(1));
         }
         workspace_tabs = workspace_tabs.push(
-            button(
-                text(if compact { "New" } else { "New workspace" })
-                    .font(UI_MEDIUM)
-                    .size(if compact { 16.0 } else { UI_META_SIZE }),
-            )
+            button(centered_button_label(
+                workspace_add_label(),
+                16.0,
+                UI_MEDIUM,
+            ))
             .on_press(Message::NewWorkspace)
             .height(density.control_height)
             .padding([5, 11])
@@ -1057,7 +1067,7 @@ impl DesktopApp {
         } else {
             "Refresh"
         };
-        button(text(label).size(12))
+        button(centered_button_label(label, 12.0, UI_MEDIUM))
             .on_press_maybe(can_refresh.then_some(Message::Refresh))
             .height(control_height)
             .padding([5, 10])
@@ -1138,22 +1148,23 @@ impl DesktopApp {
         let presentation = self.presentation();
         let density = presentation.density;
         let mut heading = row![
-            text("Explorer")
-                .font(UI_SEMIBOLD)
-                .size(UI_META_SIZE)
-                .style(text::secondary),
+            text("Explorer").font(UI_SEMIBOLD).size(16),
             space::horizontal(),
-            button(text("Add repository").font(UI_MEDIUM).size(UI_META_SIZE))
-                .on_press(Message::NewProject)
-                .height(density.control_height)
-                .padding([4, 8])
-                .style(chrome_action_style),
+            button(centered_button_label(
+                "Add repository",
+                UI_META_SIZE,
+                UI_MEDIUM,
+            ))
+            .on_press(Message::NewProject)
+            .height(density.control_height)
+            .padding([4, 8])
+            .style(chrome_action_style),
         ]
         .spacing(4)
         .align_y(Center);
         if presentation.explorer.mode == ExplorerMode::Collapsible {
             heading = heading.push(
-                button(text("Hide").font(UI_MEDIUM).size(UI_META_SIZE))
+                button(centered_button_label("Hide", UI_META_SIZE, UI_MEDIUM))
                     .on_press(Message::ToggleExplorer)
                     .height(density.control_height)
                     .padding([4, 8])
@@ -1161,10 +1172,17 @@ impl DesktopApp {
             );
         }
         let mut items = column![
-            container(heading)
-                .height(density.panel_header_height)
-                .padding([4, 7])
-                .width(Fill)
+            container(
+                column![
+                    heading,
+                    text("Repositories contain checkouts; checkouts contain sessions.")
+                        .size(UI_META_SIZE)
+                        .style(text::secondary),
+                ]
+                .spacing(3),
+            )
+            .padding([7, 8])
+            .width(Fill)
         ]
         .spacing(2);
         for row in &presentation.explorer.rows {
@@ -1254,18 +1272,32 @@ impl DesktopApp {
                 .style(text::secondary)
                 .into()
         };
-        let labels = column![
-            text(row.label.clone())
-                .font(if is_selected { UI_MEDIUM } else { UI_FONT })
-                .size(UI_TEXT_SIZE)
+        let kind = row.kind;
+        let badge = container(
+            text(explorer_kind_label(kind))
+                .font(UI_SEMIBOLD)
+                .size(10)
                 .wrapping(text::Wrapping::None),
+        )
+        .padding([2, 6])
+        .style(move |theme| explorer_kind_badge_style(theme, kind));
+        let labels = column![
+            row![
+                badge,
+                text(row.label.clone())
+                    .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
+                    .size(UI_TEXT_SIZE)
+                    .wrapping(text::Wrapping::None),
+            ]
+            .spacing(6)
+            .align_y(Center),
             detail,
         ]
         .spacing(1)
         .width(Fill);
         let content = container(
             row![
-                space::horizontal().width(Length::Fixed(f32::from(row.depth) * 14.0)),
+                space::horizontal().width(Length::Fixed(f32::from(row.depth) * 18.0)),
                 disclosure,
                 labels,
             ]
@@ -1273,10 +1305,10 @@ impl DesktopApp {
             .align_y(Center),
         )
         .width(Fill)
-        .height(density.row_height.max(38))
-        .padding([3, 5])
+        .height(density.row_height.max(44))
+        .padding([4, 6])
         .clip(true)
-        .style(move |theme| list_item_container_style(theme, is_selected, is_hovered));
+        .style(move |theme| explorer_row_container_style(theme, is_selected, is_hovered, kind));
         let double_click = match row.id {
             ExplorerNodeId::Session(session_id) => Message::BeginSessionRename(session_id),
             ExplorerNodeId::Repository(_) | ExplorerNodeId::Checkout(_) => {
@@ -1296,28 +1328,32 @@ impl DesktopApp {
         let density = self.presentation().density;
         let presentation_theme = self.presentation().theme;
         let mut controls =
-            row![space::horizontal().width(Length::Fixed(f32::from(depth + 1) * 14.0 + 24.0))]
+            row![space::horizontal().width(Length::Fixed(f32::from(depth + 1) * 18.0 + 24.0))]
                 .spacing(4)
                 .align_y(Center);
         for action in actions {
             let action = *action;
             let danger = matches!(action, ExplorerAction::DeleteCheckout(_));
             controls = controls.push(
-                button(text(explorer_action_label(action)).size(UI_META_SIZE))
-                    .on_press(Message::RunExplorerAction(action))
-                    .height(density.control_height)
-                    .padding([4, 7])
-                    .style(move |_theme, status| {
-                        button_intent_style(
-                            presentation_theme,
-                            if danger {
-                                ButtonIntent::Danger
-                            } else {
-                                ButtonIntent::Quiet
-                            },
-                            status,
-                        )
-                    }),
+                button(centered_button_label(
+                    explorer_action_label(action),
+                    UI_META_SIZE,
+                    UI_MEDIUM,
+                ))
+                .on_press(Message::RunExplorerAction(action))
+                .height(density.control_height)
+                .padding([4, 7])
+                .style(move |_theme, status| {
+                    button_intent_style(
+                        presentation_theme,
+                        if danger {
+                            ButtonIntent::Danger
+                        } else {
+                            ButtonIntent::Quiet
+                        },
+                        status,
+                    )
+                }),
             );
         }
         scrollable(controls)
@@ -1393,10 +1429,12 @@ impl DesktopApp {
                 container(
                     row![
                         button(
-                            text(label)
-                                .font(if active { UI_SEMIBOLD } else { UI_FONT })
-                                .size(UI_TEXT_SIZE)
-                                .wrapping(text::Wrapping::None)
+                            centered_button_label(
+                                label,
+                                UI_TEXT_SIZE,
+                                if active { UI_SEMIBOLD } else { UI_FONT },
+                            )
+                            .wrapping(text::Wrapping::None)
                         )
                         .on_press(Message::SelectOpenSession(session_id))
                         .height(density.row_height)
@@ -1485,10 +1523,12 @@ impl DesktopApp {
                 };
                 actions = actions.push(
                     button(
-                        text(active_terminal_action_label(action, compact))
-                            .font(UI_MEDIUM)
-                            .size(UI_META_SIZE)
-                            .wrapping(text::Wrapping::None),
+                        centered_button_label(
+                            active_terminal_action_label(action, compact),
+                            UI_META_SIZE,
+                            UI_MEDIUM,
+                        )
+                        .wrapping(text::Wrapping::None),
                     )
                     .on_press(message)
                     .height(density.control_height)
@@ -1500,25 +1540,29 @@ impl DesktopApp {
             }
             if can_stop {
                 actions = actions.push(
-                    button(text(STOP_SESSION_LABEL).font(UI_MEDIUM).size(UI_META_SIZE))
-                        .on_press(Message::Stop)
-                        .height(density.control_height)
-                        .padding([6, 9])
-                        .style(move |_theme, status| {
-                            button_intent_style(presentation_theme, ButtonIntent::Danger, status)
-                        }),
+                    button(centered_button_label(
+                        STOP_SESSION_LABEL,
+                        UI_META_SIZE,
+                        UI_MEDIUM,
+                    ))
+                    .on_press(Message::Stop)
+                    .height(density.control_height)
+                    .padding([6, 9])
+                    .style(move |_theme, status| {
+                        button_intent_style(presentation_theme, ButtonIntent::Danger, status)
+                    }),
                 );
             } else if can_resume {
                 actions = actions.push(
-                    button(
-                        text(if resume_pending {
+                    button(centered_button_label(
+                        if resume_pending {
                             "Resuming…"
                         } else {
                             "Resume"
-                        })
-                        .font(UI_MEDIUM)
-                        .size(UI_META_SIZE),
-                    )
+                        },
+                        UI_META_SIZE,
+                        UI_MEDIUM,
+                    ))
                     .on_press_maybe((!resume_pending).then_some(Message::Resume(session_id)))
                     .height(density.control_height)
                     .padding([6, 9])
@@ -1894,7 +1938,7 @@ impl DesktopApp {
                 row![
                     text("Keyboard shortcuts").font(UI_SEMIBOLD).size(22),
                     space::horizontal(),
-                    button("Done")
+                    button(centered_button_label("Done", UI_META_SIZE, UI_MEDIUM))
                         .on_press(Message::CancelModal)
                         .height(density.control_height)
                         .padding([6, 12])
@@ -1977,7 +2021,7 @@ impl DesktopApp {
             row![
                 text("Settings").font(UI_SEMIBOLD).size(24),
                 space::horizontal(),
-                button(text("Done").font(UI_MEDIUM).size(12))
+                button(centered_button_label("Done", 12.0, UI_MEDIUM))
                     .on_press(Message::ToggleSettings)
                     .height(density.control_height)
                     .padding([6, 10])
@@ -2049,13 +2093,16 @@ impl DesktopApp {
                 let selected = self.desktop_state.theme == choice;
                 let focused = self.disclosures.settings_theme_focus == theme_gallery_index(choice);
                 classic = classic.push(
-                    button(text(choice.to_string()).wrapping(text::Wrapping::None))
-                        .on_press(Message::SelectTheme(choice))
-                        .height(density.control_height)
-                        .padding([5, 9])
-                        .style(move |theme, status| {
-                            theme_preview_style(theme, status, selected, focused)
-                        }),
+                    button(
+                        centered_button_label(choice.to_string(), UI_META_SIZE, UI_MEDIUM)
+                            .wrapping(text::Wrapping::None),
+                    )
+                    .on_press(Message::SelectTheme(choice))
+                    .height(density.control_height)
+                    .padding([5, 9])
+                    .style(move |theme, status| {
+                        theme_preview_style(theme, status, selected, focused)
+                    }),
                 );
             }
             gallery = gallery.push(
@@ -2437,13 +2484,24 @@ impl DesktopApp {
     }
 
     fn footer(&self) -> Element<'_, Message> {
-        let density = self.presentation().density;
-        let compact = self.desktop_state.window_width < 900;
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let width = self.desktop_state.window_width;
         let workspace = self
             .active_workspace()
-            .map_or("No workspace", |workspace| workspace.name.as_str());
+            .map_or_else(|| "None".to_owned(), |workspace| workspace.name.clone());
+        let repository = presentation
+            .selection
+            .project_id
+            .and_then(|id| {
+                self.snapshot
+                    .projects
+                    .iter()
+                    .find(|project| project.id == id)
+            })
+            .map_or_else(|| "None".to_owned(), |project| project.name.clone());
         let checkout = self.selected_worktree().map_or_else(
-            || "No checkout".to_owned(),
+            || "None".to_owned(),
             |worktree| {
                 format!(
                     "{} · {}",
@@ -2452,37 +2510,53 @@ impl DesktopApp {
                 )
             },
         );
-        let connection: Element<'_, Message> = match self.connection {
-            ConnectionState::Connecting => text("Connecting")
-                .size(FOOTER_TEXT_SIZE)
-                .style(text::warning)
-                .into(),
-            ConnectionState::Connected => text("Connected")
-                .size(FOOTER_TEXT_SIZE)
-                .style(text::success)
-                .into(),
-            ConnectionState::Disconnected => text("Disconnected")
-                .size(FOOTER_TEXT_SIZE)
-                .style(text::danger)
-                .into(),
-        };
+        let session = presentation
+            .selection
+            .active_session_id
+            .and_then(|id| self.session(id))
+            .map_or_else(
+                || "None".to_owned(),
+                |session| {
+                    format!(
+                        "{} · {}",
+                        session.display_name,
+                        session_state_label(session.state)
+                    )
+                },
+            );
         let mut status = row![
-            text(format!("SylvOps {}", env!("CARGO_PKG_VERSION")))
+            text(application_version_text())
                 .font(UI_SEMIBOLD)
                 .size(FOOTER_TEXT_SIZE),
-            footer_separator(),
-            footer_item(workspace),
+            footer_connection(self.connection),
         ]
         .spacing(density.region_spacing)
         .align_y(Center);
-        if !compact {
-            status = status.push(footer_separator()).push(footer_item(&checkout));
-        }
-        status = status.push(space::horizontal()).push(connection);
-        if !compact {
+        if width >= 720 {
             status = status
                 .push(footer_separator())
-                .push(footer_item("Ctrl+K shortcuts  ·  Ctrl+] leave terminal"));
+                .push(footer_context("Workspace", workspace));
+        }
+        if width >= 980 {
+            status = status
+                .push(footer_separator())
+                .push(footer_context("Repository", repository))
+                .push(footer_separator())
+                .push(footer_context("Checkout", checkout));
+        }
+        if width >= 1_180 {
+            status = status
+                .push(footer_separator())
+                .push(footer_context("Session", session));
+        }
+        status = status.push(space::horizontal()).push(footer_context(
+            "View",
+            main_tab_label(presentation.selection.main_tab).to_owned(),
+        ));
+        if width >= 1_180 {
+            status = status
+                .push(footer_separator())
+                .push(footer_item("Ctrl+K shortcuts"));
         }
         container(status)
             .height(density.footer_height)
@@ -4765,10 +4839,12 @@ fn tab_button(
 ) -> Element<'_, Message> {
     let selected = tab == active;
     button(
-        text(label)
-            .font(if selected { UI_SEMIBOLD } else { UI_FONT })
-            .size(UI_TEXT_SIZE)
-            .wrapping(text::Wrapping::None),
+        centered_button_label(
+            label.to_owned(),
+            UI_TEXT_SIZE,
+            if selected { UI_SEMIBOLD } else { UI_FONT },
+        )
+        .wrapping(text::Wrapping::None),
     )
     .on_press(Message::SelectMainTab(tab))
     .height(density.control_height)
@@ -5045,7 +5121,9 @@ fn centered_action(
     container(
         column![
             text(message).style(text::secondary),
-            button(label).on_press(action).style(primary_action_style),
+            button(centered_button_label(label, UI_TEXT_SIZE, UI_MEDIUM))
+                .on_press(action)
+                .style(primary_action_style),
         ]
         .spacing(12)
         .align_x(Center),
@@ -5064,13 +5142,65 @@ fn empty_action(
     container(
         column![
             text(message).size(UI_META_SIZE).style(text::secondary),
-            button(label).on_press(action).style(chrome_action_style),
+            button(centered_button_label(label, UI_META_SIZE, UI_MEDIUM))
+                .on_press(action)
+                .style(chrome_action_style),
         ]
         .spacing(8),
     )
     .padding(8)
     .width(Fill)
     .into()
+}
+
+fn centered_button_label(label: impl Into<String>, size: f32, font: Font) -> widget::Text<'static> {
+    text(label.into())
+        .font(font)
+        .size(size)
+        .height(Fill)
+        .align_x(Center)
+        .align_y(Vertical::Center)
+}
+
+fn application_version_text() -> String {
+    format_application_version(
+        option_env!("PREVIEW_TAG"),
+        option_env!("RELEASE_TAG"),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn format_application_version(
+    preview_tag: Option<&str>,
+    release_tag: Option<&str>,
+    package_version: &str,
+) -> String {
+    let version = preview_tag.or(release_tag).unwrap_or(package_version);
+    if version.starts_with('v') {
+        format!("SylvOps {version}")
+    } else {
+        format!("SylvOps v{version}")
+    }
+}
+
+const fn main_tab_label(tab: MainTab) -> &'static str {
+    match tab {
+        MainTab::Terminal => "Terminal",
+        MainTab::Changes => "Changes",
+        MainTab::Details => "Details",
+    }
+}
+
+const fn explorer_kind_label(kind: ExplorerNodeKind) -> &'static str {
+    match kind {
+        ExplorerNodeKind::Repository => "REPOSITORY",
+        ExplorerNodeKind::Checkout => "CHECKOUT",
+        ExplorerNodeKind::Session => "SESSION",
+    }
+}
+
+const fn workspace_add_label() -> &'static str {
+    "+"
 }
 
 fn footer_item(label: &str) -> Element<'static, Message> {
@@ -5081,11 +5211,45 @@ fn footer_item(label: &str) -> Element<'static, Message> {
         .into()
 }
 
+fn footer_context(label: &'static str, value: String) -> Element<'static, Message> {
+    container(
+        row![
+            text(format!("{label}:"))
+                .font(UI_MEDIUM)
+                .size(FOOTER_TEXT_SIZE),
+            text(value)
+                .size(FOOTER_TEXT_SIZE)
+                .style(text::secondary)
+                .wrapping(text::Wrapping::None),
+        ]
+        .spacing(4)
+        .align_y(Center),
+    )
+    .clip(true)
+    .into()
+}
+
+fn footer_connection(connection: ConnectionState) -> Element<'static, Message> {
+    let (icon, label) = match connection {
+        ConnectionState::Connecting => (LineIcon::Working, "Daemon connecting"),
+        ConnectionState::Connected => (LineIcon::Finished, "Daemon connected"),
+        ConnectionState::Disconnected => (LineIcon::Disconnected, "Daemon offline"),
+    };
+    container(
+        row![
+            line_icon(icon, 12),
+            text(label).font(UI_MEDIUM).size(FOOTER_TEXT_SIZE),
+        ]
+        .spacing(4)
+        .align_y(Center),
+    )
+    .padding([3, 7])
+    .style(move |theme| footer_connection_style(theme, connection))
+    .into()
+}
+
 fn footer_separator() -> Element<'static, Message> {
-    text("/")
-        .size(FOOTER_TEXT_SIZE)
-        .style(text::secondary)
-        .into()
+    container(rule::vertical(1)).height(16).into()
 }
 
 fn chrome_surface(theme: &Theme) -> container::Style {
@@ -5354,6 +5518,67 @@ fn list_item_container_style(theme: &Theme, selected: bool, hovered: bool) -> co
         background: style.background,
         text_color: Some(style.text_color),
         border: style.border,
+        ..container::Style::default()
+    }
+}
+
+fn explorer_row_container_style(
+    theme: &Theme,
+    selected: bool,
+    hovered: bool,
+    kind: ExplorerNodeKind,
+) -> container::Style {
+    let mut style = list_item_container_style(theme, selected, hovered);
+    if !selected && !hovered {
+        let palette = theme.extended_palette();
+        style.background = Some(Background::Color(match kind {
+            ExplorerNodeKind::Repository => palette.background.weaker.color,
+            ExplorerNodeKind::Checkout => palette.background.weakest.color,
+            ExplorerNodeKind::Session => palette.background.base.color,
+        }));
+        style.border = Border {
+            width: 1.0,
+            radius: 5.0.into(),
+            color: palette.background.weak.color,
+        };
+    }
+    style
+}
+
+fn explorer_kind_badge_style(theme: &Theme, kind: ExplorerNodeKind) -> container::Style {
+    let palette = theme.extended_palette();
+    let pair = match kind {
+        ExplorerNodeKind::Repository => palette.primary.weak,
+        ExplorerNodeKind::Checkout => palette.secondary.weak,
+        ExplorerNodeKind::Session => palette.background.weak,
+    };
+    container::Style {
+        background: Some(Background::Color(pair.color)),
+        text_color: Some(contrast_safe_text(pair.color, pair.text)),
+        border: Border {
+            width: 1.0,
+            radius: 4.0.into(),
+            color: pair.color,
+        },
+        ..container::Style::default()
+    }
+}
+
+fn footer_connection_style(theme: &Theme, connection: ConnectionState) -> container::Style {
+    let palette = theme.extended_palette();
+    let (pair, border) = match connection {
+        ConnectionState::Connecting => (palette.warning.weak, palette.warning.strong.color),
+        ConnectionState::Connected => (palette.success.weak, palette.success.strong.color),
+        ConnectionState::Disconnected => (palette.danger.weak, palette.danger.strong.color),
+    };
+    container::Style {
+        background: Some(Background::Color(pair.color)),
+        text_color: Some(contrast_safe_text(pair.color, pair.text)),
+        border: Border {
+            width: 1.0,
+            radius: 5.0.into(),
+            color: border,
+        },
         ..container::Style::default()
     }
 }
@@ -5997,7 +6222,7 @@ mod tests {
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [127, 129, 89, 183, 239, 110, 149]
+            [169, 150, 108, 202, 260, 140, 170]
         );
         let baselines = [
             &canopy_attention,
@@ -6390,6 +6615,24 @@ mod tests {
         const {
             assert!(FOOTER_TEXT_SIZE >= 12.0);
         }
+        assert!(application_version_text().starts_with("SylvOps v"));
+        assert_eq!(
+            format_application_version(Some("v0.1.0-preview.2"), None, "0.1.0"),
+            "SylvOps v0.1.0-preview.2"
+        );
+        assert_eq!(workspace_add_label(), "+");
+    }
+
+    #[test]
+    fn explorer_rows_name_each_level_in_plain_language() {
+        assert_eq!(
+            [
+                explorer_kind_label(ExplorerNodeKind::Repository),
+                explorer_kind_label(ExplorerNodeKind::Checkout),
+                explorer_kind_label(ExplorerNodeKind::Session),
+            ],
+            ["REPOSITORY", "CHECKOUT", "SESSION"]
+        );
     }
 
     #[test]

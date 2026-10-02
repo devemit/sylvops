@@ -275,9 +275,9 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 ### Desktop essentials
 
 - `sylvops` or `sylvops up [PATH]` opens the native window; closing it leaves daemon-owned sessions running.
-- The top bar switches workspaces. A collapsible Repository -> Checkout -> Session Explorer stays beside the large Terminal/Changes/Details area and becomes a dedicated narrow view below 820 px.
+- The top bar switches workspaces and uses a compact **+** control to create one. A collapsible Repository -> Checkout -> Session Explorer labels every hierarchy level beside the large Terminal/Changes/Details area and becomes a dedicated narrow view below 820 px.
 - Select a session, click **Open terminal**, and interact normally. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
-- The footer always shows the version, workspace, branch, current view, daemon connectivity, and key hints.
+- The footer shows the real build or preview tag, local-daemon health, responsive Workspace/Repository/Checkout/Session context, current view, and key hints.
 - Settings is a scrollable right-side sheet on wide and compact windows and a full-window view on narrow windows. Appearance offers immediate preview cards for System, Grove, Canopy, and Midnight, with seven Classic themes in an expandable secondary group; density, terminal typeface, 10–22 px text sizing, and Block/Line cursor remain bounded controls.
 - Details shows dates in the operating-system locale and timezone and labels repository locations **Path**. IDs, raw timestamps, process/transport terms, and exact quantities stay under expandable **Technical details** with bounded copy actions. Session-record retention and non-persisted terminal output are described separately.
 - Important actions keep visible text, including **Start shell**, **Start Codex**, **Check again**, **Open terminal**, **Leave terminal**, **Stop session**, and **Delete checkout**. The terminal TUI remains available as a keyboard-first alternative.
