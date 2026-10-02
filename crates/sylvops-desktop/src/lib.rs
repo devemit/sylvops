@@ -117,6 +117,20 @@ const UI_SEMIBOLD: Font = Font {
     ..UI_FONT
 };
 
+#[cfg(test)]
+fn load_bundled_ui_fonts_for_rendering() {
+    let mut font_system = iced::advanced::graphics::text::font_system()
+        .write()
+        .expect("global font system lock");
+    for bytes in [
+        JETBRAINS_MONO_REGULAR,
+        JETBRAINS_MONO_MEDIUM,
+        JETBRAINS_MONO_SEMIBOLD,
+    ] {
+        font_system.load_font(std::borrow::Cow::Borrowed(bytes));
+    }
+}
+
 /// Opens the native `SylvOps` desktop client.
 ///
 /// # Errors
@@ -5880,33 +5894,33 @@ mod tests {
 
     #[cfg(windows)]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        890_588_336_788_342_999,
-        7_737_610_790_606_349_347,
-        4_333_192_644_305_359_696,
-        8_866_434_212_287_806_131,
-        8_196_109_692_910_327_130,
-        17_347_384_721_128_351_555,
-        5_667_387_616_225_285_383,
+        16_770_857_131_302_816_660,
+        11_447_965_043_770_947_898,
+        13_462_223_169_590_025_047,
+        7_770_067_056_298_849_975,
+        396_902_320_718_205_612,
+        8_629_820_395_131_443_783,
+        18_156_419_510_933_694_931,
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        13_194_026_567_861_172_281,
-        563_084_472_704_449_315,
-        12_743_232_607_106_845_125,
-        10_903_698_024_689_617_689,
-        7_181_879_259_533_975_582,
-        1_595_693_411_202_069_911,
-        1_782_230_244_859_661_289,
+        10_261_111_758_407_608_756,
+        413_027_520_852_513_543,
+        3_252_979_202_346_465_710,
+        9_923_989_739_980_506_111,
+        16_415_112_537_660_826_483,
+        4_762_314_981_531_960_153,
+        1_577_536_443_678_212_804,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        4_659_924_049_341_952_046,
-        16_150_320_299_879_608_399,
-        2_197_266_295_232_895_673,
-        8_272_705_211_345_580_693,
-        3_569_329_796_830_840_347,
-        897_763_746_096_838_364,
-        11_906_547_719_224_840_432,
+        10_455_792_764_679_897_656,
+        16_698_083_490_593_655_288,
+        366_487_815_231_424_087,
+        7_813_297_413_741_336_334,
+        12_287_516_176_438_606_193,
+        983_963_529_038_412_029,
+        30_296_500_964_335_230,
     ];
 
     async fn render_desktop_baseline(
@@ -5914,6 +5928,7 @@ mod tests {
         width: u16,
         height: u16,
     ) -> RenderedBaseline {
+        load_bundled_ui_fonts_for_rendering();
         let mut renderer =
             <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
                 .await
