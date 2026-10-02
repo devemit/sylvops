@@ -169,7 +169,7 @@ The first Codex session is created only after the visible action in step 3; Sylv
 
 These update controls apply only to official signed application releases. Unsigned previews fail closed for signed-update discovery and must be replaced by explicitly installing a later preview or building a newer revision from source.
 
-In **Settings -> Updates**, choose **Check again**, then **Download verified upgrade**, then **Install update**. The desktop shows the target version, human-readable download size, and bounded release notes; exact bytes are available under **Technical details** with a bounded copy action. Periodic checks are on by default at a bounded 24-hour interval and can be disabled with **Periodic checks: Off**. Checks read signed metadata; downloads and installation always require visible user actions.
+In **Settings -> Updates**, use the single available update action: **Check again**, **Download verified upgrade**, or **Install update**, depending on the current status. The desktop shows the target version, human-readable download size, and bounded release notes. Periodic checks are on by default at a bounded 24-hour interval and can be disabled with **Periodic checks: Off**. Checks read signed metadata; downloads and installation always require visible user actions.
 
 The equivalent CLI flow is:
 
@@ -201,7 +201,7 @@ SylvOps-owned data uses these paths:
 - macOS and Linux configuration: `$XDG_CONFIG_HOME/sylvops`, or `~/.config/sylvops` when `XDG_CONFIG_HOME` is unset.
 - macOS and Linux runtime: `$XDG_RUNTIME_DIR/sylvops` when set, otherwise the data directory's `run` subdirectory.
 
-To remove that data deliberately, first stop every session, then use **Settings -> Safety -> Remove SylvOps user data** or:
+To remove that data deliberately, first stop every session, then use **Settings -> Advanced -> Safety and data -> Remove SylvOps user data** or:
 
 ```text
 sylvops data remove --confirm "DELETE SYLVOPS USER DATA"
@@ -275,12 +275,13 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 ### Desktop essentials
 
 - `sylvops` or `sylvops up [PATH]` opens the native window; closing it leaves daemon-owned sessions running.
-- The top bar switches workspaces and uses a compact **+** control to create one. A collapsible Repository -> Checkout -> Session Explorer labels every hierarchy level beside the large Terminal/Changes/Details area and becomes a dedicated narrow view below 820 px.
-- Select a session, click **Open terminal**, and interact normally. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
+- The top bar switches workspaces and uses a borderless **+** control to create one. Wide windows show three independently resizable columns—**Repositories**, **Checkouts**, and **Sessions**—beside the large Terminal/Changes/Details workspace. Compact windows use a tabbed navigator, and narrow windows switch between Navigator and Main.
+- Select a session once to open it, then click **Open terminal** to interact. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
 - The footer shows the real build or preview tag, local-daemon health, responsive Workspace/Repository/Checkout/Session context, current view, and key hints.
-- Settings is a scrollable right-side sheet on wide and compact windows and a full-window view on narrow windows. Appearance offers immediate preview cards for System, Grove, Canopy, and Midnight, with seven Classic themes in an expandable secondary group; density, terminal typeface, 10–22 px text sizing, and Block/Line cursor remain bounded controls.
+- Settings is one centered, scrollable modal at every window size. **Essentials** contains signature themes, density, terminal typeface, 10–22 px text sizing, and Block/Line cursor. **Updates** exposes one context-sensitive action. Collapsed **Advanced** contains Classic themes, layout reset, and protected data-removal controls.
+- The desktop interface bundles JetBrains Mono for consistent developer-focused typography across Windows, Linux, and macOS; terminal text keeps its independent font preference.
 - Details shows dates in the operating-system locale and timezone and labels repository locations **Path**. IDs, raw timestamps, process/transport terms, and exact quantities stay under expandable **Technical details** with bounded copy actions. Session-record retention and non-persisted terminal output are described separately.
-- Important actions keep visible text, including **Start shell**, **Start Codex**, **Check again**, **Open terminal**, **Leave terminal**, **Stop session**, and **Delete checkout**. The terminal TUI remains available as a keyboard-first alternative.
+- Universal controls such as add, refresh, full screen, navigator visibility, and close use the bundled line icons. Named and risky actions retain visible text, including **Start shell**, **Start Codex**, **Open terminal**, **Leave terminal**, **Stop session**, and **Delete checkout**. The terminal TUI remains available as a keyboard-first alternative.
 
 ## Current commands
 
