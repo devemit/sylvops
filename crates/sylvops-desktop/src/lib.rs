@@ -1143,7 +1143,6 @@ impl DesktopApp {
         let density = presentation.density;
         let mut items = column![navigator_heading(
             "Repositories",
-            "Choose a codebase",
             Some((LineIcon::Add, Message::NewProject)),
             density,
         )]
@@ -1184,13 +1183,7 @@ impl DesktopApp {
             .selection
             .project_id
             .map(|_| (LineIcon::Add, Message::NewWorktree));
-        let mut items = column![navigator_heading(
-            "Checkouts",
-            "Choose a branch checkout",
-            create,
-            density,
-        )]
-        .spacing(2);
+        let mut items = column![navigator_heading("Checkouts", create, density,)].spacing(2);
         for row in &presentation.navigator.checkouts {
             if self
                 .inline_navigator_rename
@@ -1221,13 +1214,7 @@ impl DesktopApp {
             .selection
             .worktree_id
             .map(|_| (LineIcon::Add, Message::NewSession));
-        let mut items = column![navigator_heading(
-            "Sessions",
-            "Choose or start work",
-            create,
-            density,
-        )]
-        .spacing(2);
+        let mut items = column![navigator_heading("Sessions", create, density,)].spacing(2);
         for row in &presentation.navigator.sessions {
             if self
                 .inline_navigator_rename
@@ -2522,33 +2509,34 @@ impl DesktopApp {
                     .size(FOOTER_TEXT_SIZE)
                     .wrapping(text::Wrapping::None),
             )
-            .width(Length::Fixed(105.0))
+            .width(Length::Fixed(110.0))
             .clip(true),
             footer_connection(self.connection),
         ]
         .spacing(density.region_spacing)
         .align_y(Center);
         if width >= 720 {
-            status =
-                status
-                    .push(footer_separator())
-                    .push(footer_context("Workspace", workspace, 110.0));
+            status = status.push(footer_separator()).push(footer_context(
+                "Workspace",
+                &workspace,
+                120.0,
+            ));
         }
         if width >= 980 {
             status = status
                 .push(footer_separator())
-                .push(footer_context("Repository", repository, 115.0))
+                .push(footer_context("Repository", &repository, 125.0))
                 .push(footer_separator())
-                .push(footer_context("Checkout", checkout, 150.0));
+                .push(footer_context("Checkout", &checkout, 145.0));
         }
         if width >= 1_180 {
             status = status
                 .push(footer_separator())
-                .push(footer_context("Session", session, 150.0));
+                .push(footer_context("Session", &session, 145.0));
         }
         status = status.push(space::horizontal()).push(footer_context(
             "View",
-            main_tab_label(presentation.selection.main_tab).to_owned(),
+            main_tab_label(presentation.selection.main_tab),
             80.0,
         ));
         if width >= 1_180 {
@@ -2560,6 +2548,7 @@ impl DesktopApp {
             .height(density.footer_height)
             .padding([3, 10])
             .width(Fill)
+            .clip(true)
             .style(chrome_surface)
             .into()
     }
@@ -4730,7 +4719,6 @@ fn panel<'a>(content: impl Into<Element<'a, Message>>, _width: f32) -> Element<'
 
 fn navigator_heading(
     title: &'static str,
-    subtitle: &'static str,
     action: Option<(LineIcon, Message)>,
     density: DensityMetrics,
 ) -> Element<'static, Message> {
@@ -4746,18 +4734,12 @@ fn navigator_heading(
                 .style(borderless_icon_style),
         );
     }
-    container(
-        column![
-            title_row,
-            text(subtitle).size(UI_META_SIZE).style(text::secondary),
-        ]
-        .spacing(1),
-    )
-    .height(density.panel_header_height.max(48))
-    .padding([5, 7])
-    .width(Fill)
-    .align_y(Vertical::Center)
-    .into()
+    container(title_row)
+        .height(density.panel_header_height)
+        .padding([5, 7])
+        .width(Fill)
+        .align_y(Vertical::Center)
+        .into()
 }
 
 fn compact_panel_button(
@@ -5180,22 +5162,16 @@ fn footer_item(label: &str) -> Element<'static, Message> {
         .font(UI_FONT)
         .size(FOOTER_TEXT_SIZE)
         .style(text::secondary)
+        .wrapping(text::Wrapping::None)
         .into()
 }
 
-fn footer_context(label: &'static str, value: String, width: f32) -> Element<'static, Message> {
+fn footer_context(label: &'static str, value: &str, width: f32) -> Element<'static, Message> {
     container(
-        row![
-            text(format!("{label}:"))
-                .font(UI_MEDIUM)
-                .size(FOOTER_TEXT_SIZE),
-            text(value)
-                .size(FOOTER_TEXT_SIZE)
-                .style(text::secondary)
-                .wrapping(text::Wrapping::None),
-        ]
-        .spacing(4)
-        .align_y(Center),
+        text(format!("{label}: {value}"))
+            .font(UI_MEDIUM)
+            .size(FOOTER_TEXT_SIZE)
+            .wrapping(text::Wrapping::None),
     )
     .width(Length::Fixed(width))
     .clip(true)
@@ -5204,19 +5180,22 @@ fn footer_context(label: &'static str, value: String, width: f32) -> Element<'st
 
 fn footer_connection(connection: ConnectionState) -> Element<'static, Message> {
     let (icon, label) = match connection {
-        ConnectionState::Connecting => (LineIcon::Working, "Daemon connecting"),
-        ConnectionState::Connected => (LineIcon::Finished, "Daemon connected"),
-        ConnectionState::Disconnected => (LineIcon::Disconnected, "Daemon offline"),
+        ConnectionState::Connecting => (LineIcon::Working, "Connecting"),
+        ConnectionState::Connected => (LineIcon::Finished, "Connected"),
+        ConnectionState::Disconnected => (LineIcon::Disconnected, "Offline"),
     };
     container(
         row![
             line_icon(icon, 12),
-            text(label).font(UI_MEDIUM).size(FOOTER_TEXT_SIZE),
+            text(label)
+                .font(UI_MEDIUM)
+                .size(FOOTER_TEXT_SIZE)
+                .wrapping(text::Wrapping::None),
         ]
         .spacing(4)
         .align_y(Center),
     )
-    .width(Length::Fixed(120.0))
+    .width(Length::Fixed(95.0))
     .padding([3, 7])
     .style(move |theme| footer_connection_style(theme, connection))
     .into()
@@ -5459,7 +5438,7 @@ fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::S
 fn list_item_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
-        palette.primary.weak
+        palette.background.weak
     } else {
         match status {
             Status::Hovered => palette.background.weak,
@@ -6186,7 +6165,7 @@ mod tests {
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [167, 117, 80, 165, 224, 166, 137]
+            [151, 111, 76, 161, 218, 150, 131]
         );
         let baselines = [
             &canopy_attention,
@@ -6396,6 +6375,24 @@ mod tests {
             background.relative_contrast(active.text_color) >= 4.5,
             "selected tab text must remain readable against its fill"
         );
+    }
+
+    #[test]
+    fn selected_navigator_rows_use_a_subtle_surface_fill() {
+        for choice in DesktopTheme::ALL {
+            let theme = theme::resolve(PresentationTheme::resolve(choice, SystemAppearance::Dark));
+            let style = list_item_style(&theme, Status::Active, true);
+            assert_eq!(
+                style.background,
+                Some(Background::Color(
+                    theme.extended_palette().background.weak.color
+                ))
+            );
+            let Some(Background::Color(background)) = style.background else {
+                unreachable!();
+            };
+            assert!(background.relative_contrast(style.text_color) >= 4.5);
+        }
     }
 
     #[test]
@@ -6652,7 +6649,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("footer source");
         assert!(footer.matches("footer_context(").count() >= 5);
-        assert!(footer.contains("Length::Fixed(105.0)"));
+        assert!(footer.contains("Length::Fixed(110.0)"));
+        assert!(footer.contains("Wrapping::None"));
     }
 
     #[test]
@@ -6664,11 +6662,11 @@ mod tests {
             .map(|(body, _)| body)
             .expect("navigator column source");
         assert!(navigator.contains("\"Repositories\""));
-        assert!(navigator.contains("Choose a codebase"));
         assert!(navigator.contains("\"Checkouts\""));
-        assert!(navigator.contains("Choose a branch checkout"));
         assert!(navigator.contains("\"Sessions\""));
-        assert!(navigator.contains("Choose or start work"));
+        assert!(!navigator.contains("Choose a codebase"));
+        assert!(!navigator.contains("Choose a branch checkout"));
+        assert!(!navigator.contains("Choose or start work"));
         assert!(!navigator.contains("1  Repositories"));
         assert!(!navigator.contains("2  Checkouts"));
         assert!(!navigator.contains("3  Sessions"));

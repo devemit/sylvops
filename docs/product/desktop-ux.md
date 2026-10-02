@@ -24,7 +24,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 - Workspace tabs are full-height segments separated by vertical rules. Selected tabs and rows use a restrained theme tint, a contrast-safe accent outline, and stronger type instead of saturated text backgrounds; inactive controls remain transparent until hover or press.
 - A session label and its close action are one visual group.
 - Session navigator rows use `Name · State`; open-session tabs show only the name and never prepend a status glyph.
-- Wide windows present three independently resizable columns: **Repositories — Choose a codebase**, **Checkouts — Choose a branch checkout**, and **Sessions — Choose or start work**. Each column shows only the records that depend on the selection to its left.
+- Wide windows present three independently resizable columns: **Repositories**, **Checkouts**, and **Sessions**. Headers stay on one line with their contextual add control; each column shows only the records that depend on the selection to its left.
 - Compact windows use one tabbed Repository/Checkout/Session navigator beside the main workspace. Narrow windows retain the Navigator/Main switch.
 - Repository rows show rolled-up attention. Checkout rows show branch plus Root/Managed status and rolled-up attention. Session rows place a minimal written state inline with the session name and use no status glyph; one click selects and opens a session.
 - Double-clicking any Repository, Checkout, or Session row—or pressing `R` in the active column—focuses its inline rename editor. Enter saves through the daemon; Escape or clicking away cancels before submission. The editor has no redundant Save, Cancel, or Rename buttons. Validation and IPC errors preserve the entered value.
