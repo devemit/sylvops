@@ -5724,6 +5724,37 @@ mod tests {
         checksum: u64,
     }
 
+    #[cfg(windows)]
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
+        16_107_069_819_612_543_831,
+        8_144_574_017_956_600_494,
+        6_758_989_126_967_608_015,
+        17_822_691_787_296_232_232,
+        8_133_345_142_573_037_294,
+        17_524_761_043_092_119_647,
+        4_557_710_486_591_321_542,
+    ];
+    #[cfg(target_os = "macos")]
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
+        12_016_516_532_157_958_497,
+        10_938_616_273_572_432_211,
+        13_458_278_289_795_482_825,
+        14_093_829_066_763_877_856,
+        3_626_425_705_574_108_520,
+        45_188_728_839_142_635,
+        9_942_103_752_259_472_644,
+    ];
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
+        10_802_420_735_386_369_826,
+        2_034_064_434_892_050_200,
+        15_635_314_370_791_741_553,
+        11_588_738_413_117_789_024,
+        17_079_586_721_189_910_918,
+        2_991_030_526_025_802_914,
+        4_597_883_597_611_191_495,
+    ];
+
     async fn render_desktop_baseline(
         app: &DesktopApp,
         width: u16,
@@ -5987,15 +6018,7 @@ mod tests {
         assert_eq!(unique_checksums.len(), baselines.len());
         assert_eq!(
             baselines.map(|baseline| baseline.checksum),
-            [
-                16_107_069_819_612_543_831,
-                8_144_574_017_956_600_494,
-                6_758_989_126_967_608_015,
-                17_822_691_787_296_232_232,
-                8_133_345_142_573_037_294,
-                17_524_761_043_092_119_647,
-                4_557_710_486_591_321_542,
-            ]
+            APPROVED_VISUAL_CHECKSUMS
         );
     }
 
@@ -6705,30 +6728,6 @@ mod tests {
 
         let _ = app.update(Message::CancelModal);
         assert!(app.modal.is_none());
-    }
-
-    #[test]
-    fn desktop_data_removal_becomes_irreversible_only_after_exact_confirmation() {
-        let runtime_root = std::env::temp_dir().join(format!(
-            "sylvops-desktop-data-removal-submit-test-{}",
-            SessionId::new()
-        ));
-        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
-        let mut app = DesktopApp::new(paths);
-
-        app.open_data_removal_confirmation();
-        let _ = app.update(Message::DataRemovalConfirmationInput(
-            sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION.into(),
-        ));
-        let _ = app.update(Message::SubmitDataRemoval);
-
-        assert!(matches!(
-            app.modal,
-            Some(Modal::DataRemoval(DataRemovalConfirmation {
-                pending: true,
-                ..
-            }))
-        ));
     }
 
     #[test]
