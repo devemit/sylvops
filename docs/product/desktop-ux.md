@@ -26,7 +26,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 - Session navigator rows use `Name · State`; open-session tabs show only the name and never prepend a status glyph.
 - Wide windows present three independently resizable columns: **Repositories — Choose a codebase**, **Checkouts — Choose a branch checkout**, and **Sessions — Choose or start work**. Each column shows only the records that depend on the selection to its left.
 - Compact windows use one tabbed Repository/Checkout/Session navigator beside the main workspace. Narrow windows retain the Navigator/Main switch.
-- Repository rows show rolled-up attention. Checkout rows show branch plus Root/Managed status and rolled-up attention. Session rows show their written state and semantic status icon; one click selects and opens a session.
+- Repository rows show rolled-up attention. Checkout rows show branch plus Root/Managed status and rolled-up attention. Session rows place a minimal written state inline with the session name and use no status glyph; one click selects and opens a session.
 - Double-clicking any Repository, Checkout, or Session row—or pressing `R` in the active column—focuses its inline rename editor. Enter saves through the daemon; Escape or clicking away cancels before submission. The editor has no redundant Save, Cancel, or Rename buttons. Validation and IPC errors preserve the entered value.
 - Navigator interaction clears terminal keyboard focus without detaching the session. Long single-line navigation labels stay clipped inside their controls. SylvOps does not show hover tooltips; important meaning must be visible in the interface or available through the shortcuts panel.
 - An active managed checkout exposes `Delete checkout` on its selected row. The existing state-bound confirmation still refuses root, external, dirty, missing, invalid, or live-session removal and preserves the Git branch.
@@ -39,6 +39,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 - JetBrains Mono Regular, Medium, and SemiBold are bundled under OFL-1.1 and form the desktop UI family on every platform. The embedded terminal continues to honor its separate font preference.
 - The desktop and TUI new-session forms expose the provider picker and optional display name only. Model, effort, and initial prompt remain supported by the CLI and protocol but are not interactive-form settings.
 - The footer presents the actual build identity (including an unsigned-preview or release tag when supplied at build time), local-daemon health beside the version, responsive Workspace/Repository/Checkout/Session context, the active content view, and essential shortcuts. Internal enum names and keyboard-panel debug state are not user-facing status.
+- Navigator rows keep a fixed height when selection changes; the managed-checkout delete action stays inside the selected row. Footer context regions use breakpoint-specific fixed widths so changing names and state does not move neighboring labels.
 
 ## Embedded terminal baseline
 

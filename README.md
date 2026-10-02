@@ -276,6 +276,7 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 
 - `sylvops` or `sylvops up [PATH]` opens the native window; closing it leaves daemon-owned sessions running.
 - The top bar switches workspaces and uses a borderless **+** control to create one. Wide windows show three independently resizable columns—**Repositories**, **Checkouts**, and **Sessions**—beside the large Terminal/Changes/Details workspace. Compact windows use a tabbed navigator, and narrow windows switch between Navigator and Main.
+- Session rows keep their written state inline with the name, and navigator/footer regions retain stable positions as selection and context change.
 - Select a session once to open it, then click **Open terminal** to interact. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
 - The footer shows the real build or preview tag, local-daemon health, responsive Workspace/Repository/Checkout/Session context, current view, and key hints.
 - Settings is one centered, scrollable modal at every window size. **Essentials** contains signature themes, density, terminal typeface, 10–22 px text sizing, and Block/Line cursor. **Updates** exposes one context-sensitive action. Collapsed **Advanced** contains Classic themes, layout reset, and protected data-removal controls.

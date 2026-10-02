@@ -34,7 +34,7 @@ pub(crate) fn resolve(presentation: PresentationTheme) -> Theme {
                 strong: pair(tokens.focus, tokens.interaction_text),
             },
             secondary: palette::Secondary {
-                base: pair(tokens.surface, tokens.text_muted),
+                base: pair(tokens.text_muted, tokens.canvas),
                 weak: pair(tokens.surface_sunken, tokens.text),
                 strong: pair(tokens.surface_raised, tokens.text),
             },
@@ -105,7 +105,8 @@ mod tests {
                 palette.background.stronger.color,
                 color(tokens.border_strong)
             );
-            assert_eq!(palette.secondary.base.text, color(tokens.text_muted));
+            assert_eq!(palette.secondary.base.color, color(tokens.text_muted));
+            assert_eq!(palette.secondary.base.text, color(tokens.canvas));
             assert_eq!(palette.primary.base.color, color(tokens.interaction));
             assert_eq!(palette.primary.strong.color, color(tokens.focus));
             assert_eq!(palette.primary.weak.color, color(tokens.selection));

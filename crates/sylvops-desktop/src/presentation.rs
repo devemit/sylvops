@@ -306,10 +306,7 @@ pub(crate) enum NavigatorAttention {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NavigatorAction {
-    CreateCheckout(ProjectId),
-    CreateSession(WorktreeId),
     DeleteCheckout(WorktreeId),
-    OpenSession(SessionId),
 }
 
 impl SessionIndicator {
@@ -671,7 +668,7 @@ fn build_repository_rows(
                 detail: "Repository".into(),
                 indicator: None,
                 attention,
-                actions: vec![NavigatorAction::CreateCheckout(project.id)],
+                actions: Vec::new(),
                 selected: selected_project_id == Some(project.id),
             }
         })
@@ -706,7 +703,7 @@ fn build_checkout_rows(
                 .iter()
                 .filter(|session| session.worktree_id == worktree.id)
                 .collect();
-            let mut actions = vec![NavigatorAction::CreateSession(worktree.id)];
+            let mut actions = Vec::new();
             if !worktree.is_root_checkout && worktree.status == WorktreeStatus::Active {
                 actions.push(NavigatorAction::DeleteCheckout(worktree.id));
             }
@@ -760,7 +757,7 @@ fn build_session_rows(
             detail: session_state_label(session.state).to_owned(),
             indicator: Some(SessionIndicator::for_state(session.state)),
             attention: attention_for_state(session.state),
-            actions: vec![NavigatorAction::OpenSession(session.id)],
+            actions: Vec::new(),
             selected: selected_session_id == Some(session.id),
         })
         .collect()
@@ -1303,7 +1300,10 @@ mod tests {
                 ("surface", tokens.text, tokens.surface),
                 ("raised surface", tokens.text, tokens.surface_raised),
                 ("sunken surface", tokens.text, tokens.surface_sunken),
-                ("muted", tokens.text_muted, tokens.surface),
+                ("muted canvas", tokens.text_muted, tokens.canvas),
+                ("muted surface", tokens.text_muted, tokens.surface),
+                ("muted raised", tokens.text_muted, tokens.surface_raised),
+                ("muted sunken", tokens.text_muted, tokens.surface_sunken),
                 ("selection", tokens.selection_text, tokens.selection),
                 ("success", tokens.success, tokens.success_surface),
                 ("attention", tokens.attention, tokens.attention_surface),
@@ -1672,21 +1672,12 @@ mod tests {
             },
         });
 
-        assert_eq!(
-            presentation.navigator.repositories[0].actions,
-            vec![NavigatorAction::CreateCheckout(fixture.project_id)]
-        );
+        assert!(presentation.navigator.repositories[0].actions.is_empty());
         assert_eq!(
             presentation.navigator.checkouts[0].actions,
-            vec![
-                NavigatorAction::CreateSession(fixture.worktree_id),
-                NavigatorAction::DeleteCheckout(fixture.worktree_id),
-            ]
+            vec![NavigatorAction::DeleteCheckout(fixture.worktree_id)]
         );
-        assert_eq!(
-            presentation.navigator.sessions[0].actions,
-            vec![NavigatorAction::OpenSession(fixture.session_id)]
-        );
+        assert!(presentation.navigator.sessions[0].actions.is_empty());
     }
 
     #[test]

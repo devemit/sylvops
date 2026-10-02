@@ -40,8 +40,8 @@ use presentation::{
     ActiveTerminalAction, ButtonIntent, ButtonTokens, ControlState, DensityMetrics,
     DesktopPresentation, InteractionState as PresentationInteraction, NavigatorAction,
     NavigatorAttention, NavigatorMode, NavigatorNodeId, NavigatorRow, PresentationInput,
-    PresentationLayout, PresentationTheme, SessionIndicator, SystemAppearance, TerminalPalette,
-    Viewport, WorkspaceNavigation, button_visual, session_state_can_replay as session_can_replay,
+    PresentationLayout, PresentationTheme, SystemAppearance, TerminalPalette, Viewport,
+    WorkspaceNavigation, button_visual, session_state_can_replay as session_can_replay,
     session_state_can_stop as session_can_stop, session_state_label,
 };
 use sylvops_core::{
@@ -1158,9 +1158,6 @@ impl DesktopApp {
             } else {
                 items = items.push(self.navigator_row(row));
             }
-            if row.selected {
-                items = items.push(self.navigator_actions(&row.actions));
-            }
         }
         if presentation.navigator.repositories.is_empty() {
             items = items.push(if self.active_workspace().is_some() {
@@ -1204,9 +1201,6 @@ impl DesktopApp {
             } else {
                 items = items.push(self.navigator_row(row));
             }
-            if row.selected {
-                items = items.push(self.navigator_actions(&row.actions));
-            }
         }
         if presentation.selection.project_id.is_none() {
             items = items.push(empty_hint("Select a repository first."));
@@ -1243,9 +1237,6 @@ impl DesktopApp {
                 items = items.push(self.navigator_rename_row());
             } else {
                 items = items.push(self.navigator_row(row));
-            }
-            if row.selected {
-                items = items.push(self.navigator_actions(&row.actions));
             }
         }
         if presentation.selection.worktree_id.is_none() {
@@ -1312,46 +1303,64 @@ impl DesktopApp {
         let density = self.presentation().density;
         let is_selected = row.selected;
         let is_hovered = self.hovered_navigator_node == Some(row.id);
-        let detail: Element<'static, Message> = if let Some(attention) = row.attention {
+        let name = text(row.label.clone())
+            .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
+            .size(UI_TEXT_SIZE)
+            .wrapping(text::Wrapping::None);
+        let labels: Element<'static, Message> = if matches!(row.id, NavigatorNodeId::Session(_)) {
             row![
-                line_icon(navigator_attention_icon(attention), 13),
-                text(format!(
-                    "{} · {}",
-                    navigator_attention_label(attention),
-                    row.detail
-                ))
-                .size(UI_META_SIZE)
-                .style(text::secondary),
-            ]
-            .spacing(4)
-            .align_y(Center)
-            .into()
-        } else if let Some(indicator) = row.indicator {
-            row![
-                line_icon(session_indicator_icon(indicator), 13),
-                text(row.detail.clone())
+                name,
+                text(format!("· {}", row.detail))
                     .size(UI_META_SIZE)
-                    .style(text::secondary),
+                    .style(text::secondary)
+                    .wrapping(text::Wrapping::None),
             ]
-            .spacing(4)
+            .spacing(5)
             .align_y(Center)
+            .width(Fill)
             .into()
         } else {
-            text(row.detail.clone())
-                .size(UI_META_SIZE)
-                .style(text::secondary)
+            let detail: Element<'static, Message> = if let Some(attention) = row.attention {
+                row![
+                    line_icon(navigator_attention_icon(attention), 13),
+                    text(format!(
+                        "{} · {}",
+                        navigator_attention_label(attention),
+                        row.detail
+                    ))
+                    .size(UI_META_SIZE)
+                    .style(text::secondary),
+                ]
+                .spacing(4)
+                .align_y(Center)
                 .into()
+            } else {
+                text(row.detail.clone())
+                    .size(UI_META_SIZE)
+                    .style(text::secondary)
+                    .into()
+            };
+            column![name, detail].spacing(1).width(Fill).into()
         };
-        let labels = column![
-            text(row.label.clone())
-                .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
-                .size(UI_TEXT_SIZE)
-                .wrapping(text::Wrapping::None),
-            detail,
-        ]
-        .spacing(1)
-        .width(Fill);
-        let content = container(row![labels].spacing(3).align_y(Center))
+        let mut row_content = row![labels].spacing(3).align_y(Center);
+        if is_selected
+            && let Some(NavigatorAction::DeleteCheckout(worktree_id)) = row.actions.first()
+        {
+            row_content = row_content.push(
+                button(icon_text_label(
+                    LineIcon::Delete,
+                    DELETE_CHECKOUT_LABEL,
+                    UI_META_SIZE,
+                ))
+                .on_press(Message::RunNavigatorAction(
+                    NavigatorAction::DeleteCheckout(*worktree_id),
+                ))
+                .height(density.control_height)
+                .padding([4, 7])
+                .style(flat_danger_style),
+            );
+        }
+        let content = container(row_content)
             .width(Fill)
             .height(density.row_height.max(44))
             .padding([4, 6])
@@ -1369,52 +1378,6 @@ impl DesktopApp {
             .on_press(select)
             .on_double_click(double_click)
             .interaction(mouse::Interaction::Pointer)
-            .into()
-    }
-
-    fn navigator_actions(&self, actions: &[NavigatorAction]) -> Element<'static, Message> {
-        let density = self.presentation().density;
-        let presentation_theme = self.presentation().theme;
-        let mut controls = row![].spacing(4).align_y(Center);
-        for action in actions {
-            let action = *action;
-            if matches!(
-                action,
-                NavigatorAction::CreateCheckout(_)
-                    | NavigatorAction::CreateSession(_)
-                    | NavigatorAction::OpenSession(_)
-            ) {
-                continue;
-            }
-            let danger = matches!(action, NavigatorAction::DeleteCheckout(_));
-            controls = controls.push(
-                button(icon_text_label(
-                    navigator_action_icon(action),
-                    navigator_action_label(action),
-                    UI_META_SIZE,
-                ))
-                .on_press(Message::RunNavigatorAction(action))
-                .height(density.control_height)
-                .padding([4, 7])
-                .style(move |_theme, status| {
-                    button_intent_style(
-                        presentation_theme,
-                        if danger {
-                            ButtonIntent::Danger
-                        } else {
-                            ButtonIntent::Quiet
-                        },
-                        status,
-                    )
-                }),
-            );
-        }
-        scrollable(container(controls).padding([2, 7]))
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::hidden(),
-            ))
-            .height(density.control_height)
-            .width(Fill)
             .into()
     }
 
@@ -2553,33 +2516,40 @@ impl DesktopApp {
                 },
             );
         let mut status = row![
-            text(application_version_text())
-                .font(UI_SEMIBOLD)
-                .size(FOOTER_TEXT_SIZE),
+            container(
+                text(application_version_text())
+                    .font(UI_SEMIBOLD)
+                    .size(FOOTER_TEXT_SIZE)
+                    .wrapping(text::Wrapping::None),
+            )
+            .width(Length::Fixed(105.0))
+            .clip(true),
             footer_connection(self.connection),
         ]
         .spacing(density.region_spacing)
         .align_y(Center);
         if width >= 720 {
-            status = status
-                .push(footer_separator())
-                .push(footer_context("Workspace", workspace));
+            status =
+                status
+                    .push(footer_separator())
+                    .push(footer_context("Workspace", workspace, 110.0));
         }
         if width >= 980 {
             status = status
                 .push(footer_separator())
-                .push(footer_context("Repository", repository))
+                .push(footer_context("Repository", repository, 115.0))
                 .push(footer_separator())
-                .push(footer_context("Checkout", checkout));
+                .push(footer_context("Checkout", checkout, 150.0));
         }
         if width >= 1_180 {
             status = status
                 .push(footer_separator())
-                .push(footer_context("Session", session));
+                .push(footer_context("Session", session, 150.0));
         }
         status = status.push(space::horizontal()).push(footer_context(
             "View",
             main_tab_label(presentation.selection.main_tab).to_owned(),
+            80.0,
         ));
         if width >= 1_180 {
             status = status
@@ -3584,19 +3554,10 @@ impl DesktopApp {
 
     fn run_navigator_action(&mut self, action: NavigatorAction) -> Task<Message> {
         match action {
-            NavigatorAction::CreateCheckout(project_id) => {
-                self.select_project(project_id);
-                self.open_worktree_form();
-            }
-            NavigatorAction::CreateSession(worktree_id) => {
-                self.select_worktree(worktree_id);
-                self.open_session_form();
-            }
             NavigatorAction::DeleteCheckout(worktree_id) => {
                 self.select_worktree(worktree_id);
                 self.inspect_worktree_removal();
             }
-            NavigatorAction::OpenSession(session_id) => self.select_session(session_id),
         }
         Task::none()
     }
@@ -4773,15 +4734,8 @@ fn navigator_heading(
     action: Option<(LineIcon, Message)>,
     density: DensityMetrics,
 ) -> Element<'static, Message> {
-    let mut title_row = row![
-        column![
-            text(title).font(UI_SEMIBOLD).size(15),
-            text(subtitle).size(UI_META_SIZE).style(text::secondary),
-        ]
-        .spacing(1),
-        space::horizontal(),
-    ]
-    .align_y(Center);
+    let mut title_row =
+        row![text(title).font(UI_SEMIBOLD).size(15), space::horizontal(),].align_y(Center);
     if let Some((icon, message)) = action {
         title_row = title_row.push(
             button(line_icon(icon, 16))
@@ -4792,12 +4746,18 @@ fn navigator_heading(
                 .style(borderless_icon_style),
         );
     }
-    container(title_row)
-        .height(density.panel_header_height.max(48))
-        .padding([5, 7])
-        .width(Fill)
-        .align_y(Vertical::Center)
-        .into()
+    container(
+        column![
+            title_row,
+            text(subtitle).size(UI_META_SIZE).style(text::secondary),
+        ]
+        .spacing(1),
+    )
+    .height(density.panel_header_height.max(48))
+    .padding([5, 7])
+    .width(Fill)
+    .align_y(Vertical::Center)
+    .into()
 }
 
 fn compact_panel_button(
@@ -4845,35 +4805,6 @@ const fn navigator_attention_label(attention: NavigatorAttention) -> &'static st
         NavigatorAttention::Finished => "Finished unseen",
         NavigatorAttention::NeedsFeedback => "Needs feedback",
         NavigatorAttention::Failed => "Failed",
-    }
-}
-
-const fn session_indicator_icon(indicator: SessionIndicator) -> LineIcon {
-    match indicator {
-        SessionIndicator::Ready => LineIcon::Ready,
-        SessionIndicator::Working => LineIcon::Working,
-        SessionIndicator::NeedsFeedback => LineIcon::NeedsFeedback,
-        SessionIndicator::Finished => LineIcon::Finished,
-        SessionIndicator::Failed => LineIcon::Failed,
-        SessionIndicator::Stopped => LineIcon::Stopped,
-        SessionIndicator::Disconnected => LineIcon::Disconnected,
-    }
-}
-
-const fn navigator_action_label(action: NavigatorAction) -> &'static str {
-    match action {
-        NavigatorAction::CreateCheckout(_) => "New checkout",
-        NavigatorAction::CreateSession(_) => "Start session",
-        NavigatorAction::DeleteCheckout(_) => DELETE_CHECKOUT_LABEL,
-        NavigatorAction::OpenSession(_) => "Open",
-    }
-}
-
-const fn navigator_action_icon(action: NavigatorAction) -> LineIcon {
-    match action {
-        NavigatorAction::CreateCheckout(_) | NavigatorAction::CreateSession(_) => LineIcon::Add,
-        NavigatorAction::DeleteCheckout(_) => LineIcon::Delete,
-        NavigatorAction::OpenSession(_) => LineIcon::Terminal,
     }
 }
 
@@ -5252,7 +5183,7 @@ fn footer_item(label: &str) -> Element<'static, Message> {
         .into()
 }
 
-fn footer_context(label: &'static str, value: String) -> Element<'static, Message> {
+fn footer_context(label: &'static str, value: String, width: f32) -> Element<'static, Message> {
     container(
         row![
             text(format!("{label}:"))
@@ -5266,6 +5197,7 @@ fn footer_context(label: &'static str, value: String) -> Element<'static, Messag
         .spacing(4)
         .align_y(Center),
     )
+    .width(Length::Fixed(width))
     .clip(true)
     .into()
 }
@@ -5284,6 +5216,7 @@ fn footer_connection(connection: ConnectionState) -> Element<'static, Message> {
         .spacing(4)
         .align_y(Center),
     )
+    .width(Length::Fixed(120.0))
     .padding([3, 7])
     .style(move |theme| footer_connection_style(theme, connection))
     .into()
@@ -5420,7 +5353,7 @@ fn iced_button_tokens(theme: &Theme) -> ButtonTokens {
         border: theme::rgb(palette.background.strong.color),
         border_strong: theme::rgb(palette.background.stronger.color),
         text: theme::rgb(palette.background.base.text),
-        text_muted: theme::rgb(palette.secondary.base.text),
+        text_muted: theme::rgb(palette.secondary.base.color),
         interaction: theme::rgb(palette.primary.base.color),
         interaction_text: theme::rgb(palette.primary.base.text),
         danger: theme::rgb(palette.danger.base.color),
@@ -6253,7 +6186,7 @@ mod tests {
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [179, 123, 86, 171, 230, 165, 143]
+            [167, 117, 80, 165, 224, 166, 137]
         );
         let baselines = [
             &canopy_attention,
@@ -6712,6 +6645,14 @@ mod tests {
             format_application_version(Some("v0.1.0-preview.2"), None, "0.1.0"),
             "SylvOps v0.1.0-preview.2"
         );
+        let source = include_str!("lib.rs");
+        let footer = source
+            .split_once("    fn footer(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn process_bridge_events"))
+            .map(|(body, _)| body)
+            .expect("footer source");
+        assert!(footer.matches("footer_context(").count() >= 5);
+        assert!(footer.contains("Length::Fixed(105.0)"));
     }
 
     #[test]
@@ -6731,6 +6672,9 @@ mod tests {
         assert!(!navigator.contains("1  Repositories"));
         assert!(!navigator.contains("2  Checkouts"));
         assert!(!navigator.contains("3  Sessions"));
+        assert!(!navigator.contains("navigator_actions"));
+        assert!(!navigator.contains("session_indicator_icon"));
+        assert!(source.contains("text(format!(\"· {}\", row.detail))"));
     }
 
     #[test]
