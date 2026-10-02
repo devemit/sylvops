@@ -15,15 +15,18 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $DesktopGuidanceLabels = [ordered]@{
-    'Application updates' = 'text\("Application updates"\)'
-    'Check now' = 'button\("Check now"\)'
+    'Updates' = 'text\("Updates"\)'
+    'Check again' = 'CHECK_AGAIN_LABEL'
     'Download verified upgrade' = 'button\("Download verified upgrade"\)'
     'Install update' = 'button\("Install update"\)'
     'Periodic checks: Off' = '"Periodic checks: Off"'
     'Remove SylvOps user data' = 'button\("Remove SylvOps user data'
     'Start Codex' = 'Some\(ProviderKind::Codex\) => "Start Codex"'
-    'Retry discovery' = '"Retry discovery"'
+    'Start shell' = 'Some\(ProviderKind::Shell\) => "Start shell"'
     'Open terminal' = '"Open terminal"'
+    'Leave terminal' = '"Leave terminal"'
+    'Stop session' = 'STOP_SESSION_LABEL'
+    'Delete checkout' = 'DELETE_CHECKOUT_LABEL'
 }
 
 function Assert-ReleaseCondition {

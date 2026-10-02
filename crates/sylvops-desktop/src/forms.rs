@@ -1,6 +1,6 @@
 use sylvops_core::{
     domain::{GitWorktreeState, ProviderKind},
-    ui_forms::Form,
+    ui_forms::{Form, FormKind},
     upgrade::ActiveUpgradeSession,
 };
 use sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION;
@@ -31,6 +31,54 @@ impl FormModal {
             first_run: true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FirstRunStepState {
+    Complete,
+    Current,
+    Upcoming,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FirstRunStep {
+    pub title: &'static str,
+    pub description: &'static str,
+    pub state: FirstRunStepState,
+}
+
+pub(crate) fn first_run_steps(kind: FormKind) -> Option<[FirstRunStep; 3]> {
+    let current: usize = match kind {
+        FormKind::CreateWorkspace => 0,
+        FormKind::RegisterProject(_) => 1,
+        FormKind::CreateSession(_) => 2,
+        FormKind::CreateWorktree(_)
+        | FormKind::RenameProject(_)
+        | FormKind::RenameWorktree(_)
+        | FormKind::RenameSession(_) => return None,
+    };
+    let state = |index: usize| match index.cmp(&current) {
+        std::cmp::Ordering::Less => FirstRunStepState::Complete,
+        std::cmp::Ordering::Equal => FirstRunStepState::Current,
+        std::cmp::Ordering::Greater => FirstRunStepState::Upcoming,
+    };
+    Some([
+        FirstRunStep {
+            title: "Create workspace",
+            description: "Group the repositories you want to supervise together.",
+            state: state(0),
+        },
+        FirstRunStep {
+            title: "Add repository",
+            description: "Choose an existing Git repository and register its root checkout.",
+            state: state(1),
+        },
+        FirstRunStep {
+            title: "Start session",
+            description: "Start Shell or Codex in the selected checkout.",
+            state: state(2),
+        },
+    ])
 }
 
 #[derive(Clone, Debug)]
@@ -85,9 +133,13 @@ pub(crate) enum Modal {
 
 #[cfg(test)]
 mod tests {
+    use sylvops_core::{
+        ids::{WorkspaceId, WorktreeId},
+        ui_forms::FormKind,
+    };
     use sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION;
 
-    use super::DataRemovalConfirmation;
+    use super::{DataRemovalConfirmation, FirstRunStepState, first_run_steps};
 
     #[test]
     fn user_data_removal_requires_the_exact_confirmation_phrase() {
@@ -102,5 +154,38 @@ mod tests {
         confirmation.begin_submission();
         assert!(confirmation.pending);
         assert!(!confirmation.can_submit());
+    }
+
+    #[test]
+    fn first_run_checklist_collapses_completed_steps_and_expands_the_current_step() {
+        let workspace = first_run_steps(FormKind::CreateWorkspace).unwrap();
+        assert_eq!(
+            workspace.map(|step| step.state),
+            [
+                FirstRunStepState::Current,
+                FirstRunStepState::Upcoming,
+                FirstRunStepState::Upcoming,
+            ]
+        );
+
+        let repository = first_run_steps(FormKind::RegisterProject(WorkspaceId::new())).unwrap();
+        assert_eq!(
+            repository.map(|step| step.state),
+            [
+                FirstRunStepState::Complete,
+                FirstRunStepState::Current,
+                FirstRunStepState::Upcoming,
+            ]
+        );
+
+        let session = first_run_steps(FormKind::CreateSession(WorktreeId::new())).unwrap();
+        assert_eq!(
+            session.map(|step| step.state),
+            [
+                FirstRunStepState::Complete,
+                FirstRunStepState::Complete,
+                FirstRunStepState::Current,
+            ]
+        );
     }
 }

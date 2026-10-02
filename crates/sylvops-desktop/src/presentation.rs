@@ -188,6 +188,12 @@ pub(crate) enum PresentationLayout {
     Narrow,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsMode {
+    SideSheet,
+    FullWindow,
+}
+
 impl PresentationLayout {
     pub(crate) const fn for_width(width: u16) -> Self {
         if width >= 1_180 {
@@ -196,6 +202,13 @@ impl PresentationLayout {
             Self::Compact
         } else {
             Self::Narrow
+        }
+    }
+
+    pub(crate) const fn settings_mode(self) -> SettingsMode {
+        match self {
+            Self::Wide | Self::Compact => SettingsMode::SideSheet,
+            Self::Narrow => SettingsMode::FullWindow,
         }
     }
 }
@@ -1915,5 +1928,21 @@ mod tests {
         assert_eq!(active.terminal_action, Some(ActiveTerminalAction::Leave));
         assert!(active.can_stop);
         assert_eq!(wide.selection.main_tab, MainTab::Changes);
+    }
+
+    #[test]
+    fn settings_are_a_side_sheet_until_the_shell_becomes_narrow() {
+        assert_eq!(
+            PresentationLayout::Wide.settings_mode(),
+            SettingsMode::SideSheet
+        );
+        assert_eq!(
+            PresentationLayout::Compact.settings_mode(),
+            SettingsMode::SideSheet
+        );
+        assert_eq!(
+            PresentationLayout::Narrow.settings_mode(),
+            SettingsMode::FullWindow
+        );
     }
 }
