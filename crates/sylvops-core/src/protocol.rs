@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 9;
+pub const PROTOCOL_MINOR: u16 = 10;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -581,7 +581,9 @@ pub enum DaemonEvent {
         health: ProviderHealth,
     },
     ProviderEvent {
+        provider: ProviderKind,
         session_id: SessionId,
+        worktree_id: WorktreeId,
         event: NormalizedProviderEvent,
     },
     SessionOutput {
@@ -683,6 +685,13 @@ fn take_uuid(bytes: &[u8], position: &mut usize) -> Result<Uuid> {
 mod tests {
     use super::*;
     use crate::ui::{MainTab, TuiState};
+    use crate::{
+        provider::{AuthenticationRequirement, ProviderCapabilities, ProviderRuntimeCapabilities},
+        status::{
+            ConversationIdentity, ConversationIdentityTransition, ProviderConversationId,
+            RemainingWork, TurnFailureCategory,
+        },
+    };
 
     #[test]
     fn messagepack_frame_round_trips() {
@@ -698,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_9_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_10_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -710,7 +719,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 9);
+        assert_eq!(PROTOCOL_MINOR, 10);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -725,6 +734,68 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &install).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), install);
+    }
+
+    #[test]
+    fn protocol_1_10_provider_runtime_data_round_trips() {
+        let capabilities = ProviderCapabilities {
+            interactive: true,
+            resume: true,
+            status_hooks: true,
+            model_selection: true,
+            effort_selection: true,
+            authentication: AuthenticationRequirement::ExistingLogin,
+            runtime: Some(ProviderRuntimeCapabilities {
+                lifecycle_events: true,
+                recoverable_turn_failures: true,
+                remaining_background_work: true,
+                conversation_identity_transitions: true,
+            }),
+        };
+        let response = DaemonResponse::Provider(ProviderHealth {
+            kind: ProviderKind::Claude,
+            available: true,
+            authenticated: true,
+            executable_path: Some("claude".into()),
+            version: Some("2.1.145".into()),
+            diagnostic: None,
+            capabilities,
+            checked_at: 1,
+        });
+        let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
+
+        let session_id = SessionId::new();
+        let worktree_id = WorktreeId::new();
+        let events = [
+            NormalizedProviderEvent::TurnStarted {
+                conversation: Some(ConversationIdentity {
+                    id: ProviderConversationId::new("conversation-123").unwrap(),
+                    transition: ConversationIdentityTransition::Resumed,
+                }),
+            },
+            NormalizedProviderEvent::TurnStopped {
+                remaining_work: RemainingWork {
+                    background_tasks: true,
+                    scheduled_tasks: true,
+                    ..RemainingWork::default()
+                },
+            },
+            NormalizedProviderEvent::TurnFailed {
+                category: TurnFailureCategory::new("provider_unavailable").unwrap(),
+            },
+        ];
+
+        for lifecycle in events {
+            let event = DaemonEvent::ProviderEvent {
+                provider: ProviderKind::Claude,
+                session_id,
+                worktree_id,
+                event: lifecycle,
+            };
+            let frame = Frame::message(MessageClass::Event, 20, &event).unwrap();
+            assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
+        }
     }
 
     #[test]

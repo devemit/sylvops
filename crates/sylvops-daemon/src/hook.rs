@@ -15,7 +15,7 @@ use subtle::ConstantTimeEq;
 use sylvops_core::{
     ids::{SessionId, WorktreeId},
     provider::HookEndpoint,
-    status::NormalizedProviderEvent,
+    status::{NormalizedProviderEvent, RemainingWork},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -304,7 +304,7 @@ async fn handle_connection(
 
 fn normalize_event(payload: &Value) -> Option<NormalizedProviderEvent> {
     match payload.get("hook_event_name")?.as_str()? {
-        "SessionStart" => Some(NormalizedProviderEvent::TurnStarted),
+        "SessionStart" => Some(NormalizedProviderEvent::TurnStarted { conversation: None }),
         "SessionEnd" => Some(NormalizedProviderEvent::SessionEnded),
         "UserPromptSubmit" => Some(NormalizedProviderEvent::PromptSubmitted),
         "PermissionRequest" => Some(NormalizedProviderEvent::PermissionRequested),
@@ -314,7 +314,9 @@ fn normalize_event(payload: &Value) -> Option<NormalizedProviderEvent> {
         "SubagentStop" => Some(NormalizedProviderEvent::SubagentStopped {
             agent_id: bounded_field(payload, "agent_id"),
         }),
-        "Stop" | "Interrupt" => Some(NormalizedProviderEvent::TurnStopped),
+        "Stop" | "Interrupt" => Some(NormalizedProviderEvent::TurnStopped {
+            remaining_work: RemainingWork::default(),
+        }),
         _ => None,
     }
 }

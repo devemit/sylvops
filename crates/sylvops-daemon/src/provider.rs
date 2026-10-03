@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use sylvops_core::{
     domain::ProviderKind,
     provider::{
-        HookEndpoint, HookInstallation, LaunchArguments, LaunchContext, LaunchSpec,
-        ProviderAdapter, ProviderCapabilities, ProviderHealth, ResumeContext, provider_error,
+        AuthenticationRequirement, HookEndpoint, HookInstallation, LaunchArguments, LaunchContext,
+        LaunchSpec, ProviderAdapter, ProviderCapabilities, ProviderHealth, ResumeContext,
+        provider_error,
     },
 };
 use tokio::{io::AsyncReadExt, time::timeout};
@@ -307,6 +308,8 @@ impl ProviderAdapter for CodexAdapter {
             status_hooks: true,
             model_selection: true,
             effort_selection: true,
+            authentication: AuthenticationRequirement::ExistingLogin,
+            runtime: None,
         };
         let discovery = match self.discovery() {
             Ok(discovery) => discovery,
@@ -369,6 +372,8 @@ impl ProviderAdapter for CodexAdapter {
                         status_hooks: true,
                         model_selection: true,
                         effort_selection: true,
+                        authentication: AuthenticationRequirement::ExistingLogin,
+                        runtime: None,
                     },
                     checked_at: now_millis(),
                 };
@@ -844,6 +849,7 @@ mod tests {
                 model: None,
                 effort: None,
                 initial_prompt: None,
+                lifecycle_endpoint: None,
             })
             .expect("shell launch specification");
         #[cfg(windows)]
@@ -881,6 +887,7 @@ mod tests {
                 model: Some("gpt-test".into()),
                 effort: Some("high".into()),
                 initial_prompt: Some("fix the parser; do not invoke a shell".into()),
+                lifecycle_endpoint: None,
             })
             .expect("launch specification");
         assert_eq!(spec.arguments.all()[0], OsString::from("--cd"));
@@ -913,6 +920,7 @@ mod tests {
             cwd: PathBuf::from("worktree"),
             model: None,
             effort: None,
+            lifecycle_endpoint: None,
         });
         assert!(result.is_err());
     }

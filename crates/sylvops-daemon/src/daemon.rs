@@ -1430,6 +1430,7 @@ async fn handle_request(
                     model,
                     effort,
                     initial_prompt: initial_prompt.clone(),
+                    lifecycle_endpoint: None,
                 },
             )?;
             let record = NewSession {
@@ -1508,6 +1509,7 @@ async fn handle_request(
                     cwd: PathBuf::from(&worktree.canonical_path),
                     model: None,
                     effort: None,
+                    lifecycle_endpoint: None,
                 },
             )?;
             let record = NewSession {
@@ -2290,11 +2292,11 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             .turn_id
             .as_ref()
             .is_some_and(|turn_id| tracking.stopped_turns.contains(turn_id))
-            && !matches!(&event, NormalizedProviderEvent::TurnStopped)
+            && !matches!(&event, NormalizedProviderEvent::TurnStopped { .. })
         {
             Some("stale")
         } else {
-            if matches!(&event, NormalizedProviderEvent::TurnStopped)
+            if matches!(&event, NormalizedProviderEvent::TurnStopped { .. })
                 && let Some(turn_id) = delivery.turn_id.as_ref()
             {
                 tracking.close_turn(turn_id.clone());
@@ -2333,7 +2335,9 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
         *managed.record.write().await = session.clone();
     }
     let _ = state.events.send(DaemonEvent::ProviderEvent {
+        provider: persisted.provider_kind,
         session_id: delivery.session_id,
+        worktree_id: persisted.worktree_id,
         event,
     });
     let _ = state
