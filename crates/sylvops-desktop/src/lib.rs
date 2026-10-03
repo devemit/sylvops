@@ -2517,54 +2517,58 @@ impl DesktopApp {
                 },
             );
         let mut status = row![
-            container(
-                text(application_version_text())
-                    .font(UI_SEMIBOLD)
-                    .size(FOOTER_TEXT_SIZE)
-                    .wrapping(text::Wrapping::None),
-            )
-            .width(Length::Fixed(110.0))
-            .clip(true),
+            text(application_version_text())
+                .font(UI_SEMIBOLD)
+                .size(FOOTER_TEXT_SIZE)
+                .wrapping(text::Wrapping::None),
             footer_connection(self.connection),
         ]
         .spacing(density.region_spacing)
         .align_y(Center);
         if width >= 720 {
-            status = status.push(footer_separator()).push(footer_context(
-                "Workspace",
-                &workspace,
-                120.0,
-            ));
+            status = status
+                .push(footer_separator())
+                .push(footer_context("Workspace", &workspace));
         }
         if width >= 980 {
             status = status
                 .push(footer_separator())
-                .push(footer_context("Repository", &repository, 125.0))
+                .push(footer_context("Repository", &repository))
                 .push(footer_separator())
-                .push(footer_context("Checkout", &checkout, 145.0));
+                .push(footer_context("Checkout", &checkout));
         }
         if width >= 1_180 {
             status = status
                 .push(footer_separator())
-                .push(footer_context("Session", &session, 145.0));
+                .push(footer_context("Session", &session));
         }
-        status = status.push(space::horizontal()).push(footer_context(
+        let mut trailing = row![footer_context(
             "View",
             main_tab_label(presentation.selection.main_tab),
-            80.0,
-        ));
+        )]
+        .spacing(density.region_spacing)
+        .align_y(Center);
         if width >= 1_180 {
-            status = status
+            trailing = trailing
                 .push(footer_separator())
                 .push(footer_item("Ctrl+K shortcuts"));
         }
-        container(status)
-            .height(density.footer_height)
-            .padding([3, 10])
+        let contexts = scrollable(status)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::hidden(),
+            ))
             .width(Fill)
-            .clip(true)
-            .style(chrome_surface)
-            .into()
+            .height(density.footer_height);
+        container(
+            row![contexts, trailing]
+                .spacing(density.region_spacing)
+                .align_y(Center),
+        )
+        .height(density.footer_height)
+        .padding([3, 10])
+        .width(Fill)
+        .style(chrome_surface)
+        .into()
     }
 
     fn process_bridge_events(&mut self) {
@@ -5180,16 +5184,12 @@ fn footer_item(label: &str) -> Element<'static, Message> {
         .into()
 }
 
-fn footer_context(label: &'static str, value: &str, width: f32) -> Element<'static, Message> {
-    container(
-        text(format!("{label}: {value}"))
-            .font(UI_MEDIUM)
-            .size(FOOTER_TEXT_SIZE)
-            .wrapping(text::Wrapping::None),
-    )
-    .width(Length::Fixed(width))
-    .clip(true)
-    .into()
+fn footer_context(label: &'static str, value: &str) -> Element<'static, Message> {
+    text(format!("{label}: {value}"))
+        .font(UI_MEDIUM)
+        .size(FOOTER_TEXT_SIZE)
+        .wrapping(text::Wrapping::None)
+        .into()
 }
 
 fn footer_connection(connection: ConnectionState) -> Element<'static, Message> {
@@ -5209,7 +5209,6 @@ fn footer_connection(connection: ConnectionState) -> Element<'static, Message> {
         .spacing(4)
         .align_y(Center),
     )
-    .width(Length::Fixed(95.0))
     .padding([3, 7])
     .style(move |theme| footer_connection_style(theme, connection))
     .into()
@@ -5894,33 +5893,33 @@ mod tests {
 
     #[cfg(windows)]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        16_770_857_131_302_816_660,
-        11_447_965_043_770_947_898,
-        13_462_223_169_590_025_047,
-        7_770_067_056_298_849_975,
-        396_902_320_718_205_612,
-        8_629_820_395_131_443_783,
-        18_156_419_510_933_694_931,
+        3_776_480_829_573_680_607,
+        15_224_806_857_697_282_047,
+        16_392_266_689_671_405_100,
+        10_448_167_447_137_816_396,
+        1_071_659_710_684_271_305,
+        6_252_492_281_865_111_872,
+        8_044_612_287_909_611_382,
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        16_770_857_131_302_816_660,
-        11_447_965_043_770_947_898,
-        13_462_223_169_590_025_047,
-        7_770_067_056_298_849_975,
-        396_902_320_718_205_612,
-        8_629_820_395_131_443_783,
-        18_156_419_510_933_694_931,
+        3_776_480_829_573_680_607,
+        15_224_806_857_697_282_047,
+        16_392_266_689_671_405_100,
+        10_448_167_447_137_816_396,
+        1_071_659_710_684_271_305,
+        6_252_492_281_865_111_872,
+        8_044_612_287_909_611_382,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        16_770_857_131_302_816_660,
-        11_447_965_043_770_947_898,
-        13_462_223_169_590_025_047,
-        7_770_067_056_298_849_975,
-        396_902_320_718_205_612,
-        8_629_820_395_131_443_783,
-        18_156_419_510_933_694_931,
+        3_776_480_829_573_680_607,
+        15_224_806_857_697_282_047,
+        16_392_266_689_671_405_100,
+        10_448_167_447_137_816_396,
+        1_071_659_710_684_271_305,
+        6_252_492_281_865_111_872,
+        8_044_612_287_909_611_382,
     ];
 
     async fn render_desktop_baseline(
@@ -6180,7 +6179,7 @@ mod tests {
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [151, 111, 76, 161, 218, 150, 131]
+            [147, 110, 76, 161, 217, 146, 130]
         );
         let baselines = [
             &canopy_attention,
@@ -6664,7 +6663,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("footer source");
         assert!(footer.matches("footer_context(").count() >= 5);
-        assert!(footer.contains("Length::Fixed(110.0)"));
+        assert!(footer.contains("scrollable(status)"));
+        assert!(footer.contains("scrollable::Direction::Horizontal"));
+        assert!(!footer.contains("Length::Fixed"));
         assert!(footer.contains("Wrapping::None"));
     }
 

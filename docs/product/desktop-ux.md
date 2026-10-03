@@ -39,7 +39,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 - JetBrains Mono Regular, Medium, and SemiBold are bundled under OFL-1.1 and form the desktop UI family on every platform. The embedded terminal continues to honor its separate font preference.
 - The desktop and TUI new-session forms expose the provider picker and optional display name only. Model, effort, and initial prompt remain supported by the CLI and protocol but are not interactive-form settings.
 - The footer presents the actual build identity (including an unsigned-preview or release tag when supplied at build time), local-daemon health beside the version, responsive Workspace/Repository/Checkout/Session context, the active content view, and essential shortcuts. Internal enum names and keyboard-panel debug state are not user-facing status.
-- Navigator rows keep a fixed height when selection changes; the managed-checkout delete action stays inside the selected row. Footer context regions use breakpoint-specific fixed widths so changing names and state does not move neighboring labels.
+- Navigator rows keep a fixed height when selection changes; the managed-checkout delete action stays inside the selected row. Footer context remains one line and uses a horizontally scrollable natural-width strip so complete Workspace, Repository, Checkout, and Session names remain available without pushing View and shortcuts off the right edge.
 
 ## Embedded terminal baseline
 
