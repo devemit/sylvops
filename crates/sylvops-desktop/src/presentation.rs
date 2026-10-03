@@ -329,6 +329,7 @@ pub(crate) struct NavigatorRow {
     pub kind: NavigatorNodeKind,
     pub label: String,
     pub detail: String,
+    pub badge: Option<String>,
     pub indicator: Option<SessionIndicator>,
     pub attention: Option<NavigatorAttention>,
     pub actions: Vec<NavigatorAction>,
@@ -666,6 +667,7 @@ fn build_repository_rows(
                 kind: NavigatorNodeKind::Repository,
                 label: project.name.clone(),
                 detail: "Repository".into(),
+                badge: None,
                 indicator: None,
                 attention,
                 actions: Vec::new(),
@@ -711,14 +713,14 @@ fn build_checkout_rows(
                 id: NavigatorNodeId::Checkout(worktree.id),
                 kind: NavigatorNodeKind::Checkout,
                 label: worktree.name.clone(),
-                detail: format!(
-                    "{} · {}",
-                    worktree.branch.as_deref().unwrap_or("detached"),
+                detail: worktree.branch.as_deref().unwrap_or("detached").to_owned(),
+                badge: Some(
                     if worktree.is_root_checkout {
                         "Root"
                     } else {
                         "Managed"
                     }
+                    .to_owned(),
                 ),
                 indicator: None,
                 attention: sessions
@@ -755,6 +757,7 @@ fn build_session_rows(
             kind: NavigatorNodeKind::Session,
             label: session.display_name.clone(),
             detail: session_state_label(session.state).to_owned(),
+            badge: None,
             indicator: Some(SessionIndicator::for_state(session.state)),
             attention: attention_for_state(session.state),
             actions: Vec::new(),
@@ -1556,7 +1559,11 @@ mod tests {
         });
 
         assert_eq!(presentation.navigator.repositories[0].label, "SylvOps");
-        assert_eq!(presentation.navigator.checkouts[0].detail, "main · Root");
+        assert_eq!(presentation.navigator.checkouts[0].detail, "main");
+        assert_eq!(
+            presentation.navigator.checkouts[0].badge.as_deref(),
+            Some("Root")
+        );
         assert_eq!(
             presentation.navigator.sessions[0].indicator,
             Some(SessionIndicator::Working)

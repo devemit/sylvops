@@ -1321,47 +1321,52 @@ impl DesktopApp {
             .width(Fill)
             .into()
         } else {
-            let detail: Element<'static, Message> = if let Some(attention) = row.attention {
-                row![
-                    line_icon(navigator_attention_icon(attention), 13),
-                    text(format!(
-                        "{} · {}",
-                        navigator_attention_label(attention),
-                        row.detail
-                    ))
-                    .size(UI_META_SIZE)
-                    .style(text::secondary),
-                ]
-                .spacing(4)
-                .align_y(Center)
-                .into()
-            } else {
+            let mut title = row![name].spacing(5).align_y(Center);
+            if let Some(badge) = &row.badge {
+                title = title.push(
+                    container(text(badge.clone()).font(UI_MEDIUM).size(10))
+                        .padding([1, 4])
+                        .style(navigator_badge_style),
+                );
+            }
+            if let Some(attention) = row.attention {
+                title = title.push(
+                    row![
+                        line_icon(navigator_attention_icon(attention), 13),
+                        text(navigator_attention_label(attention))
+                            .size(10)
+                            .style(text::secondary),
+                    ]
+                    .spacing(3)
+                    .align_y(Center),
+                );
+            }
+            title = title.push(space::horizontal());
+            if is_selected
+                && let Some(NavigatorAction::DeleteCheckout(worktree_id)) = row.actions.first()
+            {
+                title = title.push(
+                    button(icon_text_label(LineIcon::Delete, "Delete", UI_META_SIZE))
+                        .on_press(Message::RunNavigatorAction(
+                            NavigatorAction::DeleteCheckout(*worktree_id),
+                        ))
+                        .height(density.control_height)
+                        .padding([3, 6])
+                        .style(flat_danger_style),
+                );
+            }
+            column![
+                title,
                 text(row.detail.clone())
                     .size(UI_META_SIZE)
                     .style(text::secondary)
-                    .into()
-            };
-            column![name, detail].spacing(1).width(Fill).into()
+                    .wrapping(text::Wrapping::None),
+            ]
+            .spacing(1)
+            .width(Fill)
+            .into()
         };
-        let mut row_content = row![labels].spacing(3).align_y(Center);
-        if is_selected
-            && let Some(NavigatorAction::DeleteCheckout(worktree_id)) = row.actions.first()
-        {
-            row_content = row_content.push(
-                button(icon_text_label(
-                    LineIcon::Delete,
-                    DELETE_CHECKOUT_LABEL,
-                    UI_META_SIZE,
-                ))
-                .on_press(Message::RunNavigatorAction(
-                    NavigatorAction::DeleteCheckout(*worktree_id),
-                ))
-                .height(density.control_height)
-                .padding([4, 7])
-                .style(flat_danger_style),
-            );
-        }
-        let content = container(row_content)
+        let content = container(row![labels].spacing(3).align_y(Center))
             .width(Fill)
             .height(density.row_height.max(44))
             .padding([4, 6])
@@ -5501,6 +5506,20 @@ fn navigator_row_container_style(theme: &Theme, selected: bool, hovered: bool) -
     list_item_container_style(theme, selected, hovered)
 }
 
+fn navigator_badge_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.weak.color)),
+        text_color: Some(palette.background.weak.text),
+        border: Border {
+            width: 1.0,
+            radius: 4.0.into(),
+            color: palette.background.strong.color,
+        },
+        ..container::Style::default()
+    }
+}
+
 fn footer_connection_style(theme: &Theme, connection: ConnectionState) -> container::Style {
     let palette = theme.extended_palette();
     let (pair, border) = match connection {
@@ -5893,7 +5912,7 @@ mod tests {
 
     #[cfg(windows)]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        3_776_480_829_573_680_607,
+        6_984_639_791_195_575_364,
         15_224_806_857_697_282_047,
         16_392_266_689_671_405_100,
         10_448_167_447_137_816_396,
@@ -5903,7 +5922,7 @@ mod tests {
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        3_776_480_829_573_680_607,
+        6_984_639_791_195_575_364,
         15_224_806_857_697_282_047,
         16_392_266_689_671_405_100,
         10_448_167_447_137_816_396,
@@ -5913,7 +5932,7 @@ mod tests {
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        3_776_480_829_573_680_607,
+        6_984_639_791_195_575_364,
         15_224_806_857_697_282_047,
         16_392_266_689_671_405_100,
         10_448_167_447_137_816_396,
@@ -6179,7 +6198,7 @@ mod tests {
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [147, 110, 76, 161, 217, 146, 130]
+            [155, 110, 76, 161, 217, 146, 130]
         );
         let baselines = [
             &canopy_attention,
