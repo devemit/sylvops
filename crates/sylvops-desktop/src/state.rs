@@ -9,9 +9,15 @@ pub(crate) fn reset_layout(state: &mut DesktopState) {
 }
 
 pub(crate) fn panel_ratios_fit(width: u16, ratios: [u16; 3]) -> bool {
-    let width = u32::from(width);
-    let explorer = width.saturating_mul(u32::from(ratios[0])) / 1000;
-    explorer >= 180 && width.saturating_sub(explorer) >= 680
+    let mut remaining = u32::from(width);
+    for ratio in ratios {
+        let pane = remaining.saturating_mul(u32::from(ratio)) / 1000;
+        if pane < 150 {
+            return false;
+        }
+        remaining = remaining.saturating_sub(pane);
+    }
+    remaining >= 480
 }
 
 #[cfg(test)]
@@ -33,7 +39,9 @@ mod tests {
     #[test]
     fn panel_limits_preserve_a_useful_main_surface() {
         assert!(panel_ratios_fit(1440, DesktopState::default().panel_ratios));
-        assert!(panel_ratios_fit(1180, [350, 350, 350]));
+        assert!(!panel_ratios_fit(1180, [350, 350, 350]));
         assert!(!panel_ratios_fit(1180, [100, 350, 350]));
+        assert!(!panel_ratios_fit(1180, [350, 350, 100]));
+        assert!(!panel_ratios_fit(900, [350, 350, 350]));
     }
 }
