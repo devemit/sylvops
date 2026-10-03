@@ -9,7 +9,7 @@ use crate::{
     CoreError, Result,
     domain::ProviderKind,
     ids::{SessionId, WorktreeId},
-    status::NormalizedProviderEvent,
+    status::{NormalizedProviderEvent, ProviderConversationId},
 };
 
 pub const MAX_PROVIDER_LIFECYCLE_PAYLOAD_SIZE: usize = 64 * 1024;
@@ -241,6 +241,13 @@ pub struct ProviderRuntimeSpec {
     pub owned_paths: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProviderLifecycleEvent {
+    pub event: Option<NormalizedProviderEvent>,
+    pub conversation_id: Option<ProviderConversationId>,
+    pub turn_id: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct LaunchArguments {
     values: Vec<OsString>,
@@ -313,64 +320,7 @@ impl fmt::Debug for LaunchSpec {
     }
 }
 
-#[derive(Clone)]
-pub struct HookEndpoint {
-    pub url: String,
-    pub bearer_token: String,
-    pub relay_executable: PathBuf,
-    pub profile_name: String,
-}
-
-impl fmt::Debug for HookEndpoint {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("HookEndpoint")
-            .field("url", &self.url)
-            .field("bearer_token", &"[REDACTED]")
-            .field("relay_executable", &self.relay_executable)
-            .field("profile_name", &self.profile_name)
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HookInstallation {
-    pub profile_name: String,
-    pub owned_paths: Vec<PathBuf>,
-}
-
-#[async_trait]
-pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
-    fn kind(&self) -> ProviderKind;
-    async fn probe(&self) -> ProviderHealth;
-    async fn refresh(&self) -> ProviderHealth {
-        self.probe().await
-    }
-    /// Builds a structured executable, argument vector, and reviewed environment.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the provider is unavailable or an option is invalid.
-    fn build_launch(&self, context: LaunchContext) -> Result<LaunchSpec>;
-    /// Builds a structured resume command when the provider supports resume.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the stored external identifier or options are invalid.
-    fn build_resume(&self, context: ResumeContext) -> Result<Option<LaunchSpec>>;
-    /// Installs only application-owned observational status-hook configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a safe, non-overwriting installation is impossible.
-    fn install_status_hooks(
-        &self,
-        worktree: &std::path::Path,
-        endpoint: &HookEndpoint,
-    ) -> Result<HookInstallation>;
-}
-
-/// Provider-owned runtime behavior introduced alongside the legacy adapter migration path.
+/// Provider-owned runtime behavior used by the authoritative daemon.
 ///
 /// Shared daemon code supplies trusted Session and Worktree context, while each implementation
 /// owns its structured launch/resume configuration and parsing of bounded provider hook payloads.
@@ -379,6 +329,9 @@ pub trait ProviderRuntime: Send + Sync + std::fmt::Debug {
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self) -> ProviderCapabilities;
     async fn probe(&self) -> ProviderHealth;
+    async fn refresh(&self) -> ProviderHealth {
+        self.probe().await
+    }
 
     /// Builds the executable, structured argument vector, and reviewed environment for a new
     /// Session. Transient input must remain outside [`LaunchArguments::persisted_values`].
@@ -395,8 +348,17 @@ pub trait ProviderRuntime: Send + Sync + std::fmt::Debug {
     /// Returns an error when the conversation identity or requested options are invalid.
     fn configure_resume(&self, context: ResumeContext) -> Result<Option<ProviderRuntimeSpec>>;
 
-    /// Converts one bounded provider-owned hook payload into provider-neutral lifecycle data.
-    /// Unknown events return `Ok(None)`; malformed known events fail closed with an error.
+    /// Removes application-owned runtime overlays after revalidating their identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cleanup detects an unsafe or inconsistent owned path.
+    fn cleanup_runtime_paths(&self, _paths: &[PathBuf]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Converts one bounded provider-owned hook payload into provider-neutral lifecycle data and
+    /// bounded identity metadata. Unknown and malformed payloads fail closed with an error.
     ///
     /// # Errors
     ///
@@ -404,7 +366,7 @@ pub trait ProviderRuntime: Send + Sync + std::fmt::Debug {
     fn normalize_lifecycle_event(
         &self,
         payload: &ProviderLifecyclePayload,
-    ) -> Result<Option<NormalizedProviderEvent>>;
+    ) -> Result<ProviderLifecycleEvent>;
 }
 
 pub fn provider_error(message: impl Into<String>) -> CoreError {
@@ -496,24 +458,29 @@ mod tests {
         fn normalize_lifecycle_event(
             &self,
             payload: &ProviderLifecyclePayload,
-        ) -> Result<Option<NormalizedProviderEvent>> {
-            match payload.as_bytes() {
-                b"background" => Ok(Some(NormalizedProviderEvent::TurnStopped {
+        ) -> Result<ProviderLifecycleEvent> {
+            let event = match payload.as_bytes() {
+                b"background" => Some(NormalizedProviderEvent::TurnStopped {
                     remaining_work: RemainingWork {
                         background_tasks: true,
                         ..RemainingWork::default()
                     },
-                })),
-                b"failure" => Ok(Some(NormalizedProviderEvent::TurnFailed {
+                }),
+                b"failure" => Some(NormalizedProviderEvent::TurnFailed {
                     category: TurnFailureCategory::new("provider_unavailable")
                         .expect("valid category"),
-                })),
-                _ => Ok(None),
-            }
+                }),
+                _ => return Err(provider_error("unknown provider lifecycle event")),
+            };
+            Ok(ProviderLifecycleEvent {
+                event,
+                ..ProviderLifecycleEvent::default()
+            })
         }
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn provider_runtime_owns_configuration_and_lifecycle_normalization() {
         let runtime: Box<dyn ProviderRuntime> = Box::new(FakeRuntime);
         let health = runtime.probe().await;
@@ -601,7 +568,8 @@ mod tests {
         assert!(matches!(
             runtime
                 .normalize_lifecycle_event(&background_payload)
-                .unwrap(),
+                .unwrap()
+                .event,
             Some(NormalizedProviderEvent::TurnStopped {
                 remaining_work: RemainingWork {
                     background_tasks: true,
@@ -611,7 +579,10 @@ mod tests {
         ));
         let failure_payload = ProviderLifecyclePayload::new(b"failure".to_vec()).unwrap();
         assert!(matches!(
-            runtime.normalize_lifecycle_event(&failure_payload).unwrap(),
+            runtime
+                .normalize_lifecycle_event(&failure_payload)
+                .unwrap()
+                .event,
             Some(NormalizedProviderEvent::TurnFailed { .. })
         ));
         assert!(

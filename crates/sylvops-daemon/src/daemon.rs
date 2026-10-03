@@ -25,8 +25,11 @@ use sylvops_core::{
         PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolFailure, WelcomeResponse, read_frame,
         validate_terminal_size, write_frame,
     },
-    provider::{LaunchContext, LaunchSpec, ResumeContext},
-    status::{NormalizedProviderEvent, SessionStatusMachine},
+    provider::{LaunchContext, ProviderRuntimeSpec, ResumeContext},
+    status::{
+        ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId,
+        SessionStatusMachine,
+    },
     upgrade::{
         ActiveUpgradeSession, InstallDisposition, MAX_UPGRADE_ACTIVE_SESSIONS,
         MAX_UPGRADE_CLIENT_PROCESSES, NativeUpgradeHandoff, ReleaseMetadata, UpgradeStatus,
@@ -44,7 +47,7 @@ use crate::{
     data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan},
     database::{DatabaseHandle, NewSession},
     git,
-    hook::{HookDelivery, HookReceiver},
+    hook::{HookCredentials, HookDelivery, HookReceiver},
     ipc::{BoxStream, LocalListener},
     provider::ProviderRegistry,
     runtime::{AuthenticationToken, RuntimePaths},
@@ -135,6 +138,7 @@ struct ManagedSession {
     handle: SessionHandle,
     record: Arc<RwLock<Session>>,
     completed: watch::Receiver<bool>,
+    owned_runtime_paths: Arc<Vec<PathBuf>>,
 }
 
 #[derive(Debug)]
@@ -332,6 +336,7 @@ struct DaemonState {
     scrollback_bytes: usize,
     managed_worktree_root: PathBuf,
     providers: Arc<ProviderRegistry>,
+    hook_credentials: HookCredentials,
     status_machines: Arc<Mutex<HashMap<SessionId, SessionStatusMachine>>>,
     hook_tracking: Arc<Mutex<HashMap<SessionId, HookTracking>>>,
     upgrade: Arc<UpgradeCoordinator>,
@@ -481,8 +486,9 @@ pub async fn run_with_handoff_launchers(
         config.hook_requests_per_minute,
     )
     .await?;
+    let hook_credentials = hook_receiver.credentials();
     let providers = Arc::new(ProviderRegistry::new(
-        Some(&hook_receiver.endpoint),
+        Some(hook_receiver.relay_executable()),
         &config.enabled_providers,
     )?);
     let upgrade = prepare_upgrade(&paths).await?;
@@ -529,6 +535,7 @@ pub async fn run_with_handoff_launchers(
         scrollback_bytes: config.scrollback_capacity_bytes,
         managed_worktree_root,
         providers,
+        hook_credentials,
         status_machines: Arc::new(Mutex::new(HashMap::new())),
         hook_tracking: Arc::new(Mutex::new(HashMap::new())),
         upgrade,
@@ -576,6 +583,7 @@ pub async fn run_with_handoff_launchers(
     state.shutdown.send_replace(true);
     while clients.join_next().await.is_some() {}
     stop_all_sessions(&state).await;
+    state.hook_credentials.invalidate_all();
     hook_receiver.shutdown().await;
     let database_result = database.shutdown().await;
     remove_token_if_owned(&paths, &token);
@@ -1421,7 +1429,17 @@ async fn handle_request(
                     "Codex is not authenticated; run `codex login` explicitly".into(),
                 ));
             }
-            let spec = state.providers.launch(
+            let display_name = validated_session_name(display_name, provider)?;
+            let lifecycle_endpoint = if state.providers.supports_lifecycle_events(provider)? {
+                Some(
+                    state
+                        .hook_credentials
+                        .register(provider, session_id, worktree_id)?,
+                )
+            } else {
+                None
+            };
+            let spec = match state.providers.launch(
                 provider,
                 LaunchContext {
                     session_id,
@@ -1430,17 +1448,33 @@ async fn handle_request(
                     model,
                     effort,
                     initial_prompt: initial_prompt.clone(),
-                    lifecycle_endpoint: None,
+                    lifecycle_endpoint,
                 },
-            )?;
+            ) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    state.hook_credentials.invalidate(session_id);
+                    return Err(error);
+                }
+            };
+            let command = match path_text(&spec.launch.executable) {
+                Ok(command) => command,
+                Err(error) => {
+                    state.hook_credentials.invalidate(session_id);
+                    state
+                        .providers
+                        .cleanup_runtime_paths(provider, &spec.owned_paths);
+                    return Err(error);
+                }
+            };
             let record = NewSession {
                 id: session_id,
                 worktree_id,
-                display_name: validated_session_name(display_name, provider)?,
+                display_name,
                 provider_profile_id: Some(provider_profile_id(provider)),
                 provider_kind: provider,
-                command: path_text(&spec.executable)?,
-                arguments_json: arguments_json(spec.arguments.persisted_values())?,
+                command,
+                arguments_json: arguments_json(spec.launch.arguments.persisted_values())?,
                 cwd: worktree.canonical_path.clone(),
                 external_session_id: None,
                 resumed_from_session_id: None,
@@ -1500,7 +1534,19 @@ async fn handle_request(
                 ));
             }
             let session_id = SessionId::new();
-            let spec = state.providers.resume(
+            let lifecycle_endpoint = if state
+                .providers
+                .supports_lifecycle_events(source.provider_kind)?
+            {
+                Some(state.hook_credentials.register(
+                    source.provider_kind,
+                    session_id,
+                    source.worktree_id,
+                )?)
+            } else {
+                None
+            };
+            let spec = match state.providers.resume(
                 source.provider_kind,
                 ResumeContext {
                     session_id,
@@ -1509,9 +1555,25 @@ async fn handle_request(
                     cwd: PathBuf::from(&worktree.canonical_path),
                     model: None,
                     effort: None,
-                    lifecycle_endpoint: None,
+                    lifecycle_endpoint,
                 },
-            )?;
+            ) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    state.hook_credentials.invalidate(session_id);
+                    return Err(error);
+                }
+            };
+            let command = match path_text(&spec.launch.executable) {
+                Ok(command) => command,
+                Err(error) => {
+                    state.hook_credentials.invalidate(session_id);
+                    state
+                        .providers
+                        .cleanup_runtime_paths(source.provider_kind, &spec.owned_paths);
+                    return Err(error);
+                }
+            };
             let record = NewSession {
                 id: session_id,
                 worktree_id: source.worktree_id,
@@ -1521,8 +1583,8 @@ async fn handle_request(
                     .collect(),
                 provider_profile_id: source.provider_profile_id,
                 provider_kind: source.provider_kind,
-                command: path_text(&spec.executable)?,
-                arguments_json: arguments_json(spec.arguments.persisted_values())?,
+                command,
+                arguments_json: arguments_json(spec.launch.arguments.persisted_values())?,
                 cwd: worktree.canonical_path,
                 external_session_id: Some(external_session_id),
                 resumed_from_session_id: Some(source_session_id),
@@ -2123,13 +2185,22 @@ async fn send_resync(
 async fn spawn_managed_session(
     state: &DaemonState,
     record: NewSession,
-    launch: LaunchSpec,
+    runtime: ProviderRuntimeSpec,
     columns: u16,
     rows: u16,
 ) -> Result<(u64, Session)> {
     let session_id = record.id;
+    let provider_kind = record.provider_kind;
     let cwd = PathBuf::from(&record.cwd);
-    let _ = state.database.create_session(record).await?;
+    let owned_runtime_paths = Arc::new(runtime.owned_paths);
+    let launch = runtime.launch;
+    if let Err(error) = state.database.create_session(record).await {
+        state.hook_credentials.invalidate(session_id);
+        state
+            .providers
+            .cleanup_runtime_paths(provider_kind, &owned_runtime_paths);
+        return Err(error);
+    }
     let spec = SessionSpec {
         program: launch.executable,
         arguments: launch.arguments.into_all(),
@@ -2141,6 +2212,10 @@ async fn spawn_managed_session(
     let handle = match SessionHandle::spawn_sanitized(&spec, &launch.environment) {
         Ok(handle) => handle,
         Err(error) => {
+            state.hook_credentials.invalidate(session_id);
+            state
+                .providers
+                .cleanup_runtime_paths(provider_kind, &owned_runtime_paths);
             if let Ok((revision, session)) = state
                 .database
                 .finish_session(
@@ -2166,6 +2241,10 @@ async fn spawn_managed_session(
         Ok(result) => result,
         Err(error) => {
             let _ = handle.stop().await;
+            state.hook_credentials.invalidate(session_id);
+            state
+                .providers
+                .cleanup_runtime_paths(provider_kind, &owned_runtime_paths);
             let _ = state
                 .database
                 .finish_session(
@@ -2183,6 +2262,7 @@ async fn spawn_managed_session(
         handle: handle.clone(),
         record: Arc::new(RwLock::new(running.clone())),
         completed,
+        owned_runtime_paths,
     };
     state
         .sessions
@@ -2233,11 +2313,38 @@ async fn persist_provider_health(
     Ok(())
 }
 
+fn provider_external_id_update(
+    existing: Option<&str>,
+    received: Option<&ProviderConversationId>,
+    transition: Option<ConversationIdentityTransition>,
+) -> Result<Option<String>> {
+    let Some(received) = received else {
+        return Ok(None);
+    };
+    match existing {
+        None => Ok(Some(received.to_string())),
+        Some(existing) if existing == received.as_str() => Ok(None),
+        Some(_)
+            if transition.is_some_and(|transition| {
+                matches!(
+                    transition,
+                    ConversationIdentityTransition::Cleared
+                        | ConversationIdentityTransition::Resumed
+                )
+            }) =>
+        {
+            Ok(Some(received.to_string()))
+        }
+        Some(_) => Err(DaemonError::Provider(
+            "hook external session identifier changed unexpectedly".into(),
+        )),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Result<()> {
     let persisted = state.database.session(delivery.session_id).await?;
-    if persisted.worktree_id != delivery.worktree_id
-        || persisted.provider_kind != ProviderKind::Codex
+    if persisted.worktree_id != delivery.worktree_id || persisted.provider_kind != delivery.provider
     {
         state
             .database
@@ -2251,44 +2358,69 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             "hook session/worktree association is invalid".into(),
         ));
     }
-    if let (Some(existing), Some(received)) = (
+    let normalized = state
+        .providers
+        .normalize_lifecycle_event(delivery.provider, &delivery.payload)?;
+    let identity_transition = normalized.event.as_ref().and_then(|event| match event {
+        NormalizedProviderEvent::TurnStarted {
+            conversation: Some(conversation),
+        } => Some(conversation.transition),
+        _ => None,
+    });
+    let external_session_id = match provider_external_id_update(
         persisted.external_session_id.as_deref(),
-        delivery.external_session_id.as_deref(),
-    ) && existing != received
-    {
-        state
-            .database
-            .audit(
-                "provider_hook_refused",
-                "refused",
-                &serde_json::json!({"reason": "external_session_id_changed"}).to_string(),
-            )
-            .await?;
-        return Err(DaemonError::Provider(
-            "hook external session identifier changed unexpectedly".into(),
-        ));
-    }
-    let Some(event) = delivery.event else {
+        normalized.conversation_id.as_ref(),
+        identity_transition,
+    ) {
+        Ok(update) => update,
+        Err(error) => {
+            state
+                .database
+                .audit(
+                    "provider_hook_refused",
+                    "refused",
+                    &serde_json::json!({"reason": "external_session_id_changed"}).to_string(),
+                )
+                .await?;
+            return Err(error);
+        }
+    };
+    let Some(event) = normalized.event else {
         state
             .database
             .audit(
                 "provider_hook_unknown",
                 "refused",
+                &serde_json::json!({"session_id": delivery.session_id}).to_string(),
+            )
+            .await?;
+        return Err(DaemonError::Provider(
+            "provider lifecycle event type is unknown".into(),
+        ));
+    };
+    if persisted.external_session_id.is_some()
+        && external_session_id.is_some()
+        && let Some(transition) = identity_transition
+    {
+        state
+            .database
+            .audit(
+                "provider_conversation_changed",
+                "succeeded",
                 &serde_json::json!({
                     "session_id": delivery.session_id,
-                    "event_name": delivery.event_name
+                    "transition": transition
                 })
                 .to_string(),
             )
             .await?;
-        return Ok(());
-    };
+    }
     let disposition = {
         let mut tracking = state.hook_tracking.lock().await;
         let tracking = tracking.entry(delivery.session_id).or_default();
         if !tracking.accept_fingerprint(delivery.fingerprint) {
             Some("duplicate")
-        } else if delivery
+        } else if normalized
             .turn_id
             .as_ref()
             .is_some_and(|turn_id| tracking.stopped_turns.contains(turn_id))
@@ -2297,7 +2429,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             Some("stale")
         } else {
             if matches!(&event, NormalizedProviderEvent::TurnStopped { .. })
-                && let Some(turn_id) = delivery.turn_id.as_ref()
+                && let Some(turn_id) = normalized.turn_id.as_ref()
             {
                 tracking.close_turn(turn_id.clone());
             }
@@ -2312,7 +2444,6 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
                 "refused",
                 &serde_json::json!({
                     "session_id": delivery.session_id,
-                    "event_name": delivery.event_name,
                     "reason": disposition
                 })
                 .to_string(),
@@ -2329,7 +2460,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
     };
     let (revision, session) = state
         .database
-        .update_session_status(delivery.session_id, next, delivery.external_session_id)
+        .update_session_status(delivery.session_id, next, external_session_id)
         .await?;
     if let Some(managed) = get_managed_session(state, delivery.session_id).await {
         *managed.record.write().await = session.clone();
@@ -2375,7 +2506,14 @@ fn spawn_exit_monitor(
 ) {
     tokio::spawn(async move {
         let mut handle = managed.handle.clone();
-        match handle.wait().await {
+        let provider_kind = managed.record.read().await.provider_kind;
+        let exit = handle.wait().await;
+        state.hook_credentials.invalidate(session_id);
+        state
+            .providers
+            .cleanup_runtime_paths(provider_kind, &managed.owned_runtime_paths);
+        state.hook_tracking.lock().await.remove(&session_id);
+        match exit {
             Ok(exit) => {
                 let state_value = if exit.stop_requested {
                     SessionState::Terminated
@@ -2757,7 +2895,10 @@ impl Drop for ClientGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplicationMutationCoordinator, LifecycleCoordinator};
+    use super::{
+        ApplicationMutationCoordinator, LifecycleCoordinator, provider_external_id_update,
+    };
+    use sylvops_core::status::{ConversationIdentityTransition, ProviderConversationId};
 
     #[tokio::test]
     async fn lifecycle_quiescing_drains_existing_activity_and_refuses_new_work() {
@@ -2794,5 +2935,27 @@ mod tests {
         finalization.complete();
         assert!(!coordinator.handoff_pending());
         assert!(coordinator.begin().is_ok());
+    }
+
+    #[test]
+    fn verified_external_id_is_captured_from_any_event_but_cannot_change_for_codex() {
+        let received = ProviderConversationId::new("codex-session-1").unwrap();
+        assert_eq!(
+            provider_external_id_update(None, Some(&received), None).unwrap(),
+            Some("codex-session-1".into())
+        );
+        assert_eq!(
+            provider_external_id_update(Some("codex-session-1"), Some(&received), None).unwrap(),
+            None
+        );
+        let changed = ProviderConversationId::new("codex-session-2").unwrap();
+        assert!(
+            provider_external_id_update(
+                Some("codex-session-1"),
+                Some(&changed),
+                Some(ConversationIdentityTransition::Established),
+            )
+            .is_err()
+        );
     }
 }

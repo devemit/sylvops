@@ -40,7 +40,8 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
             ))
             .expect("test PATH"),
         );
-    let _codex_home = EnvironmentGuard::set("CODEX_HOME", temporary.path().join("codex-home"));
+    let codex_home = temporary.path().join("codex-home");
+    let _codex_home = EnvironmentGuard::set("CODEX_HOME", codex_home.clone());
 
     let paths = RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("paths");
     let daemon_paths = paths.clone();
@@ -98,6 +99,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .expect("stop shell response");
 
     let terminated_session_id = create_codex_session(&client, worktree_id).await;
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
     attach(&client, terminated_session_id).await;
     client
         .request(&ClientRequest::SessionInput {
@@ -120,6 +122,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         session.state == SessionState::Terminated
     })
     .await;
+    assert_eq!(owned_hook_profile_count(&codex_home), 0);
     match client
         .request(&ClientRequest::ResumeSession {
             session_id: terminated_session_id,
@@ -167,6 +170,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
             )
     })
     .await;
+    assert_eq!(owned_hook_profile_count(&codex_home), 0);
 
     let first_resume = ClientRequest::ResumeSession {
         session_id: source_session_id,
@@ -254,6 +258,14 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("resumed finish input");
     wait_for_session(&client, resumed_id, |session| session.process_id.is_none()).await;
+    assert_eq!(owned_hook_profile_count(&codex_home), 0);
+
+    let cleanup_session_id = create_codex_session(&client, worktree_id).await;
+    wait_for_session(&client, cleanup_session_id, |session| {
+        session.state == SessionState::Running && session.process_id.is_some()
+    })
+    .await;
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
 
     client
         .request(&ClientRequest::ShutdownDaemon)
@@ -264,6 +276,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .expect("daemon shutdown timeout")
         .expect("daemon task")
         .expect("daemon result");
+    assert_eq!(owned_hook_profile_count(&codex_home), 0);
 
     let restart_paths = paths.clone();
     let mut restart_task = tokio::spawn(async move { daemon::run(restart_paths).await });
@@ -305,6 +318,20 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .expect("restart daemon task")
         .expect("restart daemon result");
     assert_no_persisted_text_contains(&paths.database, PROMPT_SENTINEL);
+}
+
+fn owned_hook_profile_count(codex_home: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(codex_home) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("sylvops-") && name.ends_with(".config.toml")
+        })
+        .count()
 }
 
 async fn create_codex_session(client: &DaemonClient, worktree_id: WorktreeId) -> SessionId {
