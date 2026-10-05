@@ -4,7 +4,8 @@ use std::{
     env, fs,
     io::{self, BufRead, Read, Write},
     net::{SocketAddr, TcpStream},
-    process::ExitCode,
+    path::Path,
+    process::{Command, ExitCode},
     time::Duration,
 };
 
@@ -23,6 +24,12 @@ fn main() -> ExitCode {
 #[allow(clippy::too_many_lines)]
 fn run() -> io::Result<()> {
     let arguments: Vec<_> = env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("--fake-descendant-heartbeat") {
+        let path = arguments
+            .get(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing heartbeat path"))?;
+        return heartbeat_forever(Path::new(path));
+    }
     if let Some(exit) = probe_exit(&arguments) {
         return if exit == ExitCode::SUCCESS {
             Ok(())
@@ -165,6 +172,12 @@ fn run() -> io::Result<()> {
                 emit_hook_with_marker("UserPromptSubmit", &external_id, "after-output-flood")?;
                 println!("FAKE_CLAUDE_OUTPUT_FLOOD_DONE");
             }
+            value if value.starts_with("spawn-descendant:") => {
+                let heartbeat = value
+                    .strip_prefix("spawn-descendant:")
+                    .expect("matched descendant prefix");
+                spawn_descendant(Path::new(heartbeat))?;
+            }
             "malformed-hook" => {
                 emit_hook_bytes(
                     br#"{"hook_event_name":"Stop","private":"SYLVOPS_PRIVATE_MALFORMED_HOOK_75""#,
@@ -214,6 +227,24 @@ fn run() -> io::Result<()> {
         io::stdout().flush()?;
     }
     Ok(())
+}
+
+fn spawn_descendant(heartbeat: &Path) -> io::Result<()> {
+    let child = Command::new(env::current_exe()?)
+        .arg("--fake-descendant-heartbeat")
+        .arg(heartbeat)
+        .spawn()?;
+    println!("FAKE_CLAUDE_DESCENDANT_PID={}", child.id());
+    Ok(())
+}
+
+fn heartbeat_forever(path: &Path) -> io::Result<()> {
+    let mut counter = 0_u64;
+    loop {
+        counter = counter.saturating_add(1);
+        fs::write(path, counter.to_string())?;
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn probe_exit(arguments: &[String]) -> Option<ExitCode> {

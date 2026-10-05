@@ -329,6 +329,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 ```
 
+The default suite is offline. The explicit real-Claude release smoke requires a pre-authenticated host and is documented in [the testing guide](docs/development/testing.md); it is never enabled by the commands above.
+
 See [the MVP definition](docs/product/mvp.md) and [process architecture](docs/architecture/process-model.md).
 
 The standard Windows target requires Visual C++ Build Tools and the Windows SDK. See [the PTY architecture](docs/architecture/pty.md) for the atomic ConPTY/Job Object boundary.

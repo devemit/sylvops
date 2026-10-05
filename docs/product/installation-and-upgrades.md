@@ -115,6 +115,7 @@ An application release is ready when all of the following are true:
 - Normal uninstall removes the app but preserves user data; explicit data removal still never touches repositories or worktrees.
 - No initial prompt is present in persisted SQLite content.
 - Eligible Codex and Claude Sessions resume from desktop, TUI, and CLI into new session records.
+- Claude enablement passes the offline provider suite on every hosted operating system and the explicit bounded real-account smoke on a pre-authenticated host for the exact promoted commit; neither gate receives provider credentials from SylvOps.
 - All four supported target builds pass their native install and upgrade checks.
 
 ## Deferred scope
