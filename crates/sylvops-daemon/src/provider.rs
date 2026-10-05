@@ -2209,7 +2209,7 @@ mod tests {
                 .get(OsStr::new("SYLVOPS_HOOK_TOKEN")),
             Some(&OsString::from(endpoint.bearer_token()))
         );
-        assert!(configured.owned_paths.is_empty());
+        assert_eq!(configured.owned_paths, Vec::<PathBuf>::new());
 
         let source = std::fs::read_to_string(&settings_path).expect("managed settings source");
         assert!(source.contains("SessionStart"));

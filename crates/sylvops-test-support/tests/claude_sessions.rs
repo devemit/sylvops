@@ -102,16 +102,7 @@ async fn interactive_client_request_creates_claude_session() {
     })
     .await;
 
-    client
-        .request(&ClientRequest::StopSession {
-            session_id: session.id,
-        })
-        .await
-        .expect("stop response");
-    wait_for_session(&client, session.id, |session| {
-        session.state == SessionState::Terminated && session.process_id.is_none()
-    })
-    .await;
+    assert_claude_descendant_stops_with_session(&client, session.id, temporary.path()).await;
     client
         .request(&ClientRequest::ShutdownDaemon)
         .await
@@ -575,7 +566,10 @@ async fn managed_claude_session_inner() {
         .expect("daemon shutdown timeout")
         .expect("daemon task")
         .expect("daemon result");
-    assert!(managed_claude_settings(&paths.runtime_directory).is_empty());
+    assert_eq!(
+        managed_claude_settings(&paths.runtime_directory),
+        Vec::<std::path::PathBuf>::new()
+    );
     assert_no_persisted_text_contains(&paths.database, PROMPT_SENTINEL);
     assert_no_persisted_text_contains(&paths.database, FAILURE_SENTINEL);
     assert_no_persisted_text_contains(&paths.database, MALFORMED_SENTINEL);
@@ -740,18 +734,36 @@ async fn late_session_start_recovers_after_warning() {
         .clone()
         .expect("verified Claude conversation ID");
 
-    let resumed = match client
-        .request(&ClientRequest::ResumeSession {
-            session_id: failed_session_id,
-            columns: 80,
-            rows: 24,
-        })
-        .await
-        .expect("Claude resume response")
-    {
-        DaemonResponse::SessionResumed { session, .. } => session,
-        response => panic!("unexpected Claude resume response: {response:?}"),
+    let first_resume = ClientRequest::ResumeSession {
+        session_id: failed_session_id,
+        columns: 80,
+        rows: 24,
     };
+    let concurrent_resume = first_resume.clone();
+    let (first_response, concurrent_response) = tokio::join!(
+        client.request(&first_resume),
+        client.request(&concurrent_resume)
+    );
+    let mut resumed = None;
+    let mut refused = 0;
+    for response in [first_response, concurrent_response] {
+        match response.expect("concurrent Claude resume response") {
+            DaemonResponse::SessionResumed { session, .. } => {
+                assert!(resumed.replace(session).is_none());
+            }
+            DaemonResponse::Error(error) => {
+                assert!(
+                    error.message.contains("already been resumed"),
+                    "concurrent Claude resume error should be actionable: {}",
+                    error.message
+                );
+                refused += 1;
+            }
+            response => panic!("unexpected concurrent Claude resume response: {response:?}"),
+        }
+    }
+    assert_eq!(refused, 1);
+    let resumed = resumed.expect("one concurrent Claude resume succeeds");
     assert_ne!(resumed.id, failed_session_id);
     assert_eq!(resumed.provider_kind, ProviderKind::Claude);
     assert_eq!(resumed.worktree_id, worktree_id);
@@ -781,6 +793,24 @@ async fn late_session_start_recovers_after_warning() {
             && session.external_session_id.as_deref() == Some(external_id.as_str())
     })
     .await;
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: resumed.id,
+        })
+        .await
+        .expect("stop resumed Claude response");
+    wait_for_session(&client, resumed.id, |session| {
+        session.state == SessionState::Terminated && session.process_id.is_none()
+    })
+    .await;
+    match client
+        .request(&first_resume)
+        .await
+        .expect("stale Claude resume response")
+    {
+        DaemonResponse::Error(error) => assert!(error.message.contains("already been resumed")),
+        response => panic!("stale Claude resume unexpectedly succeeded: {response:?}"),
+    }
 
     client
         .request(&ClientRequest::ShutdownDaemon)
@@ -791,6 +821,46 @@ async fn late_session_start_recovers_after_warning() {
         .expect("daemon shutdown timeout")
         .expect("daemon task")
         .expect("daemon result");
+    assert_eq!(
+        managed_claude_settings(&paths.runtime_directory),
+        Vec::<std::path::PathBuf>::new()
+    );
+
+    let restart_paths = paths.clone();
+    let mut restart_task = tokio::spawn(async move { daemon::run(restart_paths).await });
+    let restarted = tokio::select! {
+        result = &mut restart_task => panic!("restarted daemon exited before connection: {result:?}"),
+        client = connect_eventually(&paths) => client,
+    };
+    let snapshot = match restarted
+        .request(&ClientRequest::GetSnapshot)
+        .await
+        .expect("restart snapshot response")
+    {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => panic!("unexpected restart response: {response:?}"),
+    };
+    assert!(snapshot.sessions.iter().any(|session| {
+        session.id == failed_session_id
+            && session.external_session_id.as_deref() == Some(external_id.as_str())
+    }));
+    match restarted
+        .request(&first_resume)
+        .await
+        .expect("restart stale Claude resume response")
+    {
+        DaemonResponse::Error(error) => assert!(error.message.contains("already been resumed")),
+        response => panic!("restart stale Claude resume unexpectedly succeeded: {response:?}"),
+    }
+    restarted
+        .request(&ClientRequest::ShutdownDaemon)
+        .await
+        .expect("restart shutdown response");
+    tokio::time::timeout(Duration::from_secs(10), restart_task)
+        .await
+        .expect("restart daemon shutdown timeout")
+        .expect("restart daemon task")
+        .expect("restart daemon result");
 }
 
 fn managed_claude_settings(directory: &Path) -> Vec<std::path::PathBuf> {
@@ -822,6 +892,49 @@ async fn attach(client: &DaemonClient, session_id: SessionId, from_sequence: u64
             .expect("attach response"),
         DaemonResponse::Attached { .. }
     ));
+}
+
+async fn assert_claude_descendant_stops_with_session(
+    client: &DaemonClient,
+    session_id: SessionId,
+    directory: &Path,
+) {
+    let heartbeat = directory.join("claude-descendant-heartbeat.txt");
+    attach(client, session_id, 0).await;
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line(&format!("spawn-descendant:{}", heartbeat.to_string_lossy())),
+        })
+        .await
+        .expect("spawn descendant input");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if heartbeat.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("Claude descendant heartbeat timeout");
+
+    client
+        .request(&ClientRequest::StopSession { session_id })
+        .await
+        .expect("stop response");
+    wait_for_session(client, session_id, |session| {
+        session.state == SessionState::Terminated && session.process_id.is_none()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let stopped_heartbeat = std::fs::read_to_string(&heartbeat).expect("stopped heartbeat");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_to_string(&heartbeat).expect("later heartbeat"),
+        stopped_heartbeat,
+        "Claude descendant remained alive after Session stop"
+    );
 }
 
 async fn wait_for_output(

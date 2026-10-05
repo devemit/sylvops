@@ -9,6 +9,7 @@ use std::{
 use sylvops_core::provider::provider_error;
 
 const MAX_PATH_DIRECTORIES: usize = 128;
+#[cfg(windows)]
 const MAX_KNOWN_LAYOUT_ENTRIES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

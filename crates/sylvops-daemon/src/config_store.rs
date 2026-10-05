@@ -25,11 +25,10 @@ pub fn load(primary: &Path, machine_local: &Path) -> Result<AppConfig> {
     }
 
     let mut value = read_toml(primary)?;
-    if migrate_primary(&mut value)? {
-        let encoded = toml::to_string_pretty(&value)
-            .map_err(|error| DaemonError::Configuration(error.to_string()))?;
-        atomic_file::write(primary, encoded.as_bytes())?;
-    }
+    let migrated_primary = migrate_primary(&mut value)?
+        .then(|| toml::to_string_pretty(&value))
+        .transpose()
+        .map_err(|error| DaemonError::Configuration(error.to_string()))?;
     if machine_local.exists() {
         merge(&mut value, read_toml(machine_local)?);
     }
@@ -37,6 +36,9 @@ pub fn load(primary: &Path, machine_local: &Path) -> Result<AppConfig> {
         .try_into()
         .map_err(|error| DaemonError::Configuration(format!("invalid configuration: {error}")))?;
     config.validate().map_err(DaemonError::Configuration)?;
+    if let Some(encoded) = migrated_primary {
+        atomic_file::write(primary, encoded.as_bytes())?;
+    }
     Ok(config)
 }
 
@@ -170,5 +172,22 @@ mod tests {
             config.unknown.get("future_setting").and_then(Value::as_str),
             Some("preserved")
         );
+    }
+
+    #[test]
+    fn rejected_v1_migration_leaves_the_primary_file_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("config.toml");
+        let local = directory.path().join("config.local.toml");
+        let source = "version = 1\nenabled_providers = ['shell', 'codex']\nscrollback_capacity_bytes = 1\nfuture_setting = 'preserved'\n";
+        fs::write(&primary, source).unwrap();
+
+        let error = load(&primary, &local).unwrap_err();
+
+        assert!(
+            error.to_string().contains("scrollback capacity"),
+            "unexpected migration error: {error}"
+        );
+        assert_eq!(fs::read_to_string(primary).unwrap(), source);
     }
 }

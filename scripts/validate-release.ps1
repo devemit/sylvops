@@ -561,6 +561,34 @@ foreach ($runner in @('ubuntu-latest', 'windows-latest', 'macos-latest')) {
     Assert-ReleaseCondition ($ci.Contains($runner)) "CI is missing required native runner: $runner"
 }
 
+$realClaudeSmokePath = Join-Path $root '.github\workflows\real-claude-smoke.yml'
+Assert-ReleaseCondition (Test-Path -LiteralPath $realClaudeSmokePath -PathType Leaf) "The opt-in real Claude Code smoke workflow is missing."
+$realClaudeSmoke = Get-Content -Raw -LiteralPath $realClaudeSmokePath
+foreach ($requiredText in @(
+    'workflow_call:',
+    'workflow_dispatch:',
+    'runs-on: [self-hosted, claude-code-smoke]',
+    'environment: real-claude-smoke',
+    'timeout-minutes: 10',
+    'SYLVOPS_RUN_REAL_CLAUDE_SMOKE: "1"',
+    '--test real_claude_smoke',
+    '--ignored --exact real_claude_account_smoke_is_bounded_and_redacted'
+)) {
+    Assert-ReleaseCondition ($realClaudeSmoke.Contains($requiredText)) "The real Claude Code smoke workflow is missing its locked control: $requiredText"
+}
+Assert-ReleaseCondition ($realClaudeSmoke -notmatch '(?i)secrets\.') "The real Claude Code smoke workflow must use only pre-existing runner authentication."
+
+$realClaudeSmokeTest = Get-Content -Raw -LiteralPath (Join-Path $root 'crates\sylvops-test-support\tests\real_claude_smoke.rs')
+foreach ($requiredText in @(
+    'SMOKE_DEADLINE',
+    'PermissionRequested',
+    'UserInputRequested',
+    'ResumeSession',
+    'assert_not_persisted'
+)) {
+    Assert-ReleaseCondition ($realClaudeSmokeTest.Contains($requiredText)) "The real Claude Code smoke test is missing required coverage: $requiredText"
+}
+
 $release = Get-Content -Raw -LiteralPath (Join-Path $root '.github\workflows\release.yml')
 foreach ($asset in @(
     'sylvops-windows-x86_64.zip',
@@ -583,6 +611,8 @@ foreach ($asset in @(
     Assert-ReleaseCondition ($release.Contains($asset)) "Release workflow is missing required archive: $asset"
 }
 Assert-ReleaseCondition ($release.Contains('uses: ./.github/workflows/ci.yml')) "Release workflow does not call the complete CI workflow."
+Assert-ReleaseCondition ($release.Contains('uses: ./.github/workflows/real-claude-smoke.yml')) "Release workflow does not run the real Claude Code smoke test for the promoted commit."
+Assert-ReleaseCondition ($release.Contains('needs: [verify, real-claude-smoke]')) "Release validation is not gated on the real Claude Code smoke test."
 Assert-ReleaseCondition ($release.Contains('workflow_dispatch:')) "Release publication is not an explicit workflow promotion."
 Assert-ReleaseCondition ($release.Contains('release_tag:')) "Release promotion does not require an explicit semantic tag."
 Assert-ReleaseCondition ($release -notmatch '(?ms)^\s*push:\s*\r?\n\s*tags:') "A tag push still publishes an application release without the explicit promotion action."

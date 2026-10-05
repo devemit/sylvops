@@ -24,8 +24,11 @@ jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
+  real-claude-smoke:
+    uses: ./.github/workflows/real-claude-smoke.yml
+
   validate-release:
-    needs: verify
+    needs: [verify, real-claude-smoke]
     runs-on: ubuntu-latest
     environment: release
     timeout-minutes: 10
