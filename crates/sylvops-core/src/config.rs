@@ -83,12 +83,15 @@ impl AppConfig {
         if self.enabled_providers.is_empty() {
             return Err("at least one provider must be enabled".into());
         }
-        if self
-            .enabled_providers
-            .iter()
-            .any(|provider| !matches!(provider, ProviderKind::Shell | ProviderKind::Codex))
-        {
-            return Err("only shell and codex providers are implemented in this release".into());
+        if self.enabled_providers.iter().any(|provider| {
+            !matches!(
+                provider,
+                ProviderKind::Shell | ProviderKind::Codex | ProviderKind::Claude
+            )
+        }) {
+            return Err(
+                "only shell, codex, and Claude health are implemented in this release".into(),
+            );
         }
         if !self.enabled_providers.contains(&self.default_provider) {
             return Err("default provider must be enabled".into());
@@ -140,6 +143,15 @@ future_setting = "preserved"
     #[test]
     fn default_configuration_is_valid() {
         AppConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn claude_can_be_enabled_for_provider_health_without_becoming_the_default() {
+        let config = AppConfig {
+            enabled_providers: vec![ProviderKind::Shell, ProviderKind::Claude],
+            ..AppConfig::default()
+        };
+        config.validate().unwrap();
     }
 
     #[test]
