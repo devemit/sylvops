@@ -2,6 +2,7 @@
 
 mod atomic_file;
 mod background_process;
+mod claude_discovery;
 pub mod client;
 mod codex_discovery;
 pub mod config_store;

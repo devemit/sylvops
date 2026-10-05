@@ -5,12 +5,14 @@ use std::{
     ffi::{OsStr, OsString},
     fmt::{self, Write as _},
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use semver::Version;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sylvops_core::{
     domain::ProviderKind,
@@ -27,10 +29,15 @@ use sylvops_core::{
 };
 use tokio::{io::AsyncReadExt, time::timeout};
 
-use crate::{DaemonError, Result, background_process, codex_discovery::discover_codex_executable};
+use crate::{
+    DaemonError, Result, background_process,
+    claude_discovery::{discover_claude_executable, revalidate_claude_executable},
+    codex_discovery::discover_codex_executable,
+};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
+const MIN_CLAUDE_VERSION: &str = "2.1.145";
 
 pub struct ProviderRegistry {
     runtimes: HashMap<ProviderKind, Arc<dyn ProviderRuntime>>,
@@ -80,6 +87,12 @@ impl ProviderRegistry {
             runtimes.insert(
                 ProviderKind::Codex,
                 Arc::new(runtime) as Arc<dyn ProviderRuntime>,
+            );
+        }
+        if enabled.contains(&ProviderKind::Claude) {
+            runtimes.insert(
+                ProviderKind::Claude,
+                Arc::new(ClaudeAdapter::discover()) as Arc<dyn ProviderRuntime>,
             );
         }
         Ok(Self { runtimes })
@@ -246,6 +259,322 @@ impl ProviderRuntime for ShellAdapter {
     ) -> sylvops_core::Result<ProviderLifecycleEvent> {
         Ok(ProviderLifecycleEvent::default())
     }
+}
+
+#[derive(Clone, Debug)]
+struct ClaudeDiscovery {
+    executable: Option<ClaudeExecutable>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ClaudeExecutable {
+    path: PathBuf,
+    identity: Arc<same_file::Handle>,
+}
+
+impl ClaudeExecutable {
+    fn discover(path: PathBuf) -> std::result::Result<Self, String> {
+        let identity = same_file::Handle::from_path(&path)
+            .map_err(|_| "Claude Code executable identity could not be recorded".to_owned())?;
+        Ok(Self {
+            path,
+            identity: Arc::new(identity),
+        })
+    }
+
+    fn revalidate(&self) -> Option<PathBuf> {
+        let current = same_file::Handle::from_path(&self.path).ok()?;
+        if current != *self.identity {
+            return None;
+        }
+        revalidate_claude_executable(&self.path).ok()
+    }
+}
+
+#[derive(Debug)]
+struct ClaudeAdapter {
+    discovery: RwLock<ClaudeDiscovery>,
+}
+
+impl ClaudeAdapter {
+    fn discover() -> Self {
+        Self {
+            discovery: RwLock::new(Self::discover_now()),
+        }
+    }
+
+    fn discover_now() -> ClaudeDiscovery {
+        match discover_claude_executable() {
+            Ok(path) => match ClaudeExecutable::discover(path) {
+                Ok(executable) => ClaudeDiscovery {
+                    executable: Some(executable),
+                    error: None,
+                },
+                Err(error) => ClaudeDiscovery {
+                    executable: None,
+                    error: Some(error),
+                },
+            },
+            Err(_) => ClaudeDiscovery {
+                executable: None,
+                error: Some(
+                    "Claude Code is not installed. Install an official native Claude Code CLI, then refresh Provider health."
+                        .into(),
+                ),
+            },
+        }
+    }
+
+    fn discovery(&self) -> std::result::Result<ClaudeDiscovery, String> {
+        self.discovery
+            .read()
+            .map(|discovery| discovery.clone())
+            .map_err(|_| "Claude Code discovery state is unavailable".into())
+    }
+
+    fn capabilities() -> ProviderCapabilities {
+        ProviderCapabilities {
+            authentication: AuthenticationRequirement::ExistingLogin,
+            ..ProviderCapabilities::default()
+        }
+    }
+
+    async fn probe_health(&self) -> ProviderHealth {
+        let discovery = match self.discovery() {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                return claude_health(false, false, None, None, Some(error));
+            }
+        };
+        let Some(discovered_executable) = discovery.executable else {
+            return claude_health(false, false, None, None, discovery.error);
+        };
+        let Some(executable) = discovered_executable.revalidate() else {
+            return claude_executable_changed_health();
+        };
+        let executable_path = path_text(&executable).ok();
+        let version_probe = match run_structured_probe(&executable, &["--version"]).await {
+            Ok(output) if output.success => output,
+            _ => {
+                return claude_health(
+                    false,
+                    false,
+                    executable_path,
+                    None,
+                    Some(
+                        "Claude Code version could not be verified. Run `claude --version` yourself, then refresh Provider health."
+                            .into(),
+                    ),
+                );
+            }
+        };
+        let Some(version) = parse_claude_version(&version_probe.stdout) else {
+            return claude_health(
+                false,
+                false,
+                executable_path,
+                None,
+                Some(
+                    "Claude Code returned an unrecognized version. Update Claude Code, then refresh Provider health."
+                        .into(),
+                ),
+            );
+        };
+        let version_text = version.to_string();
+        let minimum = Version::new(2, 1, 145);
+        if version < minimum {
+            return claude_health(
+                false,
+                false,
+                executable_path,
+                Some(version_text),
+                Some(format!(
+                    "Claude Code is too old. Update it to {MIN_CLAUDE_VERSION} or newer, then refresh Provider health."
+                )),
+            );
+        }
+        let Some(executable) = discovered_executable.revalidate() else {
+            return claude_executable_changed_health();
+        };
+        let authentication = match run_structured_probe(&executable, &["auth", "status"]).await {
+            Ok(output) => {
+                let authentication = parse_claude_authentication(&output.stdout);
+                if output.success || authentication == ClaudeAuthentication::LoggedOut {
+                    authentication
+                } else {
+                    ClaudeAuthentication::Unverified
+                }
+            }
+            Err(_) => ClaudeAuthentication::Unverified,
+        };
+        let (authenticated, diagnostic) = match authentication {
+            ClaudeAuthentication::Supported => (true, None),
+            ClaudeAuthentication::LoggedOut => (
+                false,
+                Some(
+                    "Claude Code is not logged in. Run `claude auth login` yourself, then refresh Provider health."
+                        .into(),
+                ),
+            ),
+            ClaudeAuthentication::Unsupported => (
+                false,
+                Some(
+                    "Claude Code is using an unsupported authentication method. Sign in with Claude.ai or Anthropic Console, then refresh Provider health."
+                        .into(),
+                ),
+            ),
+            ClaudeAuthentication::Unverified => (
+                false,
+                Some(
+                    "Claude Code authentication could not be verified. Run `claude auth status` yourself, then refresh Provider health."
+                        .into(),
+                ),
+            ),
+        };
+        claude_health(
+            true,
+            authenticated,
+            executable_path,
+            Some(version_text),
+            diagnostic,
+        )
+    }
+
+    async fn refresh_health(&self) -> ProviderHealth {
+        let discovery = Self::discover_now();
+        if let Ok(mut current) = self.discovery.write() {
+            *current = discovery;
+        } else {
+            return claude_health(
+                false,
+                false,
+                None,
+                None,
+                Some("Claude Code discovery state is unavailable".into()),
+            );
+        }
+        self.probe_health().await
+    }
+}
+
+fn claude_executable_changed_health() -> ProviderHealth {
+    claude_health(
+        false,
+        false,
+        None,
+        None,
+        Some(
+            "Claude Code executable identity changed after discovery. Refresh Provider health before retrying."
+                .into(),
+        ),
+    )
+}
+
+fn claude_health(
+    available: bool,
+    authenticated: bool,
+    executable_path: Option<String>,
+    version: Option<String>,
+    diagnostic: Option<String>,
+) -> ProviderHealth {
+    ProviderHealth {
+        kind: ProviderKind::Claude,
+        available,
+        authenticated,
+        executable_path,
+        version,
+        diagnostic,
+        capabilities: ClaudeAdapter::capabilities(),
+        checked_at: now_millis(),
+    }
+}
+
+#[async_trait]
+impl ProviderRuntime for ClaudeAdapter {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Claude
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        Self::capabilities()
+    }
+
+    async fn probe(&self) -> ProviderHealth {
+        self.probe_health().await
+    }
+
+    async fn refresh(&self) -> ProviderHealth {
+        self.refresh_health().await
+    }
+
+    fn configure_launch(
+        &self,
+        _context: LaunchContext,
+    ) -> sylvops_core::Result<ProviderRuntimeSpec> {
+        Err(provider_error(
+            "Claude Code launch is not available in this release",
+        ))
+    }
+
+    fn configure_resume(
+        &self,
+        _context: ResumeContext,
+    ) -> sylvops_core::Result<Option<ProviderRuntimeSpec>> {
+        Ok(None)
+    }
+
+    fn normalize_lifecycle_event(
+        &self,
+        _payload: &ProviderLifecyclePayload,
+    ) -> sylvops_core::Result<ProviderLifecycleEvent> {
+        Err(provider_error(
+            "Claude Code lifecycle events are not available in this release",
+        ))
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ClaudeAuthentication {
+    Supported,
+    LoggedOut,
+    Unsupported,
+    Unverified,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeAuthenticationStatus {
+    logged_in: bool,
+    auth_method: String,
+    api_provider: Option<String>,
+}
+
+fn parse_claude_authentication(output: &[u8]) -> ClaudeAuthentication {
+    let Ok(status) = serde_json::from_slice::<ClaudeAuthenticationStatus>(output) else {
+        return ClaudeAuthentication::Unverified;
+    };
+    if !status.logged_in || status.auth_method == "none" {
+        return ClaudeAuthentication::LoggedOut;
+    }
+    let first_party = status.api_provider.as_deref() == Some("firstParty");
+    if first_party
+        && matches!(
+            status.auth_method.as_str(),
+            "claude.ai" | "oauth_token" | "api_key"
+        )
+    {
+        ClaudeAuthentication::Supported
+    } else {
+        ClaudeAuthentication::Unsupported
+    }
+}
+
+fn parse_claude_version(output: &[u8]) -> Option<Version> {
+    std::str::from_utf8(output)
+        .ok()?
+        .split_whitespace()
+        .find_map(|value| Version::parse(value.trim_start_matches('v')).ok())
 }
 
 #[derive(Clone, Debug)]
@@ -852,11 +1181,43 @@ fn codex_home() -> sylvops_core::Result<PathBuf> {
 }
 
 async fn run_probe(executable: &Path, arguments: &[&str]) -> std::result::Result<String, String> {
+    let output = run_bounded_probe(executable, arguments, true).await?;
+    let bytes = if output.stdout.is_empty() {
+        output.stderr
+    } else {
+        output.stdout
+    };
+    let text = String::from_utf8_lossy(&bytes)
+        .trim()
+        .chars()
+        .take(512)
+        .collect::<String>();
+    if output.status.success() {
+        Ok(text)
+    } else if text.is_empty() {
+        Err(format!("probe exited with {}", output.status))
+    } else {
+        Err(text)
+    }
+}
+
+#[derive(Debug)]
+struct BoundedProbeOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn run_bounded_probe(
+    executable: &Path,
+    arguments: &[&str],
+    include_codex_home: bool,
+) -> std::result::Result<BoundedProbeOutput, String> {
     let mut child = background_process::command(executable);
     child
         .args(arguments)
         .env_clear()
-        .envs(reviewed_environment(true))
+        .envs(reviewed_environment(include_codex_home))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -878,23 +1239,32 @@ async fn run_probe(executable: &Path, arguments: &[&str]) -> std::result::Result
         let status = child.wait().await.map_err(|error| error.to_string())?;
         let stdout = stdout_task.await.map_err(|error| error.to_string())??;
         let stderr = stderr_task.await.map_err(|error| error.to_string())??;
-        let output = if stdout.is_empty() { stderr } else { stdout };
-        let output = String::from_utf8_lossy(&output)
-            .trim()
-            .chars()
-            .take(512)
-            .collect::<String>();
-        if status.success() {
-            Ok(output)
-        } else if output.is_empty() {
-            Err(format!("probe exited with {status}"))
-        } else {
-            Err(output)
-        }
+        Ok(BoundedProbeOutput {
+            status,
+            stdout,
+            stderr,
+        })
     };
     timeout(PROBE_TIMEOUT, capture)
         .await
         .map_err(|_| "probe timed out".to_owned())?
+}
+
+#[derive(Debug)]
+struct StructuredProbeOutput {
+    success: bool,
+    stdout: Vec<u8>,
+}
+
+async fn run_structured_probe(
+    executable: &Path,
+    arguments: &[&str],
+) -> std::result::Result<StructuredProbeOutput, String> {
+    let output = run_bounded_probe(executable, arguments, false).await?;
+    Ok(StructuredProbeOutput {
+        success: output.status.success(),
+        stdout: output.stdout,
+    })
 }
 
 async fn read_probe_output<R: tokio::io::AsyncRead + Unpin>(
@@ -1130,8 +1500,34 @@ mod tests {
     #[test]
     fn environment_excludes_credentials() {
         assert!(!environment_allowed(OsStr::new("OPENAI_API_KEY")));
+        assert!(!environment_allowed(OsStr::new("ANTHROPIC_API_KEY")));
+        assert!(!environment_allowed(OsStr::new("CLAUDE_CODE_OAUTH_TOKEN")));
+        assert!(!environment_allowed(OsStr::new("AWS_ACCESS_KEY_ID")));
         assert!(!environment_allowed(OsStr::new("GH_TOKEN")));
         assert!(environment_allowed(OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn claude_executable_identity_must_match_the_discovered_file() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let executable = temporary.path().join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
+        let replacement = temporary.path().join("replacement");
+        let original = temporary.path().join("original");
+        let current = std::env::current_exe().expect("current test executable");
+        std::fs::copy(&current, &executable).expect("initial Claude fixture");
+        std::fs::copy(current, &replacement).expect("replacement Claude fixture");
+        let executable = std::fs::canonicalize(executable).unwrap();
+        let discovered = ClaudeExecutable::discover(executable.clone()).unwrap();
+        assert_eq!(discovered.revalidate(), Some(executable.clone()));
+
+        std::fs::rename(&executable, &original).expect("move discovered executable");
+        std::fs::rename(replacement, &executable).expect("replace discovered executable");
+
+        assert!(discovered.revalidate().is_none());
     }
 
     #[test]

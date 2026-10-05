@@ -16,6 +16,7 @@ fs2 = "0.4"
 reqwest.workspace = true
 roxmltree = "0.20"
 same-file = "1"
+semver.workspace = true
 sylvops-core = { path = "../sylvops-core" }
 serde.workspace = true
 serde_json.workspace = true
