@@ -25,6 +25,8 @@ jobs:
         run: ./scripts/validate-release.ps1
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run fake Claude acceptance
+        run: cargo test -p sylvops-test-support --test claude_health --test claude_sessions -- --nocapture
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
 

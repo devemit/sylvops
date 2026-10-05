@@ -793,6 +793,16 @@ async fn late_session_start_recovers_after_warning() {
             && session.external_session_id.as_deref() == Some(external_id.as_str())
     })
     .await;
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: resumed.id,
+        })
+        .await
+        .expect("stop resumed Claude response");
+    wait_for_session(&client, resumed.id, |session| {
+        session.state == SessionState::Terminated && session.process_id.is_none()
+    })
+    .await;
     match client
         .request(&first_resume)
         .await
