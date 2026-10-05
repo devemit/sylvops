@@ -1465,6 +1465,44 @@ fn configure_desktop_app_identity() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cli_accepts_claude_with_advanced_options_for_a_chosen_worktree() {
+        let worktree_id = WorktreeId::new();
+        let arguments = Arguments::try_parse_from([
+            "sylvops",
+            "session",
+            "create",
+            "--worktree",
+            &worktree_id.to_string(),
+            "--provider",
+            "claude",
+            "--model",
+            "sonnet",
+            "--effort",
+            "high",
+            "--prompt",
+            "Review the current changes",
+        ])
+        .expect("Claude session command");
+
+        assert!(matches!(
+            arguments.command,
+            Some(Command::Session {
+                command: SessionCommand::Create {
+                    worktree,
+                    provider: ProviderKind::Claude,
+                    model: Some(model),
+                    effort: Some(effort),
+                    prompt: Some(prompt),
+                    ..
+                }
+            }) if worktree == worktree_id
+                && model == "sonnet"
+                && effort == "high"
+                && prompt == "Review the current changes"
+        ));
+    }
+
     #[tokio::test]
     async fn cli_data_removal_rejects_weak_confirmation_without_deleting_data() {
         let temporary = tempfile::tempdir().expect("temporary directory");

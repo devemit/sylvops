@@ -6,7 +6,7 @@ SylvOps is a local-first mission control for supervising interactive coding-agen
 
 Install Git yourself and make sure `git --version` works before starting SylvOps. A Rust toolchain is not required for a packaged release.
 
-Codex is optional and separately installed and authenticated. Install the Codex CLI and complete its login using OpenAI's instructions before choosing the Codex provider. SylvOps does not install Git or Codex, run their login commands, copy credentials, or store provider secrets. After SylvOps is running, use `sylvops doctor` and `sylvops provider probe codex` to distinguish a missing executable from a login problem.
+Codex and Claude Code are optional and separately installed and authenticated. Install the provider CLI and complete its login using the provider's instructions before choosing it in SylvOps. SylvOps does not install Git or provider CLIs, run their login commands, copy credentials, or store provider secrets. After SylvOps is running, use `sylvops doctor`, `sylvops provider probe codex`, or `sylvops provider probe claude` to distinguish a missing executable, old version, unsupported authentication, or logged-out state.
 
 Download release files only from the [SylvOps GitHub Releases](https://github.com/devemit/sylvops/releases) page. Keep the release's `SHA256SUMS` beside the downloaded package and verify the named file before opening it. Every asset also has GitHub build-provenance attestations.
 
@@ -211,7 +211,7 @@ The exact phrase is required. The daemon refuses removal while sessions are acti
 
 ## Troubleshooting
 
-- **Provider discovery:** run `sylvops provider probe codex`. A missing executable and a login-required result are distinct. Install or sign in to Codex outside SylvOps; SylvOps never performs either action.
+- **Provider discovery:** run `sylvops provider probe codex` or `sylvops provider probe claude`. Missing installation, old version, unsupported authentication, and logged-out results remain distinct. Install, update, or sign in to the provider outside SylvOps; SylvOps never performs those actions.
 - **Daemon startup:** launch the installed application or run `sylvops daemon start`, then `sylvops daemon status`. If startup still fails, run `sylvops doctor` from the same installation.
 - **Mixed versions:** compare `sylvops --version` with the daemon version printed by `sylvops daemon status` or `sylvops doctor`. If they differ, run `sylvops daemon stop`, then reopen the intended installed application. For a portable copy, invoke that copy explicitly so an older executable on `PATH` is not selected.
 - **Package verification:** never open a file that fails `SHA256SUMS`. Official Windows releases must also report a valid Authenticode signature, while an unsigned preview makes no publisher-trust claim and must display its warning. Official macOS packages must pass `codesign`, `stapler`, and Gatekeeper checks. An installed Debian package can be checked with `sudo dpkg --verify sylvops`.
@@ -251,7 +251,7 @@ The repository now contains a **cross-platform application-release baseline**. I
 - guarded managed-worktree creation, status, and removal;
 - startup reconciliation for missing and externally discovered worktrees;
 - per-project Git mutation serialization and per-worktree session/removal coordination;
-- a provider adapter registry for plain shells, Codex, and explicitly configured Claude Code;
+- a provider adapter registry for plain shells, Codex, and Claude Code, all selectable from the CLI, TUI, and desktop;
 - bounded Codex and Claude discovery, version, and authentication probes;
 - application-owned provider hook settings plus an authenticated loopback hook relay;
 - deterministic attention states, verified provider conversation-ID capture, and guarded Codex and Claude resume;
@@ -259,7 +259,7 @@ The repository now contains a **cross-platform application-release baseline**. I
 - a hierarchical Ratatui mission-control client with an explorer, Terminal/Changes/Details tabs, guided forms, keyboard and mouse controls, attention selection, safe embedded terminal rendering, bounded read-only diffs, and restored navigation context;
 - CLI workspace, project, worktree, provider, session, desktop, and TUI commands.
 
-Broader Claude client exposure, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
+Claude cloud Sessions, background-agent management, Remote Control, plugins, enterprise authentication, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
 
 The Windows implementation contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The prior cross-platform baseline passed the complete hosted Windows, Linux, and macOS quality gates; the current tree must pass those gates before `v0.1.0` is promoted.
 
@@ -291,6 +291,7 @@ sylvops
 sylvops up .
 sylvops open .
 sylvops open . --provider codex --prompt "..."
+sylvops open . --provider claude --prompt "..."
 sylvops doctor
 sylvops update check
 sylvops update download

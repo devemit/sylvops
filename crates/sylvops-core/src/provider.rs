@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CoreError, Result,
-    domain::ProviderKind,
+    domain::{ProviderKind, Session, session_record_can_resume},
     ids::{SessionId, WorktreeId},
     status::{NormalizedProviderEvent, ProviderConversationId},
 };
@@ -56,6 +56,68 @@ pub struct ProviderHealth {
     pub diagnostic: Option<String>,
     pub capabilities: ProviderCapabilities,
     pub checked_at: i64,
+}
+
+impl ProviderHealth {
+    #[must_use]
+    pub fn can_start_interactive_session(&self) -> bool {
+        self.session_start_error().is_none()
+    }
+
+    #[must_use]
+    pub fn can_resume_session(&self) -> bool {
+        self.resume_error().is_none()
+    }
+
+    #[must_use]
+    pub fn resume_error(&self) -> Option<String> {
+        if !self.capabilities.resume {
+            return Some(format!(
+                "Provider {} does not support Session resume.",
+                self.kind.display_name()
+            ));
+        }
+        self.session_start_error()
+    }
+
+    #[must_use]
+    pub fn session_start_error(&self) -> Option<String> {
+        if !self.capabilities.interactive {
+            return Some(format!(
+                "Provider {} does not support interactive Sessions.",
+                self.kind.display_name()
+            ));
+        }
+        if !self.available {
+            return Some(self.diagnostic.clone().unwrap_or_else(|| {
+                format!("Provider {} is unavailable.", self.kind.display_name())
+            }));
+        }
+        if self.capabilities.authentication == AuthenticationRequirement::ExistingLogin
+            && !self.authenticated
+        {
+            return Some(self.diagnostic.clone().unwrap_or_else(|| {
+                format!(
+                    "Provider {} requires an existing login. Sign in outside SylvOps, then refresh Provider health.",
+                    self.kind.display_name()
+                )
+            }));
+        }
+        None
+    }
+}
+
+#[must_use]
+pub fn session_can_resume(
+    session: &Session,
+    sessions: &[Session],
+    providers: &[ProviderHealth],
+) -> bool {
+    session_record_can_resume(session, sessions)
+        && providers
+            .iter()
+            .find(|provider| provider.kind == session.provider_kind)
+            .is_some_and(ProviderHealth::can_resume_session)
 }
 
 #[derive(Clone)]
@@ -376,6 +438,7 @@ pub fn provider_error(message: impl Into<String>) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{ProviderKind, Session, SessionState};
     use crate::status::{NormalizedProviderEvent, RemainingWork, TurnFailureCategory};
 
     #[derive(Debug)]
@@ -589,5 +652,96 @@ mod tests {
             ProviderLifecyclePayload::new(vec![0; MAX_PROVIDER_LIFECYCLE_PAYLOAD_SIZE + 1])
                 .is_err()
         );
+    }
+
+    fn health(kind: ProviderKind) -> ProviderHealth {
+        ProviderHealth {
+            kind,
+            available: true,
+            authenticated: true,
+            executable_path: None,
+            version: None,
+            diagnostic: None,
+            capabilities: ProviderCapabilities {
+                interactive: true,
+                resume: true,
+                authentication: AuthenticationRequirement::ExistingLogin,
+                ..ProviderCapabilities::default()
+            },
+            checked_at: 0,
+        }
+    }
+
+    fn session(kind: ProviderKind) -> Session {
+        Session {
+            id: SessionId::new(),
+            worktree_id: WorktreeId::new(),
+            provider_profile_id: None,
+            provider_kind: kind,
+            display_name: kind.to_string(),
+            state: SessionState::FinishedSeen,
+            process_id: None,
+            external_session_id: Some("verified-id".into()),
+            command: kind.to_string(),
+            arguments_json: "[]".into(),
+            cwd: "/repo".into(),
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: Some(2),
+            last_activity_at: 2,
+            last_seen_output_sequence: 0,
+            exit_code: Some(0),
+            failure_reason: None,
+        }
+    }
+
+    #[test]
+    fn session_readiness_is_driven_by_health_and_capabilities() {
+        let ready = health(ProviderKind::Claude);
+        assert!(ready.can_start_interactive_session());
+        assert!(ready.session_start_error().is_none());
+
+        let mut logged_out = ready.clone();
+        logged_out.authenticated = false;
+        logged_out.diagnostic = Some("Claude Code is not logged in.".into());
+        assert!(!logged_out.can_start_interactive_session());
+        assert_eq!(
+            logged_out.session_start_error().as_deref(),
+            Some("Claude Code is not logged in.")
+        );
+
+        let mut observational = ready;
+        observational.capabilities.interactive = false;
+        assert!(!observational.can_start_interactive_session());
+    }
+
+    #[test]
+    fn resume_requires_a_healthy_resume_capability_and_an_eligible_record() {
+        let claude = session(ProviderKind::Claude);
+        let mut health = health(ProviderKind::Claude);
+        assert!(session_can_resume(
+            &claude,
+            std::slice::from_ref(&claude),
+            std::slice::from_ref(&health)
+        ));
+
+        health.capabilities.resume = false;
+        assert_eq!(
+            health.resume_error().as_deref(),
+            Some("Provider Claude Code does not support Session resume.")
+        );
+        assert!(!session_can_resume(
+            &claude,
+            std::slice::from_ref(&claude),
+            std::slice::from_ref(&health)
+        ));
+
+        health.capabilities.resume = true;
+        health.authenticated = false;
+        assert!(!session_can_resume(
+            &claude,
+            std::slice::from_ref(&claude),
+            std::slice::from_ref(&health)
+        ));
     }
 }

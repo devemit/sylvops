@@ -1,7 +1,7 @@
 #![allow(clippy::unreadable_literal)] // Six-digit values intentionally mirror CSS RGB notation.
 
 use sylvops_core::{
-    domain::{DaemonSnapshot, SessionState, WorktreeStatus, session_can_resume},
+    domain::{DaemonSnapshot, SessionState, WorktreeStatus},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     ui::{DesktopDensity, DesktopPanel, DesktopState, DesktopTheme, MainTab},
 };
@@ -259,6 +259,7 @@ pub(crate) struct InteractionState {
     pub active_session_id: Option<SessionId>,
     pub open_session_ids: Vec<SessionId>,
     pub active_session_attached: bool,
+    pub resumable_session_ids: Vec<SessionId>,
     pub main_tab: MainTab,
 }
 
@@ -583,6 +584,7 @@ impl DesktopPresentation {
             &input.interaction.open_session_ids,
             active_session_id,
             input.interaction.active_session_attached,
+            &input.interaction.resumable_session_ids,
         );
         Self {
             theme,
@@ -771,6 +773,7 @@ fn build_active_session(
     open_session_ids: &[SessionId],
     active_session_id: Option<SessionId>,
     active_session_attached: bool,
+    resumable_session_ids: &[SessionId],
 ) -> ActiveSessionPresentation {
     let tabs = open_session_ids
         .iter()
@@ -817,7 +820,7 @@ fn build_active_session(
                 None
             },
             can_stop: session_state_can_stop(session.state),
-            can_resume: session_can_resume(session, &daemon.sessions),
+            can_resume: resumable_session_ids.contains(&session.id),
         })
     });
     ActiveSessionPresentation { tabs, context }
@@ -1638,6 +1641,37 @@ mod tests {
     }
 
     #[test]
+    fn claude_session_resume_is_presented_from_returned_provider_capability() {
+        let mut fixture = hierarchy_fixture(SessionState::FinishedSeen);
+        let session = &mut fixture.snapshot.sessions[0];
+        session.provider_kind = ProviderKind::Claude;
+        session.external_session_id = Some("verified-claude-id".into());
+        let preferences = DesktopState::default();
+
+        let presentation = DesktopPresentation::build(&PresentationInput {
+            daemon: &fixture.snapshot,
+            preferences: &preferences,
+            viewport: Viewport::new(1_440, 900),
+            system_appearance: SystemAppearance::Dark,
+            interaction: InteractionState {
+                selected_project_id: Some(fixture.project_id),
+                selected_worktree_id: Some(fixture.worktree_id),
+                selected_session_id: Some(fixture.session_id),
+                active_session_id: Some(fixture.session_id),
+                resumable_session_ids: vec![fixture.session_id],
+                ..InteractionState::default()
+            },
+        });
+
+        assert!(
+            presentation
+                .active_session
+                .context
+                .is_some_and(|context| context.can_resume)
+        );
+    }
+
+    #[test]
     fn navigator_rolls_urgent_session_state_up_to_ancestors() {
         let fixture = hierarchy_fixture(SessionState::NeedsFeedback);
         let preferences = DesktopState::default();
@@ -1710,6 +1744,7 @@ mod tests {
                     active_session_id: Some(fixture.session_id),
                     open_session_ids: vec![fixture.session_id],
                     active_session_attached: true,
+                    resumable_session_ids: Vec::new(),
                     main_tab: MainTab::Changes,
                 },
             })

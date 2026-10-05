@@ -47,11 +47,11 @@ use presentation::{
 use sylvops_core::{
     domain::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
-        Worktree, WorktreeStatus, session_can_resume,
+        Worktree, WorktreeStatus,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
-    provider::ProviderHealth,
+    provider::{ProviderHealth, session_can_resume},
     ui::{
         DesktopDensity, DesktopPanel, DesktopState, DesktopTerminalCursor, DesktopTerminalFont,
         DesktopTheme, MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT,
@@ -846,6 +846,15 @@ impl DesktopApp {
                         .get(&session_id)
                         .is_some_and(|terminal| terminal.attached)
                 }),
+                resumable_session_ids: self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .filter(|session| {
+                        session_can_resume(session, &self.snapshot.sessions, &self.providers)
+                    })
+                    .map(|session| session.id)
+                    .collect(),
                 main_tab: self.main_tab,
             },
         })
@@ -1808,7 +1817,10 @@ impl DesktopApp {
             content = content
                 .push(rule::horizontal(1))
                 .push(text(&session.display_name).font(UI_SEMIBOLD).size(18))
-                .push(detail("Provider", session.provider_kind.to_string()))
+                .push(detail(
+                    "Provider",
+                    session.provider_kind.display_name().to_owned(),
+                ))
                 .push(detail("State", session_state_label(session.state).into()))
                 .push(detail("Working directory", session.cwd.clone()))
                 .push(detail(
@@ -1841,7 +1853,7 @@ impl DesktopApp {
                 ))
                 .push(detail(
                     "Resume",
-                    session_resume_label(session, &self.snapshot.sessions).into(),
+                    session_resume_label(session, &self.snapshot.sessions, &self.providers).into(),
                 ));
             technical = technical
                 .push(technical_detail("Session ID", session.id.to_string()))
@@ -2322,12 +2334,12 @@ impl DesktopApp {
             |item| {
                 let status = if !item.available {
                     "unavailable"
-                } else if item.kind == ProviderKind::Codex && !item.authenticated {
-                    "available, sign-in required"
+                } else if !item.can_start_interactive_session() {
+                    "available, setup required"
                 } else {
                     "ready"
                 };
-                format!("{} — {status}", item.kind)
+                format!("{} — {status}", item.kind.display_name())
             },
         );
         let recovery = provider.map_or_else(
@@ -2336,20 +2348,18 @@ impl DesktopApp {
         );
         let selected = provider.map(|provider| provider.kind);
         let mut choices = row![].spacing(8);
-        for kind in [ProviderKind::Shell, ProviderKind::Codex] {
-            if form.providers.iter().any(|provider| provider.kind == kind) {
-                let is_selected = selected == Some(kind);
-                choices = choices.push(
-                    button(text(kind.to_string()).font(UI_MEDIUM))
-                        .on_press_maybe((!form_pending).then_some(Message::SelectProvider(kind)))
-                        .style(move |theme, status| content_tab_style(theme, status, is_selected)),
-                );
-            }
+        for provider in &form.providers {
+            let kind = provider.kind;
+            let is_selected = selected == Some(kind);
+            choices = choices.push(
+                button(text(kind.display_name()).font(UI_MEDIUM))
+                    .on_press_maybe((!form_pending).then_some(Message::SelectProvider(kind)))
+                    .style(move |theme, status| content_tab_style(theme, status, is_selected)),
+            );
         }
         let checking_selected = probing.is_some() && probing == selected;
-        let retry_needed = provider.is_none_or(|provider| {
-            !provider.available || (provider.kind == ProviderKind::Codex && !provider.authenticated)
-        });
+        let retry_needed =
+            provider.is_none_or(|provider| !provider.can_start_interactive_session());
         let recovery_row = if retry_needed {
             row![
                 text(recovery).width(Fill).style(text::secondary),
@@ -2369,7 +2379,7 @@ impl DesktopApp {
         };
         column![
             text("Session type").font(UI_MEDIUM).size(UI_META_SIZE),
-            text("Keyboard: Alt+S selects Shell · Alt+C selects Codex · Alt+R runs Check again")
+            text("Keyboard: Alt+← / Alt+→ cycles providers · Alt+R runs Check again")
                 .size(UI_META_SIZE)
                 .style(text::secondary),
             choices,
@@ -3169,7 +3179,7 @@ impl DesktopApp {
                 Some("The selected session is no longer available. Refresh and try again.".into());
             return None;
         };
-        if !session_can_resume(session, &self.snapshot.sessions) {
+        if !session_can_resume(session, &self.snapshot.sessions, &self.providers) {
             self.error = Some(
                 "This session is not eligible for resume. Refresh to load its latest state.".into(),
             );
@@ -3436,11 +3446,20 @@ impl DesktopApp {
             return true;
         }
         match key.as_ref() {
+            Key::Named(Named::ArrowLeft) => {
+                self.select_adjacent_provider(-1);
+            }
+            Key::Named(Named::ArrowRight) => {
+                self.select_adjacent_provider(1);
+            }
             Key::Character(value) if value.eq_ignore_ascii_case("s") => {
                 self.select_provider(ProviderKind::Shell);
             }
             Key::Character(value) if value.eq_ignore_ascii_case("c") => {
                 self.select_provider(ProviderKind::Codex);
+            }
+            Key::Character(value) if value.eq_ignore_ascii_case("l") => {
+                self.select_provider(ProviderKind::Claude);
             }
             Key::Character(value) if value.eq_ignore_ascii_case("r") => {
                 self.probe_selected_provider();
@@ -3630,7 +3649,6 @@ impl DesktopApp {
             FormModal::new(form)
         }));
         self.modal_focus = ModalFocus::Pending;
-        self.probe_provider(ProviderKind::Codex);
     }
 
     fn begin_selected_navigator_rename(&mut self) -> Task<Message> {
@@ -3742,6 +3760,15 @@ impl DesktopApp {
         }
     }
 
+    fn select_adjacent_provider(&mut self, delta: isize) {
+        if let Some(Modal::Form(modal)) = &mut self.modal
+            && !modal.pending
+        {
+            modal.form.select_next_provider(delta);
+            modal.form.submission_error = None;
+        }
+    }
+
     fn probe_selected_provider(&mut self) {
         let Some(kind) = self.modal.as_ref().and_then(|modal| match modal {
             Modal::Form(modal) => modal.form.provider().map(|provider| provider.kind),
@@ -3845,23 +3872,11 @@ impl DesktopApp {
                 },
             ),
             FormKind::CreateSession(worktree_id) => {
-                let Some(provider) = form.provider() else {
+                let (columns, rows) = self.terminal_dimensions();
+                let Some(request) = form.session_request(columns, rows) else {
                     return;
                 };
-                let (columns, rows) = self.terminal_dimensions();
-                self.send_request(
-                    Operation::CreateSession(worktree_id),
-                    ClientRequest::CreateSession {
-                        worktree_id,
-                        provider: provider.kind,
-                        display_name: trimmed_option(&form.fields[0].value),
-                        model: None,
-                        effort: None,
-                        initial_prompt: None,
-                        columns,
-                        rows,
-                    },
-                );
+                self.send_request(Operation::CreateSession(worktree_id), request);
             }
             FormKind::RenameProject(project_id) => self.send_request(
                 Operation::RenameProject,
@@ -4706,8 +4721,12 @@ fn human_byte_size(bytes: u64) -> String {
     format!("{}.{:01} {suffix}", tenths / 10, tenths % 10)
 }
 
-fn session_resume_label(session: &Session, sessions: &[Session]) -> &'static str {
-    if session_can_resume(session, sessions) {
+fn session_resume_label(
+    session: &Session,
+    sessions: &[Session],
+    providers: &[ProviderHealth],
+) -> &'static str {
+    if session_can_resume(session, sessions, providers) {
         "Available"
     } else {
         "Unavailable"
@@ -4845,7 +4864,7 @@ fn form_submit_label(form: &Form, pending: bool, selected_provider_checking: boo
         return "Working…";
     }
     if selected_provider_checking {
-        return "Checking Codex…";
+        return "Checking provider…";
     }
     match form.kind {
         FormKind::CreateWorkspace => "Create workspace",
@@ -4853,6 +4872,7 @@ fn form_submit_label(form: &Form, pending: bool, selected_provider_checking: boo
         FormKind::CreateWorktree(_) => "Create checkout",
         FormKind::CreateSession(_) => match form.provider().map(|provider| provider.kind) {
             Some(ProviderKind::Codex) => "Start Codex",
+            Some(ProviderKind::Claude) => "Start Claude Code",
             Some(ProviderKind::Shell) => "Start shell",
             Some(_) | None => "Start session",
         },
@@ -4912,26 +4932,14 @@ fn first_run_checklist(kind: FormKind) -> Element<'static, Message> {
 }
 
 fn provider_recovery_message(provider: &ProviderHealth) -> String {
-    if !provider.available {
-        let diagnostic = provider
-            .diagnostic
-            .as_deref()
-            .map_or_else(String::new, |message| {
-                format!(" ({})", bounded_redacted_diagnostic(message))
-            });
-        return match provider.kind {
-            ProviderKind::Codex => format!(
-                "Codex is unavailable{diagnostic}. Install Codex, then check again. Shell remains available now."
-            ),
-            _ => format!(
-                "{} is unavailable{diagnostic}. Fix its local configuration, then check again.",
-                provider.kind
-            ),
+    if let Some(error) = provider.session_start_error() {
+        let error = bounded_redacted_diagnostic(&error);
+        let fallback = if provider.kind == ProviderKind::Shell {
+            ""
+        } else {
+            " Shell remains available now."
         };
-    }
-    if provider.kind == ProviderKind::Codex && !provider.authenticated {
-        return "Sign in to Codex on this computer, then check again. Shell remains available now."
-            .into();
+        return format!("{error} Check again after resolving it.{fallback}");
     }
     format!("{} is ready.", provider.kind)
 }
@@ -5798,7 +5806,7 @@ mod tests {
         renderer::{Headless, Renderer as _},
         widget::Tree,
     };
-    use sylvops_core::provider::ProviderCapabilities;
+    use sylvops_core::provider::{AuthenticationRequirement, ProviderCapabilities};
 
     fn session(state: SessionState, external_session_id: Option<&str>) -> Session {
         Session {
@@ -5830,8 +5838,17 @@ mod tests {
             authenticated,
             executable_path: None,
             version: None,
-            diagnostic: (!available).then(|| "not found".into()),
-            capabilities: ProviderCapabilities::default(),
+            diagnostic: (!available).then(|| format!("{kind} is unavailable")),
+            capabilities: ProviderCapabilities {
+                interactive: true,
+                resume: kind != ProviderKind::Shell,
+                authentication: if kind == ProviderKind::Shell {
+                    AuthenticationRequirement::None
+                } else {
+                    AuthenticationRequirement::ExistingLogin
+                },
+                ..ProviderCapabilities::default()
+            },
             checked_at: 0,
         }
     }
@@ -6340,18 +6357,30 @@ mod tests {
     }
 
     #[test]
-    fn desktop_session_form_keeps_advanced_codex_options_cli_only() {
-        let source = include_str!("lib.rs");
-        let create_session = source
-            .split_once("            FormKind::CreateSession(worktree_id) => {")
-            .and_then(|(_, tail)| tail.split_once("            FormKind::RenameProject"))
-            .map(|(body, _)| body)
-            .expect("desktop session submission source");
+    fn desktop_claude_session_request_keeps_advanced_options_cli_only() {
+        let worktree_id = WorktreeId::new();
+        let mut form = Form::session(
+            worktree_id,
+            vec![
+                provider_health(ProviderKind::Shell, true, true),
+                provider_health(ProviderKind::Claude, true, true),
+            ],
+        );
+        assert!(form.select_provider(ProviderKind::Claude));
 
-        assert!(create_session.contains("display_name: trimmed_option(&form.fields[0].value)"));
-        assert!(create_session.contains("model: None"));
-        assert!(create_session.contains("effort: None"));
-        assert!(create_session.contains("initial_prompt: None"));
+        assert_eq!(
+            form.session_request(100, 30),
+            Some(ClientRequest::CreateSession {
+                worktree_id,
+                provider: ProviderKind::Claude,
+                display_name: None,
+                model: None,
+                effort: None,
+                initial_prompt: None,
+                columns: 100,
+                rows: 30,
+            })
+        );
     }
 
     #[test]
@@ -6367,8 +6396,18 @@ mod tests {
             vec![
                 provider_health(ProviderKind::Shell, true, true),
                 provider_health(ProviderKind::Codex, true, true),
+                provider_health(ProviderKind::Claude, true, true),
             ],
         ))));
+
+        assert!(
+            app.handle_transient_keyboard(&Key::Character("l".into()), keyboard::Modifiers::ALT,)
+        );
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form(FormModal { ref form, .. }))
+                if form.provider().is_some_and(|provider| provider.kind == ProviderKind::Claude)
+        ));
 
         assert!(
             app.handle_transient_keyboard(&Key::Character("c".into()), keyboard::Modifiers::ALT,)
@@ -6793,30 +6832,40 @@ mod tests {
     #[test]
     fn resume_requires_daemon_eligible_state_and_verified_external_id() {
         let available = session(SessionState::FinishedSeen, Some("verified-id"));
+        let codex_health = [provider_health(ProviderKind::Codex, true, true)];
         assert!(session_can_resume(
             &available,
-            std::slice::from_ref(&available)
+            std::slice::from_ref(&available),
+            &codex_health
         ));
         let missing_id = session(SessionState::FinishedSeen, None);
         assert!(!session_can_resume(
             &missing_id,
-            std::slice::from_ref(&missing_id)
+            std::slice::from_ref(&missing_id),
+            &codex_health
         ));
         let terminated = session(SessionState::Terminated, Some("verified-id"));
         assert!(!session_can_resume(
             &terminated,
-            std::slice::from_ref(&terminated)
+            std::slice::from_ref(&terminated),
+            &codex_health
         ));
         let mut claude = available.clone();
         claude.provider_kind = ProviderKind::Claude;
-        assert!(session_can_resume(&claude, std::slice::from_ref(&claude)));
+        let claude_health = [provider_health(ProviderKind::Claude, true, true)];
+        assert!(session_can_resume(
+            &claude,
+            std::slice::from_ref(&claude),
+            &claude_health
+        ));
         let mut other_provider = claude.clone();
         other_provider.id = SessionId::new();
         other_provider.provider_kind = ProviderKind::Codex;
         other_provider.created_at = claude.created_at + 1;
         assert!(session_can_resume(
             &claude,
-            &[claude.clone(), other_provider]
+            &[claude.clone(), other_provider],
+            &claude_health
         ));
         let mut other_worktree = claude.clone();
         other_worktree.id = SessionId::new();
@@ -6824,13 +6873,15 @@ mod tests {
         other_worktree.created_at = claude.created_at + 1;
         assert!(session_can_resume(
             &claude,
-            &[claude.clone(), other_worktree]
+            &[claude.clone(), other_worktree],
+            &claude_health
         ));
         let mut unsupported_provider = available.clone();
         unsupported_provider.provider_kind = ProviderKind::Shell;
         assert!(!session_can_resume(
             &unsupported_provider,
-            std::slice::from_ref(&unsupported_provider)
+            std::slice::from_ref(&unsupported_provider),
+            &[provider_health(ProviderKind::Shell, true, true)]
         ));
     }
 
@@ -6886,7 +6937,7 @@ mod tests {
             .iter()
             .find(|item| item.id == source.id)
             .expect("historical source");
-        assert!(!session_can_resume(
+        assert!(!sylvops_core::domain::session_record_can_resume(
             historical_source,
             &app.snapshot.sessions
         ));
@@ -6901,6 +6952,8 @@ mod tests {
         let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
         let mut app = DesktopApp::new(paths);
         let source = session(SessionState::FinishedSeen, Some("verified-id"));
+        app.providers
+            .push(provider_health(ProviderKind::Codex, true, true));
         app.snapshot.sessions.push(source.clone());
 
         let request = app
@@ -6994,7 +7047,7 @@ mod tests {
         );
         assert!(steps[0].description.contains("repositories"));
         assert!(steps[1].description.contains("root checkout"));
-        assert!(steps[2].description.contains("Shell or Codex"));
+        assert!(steps[2].description.contains("Claude Code"));
     }
 
     #[test]
@@ -7028,16 +7081,38 @@ mod tests {
 
     #[test]
     fn provider_recovery_copy_offers_retry_and_shell_fallback() {
-        let unavailable =
-            provider_recovery_message(&provider_health(ProviderKind::Codex, false, false));
-        assert!(unavailable.contains("Install Codex"));
+        let mut codex_missing = provider_health(ProviderKind::Codex, false, false);
+        codex_missing.diagnostic = Some(
+            "Codex is not installed as a supported native CLI. Install Codex, then refresh Provider health."
+                .into(),
+        );
+        assert!(provider_recovery_message(&codex_missing).contains("Install Codex"));
+
+        let mut codex_logged_out = provider_health(ProviderKind::Codex, true, false);
+        codex_logged_out.diagnostic = Some(
+            "Codex authentication could not be verified. Sign in to Codex outside SylvOps or run `codex login status`, then refresh Provider health."
+                .into(),
+        );
+        assert!(provider_recovery_message(&codex_logged_out).contains("Sign in to Codex"));
+
+        let mut unavailable = provider_health(ProviderKind::Claude, false, false);
+        unavailable.diagnostic = Some(
+            "Claude Code is too old. Update it to 2.1.145 or newer, then refresh Provider health."
+                .into(),
+        );
+        let unavailable = provider_recovery_message(&unavailable);
+        assert!(unavailable.contains("Update it to 2.1.145 or newer"));
         assert!(unavailable.contains("Shell remains available"));
         assert_eq!(CHECK_AGAIN_LABEL, "Check again");
 
-        let unauthenticated =
-            provider_recovery_message(&provider_health(ProviderKind::Codex, true, false));
-        assert!(unauthenticated.contains("Sign in to Codex"));
-        assert!(unauthenticated.contains("check again"));
+        let mut unauthenticated = provider_health(ProviderKind::Claude, true, false);
+        unauthenticated.diagnostic = Some(
+            "Claude Code is not logged in. Run `claude auth login` yourself, then refresh Provider health."
+                .into(),
+        );
+        let unauthenticated = provider_recovery_message(&unauthenticated);
+        assert!(unauthenticated.contains("Run `claude auth login` yourself"));
+        assert!(unauthenticated.contains("Shell remains available"));
     }
 
     #[test]

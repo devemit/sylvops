@@ -12,7 +12,7 @@ The persisted domain model remains `Workspace → Project → Worktree → Sessi
 | Workspace | Workspace | A saved group of repositories used together. |
 | Repository | Project | An existing local Git repository registered with SylvOps. |
 | Checkout | Worktree | The repository's root checkout or an isolated managed Git worktree. |
-| Session | Session | One daemon-owned Shell or Codex process in a checkout. |
+| Session | Session | One daemon-owned Shell, Codex, or Claude Code process in a checkout. |
 | Terminal | Attachment | The live, explicitly attached view of a session's PTY. |
 
 First-run guidance names both the user-facing and domain terms where that distinction matters. Documentation and diagnostics may continue to use `Project` and `Worktree` when referring to the protocol or Git operation precisely.
@@ -37,7 +37,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 - Signature theme previews are keyboard reachable and persist immediately without Apply or Cancel semantics. Nord, Tokyo Night, Catppuccin, Dracula, Gruvbox Dark, Solarized Light, and Solarized Dark remain under Advanced. Missing named fonts fall back through the renderer.
 - One application-owned single-stroke icon family supplies add, refresh, settings, full-screen, terminal, collapse, delete, close, brand, and status marks. Every add icon is borderless; the workspace add control has an additional 10 px leading gap. Named and destructive actions retain visible text.
 - JetBrains Mono Regular, Medium, and SemiBold are bundled under OFL-1.1 and form the desktop UI family on every platform. The embedded terminal continues to honor its separate font preference.
-- The desktop and TUI new-session forms expose the provider picker and optional display name only. Model, effort, and initial prompt remain supported by the CLI and protocol but are not interactive-form settings.
+- The desktop and TUI new-session forms expose capability-driven Shell, Codex, and Claude Code choices plus an optional display name. Model, effort, and initial prompt remain supported by the CLI and protocol but are not interactive-form settings.
 - The footer presents the actual build identity (including an unsigned-preview or release tag when supplied at build time), local-daemon health beside the version, responsive Workspace/Repository/Checkout/Session context, the active content view, and essential shortcuts. Internal enum names and keyboard-panel debug state are not user-facing status.
 - Navigator rows keep a fixed height when selection changes; the managed-checkout delete action stays inside the selected row. Footer context remains one line and uses a horizontally scrollable natural-width strip so complete Workspace, Repository, Checkout, and Session names remain available without pushing View and shortcuts off the right edge.
 

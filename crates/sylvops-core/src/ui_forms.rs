@@ -3,6 +3,7 @@
 use crate::{
     domain::ProviderKind,
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
+    protocol::ClientRequest,
     provider::ProviderHealth,
 };
 
@@ -66,6 +67,10 @@ impl Form {
     }
 
     pub fn session(worktree_id: WorktreeId, providers: Vec<ProviderHealth>) -> Self {
+        let providers: Vec<_> = providers
+            .into_iter()
+            .filter(|provider| provider.capabilities.interactive)
+            .collect();
         let provider_index = providers
             .iter()
             .position(|provider| provider.kind == ProviderKind::Shell)
@@ -127,6 +132,25 @@ impl Form {
         true
     }
 
+    #[must_use]
+    pub fn session_request(&self, columns: u16, rows: u16) -> Option<ClientRequest> {
+        let FormKind::CreateSession(worktree_id) = self.kind else {
+            return None;
+        };
+        let provider = self.provider()?.kind;
+        let display_name = self.fields.first()?.value.trim();
+        Some(ClientRequest::CreateSession {
+            worktree_id,
+            provider,
+            display_name: (!display_name.is_empty()).then(|| display_name.to_owned()),
+            model: None,
+            effort: None,
+            initial_prompt: None,
+            columns,
+            rows,
+        })
+    }
+
     pub fn visible_field_indices(&self) -> Vec<usize> {
         self.fields
             .iter()
@@ -181,20 +205,8 @@ impl Form {
                 self.submission_error = Some("No providers were returned by the daemon.".into());
                 return false;
             };
-            if !provider.available {
-                self.submission_error = Some(
-                    provider
-                        .diagnostic
-                        .clone()
-                        .unwrap_or_else(|| "Selected provider is unavailable.".into()),
-                );
-                return false;
-            }
-            if provider.kind == ProviderKind::Codex && !provider.authenticated {
-                self.submission_error = Some(
-                    "Codex is not authenticated. Sign in to Codex on this computer, then retry discovery."
-                        .into(),
-                );
+            if let Some(error) = provider.session_start_error() {
+                self.submission_error = Some(error);
                 return false;
             }
         }
@@ -214,7 +226,10 @@ fn field(label: &'static str, value: &str) -> Field {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ProviderCapabilities;
+    use crate::{
+        protocol::ClientRequest,
+        provider::{AuthenticationRequirement, ProviderCapabilities},
+    };
 
     fn health(kind: ProviderKind, available: bool) -> ProviderHealth {
         ProviderHealth {
@@ -224,7 +239,10 @@ mod tests {
             executable_path: None,
             version: None,
             diagnostic: (!available).then(|| "not found".into()),
-            capabilities: ProviderCapabilities::default(),
+            capabilities: ProviderCapabilities {
+                interactive: true,
+                ..ProviderCapabilities::default()
+            },
             checked_at: 0,
         }
     }
@@ -272,16 +290,72 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_codex_validation_uses_in_app_recovery_language() {
-        let mut codex = health(ProviderKind::Codex, true);
-        codex.authenticated = false;
-        let mut form = Form::session(WorktreeId::new(), vec![codex]);
+    fn authentication_validation_uses_provider_health_instead_of_provider_names() {
+        let mut claude = health(ProviderKind::Claude, true);
+        claude.authenticated = false;
+        claude.capabilities.authentication = AuthenticationRequirement::ExistingLogin;
+        claude.diagnostic =
+            Some("Claude Code is not logged in. Run `claude auth login` yourself.".into());
+        let mut form = Form::session(WorktreeId::new(), vec![claude]);
 
         assert!(!form.validate());
-        assert!(
-            form.submission_error
-                .as_deref()
-                .is_some_and(|message| message.contains("Sign in to Codex on this computer"))
+        assert_eq!(
+            form.submission_error.as_deref(),
+            Some("Claude Code is not logged in. Run `claude auth login` yourself.")
+        );
+    }
+
+    #[test]
+    fn session_form_only_offers_interactive_providers() {
+        let mut observational = health(ProviderKind::Pi, true);
+        observational.capabilities.interactive = false;
+        let form = Form::session(
+            WorktreeId::new(),
+            vec![
+                observational,
+                health(ProviderKind::Claude, true),
+                health(ProviderKind::Shell, true),
+            ],
+        );
+
+        assert_eq!(
+            form.providers
+                .iter()
+                .map(|provider| provider.kind)
+                .collect::<Vec<_>>(),
+            vec![ProviderKind::Claude, ProviderKind::Shell]
+        );
+        assert_eq!(
+            form.provider().map(|provider| provider.kind),
+            Some(ProviderKind::Shell)
+        );
+    }
+
+    #[test]
+    fn interactive_claude_submission_builds_a_bounded_ipc_request() {
+        let worktree_id = WorktreeId::new();
+        let mut form = Form::session(
+            worktree_id,
+            vec![
+                health(ProviderKind::Shell, true),
+                health(ProviderKind::Claude, true),
+            ],
+        );
+        assert!(form.select_provider(ProviderKind::Claude));
+        form.fields[0].value = "Claude review".into();
+
+        assert_eq!(
+            form.session_request(120, 40),
+            Some(ClientRequest::CreateSession {
+                worktree_id,
+                provider: ProviderKind::Claude,
+                display_name: Some("Claude review".into()),
+                model: None,
+                effort: None,
+                initial_prompt: None,
+                columns: 120,
+                rows: 40,
+            })
         );
     }
 }
