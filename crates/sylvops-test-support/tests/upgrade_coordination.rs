@@ -834,7 +834,7 @@ async fn connect_raw_client(paths: &RuntimePaths, process_id: u32) -> BoxStream 
 }
 
 async fn connect_eventually(paths: &RuntimePaths) -> DaemonClient {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         match DaemonClient::connect(paths, "upgrade-coordination-integration").await {
             Ok(client) => return client,
