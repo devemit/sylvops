@@ -21,7 +21,7 @@ This supersedes the one-time release-cut plan. Its safety checks are repeatable 
 - An upgrade never silently stops active sessions. It waits until they finish or requires a second explicit confirmation that names the sessions that will stop.
 - One previous working version is retained for rollback until the upgraded app and daemon pass a health check.
 - Uninstall removes application files and OS integration but preserves user data by default. Removing user data is a separate explicit option and never removes repositories or worktrees.
-- Initial Codex prompts are not persisted. Eligible Codex sessions can be resumed from the desktop, TUI, and CLI.
+- Initial provider prompts are not persisted. Eligible Codex and Claude Sessions can be resumed from the desktop, TUI, and CLI.
 
 ## Packaging basis
 
@@ -114,7 +114,7 @@ An application release is ready when all of the following are true:
 - A failed post-upgrade health check restores the previous working version.
 - Normal uninstall removes the app but preserves user data; explicit data removal still never touches repositories or worktrees.
 - No initial prompt is present in persisted SQLite content.
-- Eligible Codex sessions resume from desktop, TUI, and CLI into new session records.
+- Eligible Codex and Claude Sessions resume from desktop, TUI, and CLI into new session records.
 - All four supported target builds pass their native install and upgrade checks.
 
 ## Deferred scope

@@ -251,15 +251,15 @@ The repository now contains a **cross-platform application-release baseline**. I
 - guarded managed-worktree creation, status, and removal;
 - startup reconciliation for missing and externally discovered worktrees;
 - per-project Git mutation serialization and per-worktree session/removal coordination;
-- a provider adapter registry for plain shells and Codex;
-- bounded Codex discovery, version, and authentication probes;
-- application-owned Codex hook profiles plus an authenticated loopback hook relay;
-- deterministic attention states, external Codex session-ID capture, and guarded resume;
+- a provider adapter registry for plain shells, Codex, and explicitly configured Claude Code;
+- bounded Codex and Claude discovery, version, and authentication probes;
+- application-owned provider hook settings plus an authenticated loopback hook relay;
+- deterministic attention states, verified provider conversation-ID capture, and guarded Codex and Claude resume;
 - a native, mouse-first desktop client with workspace tabs, guided repository/worktree/session management, responsive resizable navigation, a dominant terminal workspace, session tabs, Changes/Details views, persisted appearance and layout, and daemon-backed terminal attachment;
 - a hierarchical Ratatui mission-control client with an explorer, Terminal/Changes/Details tabs, guided forms, keyboard and mouse controls, attention selection, safe embedded terminal rendering, bounded read-only diffs, and restored navigation context;
 - CLI workspace, project, worktree, provider, session, desktop, and TUI commands.
 
-Claude, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
+Broader Claude client exposure, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
 
 The Windows implementation contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The prior cross-platform baseline passed the complete hosted Windows, Linux, and macOS quality gates; the current tree must pass those gates before `v0.1.0` is promoted.
 
@@ -307,8 +307,10 @@ sylvops worktree create --project <project-id> --branch feature/example --base H
 sylvops worktree status <worktree-id>
 sylvops provider list
 sylvops provider probe codex
+sylvops provider probe claude
 sylvops session create --worktree <worktree-id> --provider shell
 sylvops session create --worktree <worktree-id> --provider codex --model <model> --effort high --prompt "..."
+sylvops session create --worktree <worktree-id> --provider claude --model <model> --effort high --prompt "..."
 sylvops session attach <session-id>
 sylvops session resume <session-id>
 sylvops session stop <session-id>

@@ -95,12 +95,19 @@ async fn managed_claude_session_inner() {
         session.state == SessionState::Running && session.external_session_id.is_some()
     })
     .await;
-    assert!(
-        running
-            .external_session_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("fake-claude-"))
-    );
+    let mut verified_id = running
+        .external_session_id
+        .clone()
+        .filter(|id| id.starts_with("fake-claude-"))
+        .expect("verified Claude conversation ID");
+    let established_audit = wait_for_audit(
+        &paths.database,
+        "provider_conversation_changed",
+        Some("established"),
+        1,
+    )
+    .await;
+    assert!(!established_audit.contains("fake-claude-"));
 
     let settings = managed_claude_settings(&paths.runtime_directory);
     assert_eq!(settings.len(), 1);
@@ -130,6 +137,68 @@ async fn managed_claude_session_inner() {
         })
         .await
         .expect("resize response");
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("clear-conversation"),
+        })
+        .await
+        .expect("clear transition input");
+    verified_id.push_str("-cleared");
+    wait_for_session(&client, session_id, |session| {
+        session.external_session_id.as_deref() == Some(verified_id.as_str())
+    })
+    .await;
+    let cleared_audit = wait_for_audit(
+        &paths.database,
+        "provider_conversation_changed",
+        Some("cleared"),
+        1,
+    )
+    .await;
+    assert!(!cleared_audit.contains("fake-claude-"));
+
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("resume-conversation"),
+        })
+        .await
+        .expect("resume transition input");
+    verified_id.push_str("-resumed");
+    wait_for_session(&client, session_id, |session| {
+        session.external_session_id.as_deref() == Some(verified_id.as_str())
+    })
+    .await;
+    let resumed_audit = wait_for_audit(
+        &paths.database,
+        "provider_conversation_changed",
+        Some("resumed"),
+        1,
+    )
+    .await;
+    assert!(!resumed_audit.contains("fake-claude-"));
+
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("unexpected-id-change"),
+        })
+        .await
+        .expect("unexpected identity input");
+    wait_for_audit(
+        &paths.database,
+        "provider_hook_refused",
+        Some("external_session_id_changed"),
+        1,
+    )
+    .await;
+    wait_for_session(&client, session_id, |session| {
+        session.state == SessionState::Running
+            && session.external_session_id.as_deref() == Some(verified_id.as_str())
+    })
+    .await;
+
     client
         .request(&ClientRequest::SessionInput {
             session_id,
@@ -503,10 +572,22 @@ async fn late_session_start_recovers_after_warning() {
         .expect("input while hook warning is active");
     wait_for_output(&mut events, session_id, "FAKE_CLAUDE_ECHO=still-usable").await;
     let recovered = wait_for_session_for(&client, session_id, Duration::from_secs(10), |session| {
-        session.state == SessionState::Running && session.external_session_id.is_some()
+        session.state == SessionState::Running && session.external_session_id.is_none()
     })
     .await;
     assert!(recovered.failure_reason.is_none());
+
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("session-start"),
+        })
+        .await
+        .expect("late SessionStart input");
+    wait_for_session(&client, session_id, |session| {
+        session.state == SessionState::Running && session.external_session_id.is_some()
+    })
+    .await;
 
     client
         .request(&ClientRequest::StopSession { session_id })
@@ -556,6 +637,52 @@ async fn late_session_start_recovers_after_warning() {
         failed.failure_reason.as_deref(),
         Some("process exited with code 17")
     );
+    let external_id = failed
+        .external_session_id
+        .clone()
+        .expect("verified Claude conversation ID");
+
+    let resumed = match client
+        .request(&ClientRequest::ResumeSession {
+            session_id: failed_session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("Claude resume response")
+    {
+        DaemonResponse::SessionResumed { session, .. } => session,
+        response => panic!("unexpected Claude resume response: {response:?}"),
+    };
+    assert_ne!(resumed.id, failed_session_id);
+    assert_eq!(resumed.provider_kind, ProviderKind::Claude);
+    assert_eq!(resumed.worktree_id, worktree_id);
+    assert_eq!(resumed.cwd, failed.cwd);
+    assert_eq!(
+        resumed.external_session_id.as_deref(),
+        Some(external_id.as_str())
+    );
+    let arguments: Vec<String> =
+        serde_json::from_str(&resumed.arguments_json).expect("persisted Claude resume arguments");
+    let resume_index = arguments
+        .iter()
+        .position(|argument| argument == "--resume")
+        .expect("Claude --resume argument");
+    assert_eq!(
+        arguments.get(resume_index + 1).map(String::as_str),
+        Some(external_id.as_str())
+    );
+    assert!(!arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--continue" | "--fork-session" | "--session-id"
+        )
+    }));
+    wait_for_session(&client, resumed.id, |session| {
+        session.state == SessionState::Running
+            && session.external_session_id.as_deref() == Some(external_id.as_str())
+    })
+    .await;
 
     client
         .request(&ClientRequest::ShutdownDaemon)

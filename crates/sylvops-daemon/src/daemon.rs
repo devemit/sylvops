@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::{
     DaemonError, Result, config_store,
     data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan},
-    database::{DatabaseHandle, NewSession},
+    database::{DatabaseHandle, NewSession, VerifiedConversationIdentityUpdate},
     git,
     hook::{HookCredentials, HookDelivery, HookReceiver},
     ipc::{BoxStream, LocalListener},
@@ -2384,12 +2384,12 @@ fn provider_external_id_update(
     existing: Option<&str>,
     received: Option<&ProviderConversationId>,
     transition: Option<ConversationIdentityTransition>,
-) -> Result<Option<String>> {
+) -> Result<Option<ProviderConversationId>> {
     let Some(received) = received else {
         return Ok(None);
     };
     match existing {
-        None => Ok(Some(received.to_string())),
+        None => Ok(Some(received.clone())),
         Some(existing) if existing == received.as_str() => Ok(None),
         Some(_)
             if transition.is_some_and(|transition| {
@@ -2400,7 +2400,7 @@ fn provider_external_id_update(
                 )
             }) =>
         {
-            Ok(Some(received.to_string()))
+            Ok(Some(received.clone()))
         }
         Some(_) => Err(DaemonError::Provider(
             "hook external session identifier changed unexpectedly".into(),
@@ -2520,12 +2520,9 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
     let recovers_claude_lifecycle = delivery.provider == ProviderKind::Claude
         && session_start_missing
         && normalized.conversation_id.is_some();
-    let effective_identity_transition = identity_transition.or_else(|| {
-        recovers_claude_lifecycle.then_some(ConversationIdentityTransition::Established)
-    });
     let received_identity = if delivery.provider == ProviderKind::Claude
         && persisted.external_session_id.is_none()
-        && effective_identity_transition.is_none()
+        && identity_transition.is_none()
     {
         None
     } else {
@@ -2534,7 +2531,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
     let external_session_id = match provider_external_id_update(
         persisted.external_session_id.as_deref(),
         received_identity,
-        effective_identity_transition,
+        identity_transition,
     ) {
         Ok(update) => update,
         Err(error) => {
@@ -2549,23 +2546,9 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             return Err(error);
         }
     };
-    if persisted.external_session_id.is_some()
-        && external_session_id.is_some()
-        && let Some(transition) = identity_transition
-    {
-        state
-            .database
-            .audit(
-                "provider_conversation_changed",
-                "succeeded",
-                &serde_json::json!({
-                    "session_id": delivery.session_id,
-                    "transition": transition
-                })
-                .to_string(),
-            )
-            .await?;
-    }
+    let conversation_identity = external_session_id.map(|external_session_id| {
+        VerifiedConversationIdentityUpdate::new(external_session_id, identity_transition)
+    });
     let next = {
         let mut machines = state.status_machines.lock().await;
         let machine = machines
@@ -2575,7 +2558,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
     };
     let status_update = state
         .database
-        .update_session_status(delivery.session_id, next, external_session_id)
+        .update_session_status(delivery.session_id, next, conversation_identity)
         .await;
     let (revision, session) = match status_update {
         Ok(updated) => updated,
@@ -3205,7 +3188,7 @@ mod tests {
         let received = ProviderConversationId::new("codex-session-1").unwrap();
         assert_eq!(
             provider_external_id_update(None, Some(&received), None).unwrap(),
-            Some("codex-session-1".into())
+            Some(received.clone())
         );
         assert_eq!(
             provider_external_id_update(Some("codex-session-1"), Some(&received), None).unwrap(),

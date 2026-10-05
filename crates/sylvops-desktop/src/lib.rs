@@ -6807,6 +6807,25 @@ mod tests {
             &terminated,
             std::slice::from_ref(&terminated)
         ));
+        let mut claude = available.clone();
+        claude.provider_kind = ProviderKind::Claude;
+        assert!(session_can_resume(&claude, std::slice::from_ref(&claude)));
+        let mut other_provider = claude.clone();
+        other_provider.id = SessionId::new();
+        other_provider.provider_kind = ProviderKind::Codex;
+        other_provider.created_at = claude.created_at + 1;
+        assert!(session_can_resume(
+            &claude,
+            &[claude.clone(), other_provider]
+        ));
+        let mut other_worktree = claude.clone();
+        other_worktree.id = SessionId::new();
+        other_worktree.worktree_id = WorktreeId::new();
+        other_worktree.created_at = claude.created_at + 1;
+        assert!(session_can_resume(
+            &claude,
+            &[claude.clone(), other_worktree]
+        ));
         let mut unsupported_provider = available.clone();
         unsupported_provider.provider_kind = ProviderKind::Shell;
         assert!(!session_can_resume(

@@ -16,11 +16,12 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sylvops_core::{
     domain::ProviderKind,
+    ids::{SessionId, WorktreeId},
     provider::{
         AuthenticationRequirement, LaunchArguments, LaunchContext, LaunchSpec,
-        ProviderCapabilities, ProviderHealth, ProviderLifecycleEvent, ProviderLifecyclePayload,
-        ProviderRuntime, ProviderRuntimeCapabilities, ProviderRuntimeSpec, ResumeContext,
-        provider_error,
+        ProviderCapabilities, ProviderHealth, ProviderLifecycleEndpoint, ProviderLifecycleEvent,
+        ProviderLifecyclePayload, ProviderRuntime, ProviderRuntimeCapabilities,
+        ProviderRuntimeSpec, ResumeContext, provider_error,
     },
     status::{
         ConversationIdentity, ConversationIdentityTransition, NormalizedProviderEvent,
@@ -520,15 +521,16 @@ impl ClaudeAdapter {
     fn capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             interactive: true,
+            resume: true,
             status_hooks: true,
             model_selection: true,
             effort_selection: true,
             authentication: AuthenticationRequirement::ExistingLogin,
             runtime: Some(ProviderRuntimeCapabilities {
                 lifecycle_events: true,
+                conversation_identity_transitions: true,
                 ..ProviderRuntimeCapabilities::default()
             }),
-            ..ProviderCapabilities::default()
         }
     }
 
@@ -552,28 +554,12 @@ impl ClaudeAdapter {
         validate_claude_model(context.model.as_deref())?;
         validate_claude_effort(context.effort.as_deref())?;
         validate_prompt(context.initial_prompt.as_deref())?;
-        let settings = self
-            .settings
-            .as_ref()
-            .ok_or_else(|| provider_error("Claude Code managed settings are unavailable"))?;
-        let endpoint = context.lifecycle_endpoint.as_ref().ok_or_else(|| {
-            provider_error("Claude Code lifecycle endpoint is required for a managed Session")
-        })?;
-        if !endpoint.is_bound_to(
-            ProviderKind::Claude,
+        let (settings_path, environment) = self.managed_launch_context(
             context.session_id,
             context.worktree_id,
-        ) {
-            return Err(provider_error(
-                "Claude Code lifecycle endpoint identity does not match the Session",
-            ));
-        }
-        if endpoint.url() != settings.endpoint_url {
-            return Err(provider_error(
-                "Claude Code lifecycle endpoint does not match the daemon settings layer",
-            ));
-        }
-        let settings_path = settings.revalidate()?;
+            context.lifecycle_endpoint.as_ref(),
+            false,
+        )?;
         let mut persisted = vec![OsString::from("--settings"), settings_path.into_os_string()];
         if let Some(model) = &context.model {
             persisted.extend([OsString::from("--model"), OsString::from(model)]);
@@ -590,7 +576,60 @@ impl ClaudeAdapter {
                 )
             },
         );
-        let mut environment = safe_environment(context.session_id, context.worktree_id, false);
+        Ok(LaunchSpec {
+            executable: self.executable()?,
+            arguments,
+            environment,
+        })
+    }
+
+    fn build_resume_spec(&self, context: &ResumeContext) -> sylvops_core::Result<LaunchSpec> {
+        validate_external_id(&context.external_session_id)?;
+        let (settings_path, environment) = self.managed_launch_context(
+            context.session_id,
+            context.worktree_id,
+            context.lifecycle_endpoint.as_ref(),
+            true,
+        )?;
+        let arguments = LaunchArguments::persisted(vec![
+            OsString::from("--settings"),
+            settings_path.into_os_string(),
+            OsString::from("--resume"),
+            OsString::from(&context.external_session_id),
+        ]);
+        Ok(LaunchSpec {
+            executable: self.executable()?,
+            arguments,
+            environment,
+        })
+    }
+
+    fn managed_launch_context(
+        &self,
+        session_id: SessionId,
+        worktree_id: WorktreeId,
+        lifecycle_endpoint: Option<&ProviderLifecycleEndpoint>,
+        resume: bool,
+    ) -> sylvops_core::Result<(PathBuf, BTreeMap<OsString, OsString>)> {
+        let settings = self
+            .settings
+            .as_ref()
+            .ok_or_else(|| provider_error("Claude Code managed settings are unavailable"))?;
+        let endpoint = lifecycle_endpoint.ok_or_else(|| {
+            provider_error("Claude Code lifecycle endpoint is required for a managed Session")
+        })?;
+        if !endpoint.is_bound_to(ProviderKind::Claude, session_id, worktree_id) {
+            return Err(provider_error(
+                "Claude Code lifecycle endpoint identity does not match the Session",
+            ));
+        }
+        if endpoint.url() != settings.endpoint_url {
+            return Err(provider_error(
+                "Claude Code lifecycle endpoint does not match the daemon settings layer",
+            ));
+        }
+        let settings_path = settings.revalidate()?;
+        let mut environment = safe_environment(session_id, worktree_id, resume);
         if let Some(config_directory) = std::env::var_os("CLAUDE_CONFIG_DIR") {
             environment.insert(OsString::from("CLAUDE_CONFIG_DIR"), config_directory);
         }
@@ -602,11 +641,7 @@ impl ClaudeAdapter {
             OsString::from("SYLVOPS_HOOK_TOKEN"),
             OsString::from(endpoint.bearer_token()),
         );
-        Ok(LaunchSpec {
-            executable: self.executable()?,
-            arguments,
-            environment,
-        })
+        Ok((settings_path, environment))
     }
 
     async fn probe_health(&self) -> ProviderHealth {
@@ -789,9 +824,12 @@ impl ProviderRuntime for ClaudeAdapter {
 
     fn configure_resume(
         &self,
-        _context: ResumeContext,
+        context: ResumeContext,
     ) -> sylvops_core::Result<Option<ProviderRuntimeSpec>> {
-        Ok(None)
+        Ok(Some(ProviderRuntimeSpec {
+            launch: self.build_resume_spec(&context)?,
+            owned_paths: Vec::new(),
+        }))
     }
 
     fn normalize_lifecycle_event(
