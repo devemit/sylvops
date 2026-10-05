@@ -25,7 +25,7 @@ use sylvops_core::{
         PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolFailure, WelcomeResponse, read_frame,
         validate_terminal_size, write_frame,
     },
-    provider::{LaunchContext, ProviderRuntimeSpec, ResumeContext},
+    provider::{AuthenticationRequirement, LaunchContext, ProviderRuntimeSpec, ResumeContext},
     status::{
         ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId,
         SessionStatusMachine,
@@ -67,6 +67,8 @@ const CLIENT_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
 const LIFECYCLE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACTIVE_SESSION_REAP_TIMEOUT: Duration = Duration::from_secs(15);
+const CLAUDE_SESSION_START_TIMEOUT: Duration = Duration::from_secs(15);
+const CLAUDE_SESSION_START_GUIDANCE: &str = "Claude Code lifecycle hooks did not report SessionStart within 15 seconds. The Terminal remains usable; check Claude hook configuration or restart the Session.";
 const UPGRADE_HANDOFF_FILE: &str = "handoff.json";
 
 #[derive(Debug)]
@@ -349,6 +351,7 @@ struct DaemonState {
 struct HookTracking {
     fingerprints: HashSet<String>,
     stopped_turns: HashSet<String>,
+    session_start_missing: bool,
 }
 
 impl HookTracking {
@@ -479,6 +482,7 @@ pub async fn run_with_handoff_launchers(
     paths.prepare()?;
     let config = config_store::load(&paths.config, &paths.machine_config)?;
     let managed_worktree_root = prepare_managed_worktree_root(&paths, &config).await?;
+    let mut listener = LocalListener::bind(&paths.endpoint)?;
     let relay_executable = canonical_current_executable()?;
     let mut hook_receiver = HookReceiver::bind(
         relay_executable,
@@ -487,8 +491,10 @@ pub async fn run_with_handoff_launchers(
     )
     .await?;
     let hook_credentials = hook_receiver.credentials();
-    let providers = Arc::new(ProviderRegistry::new(
-        Some(hook_receiver.relay_executable()),
+    let providers = Arc::new(ProviderRegistry::new_managed(
+        hook_receiver.relay_executable(),
+        &paths.runtime_directory,
+        hook_receiver.endpoint_url(),
         &config.enabled_providers,
     )?);
     let upgrade = prepare_upgrade(&paths).await?;
@@ -500,7 +506,6 @@ pub async fn run_with_handoff_launchers(
     )
     .await?;
     let mut hook_deliveries = hook_receiver.take_deliveries();
-    let mut listener = LocalListener::bind(&paths.endpoint)?;
     let database = DatabaseHandle::open(&paths.database)?;
     let reconciled = database.reconcile_after_restart().await?;
     let worktree_reconciliation = reconcile_worktrees(&database).await?;
@@ -1424,10 +1429,12 @@ async fn handle_request(
                         .unwrap_or_else(|| format!("provider {provider} is unavailable")),
                 ));
             }
-            if provider == ProviderKind::Codex && !health.authenticated {
-                return Err(DaemonError::Provider(
-                    "Codex is not authenticated; run `codex login` explicitly".into(),
-                ));
+            if health.capabilities.authentication == AuthenticationRequirement::ExistingLogin
+                && !health.authenticated
+            {
+                return Err(DaemonError::Provider(health.diagnostic.unwrap_or_else(
+                    || format!("{provider} is not authenticated; sign in explicitly"),
+                )));
             }
             let display_name = validated_session_name(display_name, provider)?;
             let lifecycle_endpoint = if state.providers.supports_lifecycle_events(provider)? {
@@ -1467,6 +1474,7 @@ async fn handle_request(
                     return Err(error);
                 }
             };
+            let arguments_json = persisted_launch_arguments(state, session_id, provider, &spec)?;
             let record = NewSession {
                 id: session_id,
                 worktree_id,
@@ -1474,7 +1482,7 @@ async fn handle_request(
                 provider_profile_id: Some(provider_profile_id(provider)),
                 provider_kind: provider,
                 command,
-                arguments_json: arguments_json(spec.launch.arguments.persisted_values())?,
+                arguments_json,
                 cwd: worktree.canonical_path.clone(),
                 external_session_id: None,
                 resumed_from_session_id: None,
@@ -1574,6 +1582,8 @@ async fn handle_request(
                     return Err(error);
                 }
             };
+            let arguments_json =
+                persisted_launch_arguments(state, session_id, source.provider_kind, &spec)?;
             let record = NewSession {
                 id: session_id,
                 worktree_id: source.worktree_id,
@@ -1584,7 +1594,7 @@ async fn handle_request(
                 provider_profile_id: source.provider_profile_id,
                 provider_kind: source.provider_kind,
                 command,
-                arguments_json: arguments_json(spec.launch.arguments.persisted_values())?,
+                arguments_json,
                 cwd: worktree.canonical_path,
                 external_session_id: Some(external_session_id),
                 resumed_from_session_id: Some(source_session_id),
@@ -2275,7 +2285,10 @@ async fn spawn_managed_session(
         .await
         .entry(session_id)
         .or_insert_with(|| SessionStatusMachine::new(running.state));
-    spawn_exit_monitor(state.clone(), session_id, managed, completed_tx);
+    spawn_exit_monitor(state.clone(), session_id, managed.clone(), completed_tx);
+    if provider_kind == ProviderKind::Claude {
+        spawn_claude_session_start_monitor(state.clone(), session_id, managed);
+    }
     Ok((revision, running))
 }
 
@@ -2289,12 +2302,16 @@ async fn persist_provider_health(
         display_name: match health.kind {
             ProviderKind::Shell => "Plain shell".into(),
             ProviderKind::Codex => "Codex CLI".into(),
+            ProviderKind::Claude => "Claude Code".into(),
             other => other.to_string(),
         },
         executable_path: health.executable_path.clone(),
         default_model: None,
         default_effort: None,
-        enabled: matches!(health.kind, ProviderKind::Shell | ProviderKind::Codex),
+        enabled: matches!(
+            health.kind,
+            ProviderKind::Shell | ProviderKind::Codex | ProviderKind::Claude
+        ),
         capabilities_json: serde_json::to_string(&health.capabilities)
             .map_err(|error| DaemonError::Provider(error.to_string()))?,
         last_probe_status: Some(
@@ -2398,6 +2415,67 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             "provider lifecycle event type is unknown".into(),
         ));
     };
+    let is_claude_session_start = matches!(
+        &event,
+        NormalizedProviderEvent::TurnStarted {
+            conversation: Some(_)
+        }
+    );
+    let (disposition, session_start_missing) = {
+        let mut tracking = state.hook_tracking.lock().await;
+        let tracking = tracking.entry(delivery.session_id).or_default();
+        let disposition = if !tracking.accept_fingerprint(delivery.fingerprint) {
+            Some("duplicate")
+        } else if normalized
+            .turn_id
+            .as_ref()
+            .is_some_and(|turn_id| tracking.stopped_turns.contains(turn_id))
+            && !matches!(&event, NormalizedProviderEvent::TurnStopped { .. })
+        {
+            Some("stale")
+        } else {
+            if matches!(&event, NormalizedProviderEvent::TurnStopped { .. })
+                && let Some(turn_id) = normalized.turn_id.as_ref()
+            {
+                tracking.close_turn(turn_id.clone());
+            }
+            None
+        };
+        (disposition, tracking.session_start_missing)
+    };
+    if let Some(disposition) = disposition {
+        state
+            .database
+            .audit(
+                "provider_hook_ignored",
+                "refused",
+                &serde_json::json!({
+                    "session_id": delivery.session_id,
+                    "reason": disposition
+                })
+                .to_string(),
+            )
+            .await?;
+        return Ok(());
+    }
+    if session_start_missing && !is_claude_session_start {
+        if matches!(&event, NormalizedProviderEvent::SessionEnded) {
+            revoke_session_hook_access(state, delivery.session_id).await;
+        }
+        state
+            .database
+            .audit(
+                "provider_hook_ignored",
+                "refused",
+                &serde_json::json!({
+                    "session_id": delivery.session_id,
+                    "reason": "awaiting_session_start"
+                })
+                .to_string(),
+            )
+            .await?;
+        return Ok(());
+    }
     if persisted.external_session_id.is_some()
         && external_session_id.is_some()
         && let Some(transition) = identity_transition
@@ -2415,42 +2493,6 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             )
             .await?;
     }
-    let disposition = {
-        let mut tracking = state.hook_tracking.lock().await;
-        let tracking = tracking.entry(delivery.session_id).or_default();
-        if !tracking.accept_fingerprint(delivery.fingerprint) {
-            Some("duplicate")
-        } else if normalized
-            .turn_id
-            .as_ref()
-            .is_some_and(|turn_id| tracking.stopped_turns.contains(turn_id))
-            && !matches!(&event, NormalizedProviderEvent::TurnStopped { .. })
-        {
-            Some("stale")
-        } else {
-            if matches!(&event, NormalizedProviderEvent::TurnStopped { .. })
-                && let Some(turn_id) = normalized.turn_id.as_ref()
-            {
-                tracking.close_turn(turn_id.clone());
-            }
-            None
-        }
-    };
-    if let Some(disposition) = disposition {
-        state
-            .database
-            .audit(
-                "provider_hook_ignored",
-                "refused",
-                &serde_json::json!({
-                    "session_id": delivery.session_id,
-                    "reason": disposition
-                })
-                .to_string(),
-            )
-            .await?;
-        return Ok(());
-    }
     let next = {
         let mut machines = state.status_machines.lock().await;
         let machine = machines
@@ -2465,6 +2507,18 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
     if let Some(managed) = get_managed_session(state, delivery.session_id).await {
         *managed.record.write().await = session.clone();
     }
+    if is_claude_session_start {
+        state
+            .hook_tracking
+            .lock()
+            .await
+            .entry(delivery.session_id)
+            .or_default()
+            .session_start_missing = false;
+    }
+    if matches!(&event, NormalizedProviderEvent::SessionEnded) {
+        revoke_session_hook_access(state, delivery.session_id).await;
+    }
     let _ = state.events.send(DaemonEvent::ProviderEvent {
         provider: persisted.provider_kind,
         session_id: delivery.session_id,
@@ -2475,6 +2529,11 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
         .events
         .send(DaemonEvent::SessionStatusChanged { revision, session });
     Ok(())
+}
+
+async fn revoke_session_hook_access(state: &DaemonState, session_id: SessionId) {
+    state.hook_credentials.invalidate(session_id);
+    state.hook_tracking.lock().await.remove(&session_id);
 }
 
 fn provider_profile_id(kind: ProviderKind) -> ProviderProfileId {
@@ -2498,6 +2557,20 @@ fn arguments_json(arguments: &[std::ffi::OsString]) -> Result<String> {
     serde_json::to_string(&arguments).map_err(|error| DaemonError::Provider(error.to_string()))
 }
 
+fn persisted_launch_arguments(
+    state: &DaemonState,
+    session_id: SessionId,
+    provider_kind: ProviderKind,
+    runtime: &ProviderRuntimeSpec,
+) -> Result<String> {
+    arguments_json(runtime.launch.arguments.persisted_values()).inspect_err(|_| {
+        state.hook_credentials.invalidate(session_id);
+        state
+            .providers
+            .cleanup_runtime_paths(provider_kind, &runtime.owned_paths);
+    })
+}
+
 fn spawn_exit_monitor(
     state: DaemonState,
     session_id: SessionId,
@@ -2508,11 +2581,10 @@ fn spawn_exit_monitor(
         let mut handle = managed.handle.clone();
         let provider_kind = managed.record.read().await.provider_kind;
         let exit = handle.wait().await;
-        state.hook_credentials.invalidate(session_id);
+        revoke_session_hook_access(&state, session_id).await;
         state
             .providers
             .cleanup_runtime_paths(provider_kind, &managed.owned_runtime_paths);
-        state.hook_tracking.lock().await.remove(&session_id);
         match exit {
             Ok(exit) => {
                 let state_value = if exit.stop_requested {
@@ -2557,6 +2629,49 @@ fn spawn_exit_monitor(
             }
         }
         completed.send_replace(true);
+    });
+}
+
+fn spawn_claude_session_start_monitor(
+    state: DaemonState,
+    session_id: SessionId,
+    managed: ManagedSession,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(CLAUDE_SESSION_START_TIMEOUT).await;
+        if *managed.completed.borrow() {
+            return;
+        }
+        state
+            .hook_tracking
+            .lock()
+            .await
+            .entry(session_id)
+            .or_default()
+            .session_start_missing = true;
+        match state
+            .database
+            .mark_session_lifecycle_missing(session_id, CLAUDE_SESSION_START_GUIDANCE.into())
+            .await
+        {
+            Ok(Some((revision, session))) => {
+                *managed.record.write().await = session.clone();
+                let _ = state
+                    .events
+                    .send(DaemonEvent::SessionStatusChanged { revision, session });
+            }
+            Ok(None) => {
+                if let Some(tracking) = state.hook_tracking.lock().await.get_mut(&session_id) {
+                    tracking.session_start_missing = false;
+                }
+            }
+            Err(error) => {
+                if let Some(tracking) = state.hook_tracking.lock().await.get_mut(&session_id) {
+                    tracking.session_start_missing = false;
+                }
+                tracing::warn!(%error, %session_id, "cannot persist missing Claude lifecycle warning");
+            }
+        }
     });
 }
 
