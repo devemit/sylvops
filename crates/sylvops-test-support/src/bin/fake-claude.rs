@@ -20,6 +20,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> io::Result<()> {
     let arguments: Vec<_> = env::args().skip(1).collect();
     if let Some(exit) = probe_exit(&arguments) {
@@ -34,6 +35,8 @@ fn run() -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing --settings"))?;
     let settings = fs::read_to_string(settings_path)?;
     if !settings.contains("SessionStart")
+        || !settings.contains("PermissionRequest")
+        || !settings.contains("AskUserQuestion|ExitPlanMode")
         || !settings.contains("$SYLVOPS_HOOK_TOKEN")
         || settings.contains("permissionMode")
     {
@@ -64,6 +67,96 @@ fn run() -> io::Result<()> {
     for line in io::stdin().lock().lines() {
         let line = line?;
         match line.trim() {
+            "permission" => {
+                emit_hook("PermissionRequest", &external_id)?;
+                println!("FAKE_CLAUDE_PERMISSION");
+            }
+            "stale-permission" => {
+                emit_hook_with_marker("PermissionRequest", &external_id, "stale-turn")?;
+                println!("FAKE_CLAUDE_STALE_PERMISSION");
+            }
+            "ask-user-question" => {
+                emit_tool_hook("AskUserQuestion", &external_id)?;
+                println!("FAKE_CLAUDE_ASK_USER");
+            }
+            "exit-plan-mode" => {
+                emit_tool_hook("ExitPlanMode", &external_id)?;
+                println!("FAKE_CLAUDE_EXIT_PLAN");
+            }
+            value if value.starts_with("user-prompt-") => {
+                emit_hook_with_marker("UserPromptSubmit", &external_id, value)?;
+                println!("FAKE_CLAUDE_USER_PROMPT");
+            }
+            "subagent-start" => {
+                emit_subagent_hook("SubagentStart", &external_id, "agent-1")?;
+                println!("FAKE_CLAUDE_SUBAGENT_START");
+            }
+            "subagent-stop" => {
+                emit_subagent_hook("SubagentStop", &external_id, "agent-1")?;
+                println!("FAKE_CLAUDE_SUBAGENT_STOP");
+            }
+            value if value.starts_with("stop-normal") => {
+                emit_stop_hook(&external_id, value, false, false)?;
+                println!("FAKE_CLAUDE_STOP");
+            }
+            "stop-background" => {
+                emit_stop_hook(&external_id, "background", true, false)?;
+                println!("FAKE_CLAUDE_STOP_BACKGROUND");
+            }
+            "stop-scheduled" => {
+                emit_stop_hook(&external_id, "scheduled", false, true)?;
+                println!("FAKE_CLAUDE_STOP_SCHEDULED");
+            }
+            "stop-failure" => {
+                emit_hook_payload(
+                    json!({
+                        "hook_event_name": "StopFailure",
+                        "session_id": external_id,
+                        "error": "rate_limit",
+                        "error_details": "SYLVOPS_PRIVATE_CLAUDE_FAILURE_75",
+                        "last_assistant_message": "private provider error text"
+                    }),
+                    None,
+                )?;
+                println!("FAKE_CLAUDE_STOP_FAILURE");
+            }
+            "output-flood" => {
+                let chunk = "x".repeat(16 * 1024);
+                for _ in 0..512 {
+                    println!("{chunk}");
+                }
+                io::stdout().flush()?;
+                emit_hook_with_marker("UserPromptSubmit", &external_id, "after-output-flood")?;
+                println!("FAKE_CLAUDE_OUTPUT_FLOOD_DONE");
+            }
+            "malformed-hook" => {
+                emit_hook_bytes(
+                    br#"{"hook_event_name":"Stop","private":"SYLVOPS_PRIVATE_MALFORMED_HOOK_75""#,
+                )?;
+                println!("FAKE_CLAUDE_MALFORMED_HOOK");
+            }
+            "unknown-hook" => {
+                emit_hook_payload(
+                    json!({
+                        "hook_event_name": "FutureClaudeEvent",
+                        "session_id": external_id,
+                        "private": "SYLVOPS_PRIVATE_UNKNOWN_HOOK_75"
+                    }),
+                    None,
+                )?;
+                println!("FAKE_CLAUDE_UNKNOWN_HOOK");
+            }
+            "duplicate-hook" => {
+                let payload = json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": external_id,
+                    "fixture_marker": "duplicate"
+                });
+                emit_hook_payload(payload.clone(), None)?;
+                emit_hook_payload(payload, None)?;
+                println!("FAKE_CLAUDE_DUPLICATE_HOOK");
+            }
+            "unexpected-exit" => std::process::exit(17),
             "session-end" => {
                 emit_hook("SessionEnd", &external_id)?;
                 println!("FAKE_CLAUDE_SESSION_END");
@@ -150,26 +243,104 @@ fn argument_value<'a>(arguments: &'a [String], flag: &str) -> Option<&'a str> {
 }
 
 fn emit_hook(event: &str, external_id: &str) -> io::Result<()> {
-    emit_hook_payload(event, external_id, None)
+    emit_hook_payload(
+        json!({
+            "hook_event_name": event,
+            "session_id": external_id,
+            "source": "startup",
+            "cwd": env::current_dir()?.to_string_lossy()
+        }),
+        None,
+    )
 }
 
 fn emit_hook_with_marker(event: &str, external_id: &str, marker: &str) -> io::Result<()> {
-    emit_hook_payload(event, external_id, Some(marker))
+    emit_hook_payload(
+        json!({
+            "hook_event_name": event,
+            "session_id": external_id,
+            "source": "startup",
+            "cwd": env::current_dir()?.to_string_lossy()
+        }),
+        Some(marker),
+    )
 }
 
-fn emit_hook_payload(event: &str, external_id: &str, marker: Option<&str>) -> io::Result<()> {
+fn emit_tool_hook(tool_name: &str, external_id: &str) -> io::Result<()> {
+    emit_hook_payload(
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": external_id,
+            "tool_name": tool_name,
+            "tool_input": {}
+        }),
+        None,
+    )
+}
+
+fn emit_subagent_hook(event: &str, external_id: &str, agent_id: &str) -> io::Result<()> {
+    emit_hook_payload(
+        json!({
+            "hook_event_name": event,
+            "session_id": external_id,
+            "agent_id": agent_id,
+            "agent_type": "Explore"
+        }),
+        None,
+    )
+}
+
+fn emit_stop_hook(
+    external_id: &str,
+    marker: &str,
+    background: bool,
+    scheduled: bool,
+) -> io::Result<()> {
+    let background_tasks = if background {
+        vec![json!({
+            "id": "task-1",
+            "type": "shell",
+            "status": "running",
+            "description": "bounded fixture task"
+        })]
+    } else {
+        Vec::new()
+    };
+    let session_crons = if scheduled {
+        vec![json!({
+            "id": "cron-1",
+            "schedule": "0 9 * * 1-5",
+            "recurring": true,
+            "prompt": "bounded fixture wakeup"
+        })]
+    } else {
+        Vec::new()
+    };
+    emit_hook_payload(
+        json!({
+            "hook_event_name": "Stop",
+            "session_id": external_id,
+            "stop_hook_active": false,
+            "background_tasks": background_tasks,
+            "session_crons": session_crons
+        }),
+        Some(marker),
+    )
+}
+
+fn emit_hook_payload(mut payload: serde_json::Value, marker: Option<&str>) -> io::Result<()> {
+    if let Some(marker) = marker {
+        payload["fixture_marker"] = json!(marker);
+    }
+    let body = serde_json::to_vec(&payload).map_err(io::Error::other)?;
+    emit_hook_bytes(&body)
+}
+
+fn emit_hook_bytes(body: &[u8]) -> io::Result<()> {
     let endpoint = required_environment("SYLVOPS_HOOK_ENDPOINT")?;
     let token = required_environment("SYLVOPS_HOOK_TOKEN")?;
     let session_id = required_environment("SYLVOPS_SESSION_ID")?;
     let worktree_id = required_environment("SYLVOPS_WORKTREE_ID")?;
-    let body = serde_json::to_vec(&json!({
-        "hook_event_name": event,
-        "session_id": external_id,
-        "source": "startup",
-        "cwd": env::current_dir()?.to_string_lossy(),
-        "fixture_marker": marker
-    }))
-    .map_err(io::Error::other)?;
     let (address, path) = parse_endpoint(&endpoint)?;
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -179,7 +350,7 @@ fn emit_hook_payload(event: &str, external_id: &str, marker: Option<&str>) -> io
         "POST {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nX-SylvOps-Session-Id: {session_id}\r\nX-SylvOps-Worktree-Id: {worktree_id}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
-    stream.write_all(&body)?;
+    stream.write_all(body)?;
     stream.flush()?;
     let mut response = [0_u8; 64];
     let read = stream.read(&mut response)?;

@@ -1658,7 +1658,8 @@ fn update_session_status(
         .execute(
             "UPDATE sessions SET state = ?2, external_session_id = COALESCE(?3, external_session_id), \
              last_activity_at = ?4, failure_reason = NULL \
-             WHERE id = ?1 AND state NOT IN ('failed', 'terminated', 'disconnected')",
+             WHERE id = ?1 AND process_id IS NOT NULL \
+             AND state NOT IN ('failed', 'terminated', 'disconnected')",
             params![id.to_string(), state.to_string(), external_session_id, now],
         )
         .map_err(database_error)?;
@@ -2626,6 +2627,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.state, SessionState::FinishedUnseen);
+        assert!(
+            database
+                .update_session_status(session_id, SessionState::Running, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            database.session(session_id).await.unwrap().state,
+            SessionState::FinishedUnseen
+        );
         assert!(
             !database
                 .worktree_has_live_sessions(managed_id)

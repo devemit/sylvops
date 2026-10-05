@@ -7,13 +7,16 @@ use sylvops_core::{
     domain::{ProviderKind, Session, SessionState},
     ids::SessionId,
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+    status::NormalizedProviderEvent,
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 
 const PROMPT_SENTINEL: &str = "SYLVOPS_PRIVATE_CLAUDE_PROMPT_74_22f1";
+const FAILURE_SENTINEL: &str = "SYLVOPS_PRIVATE_CLAUDE_FAILURE_75";
+const MALFORMED_SENTINEL: &str = "SYLVOPS_PRIVATE_MALFORMED_HOOK_75";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managed_claude_sessions_cover_terminal_and_handshake_recovery() {
+async fn managed_claude_sessions_cover_attention_terminal_and_hook_recovery() {
     tokio::time::timeout(Duration::from_secs(120), async {
         managed_claude_session_inner().await;
         late_session_start_recovers_after_warning().await;
@@ -103,6 +106,11 @@ async fn managed_claude_session_inner() {
     assert_eq!(settings.len(), 1);
     let source = std::fs::read_to_string(&settings[0]).expect("managed settings source");
     assert!(source.contains("SessionStart"));
+    assert!(source.contains("PermissionRequest"));
+    assert!(source.contains("AskUserQuestion|ExitPlanMode"));
+    assert!(source.contains("SubagentStart"));
+    assert!(source.contains("SubagentStop"));
+    assert!(source.contains("StopFailure"));
     assert!(source.contains("$SYLVOPS_HOOK_TOKEN"));
     assert!(!source.contains(PROMPT_SENTINEL));
     assert!(!source.contains("permissionMode"));
@@ -138,8 +146,226 @@ async fn managed_claude_session_inner() {
 
     let reconnected = connect_eventually(&paths).await;
     let mut replay_events = reconnected.subscribe();
+    let mut lifecycle_events = reconnected.subscribe();
     attach(&reconnected, session_id, output_sequence.saturating_sub(1)).await;
     wait_for_output(&mut replay_events, session_id, "FAKE_CLAUDE_ECHO=replay-me").await;
+
+    for (index, request) in ["permission", "ask-user-question", "exit-plan-mode"]
+        .into_iter()
+        .enumerate()
+    {
+        reconnected
+            .request(&ClientRequest::SessionInput {
+                session_id,
+                bytes: input_line(request),
+            })
+            .await
+            .expect("attention hook input");
+        wait_for_session(&reconnected, session_id, |session| {
+            session.state == SessionState::NeedsFeedback
+        })
+        .await;
+        reconnected
+            .request(&ClientRequest::SessionInput {
+                session_id,
+                bytes: input_line(&format!("user-prompt-{index}")),
+            })
+            .await
+            .expect("UserPromptSubmit input");
+        wait_for_session(&reconnected, session_id, |session| {
+            session.state == SessionState::Running
+        })
+        .await;
+    }
+
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("subagent-start"),
+        })
+        .await
+        .expect("SubagentStart input");
+    wait_for_provider_event(&mut lifecycle_events, session_id, |event| {
+        matches!(event, NormalizedProviderEvent::SubagentStarted { .. })
+    })
+    .await;
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("stop-normal-while-subagent-active"),
+        })
+        .await
+        .expect("Stop input with active subagent");
+    wait_for_provider_event(&mut lifecycle_events, session_id, |event| {
+        matches!(event, NormalizedProviderEvent::TurnStopped { .. })
+    })
+    .await;
+    wait_for_session(&reconnected, session_id, |session| {
+        session.state == SessionState::Running
+    })
+    .await;
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("subagent-stop"),
+        })
+        .await
+        .expect("SubagentStop input");
+    wait_for_provider_event(&mut lifecycle_events, session_id, |event| {
+        matches!(event, NormalizedProviderEvent::SubagentStopped { .. })
+    })
+    .await;
+
+    for (request, has_background, has_schedule) in [
+        ("stop-background", true, false),
+        ("stop-scheduled", false, true),
+    ] {
+        reconnected
+            .request(&ClientRequest::SessionInput {
+                session_id,
+                bytes: input_line(request),
+            })
+            .await
+            .expect("Stop input with remaining work");
+        wait_for_provider_event(&mut lifecycle_events, session_id, |event| {
+            matches!(
+                event,
+                NormalizedProviderEvent::TurnStopped { remaining_work }
+                    if remaining_work.background_tasks == has_background
+                        && remaining_work.scheduled_tasks == has_schedule
+            )
+        })
+        .await;
+        wait_for_session(&reconnected, session_id, |session| {
+            session.state == SessionState::Running
+        })
+        .await;
+    }
+
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("stop-normal"),
+        })
+        .await
+        .expect("normal Stop input");
+    wait_for_session(&reconnected, session_id, |session| {
+        session.state == SessionState::FinishedUnseen
+    })
+    .await;
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("stale-permission"),
+        })
+        .await
+        .expect("stale PermissionRequest input");
+    wait_for_audit(&paths.database, "provider_hook_ignored", Some("stale"), 1).await;
+    wait_for_session(&reconnected, session_id, |session| {
+        session.state == SessionState::FinishedUnseen
+    })
+    .await;
+    attach(&reconnected, session_id, 0).await;
+    wait_for_session(&reconnected, session_id, |session| {
+        session.state == SessionState::FinishedSeen
+    })
+    .await;
+
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("user-prompt-after-stop"),
+        })
+        .await
+        .expect("prompt after completed turn");
+    wait_for_session(&reconnected, session_id, |session| {
+        session.state == SessionState::Running
+    })
+    .await;
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("stop-failure"),
+        })
+        .await
+        .expect("StopFailure input");
+    wait_for_provider_event(&mut lifecycle_events, session_id, |event| {
+        matches!(
+            event,
+            NormalizedProviderEvent::TurnFailed { category }
+                if category.as_str() == "rate_limit"
+        )
+    })
+    .await;
+    let recoverable = wait_for_session(&reconnected, session_id, |session| {
+        session.state == SessionState::NeedsFeedback
+    })
+    .await;
+    assert!(recoverable.failure_reason.is_none());
+
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("output-flood"),
+        })
+        .await
+        .expect("output flood input");
+    wait_for_session(&reconnected, session_id, |session| {
+        session.state == SessionState::Running
+    })
+    .await;
+
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("malformed-hook"),
+        })
+        .await
+        .expect("malformed hook input");
+    let malformed_audit = wait_for_audit(
+        &paths.database,
+        "provider_hook_refused",
+        Some("invalid_payload"),
+        1,
+    )
+    .await;
+    assert!(!malformed_audit.contains(MALFORMED_SENTINEL));
+
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("unknown-hook"),
+        })
+        .await
+        .expect("unknown hook input");
+    let unknown_audit = wait_for_audit(
+        &paths.database,
+        "provider_hook_refused",
+        Some("invalid_payload"),
+        2,
+    )
+    .await;
+    assert!(!unknown_audit.contains("FutureClaudeEvent"));
+
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("duplicate-hook"),
+        })
+        .await
+        .expect("duplicate hook input");
+    wait_for_audit(
+        &paths.database,
+        "provider_hook_ignored",
+        Some("duplicate"),
+        1,
+    )
+    .await;
+    wait_for_session(&reconnected, session_id, |session| {
+        session.state == SessionState::Running
+    })
+    .await;
+
     reconnected
         .request(&ClientRequest::SessionInput {
             session_id,
@@ -184,6 +410,8 @@ async fn managed_claude_session_inner() {
         .expect("daemon result");
     assert!(managed_claude_settings(&paths.runtime_directory).is_empty());
     assert_no_persisted_text_contains(&paths.database, PROMPT_SENTINEL);
+    assert_no_persisted_text_contains(&paths.database, FAILURE_SENTINEL);
+    assert_no_persisted_text_contains(&paths.database, MALFORMED_SENTINEL);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -194,8 +422,8 @@ async fn late_session_start_recovers_after_warning() {
     let bin_directory = temporary.path().join("bin");
     std::fs::create_dir(&bin_directory).expect("fake provider bin directory");
     let fake_claude = install_fake_claude(&bin_directory);
-    std::fs::write(bin_directory.join("fake-claude-session-start"), "late")
-        .expect("late SessionStart fixture");
+    let session_start_fixture = bin_directory.join("fake-claude-session-start");
+    std::fs::write(&session_start_fixture, "none").expect("missing SessionStart fixture");
     let _claude_cli_path = EnvironmentGuard::set("CLAUDE_CLI_PATH", fake_claude);
 
     let paths = RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("paths");
@@ -274,13 +502,6 @@ async fn late_session_start_recovers_after_warning() {
         .await
         .expect("input while hook warning is active");
     wait_for_output(&mut events, session_id, "FAKE_CLAUDE_ECHO=still-usable").await;
-    let still_waiting =
-        wait_for_session_for(&client, session_id, Duration::from_secs(1), |session| {
-            session.state == SessionState::NeedsFeedback && session.external_session_id.is_none()
-        })
-        .await;
-    assert_eq!(still_waiting.failure_reason, warning.failure_reason);
-
     let recovered = wait_for_session_for(&client, session_id, Duration::from_secs(10), |session| {
         session.state == SessionState::Running && session.external_session_id.is_some()
     })
@@ -295,6 +516,47 @@ async fn late_session_start_recovers_after_warning() {
         session.state == SessionState::Terminated
     })
     .await;
+
+    std::fs::write(&session_start_fixture, "immediate").expect("immediate SessionStart fixture");
+    let failed_session_id = match client
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Claude,
+            display_name: Some("crashing Claude".into()),
+            model: None,
+            effort: None,
+            initial_prompt: None,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("crashing session response")
+    {
+        DaemonResponse::SessionCreated { session, .. } => session.id,
+        response => panic!("unexpected crashing session response: {response:?}"),
+    };
+    wait_for_session(&client, failed_session_id, |session| {
+        session.state == SessionState::Running && session.external_session_id.is_some()
+    })
+    .await;
+    attach(&client, failed_session_id, 0).await;
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id: failed_session_id,
+            bytes: input_line("unexpected-exit"),
+        })
+        .await
+        .expect("unexpected exit input");
+    let failed = wait_for_session(&client, failed_session_id, |session| {
+        session.state == SessionState::Failed && session.process_id.is_none()
+    })
+    .await;
+    assert_eq!(failed.exit_code, Some(17));
+    assert_eq!(
+        failed.failure_reason.as_deref(),
+        Some("process exited with code 17")
+    );
+
     client
         .request(&ClientRequest::ShutdownDaemon)
         .await
@@ -359,6 +621,64 @@ async fn wait_for_output(
     })
     .await
     .expect("terminal output timeout")
+}
+
+async fn wait_for_provider_event(
+    events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
+    session_id: SessionId,
+    predicate: impl Fn(&NormalizedProviderEvent) -> bool,
+) -> NormalizedProviderEvent {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(DaemonEvent::ProviderEvent {
+                session_id: observed,
+                event,
+                ..
+            }) = events.recv().await
+                && observed == session_id
+                && predicate(&event)
+            {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("provider event timeout")
+}
+
+async fn wait_for_audit(
+    database: &Path,
+    action: &str,
+    reason: Option<&str>,
+    expected_count: i64,
+) -> String {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let connection = rusqlite::Connection::open(database).expect("open audit database");
+            let mut statement = connection
+                .prepare(
+                    "SELECT details_json FROM audit_events WHERE action = ?1 ORDER BY occurred_at",
+                )
+                .expect("prepare audit query");
+            let details = statement
+                .query_map([action], |row| row.get::<_, String>(0))
+                .expect("query audit events")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect audit events");
+            let matching: Vec<_> = details
+                .iter()
+                .filter(|details| reason.is_none_or(|reason| details.contains(reason)))
+                .collect();
+            if i64::try_from(matching.len()).unwrap_or(i64::MAX) >= expected_count {
+                return (*matching.last().expect("matching audit event")).clone();
+            }
+            drop(statement);
+            drop(connection);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("audit event timeout")
 }
 
 async fn wait_for_session(

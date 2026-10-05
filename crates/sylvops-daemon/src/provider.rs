@@ -24,7 +24,7 @@ use sylvops_core::{
     },
     status::{
         ConversationIdentity, ConversationIdentityTransition, NormalizedProviderEvent,
-        ProviderConversationId, RemainingWork,
+        ProviderConversationId, RemainingWork, TurnFailureCategory,
     },
 };
 use tokio::{io::AsyncReadExt, time::timeout};
@@ -800,19 +800,17 @@ impl ProviderRuntime for ClaudeAdapter {
     ) -> sylvops_core::Result<ProviderLifecycleEvent> {
         let payload: serde_json::Value = serde_json::from_slice(payload.as_bytes())
             .map_err(|_| provider_error("Claude Code lifecycle payload is not valid JSON"))?;
+        let conversation_id = payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| provider_error("Claude Code lifecycle event is missing its session ID"))
+            .and_then(|id| ProviderConversationId::new(id).map_err(provider_error))?;
         let event_name = payload
             .get("hook_event_name")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| provider_error("Claude Code lifecycle event type is missing"))?;
-        let (event, conversation_id) = match event_name {
+        let event = match event_name {
             "SessionStart" => {
-                let id = payload
-                    .get("session_id")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        provider_error("Claude Code SessionStart is missing its session ID")
-                    })?;
-                let id = ProviderConversationId::new(id).map_err(provider_error)?;
                 let transition = match payload.get("source").and_then(serde_json::Value::as_str) {
                     Some("startup" | "compact" | "fork") => {
                         ConversationIdentityTransition::Established
@@ -821,26 +819,100 @@ impl ProviderRuntime for ClaudeAdapter {
                     Some("clear") => ConversationIdentityTransition::Cleared,
                     _ => return Err(provider_error("Claude Code SessionStart source is invalid")),
                 };
-                (
-                    NormalizedProviderEvent::TurnStarted {
-                        conversation: Some(ConversationIdentity {
-                            id: id.clone(),
-                            transition,
-                        }),
-                    },
-                    Some(id),
-                )
+                NormalizedProviderEvent::TurnStarted {
+                    conversation: Some(ConversationIdentity {
+                        id: conversation_id.clone(),
+                        transition,
+                    }),
+                }
             }
-            "UserPromptSubmit" => (NormalizedProviderEvent::PromptSubmitted, None),
-            "SessionEnd" => (NormalizedProviderEvent::SessionEnded, None),
+            "UserPromptSubmit" => NormalizedProviderEvent::PromptSubmitted,
+            "PermissionRequest" => NormalizedProviderEvent::PermissionRequested,
+            "PreToolUse"
+                if matches!(
+                    payload.get("tool_name").and_then(serde_json::Value::as_str),
+                    Some("AskUserQuestion" | "ExitPlanMode")
+                ) =>
+            {
+                NormalizedProviderEvent::UserInputRequested
+            }
+            "SubagentStart" => NormalizedProviderEvent::SubagentStarted {
+                agent_id: claude_bounded_identifier(&payload, "agent_id")?,
+            },
+            "SubagentStop" => NormalizedProviderEvent::SubagentStopped {
+                agent_id: claude_bounded_identifier(&payload, "agent_id")?,
+            },
+            "Stop" => NormalizedProviderEvent::TurnStopped {
+                remaining_work: claude_remaining_work(&payload)?,
+            },
+            "StopFailure" => NormalizedProviderEvent::TurnFailed {
+                category: claude_failure_category(&payload)?,
+            },
+            "SessionEnd" => NormalizedProviderEvent::SessionEnded,
             _ => return Err(provider_error("unsupported Claude Code lifecycle event")),
         };
         Ok(ProviderLifecycleEvent {
             event: Some(event),
-            conversation_id,
+            conversation_id: Some(conversation_id),
             turn_id: None,
         })
     }
+}
+
+fn claude_bounded_identifier(
+    payload: &serde_json::Value,
+    name: &str,
+) -> sylvops_core::Result<String> {
+    let value = payload
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| provider_error(format!("Claude Code lifecycle event is missing {name}")))?;
+    ProviderConversationId::new(value)
+        .map(String::from)
+        .map_err(provider_error)
+}
+
+fn claude_remaining_work(payload: &serde_json::Value) -> sylvops_core::Result<RemainingWork> {
+    let background_tasks = payload
+        .get("background_tasks")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| provider_error("Claude Code Stop background tasks are invalid"))?;
+    let session_crons = payload
+        .get("session_crons")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| provider_error("Claude Code Stop scheduled tasks are invalid"))?;
+    Ok(RemainingWork {
+        active_subagents: background_tasks
+            .iter()
+            .any(|task| task.get("type").and_then(serde_json::Value::as_str) == Some("subagent")),
+        background_tasks: !background_tasks.is_empty(),
+        scheduled_tasks: !session_crons.is_empty(),
+    })
+}
+
+fn claude_failure_category(
+    payload: &serde_json::Value,
+) -> sylvops_core::Result<TurnFailureCategory> {
+    let category = payload
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| provider_error("Claude Code StopFailure category is missing"))?;
+    let bounded = match category {
+        "rate_limit"
+        | "overloaded"
+        | "authentication_failed"
+        | "oauth_org_not_allowed"
+        | "account_on_hold"
+        | "billing_error"
+        | "invalid_request"
+        | "model_not_found"
+        | "server_error"
+        | "max_output_tokens"
+        | "cloud_credential_error"
+        | "unknown" => category,
+        _ => "unknown",
+    };
+    TurnFailureCategory::new(bounded).map_err(provider_error)
 }
 
 fn claude_settings_source(endpoint_url: &str, hook_relay: &Path) -> sylvops_core::Result<String> {
@@ -873,7 +945,22 @@ fn claude_settings_source(endpoint_url: &str, hook_relay: &Path) -> sylvops_core
         "SessionStart".into(),
         serde_json::json!([{ "hooks": [command] }]),
     );
-    for event in ["SessionEnd", "UserPromptSubmit"] {
+    hooks.insert(
+        "PreToolUse".into(),
+        serde_json::json!([{
+            "matcher": "AskUserQuestion|ExitPlanMode",
+            "hooks": [http.clone()]
+        }]),
+    );
+    for event in [
+        "SessionEnd",
+        "UserPromptSubmit",
+        "PermissionRequest",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "StopFailure",
+    ] {
         hooks.insert(
             event.into(),
             serde_json::json!([{ "hooks": [http.clone()] }]),
@@ -2065,8 +2152,11 @@ mod tests {
         assert!(source.contains("SessionStart"));
         assert!(source.contains("SessionEnd"));
         assert!(source.contains("UserPromptSubmit"));
-        assert!(!source.contains("PermissionRequest"));
-        assert!(!source.contains("StopFailure"));
+        assert!(source.contains("PermissionRequest"));
+        assert!(source.contains("AskUserQuestion|ExitPlanMode"));
+        assert!(source.contains("SubagentStart"));
+        assert!(source.contains("SubagentStop"));
+        assert!(source.contains("StopFailure"));
         assert!(source.contains("SYLVOPS_HOOK_TOKEN"));
         assert!(!source.contains(endpoint.bearer_token()));
         assert!(!source.contains("permissionMode"));
@@ -2130,6 +2220,10 @@ mod tests {
         }
         for (event_name, expected) in [
             ("UserPromptSubmit", NormalizedProviderEvent::PromptSubmitted),
+            (
+                "PermissionRequest",
+                NormalizedProviderEvent::PermissionRequested,
+            ),
             ("SessionEnd", NormalizedProviderEvent::SessionEnded),
         ] {
             let payload = ProviderLifecyclePayload::new(
@@ -2144,7 +2238,83 @@ mod tests {
                 .normalize_lifecycle_event(&payload)
                 .expect("configured HTTP event");
             assert_eq!(normalized.event, Some(expected));
-            assert!(normalized.conversation_id.is_none());
+            assert_eq!(
+                normalized
+                    .conversation_id
+                    .as_ref()
+                    .map(ProviderConversationId::as_str),
+                Some("claude-session-1")
+            );
+        }
+
+        let stop = ProviderLifecyclePayload::new(
+            serde_json::to_vec(&serde_json::json!({
+                "hook_event_name": "Stop",
+                "session_id": "claude-session-1",
+                "background_tasks": [{"id": "task-1", "type": "subagent"}],
+                "session_crons": [{"id": "cron-1"}]
+            }))
+            .expect("Stop payload JSON"),
+        )
+        .expect("bounded Stop payload");
+        assert!(matches!(
+            adapter
+                .normalize_lifecycle_event(&stop)
+                .expect("valid Stop payload")
+                .event,
+            Some(NormalizedProviderEvent::TurnStopped {
+                remaining_work: RemainingWork {
+                    active_subagents: true,
+                    background_tasks: true,
+                    scheduled_tasks: true,
+                }
+            })
+        ));
+
+        for error in ["rate_limit", "future_private_provider_error"] {
+            let failure = ProviderLifecyclePayload::new(
+                serde_json::to_vec(&serde_json::json!({
+                    "hook_event_name": "StopFailure",
+                    "session_id": "claude-session-1",
+                    "error": error,
+                    "error_details": "private raw provider text"
+                }))
+                .expect("StopFailure payload JSON"),
+            )
+            .expect("bounded StopFailure payload");
+            let normalized = adapter
+                .normalize_lifecycle_event(&failure)
+                .expect("valid StopFailure payload");
+            let Some(NormalizedProviderEvent::TurnFailed { category }) = normalized.event else {
+                panic!("expected recoverable turn failure");
+            };
+            assert_eq!(
+                category.as_str(),
+                if error == "rate_limit" {
+                    "rate_limit"
+                } else {
+                    "unknown"
+                }
+            );
+        }
+
+        for malformed in [
+            serde_json::json!({
+                "hook_event_name": "SubagentStart",
+                "session_id": "claude-session-1"
+            }),
+            serde_json::json!({
+                "hook_event_name": "Stop",
+                "session_id": "claude-session-1",
+                "background_tasks": "invalid",
+                "session_crons": []
+            }),
+        ] {
+            let payload = ProviderLifecyclePayload::new(
+                serde_json::to_vec(&malformed).expect("malformed fixture JSON"),
+            )
+            .expect("bounded malformed fixture");
+            assert!(adapter.normalize_lifecycle_event(&payload).is_err());
         }
         drop(adapter);
         assert!(!settings_path.exists());
