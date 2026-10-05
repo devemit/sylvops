@@ -352,9 +352,59 @@ struct HookTracking {
     fingerprints: HashSet<String>,
     stopped_turns: HashSet<String>,
     session_start_missing: bool,
+    turn_closed: bool,
 }
 
 impl HookTracking {
+    fn classify(
+        &mut self,
+        fingerprint: String,
+        event: &NormalizedProviderEvent,
+        turn_id: Option<&str>,
+    ) -> Option<&'static str> {
+        if !self.accept_fingerprint(fingerprint) {
+            return Some("duplicate");
+        }
+        if self.turn_closed
+            && !matches!(
+                event,
+                NormalizedProviderEvent::PromptSubmitted
+                    | NormalizedProviderEvent::TurnStarted { .. }
+                    | NormalizedProviderEvent::SessionEnded
+            )
+        {
+            return Some("stale");
+        }
+        if turn_id.is_some_and(|turn_id| self.stopped_turns.contains(turn_id))
+            && !matches!(event, NormalizedProviderEvent::TurnStopped { .. })
+        {
+            return Some("stale");
+        }
+        if matches!(event, NormalizedProviderEvent::TurnStopped { .. })
+            && let Some(turn_id) = turn_id
+        {
+            self.close_turn(turn_id.to_owned());
+        }
+        None
+    }
+
+    fn record_applied(&mut self, event: &NormalizedProviderEvent, state: SessionState) {
+        match event {
+            NormalizedProviderEvent::PromptSubmitted
+            | NormalizedProviderEvent::TurnStarted { .. } => self.turn_closed = false,
+            NormalizedProviderEvent::TurnStopped { .. } => {
+                self.turn_closed = matches!(
+                    state,
+                    SessionState::FinishedUnseen | SessionState::FinishedSeen
+                );
+            }
+            NormalizedProviderEvent::SessionEnded => {
+                self.turn_closed = true;
+            }
+            _ => {}
+        }
+    }
+
     fn accept_fingerprint(&mut self, fingerprint: String) -> bool {
         if self.fingerprints.contains(&fingerprint) {
             return false;
@@ -2375,33 +2425,54 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             "hook session/worktree association is invalid".into(),
         ));
     }
-    let normalized = state
+    if !state.hook_credentials.is_registered(delivery.session_id)
+        || persisted.process_id.is_none()
+        || matches!(
+            persisted.state,
+            SessionState::Failed | SessionState::Terminated | SessionState::Disconnected
+        )
+    {
+        state
+            .database
+            .audit(
+                "provider_hook_ignored",
+                "refused",
+                &serde_json::json!({
+                    "session_id": delivery.session_id,
+                    "reason": "late_terminal"
+                })
+                .to_string(),
+            )
+            .await?;
+        return Ok(());
+    }
+    let normalized = match state
         .providers
-        .normalize_lifecycle_event(delivery.provider, &delivery.payload)?;
-    let identity_transition = normalized.event.as_ref().and_then(|event| match event {
-        NormalizedProviderEvent::TurnStarted {
-            conversation: Some(conversation),
-        } => Some(conversation.transition),
-        _ => None,
-    });
-    let external_session_id = match provider_external_id_update(
-        persisted.external_session_id.as_deref(),
-        normalized.conversation_id.as_ref(),
-        identity_transition,
-    ) {
-        Ok(update) => update,
+        .normalize_lifecycle_event(delivery.provider, &delivery.payload)
+    {
+        Ok(normalized) => normalized,
         Err(error) => {
             state
                 .database
                 .audit(
                     "provider_hook_refused",
                     "refused",
-                    &serde_json::json!({"reason": "external_session_id_changed"}).to_string(),
+                    &serde_json::json!({
+                        "session_id": delivery.session_id,
+                        "reason": "invalid_payload"
+                    })
+                    .to_string(),
                 )
                 .await?;
             return Err(error);
         }
     };
+    let identity_transition = normalized.event.as_ref().and_then(|event| match event {
+        NormalizedProviderEvent::TurnStarted {
+            conversation: Some(conversation),
+        } => Some(conversation.transition),
+        _ => None,
+    });
     let Some(event) = normalized.event else {
         state
             .database
@@ -2415,32 +2486,20 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             "provider lifecycle event type is unknown".into(),
         ));
     };
-    let is_claude_session_start = matches!(
-        &event,
-        NormalizedProviderEvent::TurnStarted {
-            conversation: Some(_)
-        }
-    );
+    let is_claude_session_start = delivery.provider == ProviderKind::Claude
+        && matches!(
+            &event,
+            NormalizedProviderEvent::TurnStarted {
+                conversation: Some(_)
+            }
+        );
     let (disposition, session_start_missing) = {
+        // The daemon run loop awaits each delivery to completion, so classification, persistence,
+        // and recording are serialized even though the lock is not held across database awaits.
         let mut tracking = state.hook_tracking.lock().await;
         let tracking = tracking.entry(delivery.session_id).or_default();
-        let disposition = if !tracking.accept_fingerprint(delivery.fingerprint) {
-            Some("duplicate")
-        } else if normalized
-            .turn_id
-            .as_ref()
-            .is_some_and(|turn_id| tracking.stopped_turns.contains(turn_id))
-            && !matches!(&event, NormalizedProviderEvent::TurnStopped { .. })
-        {
-            Some("stale")
-        } else {
-            if matches!(&event, NormalizedProviderEvent::TurnStopped { .. })
-                && let Some(turn_id) = normalized.turn_id.as_ref()
-            {
-                tracking.close_turn(turn_id.clone());
-            }
-            None
-        };
+        let disposition =
+            tracking.classify(delivery.fingerprint, &event, normalized.turn_id.as_deref());
         (disposition, tracking.session_start_missing)
     };
     if let Some(disposition) = disposition {
@@ -2458,24 +2517,38 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             .await?;
         return Ok(());
     }
-    if session_start_missing && !is_claude_session_start {
-        if matches!(&event, NormalizedProviderEvent::SessionEnded) {
-            revoke_session_hook_access(state, delivery.session_id).await;
+    let recovers_claude_lifecycle = delivery.provider == ProviderKind::Claude
+        && session_start_missing
+        && normalized.conversation_id.is_some();
+    let effective_identity_transition = identity_transition.or_else(|| {
+        recovers_claude_lifecycle.then_some(ConversationIdentityTransition::Established)
+    });
+    let received_identity = if delivery.provider == ProviderKind::Claude
+        && persisted.external_session_id.is_none()
+        && effective_identity_transition.is_none()
+    {
+        None
+    } else {
+        normalized.conversation_id.as_ref()
+    };
+    let external_session_id = match provider_external_id_update(
+        persisted.external_session_id.as_deref(),
+        received_identity,
+        effective_identity_transition,
+    ) {
+        Ok(update) => update,
+        Err(error) => {
+            state
+                .database
+                .audit(
+                    "provider_hook_refused",
+                    "refused",
+                    &serde_json::json!({"reason": "external_session_id_changed"}).to_string(),
+                )
+                .await?;
+            return Err(error);
         }
-        state
-            .database
-            .audit(
-                "provider_hook_ignored",
-                "refused",
-                &serde_json::json!({
-                    "session_id": delivery.session_id,
-                    "reason": "awaiting_session_start"
-                })
-                .to_string(),
-            )
-            .await?;
-        return Ok(());
-    }
+    };
     if persisted.external_session_id.is_some()
         && external_session_id.is_some()
         && let Some(transition) = identity_transition
@@ -2500,14 +2573,48 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             .or_insert_with(|| SessionStatusMachine::new(persisted.state));
         machine.apply(&event)
     };
-    let (revision, session) = state
+    let status_update = state
         .database
         .update_session_status(delivery.session_id, next, external_session_id)
-        .await?;
+        .await;
+    let (revision, session) = match status_update {
+        Ok(updated) => updated,
+        Err(error) => {
+            let latest = state.database.session(delivery.session_id).await?;
+            if latest.process_id.is_none()
+                || matches!(
+                    latest.state,
+                    SessionState::Failed | SessionState::Terminated | SessionState::Disconnected
+                )
+            {
+                state
+                    .database
+                    .audit(
+                        "provider_hook_ignored",
+                        "refused",
+                        &serde_json::json!({
+                            "session_id": delivery.session_id,
+                            "reason": "late_terminal"
+                        })
+                        .to_string(),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+    state
+        .hook_tracking
+        .lock()
+        .await
+        .entry(delivery.session_id)
+        .or_default()
+        .record_applied(&event, next);
     if let Some(managed) = get_managed_session(state, delivery.session_id).await {
         *managed.record.write().await = session.clone();
     }
-    if is_claude_session_start {
+    if is_claude_session_start || recovers_claude_lifecycle {
         state
             .hook_tracking
             .lock()
@@ -2516,8 +2623,18 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             .or_default()
             .session_start_missing = false;
     }
+    if recovers_claude_lifecycle {
+        state
+            .database
+            .audit(
+                "provider_lifecycle_recovered",
+                "succeeded",
+                &serde_json::json!({"session_id": delivery.session_id}).to_string(),
+            )
+            .await?;
+    }
     if matches!(&event, NormalizedProviderEvent::SessionEnded) {
-        revoke_session_hook_access(state, delivery.session_id).await;
+        state.hook_credentials.invalidate(delivery.session_id);
     }
     let _ = state.events.send(DaemonEvent::ProviderEvent {
         provider: persisted.provider_kind,
@@ -3011,9 +3128,13 @@ impl Drop for ClientGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationMutationCoordinator, LifecycleCoordinator, provider_external_id_update,
+        ApplicationMutationCoordinator, HookTracking, LifecycleCoordinator,
+        provider_external_id_update,
     };
-    use sylvops_core::status::{ConversationIdentityTransition, ProviderConversationId};
+    use sylvops_core::{
+        domain::SessionState,
+        status::{ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId},
+    };
 
     #[tokio::test]
     async fn lifecycle_quiescing_drains_existing_activity_and_refuses_new_work() {
@@ -3050,6 +3171,33 @@ mod tests {
         finalization.complete();
         assert!(!coordinator.handoff_pending());
         assert!(coordinator.begin().is_ok());
+    }
+
+    #[test]
+    fn hook_tracking_rejects_stale_turn_events_without_turn_ids() {
+        let mut tracking = HookTracking::default();
+        let stopped = NormalizedProviderEvent::TurnStopped {
+            remaining_work: sylvops_core::status::RemainingWork::default(),
+        };
+        assert_eq!(tracking.classify("stop".into(), &stopped, None), None);
+        tracking.record_applied(&stopped, SessionState::FinishedUnseen);
+
+        assert_eq!(
+            tracking.classify(
+                "permission".into(),
+                &NormalizedProviderEvent::PermissionRequested,
+                None,
+            ),
+            Some("stale")
+        );
+        assert_eq!(
+            tracking.classify(
+                "prompt".into(),
+                &NormalizedProviderEvent::PromptSubmitted,
+                None,
+            ),
+            None
+        );
     }
 
     #[test]
