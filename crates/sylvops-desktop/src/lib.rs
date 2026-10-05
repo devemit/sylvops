@@ -38,12 +38,11 @@ use iced::{font, font::Weight, widget::button::Status};
 use icons::{LineIcon, line_icon};
 use presentation::{
     ActiveTerminalAction, ButtonIntent, ButtonTokens, ControlState, DensityMetrics,
-    DesktopPresentation, ExplorerAction, ExplorerAttention, ExplorerIntent, ExplorerKey,
-    ExplorerMode, ExplorerNodeId, InteractionState as PresentationInteraction, PresentationInput,
-    PresentationLayout, PresentationTheme, SessionIndicator, SettingsMode, SystemAppearance,
-    TerminalPalette, Viewport, WorkspaceNavigation, button_visual,
-    session_state_can_replay as session_can_replay, session_state_can_stop as session_can_stop,
-    session_state_label,
+    DesktopPresentation, InteractionState as PresentationInteraction, NavigatorAction,
+    NavigatorAttention, NavigatorMode, NavigatorNodeId, NavigatorRow, PresentationInput,
+    PresentationLayout, PresentationTheme, SystemAppearance, TerminalPalette, Viewport,
+    WorkspaceNavigation, button_visual, session_state_can_replay as session_can_replay,
+    session_state_can_stop as session_can_stop, session_state_label,
 };
 use sylvops_core::{
     domain::{
@@ -54,9 +53,9 @@ use sylvops_core::{
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     provider::{ProviderHealth, session_can_resume},
     ui::{
-        DesktopDensity, DesktopState, DesktopTerminalCursor, DesktopTerminalFont, DesktopTheme,
-        MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT, MIN_DESKTOP_WIDTH,
-        MIN_TERMINAL_FONT_SIZE, MainTab,
+        DesktopDensity, DesktopPanel, DesktopState, DesktopTerminalCursor, DesktopTerminalFont,
+        DesktopTheme, MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT,
+        MIN_DESKTOP_WIDTH, MIN_TERMINAL_FONT_SIZE, MainTab,
     },
     ui_forms::{Form, FormKind},
     upgrade::{InstallDisposition, UpgradeStatus},
@@ -99,14 +98,10 @@ const STOP_SESSION_LABEL: &str = "Stop session";
 const DELETE_CHECKOUT_LABEL: &str = "Delete checkout";
 const MAX_TECHNICAL_COPY_CHARS: usize = 4_096;
 const MAX_USER_DIAGNOSTIC_CHARS: usize = 1_024;
-#[cfg(test)]
-const UI_FONT: Font = Font::DEFAULT;
-#[cfg(all(not(test), windows))]
-const UI_FONT: Font = Font::with_name("Segoe UI");
-#[cfg(all(not(test), target_os = "macos"))]
-const UI_FONT: Font = Font::with_name("SF Pro Text");
-#[cfg(all(not(test), not(windows), not(target_os = "macos")))]
-const UI_FONT: Font = Font::DEFAULT;
+const JETBRAINS_MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+const JETBRAINS_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Medium.ttf");
+const JETBRAINS_MONO_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-SemiBold.ttf");
+const UI_FONT: Font = Font::with_name("JetBrains Mono");
 #[cfg(windows)]
 const SYSTEM_TERMINAL_FONT: Font = Font::with_name("Consolas");
 #[cfg(target_os = "macos")]
@@ -121,6 +116,20 @@ const UI_SEMIBOLD: Font = Font {
     weight: Weight::Semibold,
     ..UI_FONT
 };
+
+#[cfg(test)]
+fn load_bundled_ui_fonts_for_rendering() {
+    let mut font_system = iced::advanced::graphics::text::font_system()
+        .write()
+        .expect("global font system lock");
+    for bytes in [
+        JETBRAINS_MONO_REGULAR,
+        JETBRAINS_MONO_MEDIUM,
+        JETBRAINS_MONO_SEMIBOLD,
+    ] {
+        font_system.load_font(std::borrow::Cow::Borrowed(bytes));
+    }
+}
 
 /// Opens the native `SylvOps` desktop client.
 ///
@@ -144,6 +153,9 @@ pub fn run(paths: RuntimePaths) -> iced::Result {
     .title("SylvOps")
     .theme(DesktopApp::theme)
     .subscription(subscription)
+    .font(JETBRAINS_MONO_REGULAR)
+    .font(JETBRAINS_MONO_MEDIUM)
+    .font(JETBRAINS_MONO_SEMIBOLD)
     .default_font(UI_FONT)
     .antialiasing(true)
     .window(desktop_window_settings())
@@ -218,19 +230,17 @@ struct DesktopApp {
     closing_since: Option<Instant>,
     pending_resize: Option<(SessionId, u16, u16, Instant)>,
     panes: pane_grid::State<DesktopPane>,
-    pane_splits: [pane_grid::Split; 1],
+    pane_splits: [pane_grid::Split; 3],
     restore_window_size: Option<(u16, u16)>,
     narrow_main: bool,
-    explorer_visibility: ExplorerVisibility,
-    expanded_project_ids: HashSet<ProjectId>,
-    expanded_worktree_ids: HashSet<WorktreeId>,
-    focused_explorer_node: Option<ExplorerNodeId>,
-    hovered_explorer_node: Option<ExplorerNodeId>,
+    navigator_visibility: NavigatorVisibility,
+    keyboard_panel: DesktopPanel,
+    hovered_navigator_node: Option<NavigatorNodeId>,
     terminal_focus: TerminalFocus,
     terminal_viewport: Option<iced::Size>,
     terminal_pointer: Option<Point>,
     terminal_selection_state: TerminalSelectionState,
-    inline_session_rename: Option<InlineSessionRename>,
+    inline_navigator_rename: Option<InlineNavigatorRename>,
     resume_pending: HashSet<SessionId>,
     window_mode: window::Mode,
     update_status: UpgradeStatus,
@@ -262,11 +272,13 @@ enum ModalFocus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DesktopPane {
-    Explorer,
+    Projects,
+    Worktrees,
+    Sessions,
     Main,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionState {
     Connecting,
     Connected,
@@ -288,15 +300,15 @@ enum TerminalSelectionState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ExplorerVisibility {
+enum NavigatorVisibility {
     #[default]
     Shown,
     Collapsed,
 }
 
 #[derive(Clone, Debug)]
-struct InlineSessionRename {
-    session_id: SessionId,
+struct InlineNavigatorRename {
+    target: NavigatorNodeId,
     value: String,
     pending: bool,
     error: Option<String>,
@@ -315,10 +327,10 @@ impl fmt::Display for WorkspaceChoice {
     }
 }
 
-impl InlineSessionRename {
-    fn new(session_id: SessionId, value: &str) -> Self {
+impl InlineNavigatorRename {
+    fn new(target: NavigatorNodeId, value: &str) -> Self {
         Self {
-            session_id,
+            target,
             value: value.to_owned(),
             pending: false,
             error: None,
@@ -339,7 +351,7 @@ impl InlineSessionRename {
         }
         let name = self.value.trim();
         if name.is_empty() || name.chars().count() > 200 {
-            self.error = Some("Session name must contain between 1 and 200 characters.".into());
+            self.error = Some("Name must contain between 1 and 200 characters.".into());
             return None;
         }
         self.pending = true;
@@ -364,22 +376,22 @@ enum Message {
     Tick,
     Keyboard(keyboard::Event),
     SelectWorkspace(WorkspaceId),
-    SelectExplorerNode(ExplorerNodeId),
-    ToggleExplorerNode(ExplorerNodeId),
-    OpenExplorerNode(ExplorerNodeId),
-    RunExplorerAction(ExplorerAction),
-    HoverExplorerNode(Option<ExplorerNodeId>),
+    SelectProject(ProjectId),
+    SelectWorktree(WorktreeId),
+    SelectSession(SessionId),
+    RunNavigatorAction(NavigatorAction),
+    HoverNavigatorNode(Option<NavigatorNodeId>),
     SelectOpenSession(SessionId),
     CloseSessionTab(SessionId),
     SelectMainTab(MainTab),
     NewWorkspace,
     NewProject,
-    RenameProject,
-    RenameWorktree,
-    BeginSessionRename(SessionId),
-    SessionRenameInput(String),
-    SubmitSessionRename,
-    CancelSessionRename,
+    NewWorktree,
+    NewSession,
+    BeginNavigatorRename(NavigatorNodeId),
+    NavigatorRenameInput(String),
+    SubmitNavigatorRename,
+    CancelNavigatorRename,
     RemoveSelectedWorktree,
     FormInput(usize, String),
     SelectProvider(ProviderKind),
@@ -413,7 +425,8 @@ enum Message {
     SelectTerminalCursor(DesktopTerminalCursor),
     SetTerminalFontSize(u8),
     ResetLayout,
-    ToggleExplorer,
+    SelectCompactPanel(DesktopPanel),
+    ToggleNavigator,
     WindowResized(window::Id, iced::Size),
     WindowReady(Option<window::Id>),
     SystemThemeChanged(iced::theme::Mode),
@@ -433,12 +446,20 @@ enum Message {
 
 impl DesktopApp {
     fn new(paths: RuntimePaths) -> Self {
-        let (mut panes, explorer) = pane_grid::State::new(DesktopPane::Explorer);
-        let (_, split) = panes
-            .split(pane_grid::Axis::Vertical, explorer, DesktopPane::Main)
+        let (mut panes, projects) = pane_grid::State::new(DesktopPane::Projects);
+        let (worktrees, first) = panes
+            .split(pane_grid::Axis::Vertical, projects, DesktopPane::Worktrees)
+            .expect("initial desktop pane split");
+        let (sessions, second) = panes
+            .split(pane_grid::Axis::Vertical, worktrees, DesktopPane::Sessions)
+            .expect("initial desktop pane split");
+        let (_, third) = panes
+            .split(pane_grid::Axis::Vertical, sessions, DesktopPane::Main)
             .expect("initial desktop pane split");
         let defaults = DesktopState::default();
-        panes.resize(split, f32::from(defaults.panel_ratios[0]) / 1000.0);
+        panes.resize(first, f32::from(defaults.panel_ratios[0]) / 1000.0);
+        panes.resize(second, f32::from(defaults.panel_ratios[1]) / 1000.0);
+        panes.resize(third, f32::from(defaults.panel_ratios[2]) / 1000.0);
         Self {
             bridge: Bridge::spawn(paths),
             snapshot: DaemonSnapshot::default(),
@@ -464,19 +485,17 @@ impl DesktopApp {
             closing_since: None,
             pending_resize: None,
             panes,
-            pane_splits: [split],
+            pane_splits: [first, second, third],
             restore_window_size: None,
             narrow_main: false,
-            explorer_visibility: ExplorerVisibility::Shown,
-            expanded_project_ids: HashSet::new(),
-            expanded_worktree_ids: HashSet::new(),
-            focused_explorer_node: None,
-            hovered_explorer_node: None,
+            navigator_visibility: NavigatorVisibility::Shown,
+            keyboard_panel: DesktopPanel::Projects,
+            hovered_navigator_node: None,
             terminal_focus: TerminalFocus::Unfocused,
             terminal_viewport: None,
             terminal_pointer: None,
             terminal_selection_state: TerminalSelectionState::Idle,
-            inline_session_rename: None,
+            inline_navigator_rename: None,
             resume_pending: HashSet::new(),
             window_mode: window::Mode::Windowed,
             update_status: UpgradeStatus::Idle,
@@ -516,33 +535,31 @@ impl DesktopApp {
                     return task;
                 }
                 if self.modal.is_none()
-                    && self.inline_session_rename.is_some()
+                    && self.inline_navigator_rename.is_some()
                     && let keyboard::Event::KeyPressed { key, .. } = &event
                 {
                     match key {
                         Key::Named(Named::Escape)
                             if self
-                                .inline_session_rename
+                                .inline_navigator_rename
                                 .as_ref()
                                 .is_some_and(|rename| !rename.pending) =>
                         {
-                            cancel_inline_session_rename(&mut self.inline_session_rename);
+                            cancel_inline_navigator_rename(&mut self.inline_navigator_rename);
                         }
-                        Key::Named(Named::Enter) => self.submit_session_rename(),
+                        Key::Named(Named::Enter) => self.submit_navigator_rename(),
                         _ => {}
                     }
                     return Task::none();
                 }
                 if self.modal.is_none()
                     && !self.terminal_focus.is_focused()
-                    && matches!(self.focused_explorer_node, Some(ExplorerNodeId::Session(_)))
                     && let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
                     && !modifiers.control()
                     && !modifiers.alt()
                     && matches!(key.as_ref(), Key::Character(value) if value.eq_ignore_ascii_case("r"))
-                    && let Some(ExplorerNodeId::Session(session_id)) = self.focused_explorer_node
                 {
-                    return self.begin_session_rename(session_id);
+                    return self.begin_selected_navigator_rename();
                 }
                 self.handle_keyboard(event);
             }
@@ -554,34 +571,32 @@ impl DesktopApp {
                 {
                     return Task::none();
                 }
-                self.inline_session_rename = None;
+                self.inline_navigator_rename = None;
                 self.send_request(
                     Operation::OpenWorkspace(workspace_id),
                     ClientRequest::OpenWorkspace { workspace_id },
                 );
             }
-            Message::SelectExplorerNode(node) => self.select_explorer_node(node),
-            Message::ToggleExplorerNode(node) => self.toggle_explorer_node(node),
-            Message::OpenExplorerNode(node) => self.open_explorer_node(node),
-            Message::RunExplorerAction(action) => {
-                return self.run_explorer_action(action);
+            Message::SelectProject(project_id) => self.select_project(project_id),
+            Message::SelectWorktree(worktree_id) => self.select_worktree(worktree_id),
+            Message::SelectSession(session_id) => self.select_session(session_id),
+            Message::RunNavigatorAction(action) => {
+                return self.run_navigator_action(action);
             }
-            Message::HoverExplorerNode(node) => self.hovered_explorer_node = node,
+            Message::HoverNavigatorNode(node) => self.hovered_navigator_node = node,
             Message::SelectOpenSession(session_id) => {
                 self.unfocus_terminal();
                 if self.active_session_id == Some(session_id) {
                     return Task::none();
                 }
                 if self
-                    .inline_session_rename
+                    .inline_navigator_rename
                     .as_ref()
-                    .is_some_and(|rename| rename.session_id != session_id)
+                    .is_some_and(|rename| rename.target != NavigatorNodeId::Session(session_id))
                 {
-                    self.inline_session_rename = None;
+                    self.inline_navigator_rename = None;
                 }
                 self.select_session_context(session_id);
-                self.focused_explorer_node = Some(ExplorerNodeId::Session(session_id));
-                self.expand_selected_path();
                 self.active_session_id = Some(session_id);
                 self.mark_state_dirty();
             }
@@ -609,7 +624,7 @@ impl DesktopApp {
             }
             Message::SelectMainTab(tab) => self.select_main_tab(tab),
             Message::NewWorkspace => {
-                self.inline_session_rename = None;
+                self.inline_navigator_rename = None;
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.modal = Some(Modal::Form(if self.snapshot.workspaces.is_empty() {
                     FormModal::first_run(Form::workspace())
@@ -619,19 +634,19 @@ impl DesktopApp {
                 self.modal_focus = ModalFocus::Pending;
             }
             Message::NewProject => self.open_project_form(),
-            Message::RenameProject => self.open_project_rename_form(),
-            Message::RenameWorktree => self.open_worktree_rename_form(),
-            Message::BeginSessionRename(session_id) => {
-                return self.begin_session_rename(session_id);
+            Message::NewWorktree => self.open_worktree_form(),
+            Message::NewSession => self.open_session_form(),
+            Message::BeginNavigatorRename(target) => {
+                return self.begin_navigator_rename(target);
             }
-            Message::SessionRenameInput(value) => {
-                if let Some(rename) = &mut self.inline_session_rename {
+            Message::NavigatorRenameInput(value) => {
+                if let Some(rename) = &mut self.inline_navigator_rename {
                     rename.update(value);
                 }
             }
-            Message::SubmitSessionRename => self.submit_session_rename(),
-            Message::CancelSessionRename => {
-                cancel_inline_session_rename(&mut self.inline_session_rename);
+            Message::SubmitNavigatorRename => self.submit_navigator_rename(),
+            Message::CancelNavigatorRename => {
+                cancel_inline_navigator_rename(&mut self.inline_navigator_rename);
             }
             Message::RemoveSelectedWorktree => self.inspect_worktree_removal(),
             Message::FormInput(index, value) => self.update_form_field(index, value),
@@ -751,13 +766,21 @@ impl DesktopApp {
                 self.mark_state_dirty();
                 self.queue_terminal_resize();
             }
-            Message::ToggleExplorer => {
-                self.inline_session_rename = None;
+            Message::SelectCompactPanel(panel) => {
+                self.inline_navigator_rename = None;
                 self.terminal_focus = TerminalFocus::Unfocused;
-                self.explorer_visibility = match self.explorer_visibility {
-                    ExplorerVisibility::Shown => ExplorerVisibility::Collapsed,
-                    ExplorerVisibility::Collapsed => ExplorerVisibility::Shown,
+                self.keyboard_panel = panel;
+                self.desktop_state.compact_panel = panel;
+                self.mark_state_dirty();
+            }
+            Message::ToggleNavigator => {
+                self.inline_navigator_rename = None;
+                self.terminal_focus = TerminalFocus::Unfocused;
+                self.navigator_visibility = match self.navigator_visibility {
+                    NavigatorVisibility::Shown => NavigatorVisibility::Collapsed,
+                    NavigatorVisibility::Collapsed => NavigatorVisibility::Shown,
                 };
+                self.queue_terminal_resize();
             }
             Message::WindowResized(id, size) => self.window_resized(id, size),
             Message::WindowReady(id) => self.window_id = id,
@@ -787,7 +810,7 @@ impl DesktopApp {
                 self.narrow_main = false;
             }
             Message::ShowNarrowMain => {
-                self.inline_session_rename = None;
+                self.inline_navigator_rename = None;
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.narrow_main = true;
             }
@@ -833,9 +856,6 @@ impl DesktopApp {
                     .map(|session| session.id)
                     .collect(),
                 main_tab: self.main_tab,
-                expanded_project_ids: self.expanded_project_ids.iter().copied().collect(),
-                expanded_worktree_ids: self.expanded_worktree_ids.iter().copied().collect(),
-                focused_explorer_node: self.focused_explorer_node,
             },
         })
     }
@@ -844,21 +864,13 @@ impl DesktopApp {
         let top = self.top_bar();
         let mission_control = self.mission_control();
         let body: Element<'_, Message> = if let Some(modal) = &self.modal {
-            let overlay = if matches!(modal, Modal::Settings) {
-                container(self.modal_view(modal))
-                    .width(Fill)
-                    .height(Fill)
-                    .align_x(iced::alignment::Horizontal::Right)
-                    .align_y(Vertical::Center)
-                    .style(modal_scrim)
-            } else {
-                container(self.modal_view(modal))
-                    .width(Fill)
-                    .height(Fill)
-                    .center_x(Fill)
-                    .center_y(Fill)
-                    .style(modal_scrim)
-            };
+            let overlay = container(self.modal_view(modal))
+                .width(Fill)
+                .height(Fill)
+                .center_x(Fill)
+                .center_y(Fill)
+                .padding(16)
+                .style(modal_scrim);
             let overlay: Element<'_, Message> = if matches!(modal, Modal::Settings) {
                 mouse_area(overlay).on_press(Message::ToggleSettings).into()
             } else {
@@ -904,9 +916,9 @@ impl DesktopApp {
             .push(rule::horizontal(1))
             .push(self.footer());
         let content: Element<'_, Message> = container(content).width(Fill).height(Fill).into();
-        if self.inline_session_rename.is_some() {
+        if self.inline_navigator_rename.is_some() {
             mouse_area(content)
-                .on_press(Message::CancelSessionRename)
+                .on_press(Message::CancelNavigatorRename)
                 .into()
         } else {
             content
@@ -917,7 +929,6 @@ impl DesktopApp {
         let presentation = self.presentation();
         let density = presentation.density;
         let compact = self.desktop_state.window_width < 1_000;
-        let fullscreen_label = fullscreen_label(self.window_mode, compact);
         let worktree_context = self.selected_worktree().map_or_else(
             || "No checkout selected".to_owned(),
             |worktree| {
@@ -952,18 +963,23 @@ impl DesktopApp {
         let actions = actions
             .push(self.refresh_button(compact))
             .push(
-                button(text(fullscreen_label).font(UI_MEDIUM).size(UI_META_SIZE))
+                button(line_icon(LineIcon::Fullscreen, 16))
                     .on_press(Message::ToggleFullscreen)
+                    .width(density.control_height)
                     .height(density.control_height)
-                    .padding([6, 11])
+                    .padding(7)
                     .style(chrome_action_style),
             )
             .push(
-                button(text("Settings").font(UI_MEDIUM).size(UI_META_SIZE))
-                    .on_press(Message::ToggleSettings)
-                    .height(density.control_height)
-                    .padding([6, 11])
-                    .style(chrome_action_style),
+                button(icon_text_label(
+                    LineIcon::Settings,
+                    "Settings",
+                    UI_META_SIZE,
+                ))
+                .on_press(Message::ToggleSettings)
+                .height(density.control_height)
+                .padding([6, 11])
+                .style(chrome_action_style),
             );
         let navigation = row![brand, workspace_navigation, actions]
             .spacing(density.region_spacing)
@@ -980,7 +996,7 @@ impl DesktopApp {
     fn workspace_navigation(
         &self,
         presentation: &DesktopPresentation,
-        compact: bool,
+        _compact: bool,
     ) -> Element<'static, Message> {
         let density = presentation.density;
         if presentation.workspace_navigation == WorkspaceNavigation::LabeledSwitcher {
@@ -1004,11 +1020,15 @@ impl DesktopApp {
                 ))
                 .placeholder("Choose workspace")
                 .width(Fill),
-                button(text("+").font(UI_MEDIUM).size(16))
-                    .on_press(Message::NewWorkspace)
-                    .height(density.control_height)
-                    .padding([5, 10])
-                    .style(chrome_action_style),
+                container(row![
+                    space::horizontal().width(10),
+                    button(line_icon(LineIcon::Add, 16))
+                        .on_press(Message::NewWorkspace)
+                        .width(density.control_height)
+                        .height(density.control_height)
+                        .padding(7)
+                        .style(borderless_icon_style),
+                ]),
             ]
             .spacing(5)
             .align_y(Center)
@@ -1023,10 +1043,12 @@ impl DesktopApp {
             }
             let active = workspace.is_open;
             let action = button(
-                text(workspace.name.clone())
-                    .font(if active { UI_SEMIBOLD } else { UI_FONT })
-                    .size(UI_TEXT_SIZE)
-                    .wrapping(text::Wrapping::None),
+                centered_button_label(
+                    workspace.name.clone(),
+                    UI_TEXT_SIZE,
+                    if active { UI_SEMIBOLD } else { UI_FONT },
+                )
+                .wrapping(text::Wrapping::None),
             )
             .on_press(Message::SelectWorkspace(workspace.id))
             .height(density.control_height)
@@ -1037,16 +1059,14 @@ impl DesktopApp {
         if !self.snapshot.workspaces.is_empty() {
             workspace_tabs = workspace_tabs.push(rule::vertical(1));
         }
+        workspace_tabs = workspace_tabs.push(space::horizontal().width(10));
         workspace_tabs = workspace_tabs.push(
-            button(
-                text(if compact { "New" } else { "New workspace" })
-                    .font(UI_MEDIUM)
-                    .size(if compact { 16.0 } else { UI_META_SIZE }),
-            )
-            .on_press(Message::NewWorkspace)
-            .height(density.control_height)
-            .padding([5, 11])
-            .style(chrome_action_style),
+            button(line_icon(LineIcon::Add, 16))
+                .on_press(Message::NewWorkspace)
+                .width(density.control_height)
+                .height(density.control_height)
+                .padding(7)
+                .style(borderless_icon_style),
         );
         scrollable(workspace_tabs)
             .direction(scrollable::Direction::Horizontal(
@@ -1061,15 +1081,11 @@ impl DesktopApp {
         let control_height = self.presentation().density.control_height;
         let can_refresh =
             matches!(self.connection, ConnectionState::Connected) && !self.snapshot_pending;
-        let label = if self.snapshot_pending {
-            "Refreshing…"
-        } else {
-            "Refresh"
-        };
-        button(text(label).size(12))
+        button(line_icon(LineIcon::Refresh, 15))
             .on_press_maybe(can_refresh.then_some(Message::Refresh))
+            .width(control_height)
             .height(control_height)
-            .padding([5, 10])
+            .padding(7)
             .style(chrome_action_style)
             .into()
     }
@@ -1078,29 +1094,31 @@ impl DesktopApp {
         if matches!(self.connection, ConnectionState::Connecting) {
             return centered_message("Connecting to the SylvOps daemon…");
         }
-        match self.presentation().explorer.mode {
-            ExplorerMode::Resizable => pane_grid(&self.panes, |_pane, kind, _maximized| {
+        match self.presentation().navigator.mode {
+            NavigatorMode::Columns => pane_grid(&self.panes, |_pane, kind, _maximized| {
                 let content = match kind {
-                    DesktopPane::Explorer => self.explorer_view(),
+                    DesktopPane::Projects => self.repositories_column(),
+                    DesktopPane::Worktrees => self.checkouts_column(),
+                    DesktopPane::Sessions => self.sessions_column(),
                     DesktopPane::Main => self.workspace_view(),
                 };
                 pane_grid::Content::new(content)
             })
             .spacing(1)
-            .min_size(220)
+            .min_size(150)
             .on_resize(8, Message::PaneResized)
             .into(),
-            ExplorerMode::Collapsible
-                if self.explorer_visibility == ExplorerVisibility::Collapsed =>
-            {
+            NavigatorMode::Tabs if self.navigator_visibility == NavigatorVisibility::Collapsed => {
                 row![
                     container(
-                        button("Explorer")
-                            .on_press(Message::ToggleExplorer)
-                            .style(chrome_action_style)
+                        button(line_icon(LineIcon::Collapse, 16))
+                            .on_press(Message::ToggleNavigator)
+                            .width(32)
+                            .height(32)
+                            .padding(7)
+                            .style(chrome_action_style),
                     )
-                    .width(Length::Fixed(82.0))
-                    .padding([6, 5]),
+                    .padding([5, 4]),
                     rule::vertical(1),
                     self.workspace_view(),
                 ]
@@ -1108,22 +1126,22 @@ impl DesktopApp {
                 .height(Fill)
                 .into()
             }
-            ExplorerMode::Collapsible => row![
-                container(self.explorer_view()).width(Length::Fixed(260.0)),
+            NavigatorMode::Tabs => row![
+                self.compact_navigator(),
                 rule::vertical(1),
                 self.workspace_view(),
             ]
             .width(Fill)
             .height(Fill)
             .into(),
-            ExplorerMode::Drawer => {
+            NavigatorMode::Drawer => {
                 let toggle = row![
-                    button("Explorer")
+                    button("Navigator")
                         .on_press(Message::ShowNarrowNavigator)
                         .style(move |theme, status| {
                             content_tab_style(theme, status, !self.narrow_main)
                         }),
-                    button("Active session")
+                    button("Main")
                         .on_press(Message::ShowNarrowMain)
                         .style(move |theme, status| {
                             content_tab_style(theme, status, self.narrow_main)
@@ -1133,7 +1151,7 @@ impl DesktopApp {
                 let content = if self.narrow_main {
                     self.workspace_view()
                 } else {
-                    self.explorer_view()
+                    self.compact_navigator()
                 };
                 column![container(toggle).padding([4, 6]), content]
                     .width(Fill)
@@ -1143,54 +1161,27 @@ impl DesktopApp {
         }
     }
 
-    fn explorer_view(&self) -> Element<'_, Message> {
+    fn repositories_column(&self) -> Element<'_, Message> {
         let presentation = self.presentation();
         let density = presentation.density;
-        let mut heading = row![
-            text("Explorer")
-                .font(UI_SEMIBOLD)
-                .size(UI_META_SIZE)
-                .style(text::secondary),
-            space::horizontal(),
-            button(text("Add repository").font(UI_MEDIUM).size(UI_META_SIZE))
-                .on_press(Message::NewProject)
-                .height(density.control_height)
-                .padding([4, 8])
-                .style(chrome_action_style),
-        ]
-        .spacing(4)
-        .align_y(Center);
-        if presentation.explorer.mode == ExplorerMode::Collapsible {
-            heading = heading.push(
-                button(text("Hide").font(UI_MEDIUM).size(UI_META_SIZE))
-                    .on_press(Message::ToggleExplorer)
-                    .height(density.control_height)
-                    .padding([4, 8])
-                    .style(chrome_action_style),
-            );
-        }
-        let mut items = column![
-            container(heading)
-                .height(density.panel_header_height)
-                .padding([4, 7])
-                .width(Fill)
-        ]
+        let mut items = column![navigator_heading(
+            "Repositories",
+            Some((LineIcon::Add, Message::NewProject)),
+            density,
+        )]
         .spacing(2);
-        for row in &presentation.explorer.rows {
-            if matches!(row.id, ExplorerNodeId::Session(session_id) if self
-                .inline_session_rename
+        for row in &presentation.navigator.repositories {
+            if self
+                .inline_navigator_rename
                 .as_ref()
-                .is_some_and(|rename| rename.session_id == session_id))
+                .is_some_and(|rename| rename.target == row.id)
             {
-                items = items.push(self.session_rename_row());
+                items = items.push(self.navigator_rename_row());
             } else {
-                items = items.push(self.explorer_row(row, presentation.explorer.selected));
-            }
-            if presentation.explorer.selected == Some(row.id) && !row.actions.is_empty() {
-                items = items.push(self.explorer_actions(&row.actions, row.depth));
+                items = items.push(self.navigator_row(row));
             }
         }
-        if presentation.explorer.rows.is_empty() {
+        if presentation.navigator.repositories.is_empty() {
             items = items.push(if self.active_workspace().is_some() {
                 empty_action(
                     "No repositories in this workspace yet.",
@@ -1205,147 +1196,214 @@ impl DesktopApp {
                 )
             });
         }
-        panel(scrollable(items), 260.0)
+        panel(scrollable(items), 190.0)
     }
 
-    fn explorer_row(
-        &self,
-        row: &presentation::ExplorerRow,
-        selected: Option<ExplorerNodeId>,
-    ) -> Element<'static, Message> {
+    fn checkouts_column(&self) -> Element<'_, Message> {
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let create = presentation
+            .selection
+            .project_id
+            .map(|_| (LineIcon::Add, Message::NewWorktree));
+        let mut items = column![navigator_heading("Checkouts", create, density,)].spacing(2);
+        for row in &presentation.navigator.checkouts {
+            if self
+                .inline_navigator_rename
+                .as_ref()
+                .is_some_and(|rename| rename.target == row.id)
+            {
+                items = items.push(self.navigator_rename_row());
+            } else {
+                items = items.push(self.navigator_row(row));
+            }
+        }
+        if presentation.selection.project_id.is_none() {
+            items = items.push(empty_hint("Select a repository first."));
+        } else if presentation.navigator.checkouts.is_empty() {
+            items = items.push(empty_action(
+                "No checkouts for this repository.",
+                "Create checkout",
+                Message::NewWorktree,
+            ));
+        }
+        panel(scrollable(items), 225.0)
+    }
+
+    fn sessions_column(&self) -> Element<'_, Message> {
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let create = presentation
+            .selection
+            .worktree_id
+            .map(|_| (LineIcon::Add, Message::NewSession));
+        let mut items = column![navigator_heading("Sessions", create, density,)].spacing(2);
+        for row in &presentation.navigator.sessions {
+            if self
+                .inline_navigator_rename
+                .as_ref()
+                .is_some_and(|rename| rename.target == row.id)
+            {
+                items = items.push(self.navigator_rename_row());
+            } else {
+                items = items.push(self.navigator_row(row));
+            }
+        }
+        if presentation.selection.worktree_id.is_none() {
+            items = items.push(empty_hint("Select a checkout first."));
+        } else if presentation.navigator.sessions.is_empty() {
+            items = items.push(empty_action(
+                "No sessions in this checkout.",
+                "Start session",
+                Message::NewSession,
+            ));
+        }
+        panel(scrollable(items), 255.0)
+    }
+
+    fn compact_navigator(&self) -> Element<'_, Message> {
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let tabs = row![
+            compact_panel_button(
+                "Repositories",
+                DesktopPanel::Projects,
+                self.desktop_state.compact_panel,
+                density
+            ),
+            compact_panel_button(
+                "Checkouts",
+                DesktopPanel::Worktrees,
+                self.desktop_state.compact_panel,
+                density
+            ),
+            compact_panel_button(
+                "Sessions",
+                DesktopPanel::Sessions,
+                self.desktop_state.compact_panel,
+                density
+            ),
+            button(line_icon(LineIcon::Collapse, 15))
+                .on_press_maybe(
+                    (presentation.layout == PresentationLayout::Compact)
+                        .then_some(Message::ToggleNavigator),
+                )
+                .width(density.control_height)
+                .height(density.control_height)
+                .padding(7)
+                .style(chrome_action_style),
+        ]
+        .spacing(3);
+        let panel = match self.desktop_state.compact_panel {
+            DesktopPanel::Projects => self.repositories_column(),
+            DesktopPanel::Worktrees => self.checkouts_column(),
+            DesktopPanel::Sessions => self.sessions_column(),
+        };
+        container(column![container(tabs).padding([4, 5]), panel])
+            .width(if presentation.layout == PresentationLayout::Compact {
+                Length::Fixed(300.0)
+            } else {
+                Fill
+            })
+            .height(Fill)
+            .into()
+    }
+
+    fn navigator_row(&self, row: &NavigatorRow) -> Element<'static, Message> {
         let density = self.presentation().density;
-        let is_selected = selected == Some(row.id);
-        let is_hovered = self.hovered_explorer_node == Some(row.id);
-        let disclosure: Element<'static, Message> = if row.expandable {
-            button(line_icon(
-                if row.expanded {
-                    LineIcon::ChevronDown
-                } else {
-                    LineIcon::ChevronRight
-                },
-                15,
-            ))
-            .on_press(Message::ToggleExplorerNode(row.id))
-            .height(density.row_height)
-            .width(Length::Fixed(24.0))
-            .padding(0)
-            .style(chrome_action_style)
+        let is_selected = row.selected;
+        let is_hovered = self.hovered_navigator_node == Some(row.id);
+        let name = text(row.label.clone())
+            .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
+            .size(UI_TEXT_SIZE)
+            .wrapping(text::Wrapping::None);
+        let labels: Element<'static, Message> = if matches!(row.id, NavigatorNodeId::Session(_)) {
+            row![
+                name,
+                text(format!("· {}", row.detail))
+                    .size(UI_META_SIZE)
+                    .style(text::secondary)
+                    .wrapping(text::Wrapping::None),
+            ]
+            .spacing(5)
+            .align_y(Center)
+            .width(Fill)
             .into()
         } else {
-            space::horizontal().width(Length::Fixed(24.0)).into()
-        };
-        let detail: Element<'static, Message> = if let Some(attention) = row.attention {
-            let label = if row.detail.is_empty() {
-                explorer_attention_label(attention).to_owned()
-            } else {
-                format!("{} · {}", explorer_attention_label(attention), row.detail)
-            };
-            row![
-                line_icon(explorer_attention_icon(attention), 13),
-                text(label).size(UI_META_SIZE).style(text::secondary),
-            ]
-            .spacing(4)
-            .align_y(Center)
-            .into()
-        } else if let Some(indicator) = row.indicator {
-            row![
-                line_icon(session_indicator_icon(indicator), 13),
+            let mut title = row![name].spacing(5).align_y(Center);
+            if let Some(badge) = &row.badge {
+                title = title.push(
+                    container(text(badge.clone()).font(UI_MEDIUM).size(10))
+                        .padding([1, 4])
+                        .style(navigator_badge_style),
+                );
+            }
+            if let Some(attention) = row.attention {
+                title = title.push(
+                    row![
+                        line_icon(navigator_attention_icon(attention), 13),
+                        text(navigator_attention_label(attention))
+                            .size(10)
+                            .style(text::secondary),
+                    ]
+                    .spacing(3)
+                    .align_y(Center),
+                );
+            }
+            title = title.push(space::horizontal());
+            if is_selected
+                && let Some(NavigatorAction::DeleteCheckout(worktree_id)) = row.actions.first()
+            {
+                title = title.push(
+                    button(icon_text_label(LineIcon::Delete, "Delete", UI_META_SIZE))
+                        .on_press(Message::RunNavigatorAction(
+                            NavigatorAction::DeleteCheckout(*worktree_id),
+                        ))
+                        .height(density.control_height)
+                        .padding([3, 6])
+                        .style(flat_danger_style),
+                );
+            }
+            column![
+                title,
                 text(row.detail.clone())
                     .size(UI_META_SIZE)
-                    .style(text::secondary),
+                    .style(text::secondary)
+                    .wrapping(text::Wrapping::None),
             ]
-            .spacing(4)
-            .align_y(Center)
+            .spacing(1)
+            .width(Fill)
             .into()
-        } else {
-            text(row.detail.clone())
-                .size(UI_META_SIZE)
-                .style(text::secondary)
-                .into()
         };
-        let labels = column![
-            text(row.label.clone())
-                .font(if is_selected { UI_MEDIUM } else { UI_FONT })
-                .size(UI_TEXT_SIZE)
-                .wrapping(text::Wrapping::None),
-            detail,
-        ]
-        .spacing(1)
-        .width(Fill);
-        let content = container(
-            row![
-                space::horizontal().width(Length::Fixed(f32::from(row.depth) * 14.0)),
-                disclosure,
-                labels,
-            ]
-            .spacing(3)
-            .align_y(Center),
-        )
-        .width(Fill)
-        .height(density.row_height.max(38))
-        .padding([3, 5])
-        .clip(true)
-        .style(move |theme| list_item_container_style(theme, is_selected, is_hovered));
-        let double_click = match row.id {
-            ExplorerNodeId::Session(session_id) => Message::BeginSessionRename(session_id),
-            ExplorerNodeId::Repository(_) | ExplorerNodeId::Checkout(_) => {
-                Message::OpenExplorerNode(row.id)
-            }
+        let content = container(row![labels].spacing(3).align_y(Center))
+            .width(Fill)
+            .height(density.row_height.max(44))
+            .padding([4, 6])
+            .clip(true)
+            .style(move |theme| navigator_row_container_style(theme, is_selected, is_hovered));
+        let select = match row.id {
+            NavigatorNodeId::Repository(id) => Message::SelectProject(id),
+            NavigatorNodeId::Checkout(id) => Message::SelectWorktree(id),
+            NavigatorNodeId::Session(id) => Message::SelectSession(id),
         };
+        let double_click = Message::BeginNavigatorRename(row.id);
         mouse_area(content)
-            .on_enter(Message::HoverExplorerNode(Some(row.id)))
-            .on_exit(Message::HoverExplorerNode(None))
-            .on_press(Message::SelectExplorerNode(row.id))
+            .on_enter(Message::HoverNavigatorNode(Some(row.id)))
+            .on_exit(Message::HoverNavigatorNode(None))
+            .on_press(select)
             .on_double_click(double_click)
             .interaction(mouse::Interaction::Pointer)
             .into()
     }
 
-    fn explorer_actions(&self, actions: &[ExplorerAction], depth: u8) -> Element<'static, Message> {
-        let density = self.presentation().density;
-        let presentation_theme = self.presentation().theme;
-        let mut controls =
-            row![space::horizontal().width(Length::Fixed(f32::from(depth + 1) * 14.0 + 24.0))]
-                .spacing(4)
-                .align_y(Center);
-        for action in actions {
-            let action = *action;
-            let danger = matches!(action, ExplorerAction::DeleteCheckout(_));
-            controls = controls.push(
-                button(text(explorer_action_label(action)).size(UI_META_SIZE))
-                    .on_press(Message::RunExplorerAction(action))
-                    .height(density.control_height)
-                    .padding([4, 7])
-                    .style(move |_theme, status| {
-                        button_intent_style(
-                            presentation_theme,
-                            if danger {
-                                ButtonIntent::Danger
-                            } else {
-                                ButtonIntent::Quiet
-                            },
-                            status,
-                        )
-                    }),
-            );
-        }
-        scrollable(controls)
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::hidden(),
-            ))
-            .height(density.control_height)
-            .width(Fill)
-            .into()
-    }
-
-    fn session_rename_row(&self) -> Element<'_, Message> {
-        let Some(rename) = &self.inline_session_rename else {
+    fn navigator_rename_row(&self) -> Element<'_, Message> {
+        let Some(rename) = &self.inline_navigator_rename else {
             return space::vertical().height(0).into();
         };
-        let controls = text_input("Session name", &rename.value)
+        let controls = text_input("Name", &rename.value)
             .id(rename.input_id.clone())
-            .on_input_maybe((!rename.pending).then_some(Message::SessionRenameInput))
-            .on_submit_maybe((!rename.pending).then_some(Message::SubmitSessionRename))
+            .on_input_maybe((!rename.pending).then_some(Message::NavigatorRenameInput))
+            .on_submit_maybe((!rename.pending).then_some(Message::SubmitNavigatorRename))
             .padding([6, 8])
             .size(UI_TEXT_SIZE);
         let mut content = column![controls].spacing(4);
@@ -1402,10 +1460,12 @@ impl DesktopApp {
                 container(
                     row![
                         button(
-                            text(label)
-                                .font(if active { UI_SEMIBOLD } else { UI_FONT })
-                                .size(UI_TEXT_SIZE)
-                                .wrapping(text::Wrapping::None)
+                            centered_button_label(
+                                label,
+                                UI_TEXT_SIZE,
+                                if active { UI_SEMIBOLD } else { UI_FONT },
+                            )
+                            .wrapping(text::Wrapping::None)
                         )
                         .on_press(Message::SelectOpenSession(session_id))
                         .height(density.row_height)
@@ -1494,10 +1554,12 @@ impl DesktopApp {
                 };
                 actions = actions.push(
                     button(
-                        text(active_terminal_action_label(action, compact))
-                            .font(UI_MEDIUM)
-                            .size(UI_META_SIZE)
-                            .wrapping(text::Wrapping::None),
+                        centered_button_label(
+                            active_terminal_action_label(action, compact),
+                            UI_META_SIZE,
+                            UI_MEDIUM,
+                        )
+                        .wrapping(text::Wrapping::None),
                     )
                     .on_press(message)
                     .height(density.control_height)
@@ -1509,25 +1571,29 @@ impl DesktopApp {
             }
             if can_stop {
                 actions = actions.push(
-                    button(text(STOP_SESSION_LABEL).font(UI_MEDIUM).size(UI_META_SIZE))
-                        .on_press(Message::Stop)
-                        .height(density.control_height)
-                        .padding([6, 9])
-                        .style(move |_theme, status| {
-                            button_intent_style(presentation_theme, ButtonIntent::Danger, status)
-                        }),
+                    button(centered_button_label(
+                        STOP_SESSION_LABEL,
+                        UI_META_SIZE,
+                        UI_MEDIUM,
+                    ))
+                    .on_press(Message::Stop)
+                    .height(density.control_height)
+                    .padding([6, 9])
+                    .style(move |_theme, status| {
+                        button_intent_style(presentation_theme, ButtonIntent::Danger, status)
+                    }),
                 );
             } else if can_resume {
                 actions = actions.push(
-                    button(
-                        text(if resume_pending {
+                    button(centered_button_label(
+                        if resume_pending {
                             "Resuming…"
                         } else {
                             "Resume"
-                        })
-                        .font(UI_MEDIUM)
-                        .size(UI_META_SIZE),
-                    )
+                        },
+                        UI_META_SIZE,
+                        UI_MEDIUM,
+                    ))
                     .on_press_maybe((!resume_pending).then_some(Message::Resume(session_id)))
                     .height(density.control_height)
                     .padding([6, 9])
@@ -1830,21 +1896,14 @@ impl DesktopApp {
                 ));
         }
         let mut actions = row![].spacing(8);
-        if selection.project_id.is_some() {
-            actions = actions.push(button("Rename repository").on_press(Message::RenameProject));
-        }
-        if selection.worktree_id.is_some() {
-            actions = actions.push(button("Rename checkout").on_press(Message::RenameWorktree));
-        }
-        if let Some(session) = selection.active_session_id.and_then(|id| self.session(id)) {
-            actions = actions.push(self.session_rename_action(session.id));
-            if session_can_stop(session.state) {
-                actions = actions.push(
-                    button(STOP_SESSION_LABEL)
-                        .on_press(Message::Stop)
-                        .style(flat_danger_style),
-                );
-            }
+        if let Some(session) = selection.active_session_id.and_then(|id| self.session(id))
+            && session_can_stop(session.state)
+        {
+            actions = actions.push(
+                button(STOP_SESSION_LABEL)
+                    .on_press(Message::Stop)
+                    .style(flat_danger_style),
+            );
         }
         if self.selected_worktree().is_some_and(worktree_can_delete) {
             actions = actions.push(
@@ -1876,20 +1935,6 @@ impl DesktopApp {
             .into()
     }
 
-    fn session_rename_action(&self, session_id: SessionId) -> Element<'_, Message> {
-        button(if self.inline_session_rename.is_some() {
-            "Renaming…"
-        } else {
-            "Rename session"
-        })
-        .on_press_maybe(
-            self.inline_session_rename
-                .is_none()
-                .then_some(Message::BeginSessionRename(session_id)),
-        )
-        .into()
-    }
-
     fn modal_view<'a>(&'a self, modal: &'a Modal) -> Element<'a, Message> {
         match modal {
             Modal::Settings => self.settings_view(),
@@ -1906,7 +1951,7 @@ impl DesktopApp {
                 row![
                     text("Keyboard shortcuts").font(UI_SEMIBOLD).size(22),
                     space::horizontal(),
-                    button("Done")
+                    button(centered_button_label("Done", UI_META_SIZE, UI_MEDIUM))
                         .on_press(Message::CancelModal)
                         .height(density.control_height)
                         .padding([6, 12])
@@ -1942,7 +1987,6 @@ impl DesktopApp {
     fn settings_view(&self) -> Element<'_, Message> {
         let presentation = self.presentation();
         let density = presentation.density;
-        let settings_mode = presentation.layout.settings_mode();
         let control_width = Length::Fixed(260.0);
         let appearance_controls = column![
             setting_row(
@@ -1985,40 +2029,32 @@ impl DesktopApp {
         .spacing(density.region_spacing);
         let appearance = self.appearance_theme_gallery();
         let update_settings = self.update_settings_view();
+        let advanced_settings = self.advanced_settings_view();
         let settings = column![
             row![
                 text("Settings").font(UI_SEMIBOLD).size(24),
                 space::horizontal(),
-                button(text("Done").font(UI_MEDIUM).size(12))
+                button(line_icon(LineIcon::Close, 16))
                     .on_press(Message::ToggleSettings)
+                    .width(density.control_height)
                     .height(density.control_height)
-                    .padding([6, 10])
+                    .padding(7)
                     .style(chrome_action_style)
             ]
             .align_y(Center),
-            text("Keyboard: U advances updates · P toggles periodic checks · R resets layout · D opens data removal · Esc closes Settings")
+            text("Tab and arrow keys move through themes · Enter applies · Esc closes")
                 .size(UI_META_SIZE)
                 .style(text::secondary),
             rule::horizontal(1),
             scrollable(
                 column![
-                text("Appearance").font(UI_SEMIBOLD).size(16),
-                text("Appearance changes apply immediately and persist locally for this desktop.")
-                    .style(text::secondary),
-                appearance,
-                appearance_controls,
-                button("Reset layout")
-                    .on_press(Message::ResetLayout)
-                    .style(chrome_action_style),
-                rule::horizontal(1),
-                update_settings,
-                rule::horizontal(1),
-                text("Safety").font(UI_SEMIBOLD).size(16),
-                text("Protected background services remain in control of sessions, repository changes, cleanup, and audit history.")
-                    .style(text::secondary),
-                button("Remove SylvOps user data…")
-                    .on_press(Message::OpenDataRemoval)
-                    .style(danger_action_style),
+                    text("Essentials").font(UI_SEMIBOLD).size(16),
+                    appearance,
+                    appearance_controls,
+                    rule::horizontal(1),
+                    update_settings,
+                    rule::horizontal(1),
+                    advanced_settings,
                 ]
                 .spacing(16)
                 .padding([8, 6]),
@@ -2026,12 +2062,13 @@ impl DesktopApp {
             .height(Fill),
         ]
         .spacing(12);
-        let mut surface = container(settings).padding(22).height(Fill);
-        surface = match settings_mode {
-            SettingsMode::SideSheet => surface.width(Length::Fixed(600.0)).style(modal_card),
-            SettingsMode::FullWindow => surface.width(Fill).style(workspace_surface),
-        };
-        surface.into()
+        container(settings)
+            .padding(22)
+            .width(Fill)
+            .max_width(640)
+            .height(Fill)
+            .style(modal_card)
+            .into()
     }
 
     fn appearance_theme_gallery(&self) -> Element<'_, Message> {
@@ -2040,45 +2077,64 @@ impl DesktopApp {
         for choice in DesktopTheme::ALL.into_iter().take(FEATURED_THEME_COUNT) {
             featured = featured.push(self.theme_preview_card(choice));
         }
+        featured.into()
+    }
+
+    fn advanced_settings_view(&self) -> Element<'_, Message> {
+        let density = self.presentation().density;
         let disclosure = if self.disclosures.classic_themes {
-            "Classic themes — hide"
+            "Advanced — hide"
         } else {
-            "Classic themes — show 7"
+            "Advanced — show"
         };
-        let mut gallery = column![
-            featured,
-            text("Keyboard: Tab or arrow keys move the preview focus; Enter applies; C toggles Classic themes.")
-                .size(UI_META_SIZE)
-                .style(text::secondary),
+        let mut advanced = column![
             button(disclosure)
                 .on_press(Message::ToggleClassicThemes)
+                .height(density.control_height)
                 .style(chrome_action_style),
         ]
-        .spacing(density.region_spacing);
+        .spacing(10);
         if self.disclosures.classic_themes {
             let mut classic = row![].spacing(density.region_spacing);
             for choice in DesktopTheme::ALL.into_iter().skip(FEATURED_THEME_COUNT) {
                 let selected = self.desktop_state.theme == choice;
                 let focused = self.disclosures.settings_theme_focus == theme_gallery_index(choice);
                 classic = classic.push(
-                    button(text(choice.to_string()).wrapping(text::Wrapping::None))
-                        .on_press(Message::SelectTheme(choice))
-                        .height(density.control_height)
-                        .padding([5, 9])
-                        .style(move |theme, status| {
-                            theme_preview_style(theme, status, selected, focused)
-                        }),
+                    button(centered_button_label(
+                        choice.to_string(),
+                        UI_META_SIZE,
+                        UI_MEDIUM,
+                    ))
+                    .on_press(Message::SelectTheme(choice))
+                    .height(density.control_height)
+                    .padding([5, 9])
+                    .style(move |theme, status| {
+                        theme_preview_style(theme, status, selected, focused)
+                    }),
                 );
             }
-            gallery = gallery.push(
-                scrollable(classic)
-                    .direction(scrollable::Direction::Horizontal(
-                        scrollable::Scrollbar::default(),
-                    ))
-                    .height(density.control_height + 12),
-            );
+            advanced = advanced
+                .push(text("Classic themes").font(UI_SEMIBOLD).size(UI_META_SIZE))
+                .push(
+                    scrollable(classic)
+                        .direction(scrollable::Direction::Horizontal(
+                            scrollable::Scrollbar::default(),
+                        ))
+                        .height(density.control_height + 12),
+                )
+                .push(
+                    button("Reset layout")
+                        .on_press(Message::ResetLayout)
+                        .style(chrome_action_style),
+                )
+                .push(text("Safety and data").font(UI_SEMIBOLD).size(UI_META_SIZE))
+                .push(
+                    button("Remove SylvOps user data…")
+                        .on_press(Message::OpenDataRemoval)
+                        .style(danger_action_style),
+                );
         }
-        gallery.into()
+        advanced.into()
     }
 
     fn theme_preview_card(&self, choice: DesktopTheme) -> Element<'static, Message> {
@@ -2122,49 +2178,25 @@ impl DesktopApp {
                     .style(text::secondary)
                     .into()
             }
-            UpgradeStatus::Available { release } => {
-                let mut details = column![
-                    text(format!(
-                        "SylvOps {} is available ({} download).",
-                        release.target_version,
-                        human_byte_size(release.byte_length)
-                    )),
-                    text(&release.release_notes).style(text::secondary),
-                    button("Download verified upgrade")
-                        .on_press(Message::DownloadUpdate)
-                        .style(chrome_action_style),
-                    button(if self.disclosures.technical_details {
-                        "Technical details — hide"
-                    } else {
-                        "Technical details — show"
-                    })
-                    .on_press(Message::ToggleTechnicalDetails)
-                    .style(chrome_action_style),
-                ]
-                .spacing(8);
-                if self.disclosures.technical_details {
-                    details = details.push(technical_detail(
-                        "Exact download size",
-                        format!("{} bytes", release.byte_length),
-                    ));
-                }
-                details.into()
-            }
+            UpgradeStatus::Available { release } => column![
+                text(format!(
+                    "SylvOps {} is available ({} download).",
+                    release.target_version,
+                    human_byte_size(release.byte_length)
+                )),
+                text(&release.release_notes).style(text::secondary),
+            ]
+            .spacing(8)
+            .into(),
             UpgradeStatus::Downloading { release } => text(format!(
                 "Downloading and verifying SylvOps {}…",
                 release.target_version
             ))
             .into(),
-            UpgradeStatus::Staged { release } => column![
-                text(format!(
-                    "SylvOps {} is verified and ready.",
-                    release.target_version
-                )),
-                button("Install update")
-                    .on_press(Message::InstallUpdate)
-                    .style(chrome_action_style),
-            ]
-            .spacing(8)
+            UpgradeStatus::Staged { release } => text(format!(
+                "SylvOps {} is verified and ready.",
+                release.target_version
+            ))
             .into(),
             UpgradeStatus::Installing { release } => {
                 text(format!("Installing SylvOps {}…", release.target_version)).into()
@@ -2189,20 +2221,32 @@ impl DesktopApp {
         } else {
             "Periodic checks: Off"
         };
+        let update_action: Element<'_, Message> = match &self.update_status {
+            UpgradeStatus::Available { .. } => button("Download verified upgrade")
+                .on_press(Message::DownloadUpdate)
+                .style(primary_action_style)
+                .into(),
+            UpgradeStatus::Staged { .. } => button("Install update")
+                .on_press(Message::InstallUpdate)
+                .style(primary_action_style)
+                .into(),
+            UpgradeStatus::Downloading { .. } => button("Downloading…").into(),
+            UpgradeStatus::Installing { .. } => button("Installing…").into(),
+            _ => button(CHECK_AGAIN_LABEL)
+                .on_press(Message::CheckForUpdate)
+                .style(primary_action_style)
+                .into(),
+        };
         column![
             text("Updates").font(UI_SEMIBOLD).size(16),
-            text("Checks read bounded signed GitHub release metadata. Downloads and installation always require visible actions.")
-                .style(text::secondary),
+            update_details,
             row![
-                button(CHECK_AGAIN_LABEL)
-                    .on_press(Message::CheckForUpdate)
-                    .style(chrome_action_style),
+                update_action,
                 button(periodic_label)
                     .on_press(Message::TogglePeriodicUpdateChecks)
                     .style(chrome_action_style),
             ]
             .spacing(8),
-            update_details,
         ]
         .spacing(8)
         .into()
@@ -2447,13 +2491,24 @@ impl DesktopApp {
     }
 
     fn footer(&self) -> Element<'_, Message> {
-        let density = self.presentation().density;
-        let compact = self.desktop_state.window_width < 900;
+        let presentation = self.presentation();
+        let density = presentation.density;
+        let width = self.desktop_state.window_width;
         let workspace = self
             .active_workspace()
-            .map_or("No workspace", |workspace| workspace.name.as_str());
+            .map_or_else(|| "None".to_owned(), |workspace| workspace.name.clone());
+        let repository = presentation
+            .selection
+            .project_id
+            .and_then(|id| {
+                self.snapshot
+                    .projects
+                    .iter()
+                    .find(|project| project.id == id)
+            })
+            .map_or_else(|| "None".to_owned(), |project| project.name.clone());
         let checkout = self.selected_worktree().map_or_else(
-            || "No checkout".to_owned(),
+            || "None".to_owned(),
             |worktree| {
                 format!(
                     "{} · {}",
@@ -2462,44 +2517,73 @@ impl DesktopApp {
                 )
             },
         );
-        let connection: Element<'_, Message> = match self.connection {
-            ConnectionState::Connecting => text("Connecting")
-                .size(FOOTER_TEXT_SIZE)
-                .style(text::warning)
-                .into(),
-            ConnectionState::Connected => text("Connected")
-                .size(FOOTER_TEXT_SIZE)
-                .style(text::success)
-                .into(),
-            ConnectionState::Disconnected => text("Disconnected")
-                .size(FOOTER_TEXT_SIZE)
-                .style(text::danger)
-                .into(),
-        };
+        let session = presentation
+            .selection
+            .active_session_id
+            .and_then(|id| self.session(id))
+            .map_or_else(
+                || "None".to_owned(),
+                |session| {
+                    format!(
+                        "{} · {}",
+                        session.display_name,
+                        session_state_label(session.state)
+                    )
+                },
+            );
         let mut status = row![
-            text(format!("SylvOps {}", env!("CARGO_PKG_VERSION")))
+            text(application_version_text())
                 .font(UI_SEMIBOLD)
-                .size(FOOTER_TEXT_SIZE),
-            footer_separator(),
-            footer_item(workspace),
+                .size(FOOTER_TEXT_SIZE)
+                .wrapping(text::Wrapping::None),
+            footer_connection(self.connection),
         ]
         .spacing(density.region_spacing)
         .align_y(Center);
-        if !compact {
-            status = status.push(footer_separator()).push(footer_item(&checkout));
-        }
-        status = status.push(space::horizontal()).push(connection);
-        if !compact {
+        if width >= 720 {
             status = status
                 .push(footer_separator())
-                .push(footer_item("Ctrl+K shortcuts  ·  Ctrl+] leave terminal"));
+                .push(footer_context("Workspace", &workspace));
         }
-        container(status)
-            .height(density.footer_height)
-            .padding([3, 10])
+        if width >= 980 {
+            status = status
+                .push(footer_separator())
+                .push(footer_context("Repository", &repository))
+                .push(footer_separator())
+                .push(footer_context("Checkout", &checkout));
+        }
+        if width >= 1_180 {
+            status = status
+                .push(footer_separator())
+                .push(footer_context("Session", &session));
+        }
+        let mut trailing = row![footer_context(
+            "View",
+            main_tab_label(presentation.selection.main_tab),
+        )]
+        .spacing(density.region_spacing)
+        .align_y(Center);
+        if width >= 1_180 {
+            trailing = trailing
+                .push(footer_separator())
+                .push(footer_item("Ctrl+K shortcuts"));
+        }
+        let contexts = scrollable(status)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::hidden(),
+            ))
             .width(Fill)
-            .style(chrome_surface)
-            .into()
+            .height(density.footer_height);
+        container(
+            row![contexts, trailing]
+                .spacing(density.region_spacing)
+                .align_y(Center),
+        )
+        .height(density.footer_height)
+        .padding([3, 10])
+        .width(Fill)
+        .style(chrome_surface)
+        .into()
     }
 
     fn process_bridge_events(&mut self) {
@@ -2582,8 +2666,14 @@ impl DesktopApp {
                     }
                     return;
                 }
-                if matches!(&operation, Some(Operation::RenameSession))
-                    && let Some(rename) = &mut self.inline_session_rename
+                if matches!(
+                    &operation,
+                    Some(
+                        Operation::RenameProject
+                            | Operation::RenameWorktree
+                            | Operation::RenameSession
+                    )
+                ) && let Some(rename) = &mut self.inline_navigator_rename
                 {
                     rename.fail(message);
                     return;
@@ -2903,12 +2993,12 @@ impl DesktopApp {
             }
             (Operation::RenameProject, DaemonResponse::ProjectUpdated { .. })
             | (Operation::RenameWorktree, DaemonResponse::WorktreeUpdated { .. }) => {
-                self.modal = None;
+                self.inline_navigator_rename = None;
                 self.show_success("Display name updated.");
                 self.request_snapshot();
             }
             (Operation::RenameSession, DaemonResponse::SessionUpdated { .. }) => {
-                self.inline_session_rename = None;
+                self.inline_navigator_rename = None;
                 self.show_success("Session name updated.");
                 self.request_snapshot();
             }
@@ -3215,15 +3305,13 @@ impl DesktopApp {
 
         match key.as_ref() {
             Key::Named(Named::Tab) => {
-                if self.presentation().layout == PresentationLayout::Narrow {
-                    self.narrow_main = !self.narrow_main;
-                }
+                self.cycle_keyboard_panel(if modifiers.shift() { -1 } else { 1 });
             }
-            Key::Named(Named::ArrowLeft) => self.navigate_explorer(ExplorerKey::Left),
-            Key::Named(Named::ArrowRight) => self.navigate_explorer(ExplorerKey::Right),
-            Key::Named(Named::ArrowUp) => self.navigate_explorer(ExplorerKey::Up),
-            Key::Named(Named::ArrowDown) => self.navigate_explorer(ExplorerKey::Down),
-            Key::Named(Named::Enter) => self.navigate_explorer(ExplorerKey::Enter),
+            Key::Named(Named::ArrowLeft) => self.cycle_keyboard_panel(-1),
+            Key::Named(Named::ArrowRight) => self.cycle_keyboard_panel(1),
+            Key::Named(Named::ArrowUp) => self.move_keyboard_selection(-1),
+            Key::Named(Named::ArrowDown) => self.move_keyboard_selection(1),
+            Key::Named(Named::Enter) => self.open_keyboard_selection(),
             Key::Named(Named::Delete) => self.shortcut_delete(),
             Key::Character("1") => self.select_main_tab(MainTab::Terminal),
             Key::Character("2") => self.select_main_tab(MainTab::Changes),
@@ -3327,9 +3415,9 @@ impl DesktopApp {
                 self.modal = None;
             }
             true
-        } else if self.inline_session_rename.is_some() {
+        } else if self.inline_navigator_rename.is_some() {
             if matches!(key, Key::Named(Named::Escape)) {
-                cancel_inline_session_rename(&mut self.inline_session_rename);
+                cancel_inline_navigator_rename(&mut self.inline_navigator_rename);
             }
             true
         } else {
@@ -3394,119 +3482,112 @@ impl DesktopApp {
     }
 
     fn open_settings(&mut self) {
-        self.inline_session_rename = None;
+        self.inline_navigator_rename = None;
         self.terminal_focus = TerminalFocus::Unfocused;
-        self.disclosures.classic_themes =
-            theme_gallery_index(self.desktop_state.theme) >= FEATURED_THEME_COUNT;
-        self.disclosures.settings_theme_focus = theme_gallery_index(self.desktop_state.theme);
+        self.disclosures.classic_themes = false;
+        self.disclosures.settings_theme_focus =
+            theme_gallery_index(self.desktop_state.theme).min(FEATURED_THEME_COUNT - 1);
         self.modal = Some(Modal::Settings);
     }
 
-    fn navigate_explorer(&mut self, key: ExplorerKey) {
-        self.terminal_focus = TerminalFocus::Unfocused;
-        self.narrow_main = false;
-        let presentation = self.presentation();
-        let Some(current) = self
-            .focused_explorer_node
-            .or(presentation.explorer.selected)
-            .or_else(|| presentation.explorer.rows.first().map(|row| row.id))
-        else {
-            return;
+    fn cycle_keyboard_panel(&mut self, direction: i8) {
+        let panels = [
+            DesktopPanel::Projects,
+            DesktopPanel::Worktrees,
+            DesktopPanel::Sessions,
+        ];
+        let current = panels
+            .iter()
+            .position(|panel| *panel == self.keyboard_panel)
+            .unwrap_or_default();
+        let next = if direction < 0 {
+            current.checked_sub(1).unwrap_or(panels.len() - 1)
+        } else {
+            (current + 1) % panels.len()
         };
-        let intent = presentation.explorer.navigate(current, key);
-        self.apply_explorer_intent(intent);
+        self.inline_navigator_rename = None;
+        self.keyboard_panel = panels[next];
+        self.desktop_state.compact_panel = panels[next];
+        self.narrow_main = false;
+        self.mark_state_dirty();
     }
 
-    fn apply_explorer_intent(&mut self, intent: ExplorerIntent) {
-        match intent {
-            ExplorerIntent::None => {}
-            ExplorerIntent::Focus(node) => self.select_explorer_node(node),
-            ExplorerIntent::Expand(node) => self.set_explorer_expansion(node, true),
-            ExplorerIntent::Collapse(node) => self.set_explorer_expansion(node, false),
-            ExplorerIntent::Open(session_id) => {
-                self.select_session(session_id);
-                self.narrow_main = true;
+    fn move_keyboard_selection(&mut self, direction: i8) {
+        match self.keyboard_panel {
+            DesktopPanel::Projects => {
+                let ids: Vec<_> = self.visible_projects().iter().map(|item| item.id).collect();
+                if let Some(id) = next_selection(&ids, self.selected_project_id, direction) {
+                    self.select_project(id);
+                }
             }
+            DesktopPanel::Worktrees => {
+                let ids: Vec<_> = self
+                    .selected_project_id
+                    .map_or_else(Vec::new, |project_id| {
+                        self.worktrees_for(project_id)
+                            .iter()
+                            .map(|item| item.id)
+                            .collect()
+                    });
+                if let Some(id) = next_selection(&ids, self.selected_worktree_id, direction) {
+                    self.select_worktree(id);
+                }
+            }
+            DesktopPanel::Sessions => {
+                let ids: Vec<_> = self
+                    .selected_worktree_id
+                    .map_or_else(Vec::new, |worktree_id| {
+                        self.sessions_for(worktree_id)
+                            .iter()
+                            .map(|item| item.id)
+                            .collect()
+                    });
+                if let Some(id) = next_selection(&ids, self.selected_session_id, direction) {
+                    self.select_session(id);
+                }
+            }
+        }
+    }
+
+    fn open_keyboard_selection(&mut self) {
+        if self.keyboard_panel == DesktopPanel::Sessions
+            && let Some(session_id) = self.selected_session_id
+        {
+            self.select_session(session_id);
+            self.narrow_main = true;
         }
     }
 
     fn shortcut_new(&mut self) {
         self.terminal_focus = TerminalFocus::Unfocused;
-        match self.focused_explorer_node {
-            Some(ExplorerNodeId::Repository(project_id)) => {
-                self.select_explorer_node(ExplorerNodeId::Repository(project_id));
-                self.open_worktree_form();
-            }
-            Some(ExplorerNodeId::Checkout(worktree_id)) => {
-                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
-                self.open_session_form();
-            }
-            Some(ExplorerNodeId::Session(session_id)) => {
-                self.select_explorer_node(ExplorerNodeId::Session(session_id));
-                self.open_session_form();
-            }
-            None => self.open_project_form(),
+        match self.keyboard_panel {
+            DesktopPanel::Projects => self.open_project_form(),
+            DesktopPanel::Worktrees => self.open_worktree_form(),
+            DesktopPanel::Sessions => self.open_session_form(),
         }
     }
 
     fn shortcut_rename(&mut self) {
         self.terminal_focus = TerminalFocus::Unfocused;
-        match self.focused_explorer_node {
-            Some(ExplorerNodeId::Repository(project_id)) => {
-                self.select_explorer_node(ExplorerNodeId::Repository(project_id));
-                self.open_project_rename_form();
-            }
-            Some(ExplorerNodeId::Checkout(worktree_id)) => {
-                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
-                self.open_worktree_rename_form();
-            }
-            Some(ExplorerNodeId::Session(_)) | None => {}
-        }
+        let _ = self.begin_selected_navigator_rename();
     }
 
     fn shortcut_delete(&mut self) {
         self.terminal_focus = TerminalFocus::Unfocused;
-        match self.focused_explorer_node {
-            Some(ExplorerNodeId::Repository(_)) => {
+        match self.keyboard_panel {
+            DesktopPanel::Projects => {
                 self.error = Some("Repository removal is intentionally unavailable.".into());
             }
-            Some(ExplorerNodeId::Checkout(worktree_id)) => {
-                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
-                self.inspect_worktree_removal();
-            }
-            Some(ExplorerNodeId::Session(session_id)) => {
-                self.select_session(session_id);
-                self.open_stop_confirmation();
-            }
-            None => {}
+            DesktopPanel::Worktrees => self.inspect_worktree_removal(),
+            DesktopPanel::Sessions => self.open_stop_confirmation(),
         }
     }
 
-    fn run_explorer_action(&mut self, action: ExplorerAction) -> Task<Message> {
+    fn run_navigator_action(&mut self, action: NavigatorAction) -> Task<Message> {
         match action {
-            ExplorerAction::CreateCheckout(project_id) => {
-                self.select_explorer_node(ExplorerNodeId::Repository(project_id));
-                self.open_worktree_form();
-            }
-            ExplorerAction::RenameRepository(project_id) => {
-                self.select_explorer_node(ExplorerNodeId::Repository(project_id));
-                self.open_project_rename_form();
-            }
-            ExplorerAction::CreateSession(worktree_id) => {
-                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
-                self.open_session_form();
-            }
-            ExplorerAction::RenameCheckout(worktree_id) => {
-                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
-                self.open_worktree_rename_form();
-            }
-            ExplorerAction::DeleteCheckout(worktree_id) => {
-                self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
+            NavigatorAction::DeleteCheckout(worktree_id) => {
+                self.select_worktree(worktree_id);
                 self.inspect_worktree_removal();
-            }
-            ExplorerAction::OpenSession(session_id) => self.select_session(session_id),
-            ExplorerAction::RenameSession(session_id) => {
-                return self.begin_session_rename(session_id);
             }
         }
         Task::none()
@@ -3522,7 +3603,7 @@ impl DesktopApp {
     }
 
     fn open_project_form(&mut self) {
-        self.inline_session_rename = None;
+        self.inline_navigator_rename = None;
         let Some(workspace_id) = self.active_workspace().map(|workspace| workspace.id) else {
             self.error = Some("Create a workspace before registering a repository.".into());
             self.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
@@ -3546,7 +3627,7 @@ impl DesktopApp {
     }
 
     fn open_worktree_form(&mut self) {
-        self.inline_session_rename = None;
+        self.inline_navigator_rename = None;
         let Some(project_id) = self.selected_project_id else {
             self.error = Some("Select a repository before creating a checkout.".into());
             return;
@@ -3556,7 +3637,7 @@ impl DesktopApp {
     }
 
     fn open_session_form(&mut self) {
-        self.inline_session_rename = None;
+        self.inline_navigator_rename = None;
         let Some(worktree_id) = self.selected_worktree_id else {
             self.error = Some("Select a checkout before starting a session.".into());
             return;
@@ -3570,46 +3651,43 @@ impl DesktopApp {
         self.modal_focus = ModalFocus::Pending;
     }
 
-    fn open_project_rename_form(&mut self) {
-        let Some(project) = self
-            .selected_project_id
-            .and_then(|id| self.snapshot.projects.iter().find(|item| item.id == id))
-        else {
-            self.error = Some("Select a repository to rename.".into());
-            return;
+    fn begin_selected_navigator_rename(&mut self) -> Task<Message> {
+        let target = match self.keyboard_panel {
+            DesktopPanel::Projects => self.selected_project_id.map(NavigatorNodeId::Repository),
+            DesktopPanel::Worktrees => self.selected_worktree_id.map(NavigatorNodeId::Checkout),
+            DesktopPanel::Sessions => self.selected_session_id.map(NavigatorNodeId::Session),
         };
-        self.modal = Some(Modal::Form(FormModal::new(Form::rename(
-            "Rename repository",
-            &project.name,
-            FormKind::RenameProject(project.id),
-        ))));
-        self.modal_focus = ModalFocus::Pending;
+        target.map_or_else(Task::none, |target| self.begin_navigator_rename(target))
     }
 
-    fn open_worktree_rename_form(&mut self) {
-        let Some(worktree) = self.selected_worktree() else {
-            self.error = Some("Select a checkout to rename.".into());
-            return;
+    fn begin_navigator_rename(&mut self, target: NavigatorNodeId) -> Task<Message> {
+        let value = match target {
+            NavigatorNodeId::Repository(id) => self
+                .snapshot
+                .projects
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.name.clone()),
+            NavigatorNodeId::Checkout(id) => self
+                .snapshot
+                .worktrees
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.name.clone()),
+            NavigatorNodeId::Session(id) => self.session(id).map(|item| item.display_name.clone()),
         };
-        self.modal = Some(Modal::Form(FormModal::new(Form::rename(
-            "Rename checkout",
-            &worktree.name,
-            FormKind::RenameWorktree(worktree.id),
-        ))));
-        self.modal_focus = ModalFocus::Pending;
-    }
-
-    fn begin_session_rename(&mut self, session_id: SessionId) -> Task<Message> {
-        let Some(session) = self.session(session_id) else {
-            self.error = Some("Select a session to rename.".into());
+        let Some(value) = value else {
+            self.error = Some("Select an item to rename.".into());
             return Task::none();
         };
-        let rename = InlineSessionRename::new(session.id, &session.display_name);
+        match target {
+            NavigatorNodeId::Repository(id) => self.select_project(id),
+            NavigatorNodeId::Checkout(id) => self.select_worktree(id),
+            NavigatorNodeId::Session(id) => self.select_session(id),
+        }
+        let rename = InlineNavigatorRename::new(target, &value);
         let input_id = rename.input_id.clone();
-        self.inline_session_rename = Some(rename);
-        self.select_session_context(session_id);
-        self.focused_explorer_node = Some(ExplorerNodeId::Session(session_id));
-        self.expand_selected_path();
+        self.inline_navigator_rename = Some(rename);
         self.narrow_main = false;
         self.terminal_focus = TerminalFocus::Unfocused;
         Task::batch([
@@ -3618,19 +3696,29 @@ impl DesktopApp {
         ])
     }
 
-    fn submit_session_rename(&mut self) {
-        let Some((session_id, name)) = self.inline_session_rename.as_mut().and_then(|rename| {
-            rename
-                .begin_submission()
-                .map(|name| (rename.session_id, name))
-        }) else {
+    fn submit_navigator_rename(&mut self) {
+        let Some((target, name)) = self
+            .inline_navigator_rename
+            .as_mut()
+            .and_then(|rename| rename.begin_submission().map(|name| (rename.target, name)))
+        else {
             return;
         };
-        if !self.bridge.request(
-            Operation::RenameSession,
-            ClientRequest::RenameSession { session_id, name },
-        ) && let Some(rename) = &mut self.inline_session_rename
-        {
+        let sent = match target {
+            NavigatorNodeId::Repository(project_id) => self.bridge.request(
+                Operation::RenameProject,
+                ClientRequest::RenameProject { project_id, name },
+            ),
+            NavigatorNodeId::Checkout(worktree_id) => self.bridge.request(
+                Operation::RenameWorktree,
+                ClientRequest::RenameWorktree { worktree_id, name },
+            ),
+            NavigatorNodeId::Session(session_id) => self.bridge.request(
+                Operation::RenameSession,
+                ClientRequest::RenameSession { session_id, name },
+            ),
+        };
+        if !sent && let Some(rename) = &mut self.inline_navigator_rename {
             rename.fail("The background service is busy. Try again.".into());
         }
     }
@@ -4161,6 +4249,7 @@ impl DesktopApp {
         self.open_sessions = state.open_session_ids.clone();
         self.main_tab = state.selected_main_tab;
         self.restore_window_size = Some((state.window_width, state.window_height));
+        self.keyboard_panel = state.compact_panel;
         self.desktop_state = state;
         for (index, split) in self.pane_splits.iter().copied().enumerate() {
             self.panes.resize(
@@ -4269,17 +4358,18 @@ impl DesktopApp {
         }
         let main_width = match self.presentation().layout {
             PresentationLayout::Wide => {
-                let width = u32::from(self.desktop_state.window_width);
-                let explorer =
-                    width.saturating_mul(u32::from(self.desktop_state.panel_ratios[0])) / 1000;
-                let remaining = width.saturating_sub(explorer);
+                let mut remaining = u32::from(self.desktop_state.window_width);
+                for ratio in self.desktop_state.panel_ratios {
+                    let pane = remaining.saturating_mul(u32::from(ratio)) / 1000;
+                    remaining = remaining.saturating_sub(pane);
+                }
                 u16::try_from(remaining).unwrap_or(u16::MAX)
             }
             PresentationLayout::Compact => self.desktop_state.window_width.saturating_sub(
-                if self.explorer_visibility == ExplorerVisibility::Collapsed {
-                    87
+                if self.navigator_visibility == NavigatorVisibility::Collapsed {
+                    42
                 } else {
-                    265
+                    305
                 },
             ),
             PresentationLayout::Narrow => self.desktop_state.window_width,
@@ -4292,10 +4382,7 @@ impl DesktopApp {
     }
 
     fn restore_selection(&mut self) {
-        retain_inline_session_rename(
-            &mut self.inline_session_rename,
-            self.snapshot.sessions.iter().map(|session| session.id),
-        );
+        retain_inline_navigator_rename(&mut self.inline_navigator_rename, &self.snapshot);
         let projects = self.visible_projects();
         self.selected_project_id = self
             .selected_project_id
@@ -4325,104 +4412,47 @@ impl DesktopApp {
         {
             self.active_session_id = self.open_sessions.last().copied();
         }
-        self.expanded_project_ids.retain(|project_id| {
-            self.snapshot
-                .projects
-                .iter()
-                .any(|project| project.id == *project_id)
-        });
-        self.expanded_worktree_ids.retain(|worktree_id| {
-            self.snapshot
-                .worktrees
-                .iter()
-                .any(|worktree| worktree.id == *worktree_id)
-        });
-        self.expand_selected_path();
-        let focus_exists = self.focused_explorer_node.is_some_and(|node| match node {
-            ExplorerNodeId::Repository(id) => {
-                self.snapshot.projects.iter().any(|item| item.id == id)
-            }
-            ExplorerNodeId::Checkout(id) => {
-                self.snapshot.worktrees.iter().any(|item| item.id == id)
-            }
-            ExplorerNodeId::Session(id) => self.snapshot.sessions.iter().any(|item| item.id == id),
-        });
-        if !focus_exists {
-            self.focused_explorer_node = self
-                .selected_session_id
-                .map(ExplorerNodeId::Session)
-                .or_else(|| self.selected_worktree_id.map(ExplorerNodeId::Checkout))
-                .or_else(|| self.selected_project_id.map(ExplorerNodeId::Repository));
-        }
     }
 
-    fn select_explorer_node(&mut self, node: ExplorerNodeId) {
+    fn select_project(&mut self, project_id: ProjectId) {
         self.unfocus_terminal();
-        self.inline_session_rename = None;
-        self.focused_explorer_node = Some(node);
-        match node {
-            ExplorerNodeId::Repository(project_id) => {
-                self.selected_project_id = Some(project_id);
-                self.selected_worktree_id = None;
-                self.selected_session_id = None;
-            }
-            ExplorerNodeId::Checkout(worktree_id) => {
-                self.selected_worktree_id = Some(worktree_id);
-                self.selected_project_id = self
-                    .snapshot
-                    .worktrees
-                    .iter()
-                    .find(|worktree| worktree.id == worktree_id)
-                    .map(|worktree| worktree.project_id);
-                self.selected_session_id = None;
-            }
-            ExplorerNodeId::Session(session_id) => self.select_session_context(session_id),
+        if self.selected_project_id == Some(project_id) {
+            self.keyboard_panel = DesktopPanel::Projects;
+            self.desktop_state.compact_panel = DesktopPanel::Projects;
+            return;
         }
+        self.inline_navigator_rename = None;
+        self.keyboard_panel = DesktopPanel::Projects;
+        self.desktop_state.compact_panel = DesktopPanel::Projects;
+        self.selected_project_id = Some(project_id);
+        self.selected_worktree_id = self.worktrees_for(project_id).first().map(|item| item.id);
+        self.selected_session_id = self
+            .selected_worktree_id
+            .and_then(|id| self.sessions_for(id).first().map(|item| item.id));
         self.diff = None;
         self.mark_state_dirty();
     }
 
-    fn toggle_explorer_node(&mut self, node: ExplorerNodeId) {
-        let expanded = match node {
-            ExplorerNodeId::Repository(project_id) => {
-                self.expanded_project_ids.contains(&project_id)
-            }
-            ExplorerNodeId::Checkout(worktree_id) => {
-                self.expanded_worktree_ids.contains(&worktree_id)
-            }
-            ExplorerNodeId::Session(_) => return,
-        };
-        self.set_explorer_expansion(node, !expanded);
-    }
-
-    fn set_explorer_expansion(&mut self, node: ExplorerNodeId, expanded: bool) {
-        self.select_explorer_node(node);
-        match node {
-            ExplorerNodeId::Repository(project_id) => {
-                if expanded {
-                    self.expanded_project_ids.insert(project_id);
-                } else {
-                    self.expanded_project_ids.remove(&project_id);
-                }
-            }
-            ExplorerNodeId::Checkout(worktree_id) => {
-                if expanded {
-                    self.expanded_worktree_ids.insert(worktree_id);
-                } else {
-                    self.expanded_worktree_ids.remove(&worktree_id);
-                }
-            }
-            ExplorerNodeId::Session(_) => {}
+    fn select_worktree(&mut self, worktree_id: WorktreeId) {
+        self.unfocus_terminal();
+        if self.selected_worktree_id == Some(worktree_id) {
+            self.keyboard_panel = DesktopPanel::Worktrees;
+            self.desktop_state.compact_panel = DesktopPanel::Worktrees;
+            return;
         }
-    }
-
-    fn open_explorer_node(&mut self, node: ExplorerNodeId) {
-        match node {
-            ExplorerNodeId::Session(session_id) => self.select_session(session_id),
-            ExplorerNodeId::Repository(_) | ExplorerNodeId::Checkout(_) => {
-                self.toggle_explorer_node(node);
-            }
-        }
+        self.inline_navigator_rename = None;
+        self.keyboard_panel = DesktopPanel::Worktrees;
+        self.desktop_state.compact_panel = DesktopPanel::Worktrees;
+        self.selected_worktree_id = Some(worktree_id);
+        self.selected_project_id = self
+            .snapshot
+            .worktrees
+            .iter()
+            .find(|item| item.id == worktree_id)
+            .map(|item| item.project_id);
+        self.selected_session_id = self.sessions_for(worktree_id).first().map(|item| item.id);
+        self.diff = None;
+        self.mark_state_dirty();
     }
 
     fn select_session(&mut self, session_id: SessionId) {
@@ -4430,20 +4460,20 @@ impl DesktopApp {
         if self.selected_session_id == Some(session_id)
             && self.active_session_id == Some(session_id)
         {
-            self.focused_explorer_node = Some(ExplorerNodeId::Session(session_id));
-            self.expand_selected_path();
+            self.keyboard_panel = DesktopPanel::Sessions;
+            self.desktop_state.compact_panel = DesktopPanel::Sessions;
             return;
         }
         if self
-            .inline_session_rename
+            .inline_navigator_rename
             .as_ref()
-            .is_some_and(|rename| rename.session_id != session_id)
+            .is_some_and(|rename| rename.target != NavigatorNodeId::Session(session_id))
         {
-            self.inline_session_rename = None;
+            self.inline_navigator_rename = None;
         }
         self.select_session_context(session_id);
-        self.focused_explorer_node = Some(ExplorerNodeId::Session(session_id));
-        self.expand_selected_path();
+        self.keyboard_panel = DesktopPanel::Sessions;
+        self.desktop_state.compact_panel = DesktopPanel::Sessions;
         self.active_session_id = Some(session_id);
         if !self.open_sessions.contains(&session_id) {
             if self.open_sessions.len() == MAX_OPEN_DESKTOP_SESSIONS {
@@ -4467,15 +4497,6 @@ impl DesktopApp {
                 .iter()
                 .find(|worktree| worktree.id == worktree_id)
                 .map(|worktree| worktree.project_id);
-        }
-    }
-
-    fn expand_selected_path(&mut self) {
-        if let Some(project_id) = self.selected_project_id {
-            self.expanded_project_ids.insert(project_id);
-        }
-        if let Some(worktree_id) = self.selected_worktree_id {
-            self.expanded_worktree_ids.insert(worktree_id);
         }
     }
 
@@ -4557,6 +4578,25 @@ fn subscription(_: &DesktopApp) -> Subscription<Message> {
 
 fn optional_number<T: ToString>(value: Option<T>, fallback: &str) -> String {
     value.map_or_else(|| fallback.to_owned(), |value| value.to_string())
+}
+
+fn next_selection<T: Copy + PartialEq>(
+    items: &[T],
+    selected: Option<T>,
+    direction: i8,
+) -> Option<T> {
+    if items.is_empty() {
+        return None;
+    }
+    let current = selected
+        .and_then(|selected| items.iter().position(|item| *item == selected))
+        .unwrap_or_default();
+    let next = if direction < 0 {
+        current.checked_sub(1).unwrap_or(items.len() - 1)
+    } else {
+        (current + 1) % items.len()
+    };
+    items.get(next).copied()
 }
 
 fn human_readable_timestamp(timestamp_millis: i64) -> Option<String> {
@@ -4693,15 +4733,6 @@ fn session_resume_label(
     }
 }
 
-const fn fullscreen_label(mode: window::Mode, compact: bool) -> &'static str {
-    match (mode, compact) {
-        (window::Mode::Fullscreen, true) => "Window",
-        (window::Mode::Fullscreen, false) => "Exit full screen",
-        (_, true) => "Full",
-        (_, false) => "Full screen",
-    }
-}
-
 const fn terminal_clipboard_shortcut() -> &'static str {
     if cfg!(target_os = "macos") {
         "⌘C / ⌘V"
@@ -4728,6 +4759,55 @@ fn panel<'a>(content: impl Into<Element<'a, Message>>, _width: f32) -> Element<'
         .into()
 }
 
+fn navigator_heading(
+    title: &'static str,
+    action: Option<(LineIcon, Message)>,
+    density: DensityMetrics,
+) -> Element<'static, Message> {
+    let mut title_row =
+        row![text(title).font(UI_SEMIBOLD).size(15), space::horizontal(),].align_y(Center);
+    if let Some((icon, message)) = action {
+        title_row = title_row.push(
+            button(line_icon(icon, 16))
+                .on_press(message)
+                .width(density.control_height)
+                .height(density.control_height)
+                .padding(7)
+                .style(borderless_icon_style),
+        );
+    }
+    container(title_row)
+        .height(density.panel_header_height)
+        .padding([5, 7])
+        .width(Fill)
+        .align_y(Vertical::Center)
+        .into()
+}
+
+fn compact_panel_button(
+    label: &'static str,
+    panel: DesktopPanel,
+    active: DesktopPanel,
+    density: DensityMetrics,
+) -> Element<'static, Message> {
+    button(centered_button_label(label, UI_META_SIZE, UI_MEDIUM))
+        .on_press(Message::SelectCompactPanel(panel))
+        .height(density.control_height)
+        .padding([5, 8])
+        .style(move |theme, status| content_tab_style(theme, status, panel == active))
+        .into()
+}
+
+fn icon_text_label(
+    icon: LineIcon,
+    label: &'static str,
+    size: f32,
+) -> iced::widget::Row<'static, Message> {
+    row![line_icon(icon, 14), text(label).font(UI_MEDIUM).size(size)]
+        .spacing(5)
+        .align_y(Center)
+}
+
 const fn worktree_can_delete(worktree: &Worktree) -> bool {
     checkout_delete_available(worktree.is_root_checkout, worktree.status)
 }
@@ -4736,43 +4816,19 @@ const fn checkout_delete_available(is_root_checkout: bool, status: WorktreeStatu
     !is_root_checkout && matches!(status, WorktreeStatus::Active)
 }
 
-const fn explorer_attention_icon(attention: ExplorerAttention) -> LineIcon {
+const fn navigator_attention_icon(attention: NavigatorAttention) -> LineIcon {
     match attention {
-        ExplorerAttention::Finished => LineIcon::Finished,
-        ExplorerAttention::NeedsFeedback => LineIcon::NeedsFeedback,
-        ExplorerAttention::Failed => LineIcon::Failed,
+        NavigatorAttention::Finished => LineIcon::Finished,
+        NavigatorAttention::NeedsFeedback => LineIcon::NeedsFeedback,
+        NavigatorAttention::Failed => LineIcon::Failed,
     }
 }
 
-const fn explorer_attention_label(attention: ExplorerAttention) -> &'static str {
+const fn navigator_attention_label(attention: NavigatorAttention) -> &'static str {
     match attention {
-        ExplorerAttention::Finished => "Finished unseen",
-        ExplorerAttention::NeedsFeedback => "Needs feedback",
-        ExplorerAttention::Failed => "Failed",
-    }
-}
-
-const fn session_indicator_icon(indicator: SessionIndicator) -> LineIcon {
-    match indicator {
-        SessionIndicator::Ready => LineIcon::Ready,
-        SessionIndicator::Working => LineIcon::Working,
-        SessionIndicator::NeedsFeedback => LineIcon::NeedsFeedback,
-        SessionIndicator::Finished => LineIcon::Finished,
-        SessionIndicator::Failed => LineIcon::Failed,
-        SessionIndicator::Stopped => LineIcon::Stopped,
-        SessionIndicator::Disconnected => LineIcon::Disconnected,
-    }
-}
-
-const fn explorer_action_label(action: ExplorerAction) -> &'static str {
-    match action {
-        ExplorerAction::CreateCheckout(_) => "New checkout",
-        ExplorerAction::RenameRepository(_)
-        | ExplorerAction::RenameCheckout(_)
-        | ExplorerAction::RenameSession(_) => "Rename",
-        ExplorerAction::CreateSession(_) => "Start session",
-        ExplorerAction::DeleteCheckout(_) => DELETE_CHECKOUT_LABEL,
-        ExplorerAction::OpenSession(_) => "Open",
+        NavigatorAttention::Finished => "Finished unseen",
+        NavigatorAttention::NeedsFeedback => "Needs feedback",
+        NavigatorAttention::Failed => "Failed",
     }
 }
 
@@ -4784,10 +4840,12 @@ fn tab_button(
 ) -> Element<'_, Message> {
     let selected = tab == active;
     button(
-        text(label)
-            .font(if selected { UI_SEMIBOLD } else { UI_FONT })
-            .size(UI_TEXT_SIZE)
-            .wrapping(text::Wrapping::None),
+        centered_button_label(
+            label.to_owned(),
+            UI_TEXT_SIZE,
+            if selected { UI_SEMIBOLD } else { UI_FONT },
+        )
+        .wrapping(text::Wrapping::None),
     )
     .on_press(Message::SelectMainTab(tab))
     .height(density.control_height)
@@ -5053,7 +5111,9 @@ fn centered_action(
     container(
         column![
             text(message).style(text::secondary),
-            button(label).on_press(action).style(primary_action_style),
+            button(centered_button_label(label, UI_TEXT_SIZE, UI_MEDIUM))
+                .on_press(action)
+                .style(primary_action_style),
         ]
         .spacing(12)
         .align_x(Center),
@@ -5072,7 +5132,9 @@ fn empty_action(
     container(
         column![
             text(message).size(UI_META_SIZE).style(text::secondary),
-            button(label).on_press(action).style(chrome_action_style),
+            button(centered_button_label(label, UI_META_SIZE, UI_MEDIUM))
+                .on_press(action)
+                .style(chrome_action_style),
         ]
         .spacing(8),
     )
@@ -5081,19 +5143,92 @@ fn empty_action(
     .into()
 }
 
+fn empty_hint(message: &str) -> Element<'_, Message> {
+    container(text(message).size(UI_META_SIZE).style(text::secondary))
+        .padding(8)
+        .width(Fill)
+        .into()
+}
+
+fn centered_button_label(label: impl Into<String>, size: f32, font: Font) -> widget::Text<'static> {
+    text(label.into())
+        .font(font)
+        .size(size)
+        .height(Fill)
+        .align_x(Center)
+        .align_y(Vertical::Center)
+}
+
+fn application_version_text() -> String {
+    format_application_version(
+        option_env!("PREVIEW_TAG"),
+        option_env!("RELEASE_TAG"),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn format_application_version(
+    preview_tag: Option<&str>,
+    release_tag: Option<&str>,
+    package_version: &str,
+) -> String {
+    let version = preview_tag.or(release_tag).unwrap_or(package_version);
+    if version.starts_with('v') {
+        format!("SylvOps {version}")
+    } else {
+        format!("SylvOps v{version}")
+    }
+}
+
+const fn main_tab_label(tab: MainTab) -> &'static str {
+    match tab {
+        MainTab::Terminal => "Terminal",
+        MainTab::Changes => "Changes",
+        MainTab::Details => "Details",
+    }
+}
+
 fn footer_item(label: &str) -> Element<'static, Message> {
     text(label.to_owned())
         .font(UI_FONT)
         .size(FOOTER_TEXT_SIZE)
         .style(text::secondary)
+        .wrapping(text::Wrapping::None)
         .into()
 }
 
-fn footer_separator() -> Element<'static, Message> {
-    text("/")
+fn footer_context(label: &'static str, value: &str) -> Element<'static, Message> {
+    text(format!("{label}: {value}"))
+        .font(UI_MEDIUM)
         .size(FOOTER_TEXT_SIZE)
-        .style(text::secondary)
+        .wrapping(text::Wrapping::None)
         .into()
+}
+
+fn footer_connection(connection: ConnectionState) -> Element<'static, Message> {
+    let (icon, label) = match connection {
+        ConnectionState::Connecting => (LineIcon::Working, "Connecting"),
+        ConnectionState::Connected => (LineIcon::Finished, "Connected"),
+        ConnectionState::Disconnected => (LineIcon::Disconnected, "Offline"),
+    };
+    container(
+        row![
+            line_icon(icon, 12),
+            text(label)
+                .font(UI_MEDIUM)
+                .size(FOOTER_TEXT_SIZE)
+                .wrapping(text::Wrapping::None),
+        ]
+        .spacing(4)
+        .align_y(Center),
+    )
+    .padding([3, 7])
+    .style(move |theme| footer_connection_style(theme, connection))
+    .into()
+}
+
+fn footer_separator() -> Element<'static, Message> {
+    container(rule::vertical(1)).height(16).into()
 }
 
 fn chrome_surface(theme: &Theme) -> container::Style {
@@ -5223,7 +5358,7 @@ fn iced_button_tokens(theme: &Theme) -> ButtonTokens {
         border: theme::rgb(palette.background.strong.color),
         border_strong: theme::rgb(palette.background.stronger.color),
         text: theme::rgb(palette.background.base.text),
-        text_muted: theme::rgb(palette.secondary.base.text),
+        text_muted: theme::rgb(palette.secondary.base.color),
         interaction: theme::rgb(palette.primary.base.color),
         interaction_text: theme::rgb(palette.primary.base.text),
         danger: theme::rgb(palette.danger.base.color),
@@ -5250,6 +5385,15 @@ fn button_visual_style(visual: presentation::ButtonVisual, status: Status) -> bu
 
 fn chrome_action_style(theme: &Theme, status: Status) -> button::Style {
     iced_button_intent_style(theme, ButtonIntent::Secondary, status)
+}
+
+fn borderless_icon_style(theme: &Theme, status: Status) -> button::Style {
+    let mut style = iced_button_intent_style(theme, ButtonIntent::Quiet, status);
+    style.border.width = 0.0;
+    if matches!(status, Status::Active | Status::Disabled) {
+        style.background = None;
+    }
+    style
 }
 
 fn primary_action_style(theme: &Theme, status: Status) -> button::Style {
@@ -5320,7 +5464,7 @@ fn workspace_tab_style(theme: &Theme, status: Status, active: bool) -> button::S
 fn list_item_style(theme: &Theme, status: Status, selected: bool) -> button::Style {
     let palette = theme.extended_palette();
     let pair = if selected {
-        palette.primary.weak
+        palette.background.weak
     } else {
         match status {
             Status::Hovered => palette.background.weak,
@@ -5362,6 +5506,43 @@ fn list_item_container_style(theme: &Theme, selected: bool, hovered: bool) -> co
         background: style.background,
         text_color: Some(style.text_color),
         border: style.border,
+        ..container::Style::default()
+    }
+}
+
+fn navigator_row_container_style(theme: &Theme, selected: bool, hovered: bool) -> container::Style {
+    list_item_container_style(theme, selected, hovered)
+}
+
+fn navigator_badge_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.weak.color)),
+        text_color: Some(palette.background.weak.text),
+        border: Border {
+            width: 1.0,
+            radius: 4.0.into(),
+            color: palette.background.strong.color,
+        },
+        ..container::Style::default()
+    }
+}
+
+fn footer_connection_style(theme: &Theme, connection: ConnectionState) -> container::Style {
+    let palette = theme.extended_palette();
+    let (pair, border) = match connection {
+        ConnectionState::Connecting => (palette.warning.weak, palette.warning.strong.color),
+        ConnectionState::Connected => (palette.success.weak, palette.success.strong.color),
+        ConnectionState::Disconnected => (palette.danger.weak, palette.danger.strong.color),
+    };
+    container::Style {
+        background: Some(Background::Color(pair.color)),
+        text_color: Some(contrast_safe_text(pair.color, pair.text)),
+        border: Border {
+            width: 1.0,
+            radius: 5.0.into(),
+            color: border,
+        },
         ..container::Style::default()
     }
 }
@@ -5574,20 +5755,25 @@ fn session_tab_label(name: &str) -> String {
     name.to_owned()
 }
 
-fn cancel_inline_session_rename(rename: &mut Option<InlineSessionRename>) {
+fn cancel_inline_navigator_rename(rename: &mut Option<InlineNavigatorRename>) {
     if rename.as_ref().is_some_and(|rename| !rename.pending) {
         *rename = None;
     }
 }
 
-fn retain_inline_session_rename(
-    rename: &mut Option<InlineSessionRename>,
-    session_ids: impl IntoIterator<Item = SessionId>,
+fn retain_inline_navigator_rename(
+    rename: &mut Option<InlineNavigatorRename>,
+    snapshot: &DaemonSnapshot,
 ) {
-    let Some(session_id) = rename.as_ref().map(|rename| rename.session_id) else {
+    let Some(target) = rename.as_ref().map(|rename| rename.target) else {
         return;
     };
-    if !session_ids.into_iter().any(|id| id == session_id) {
+    let exists = match target {
+        NavigatorNodeId::Repository(id) => snapshot.projects.iter().any(|item| item.id == id),
+        NavigatorNodeId::Checkout(id) => snapshot.worktrees.iter().any(|item| item.id == id),
+        NavigatorNodeId::Session(id) => snapshot.sessions.iter().any(|item| item.id == id),
+    };
+    if !exists {
         *rename = None;
     }
 }
@@ -5725,8 +5911,8 @@ mod tests {
         app.selected_session_id = Some(first_id);
         app.active_session_id = Some(first_id);
         app.open_sessions.push(first_id);
-        app.expand_selected_path();
-        app.focused_explorer_node = Some(ExplorerNodeId::Session(first_id));
+        app.keyboard_panel = DesktopPanel::Sessions;
+        app.desktop_state.compact_panel = DesktopPanel::Sessions;
         app.connection = ConnectionState::Connected;
         app.desktop_state.theme = DesktopTheme::Canopy;
         (app, project_id, worktree_id, first_id, second_id)
@@ -5743,33 +5929,33 @@ mod tests {
 
     #[cfg(windows)]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        7_107_229_671_282_305_294,
-        13_160_029_486_440_365_148,
-        12_595_225_999_725_143_477,
-        10_690_701_397_139_567_330,
-        17_172_813_117_231_753_177,
-        15_622_382_180_314_406_653,
-        17_977_078_488_199_035_880,
+        6_984_639_791_195_575_364,
+        15_224_806_857_697_282_047,
+        16_392_266_689_671_405_100,
+        10_448_167_447_137_816_396,
+        1_071_659_710_684_271_305,
+        6_252_492_281_865_111_872,
+        8_044_612_287_909_611_382,
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        12_016_516_532_157_958_497,
-        10_938_616_273_572_432_211,
-        13_458_278_289_795_482_825,
-        14_093_829_066_763_877_856,
-        3_626_425_705_574_108_520,
-        45_188_728_839_142_635,
-        9_942_103_752_259_472_644,
+        6_984_639_791_195_575_364,
+        15_224_806_857_697_282_047,
+        16_392_266_689_671_405_100,
+        10_448_167_447_137_816_396,
+        1_071_659_710_684_271_305,
+        6_252_492_281_865_111_872,
+        8_044_612_287_909_611_382,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        10_802_420_735_386_369_826,
-        2_034_064_434_892_050_200,
-        15_635_314_370_791_741_553,
-        11_588_738_413_117_789_024,
-        17_079_586_721_189_910_918,
-        2_991_030_526_025_802_914,
-        4_597_883_597_611_191_495,
+        6_984_639_791_195_575_364,
+        15_224_806_857_697_282_047,
+        16_392_266_689_671_405_100,
+        10_448_167_447_137_816_396,
+        1_071_659_710_684_271_305,
+        6_252_492_281_865_111_872,
+        8_044_612_287_909_611_382,
     ];
 
     async fn render_desktop_baseline(
@@ -5777,6 +5963,7 @@ mod tests {
         width: u16,
         height: u16,
     ) -> RenderedBaseline {
+        load_bundled_ui_fonts_for_rendering();
         let mut renderer =
             <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
                 .await
@@ -5903,27 +6090,24 @@ mod tests {
     }
 
     #[test]
-    fn explorer_selection_does_not_change_active_session_until_opened() {
+    fn single_clicking_a_session_selects_and_opens_it() {
         let (mut app, _, _, first_id, second_id) = desktop_hierarchy();
 
-        app.select_explorer_node(ExplorerNodeId::Session(second_id));
+        app.select_session(second_id);
         assert_eq!(app.selected_session_id, Some(second_id));
-        assert_eq!(app.active_session_id, Some(first_id));
-        assert_eq!(app.open_sessions, vec![first_id]);
+        assert_eq!(app.active_session_id, Some(second_id));
+        assert!(app.open_sessions.contains(&first_id));
+        assert!(app.open_sessions.contains(&second_id));
 
         app.select_main_tab(MainTab::Changes);
-        assert_eq!(app.active_session_id, Some(first_id));
-
-        app.open_explorer_node(ExplorerNodeId::Session(second_id));
         assert_eq!(app.active_session_id, Some(second_id));
-        assert!(app.open_sessions.contains(&second_id));
     }
 
     #[test]
-    fn explorer_context_actions_are_available_from_keyboard_selection() {
+    fn navigator_context_actions_are_available_from_keyboard_selection() {
         let (mut app, project_id, worktree_id, _, second_id) = desktop_hierarchy();
 
-        app.focused_explorer_node = Some(ExplorerNodeId::Repository(project_id));
+        app.keyboard_panel = DesktopPanel::Worktrees;
         app.shortcut_new();
         assert!(matches!(
             app.modal,
@@ -5937,26 +6121,43 @@ mod tests {
         ));
 
         app.modal = None;
-        app.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
+        app.select_worktree(worktree_id);
+        app.keyboard_panel = DesktopPanel::Worktrees;
         app.shortcut_rename();
-        assert!(matches!(
-            app.modal,
-            Some(Modal::Form(FormModal {
-                form: Form {
-                    kind: FormKind::RenameWorktree(id),
-                    ..
-                },
-                ..
-            })) if id == worktree_id
-        ));
+        assert_eq!(
+            app.inline_navigator_rename
+                .as_ref()
+                .map(|rename| rename.target),
+            Some(NavigatorNodeId::Checkout(worktree_id))
+        );
 
-        app.modal = None;
-        app.focused_explorer_node = Some(ExplorerNodeId::Session(second_id));
+        app.inline_navigator_rename = None;
+        app.select_session(second_id);
+        app.keyboard_panel = DesktopPanel::Sessions;
         app.shortcut_delete();
         assert!(matches!(
             app.modal,
             Some(Modal::Confirmation(Confirmation::StopSession { .. }))
         ));
+    }
+
+    #[test]
+    fn every_navigator_level_supports_inline_rename() {
+        let (mut app, project_id, worktree_id, session_id, _) = desktop_hierarchy();
+        for target in [
+            NavigatorNodeId::Repository(project_id),
+            NavigatorNodeId::Checkout(worktree_id),
+            NavigatorNodeId::Session(session_id),
+        ] {
+            let _ = app.begin_navigator_rename(target);
+            assert_eq!(
+                app.inline_navigator_rename
+                    .as_ref()
+                    .map(|rename| rename.target),
+                Some(target)
+            );
+            app.inline_navigator_rename = None;
+        }
     }
 
     #[tokio::test]
@@ -6014,7 +6215,7 @@ mod tests {
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [127, 129, 89, 183, 239, 110, 149]
+            [155, 110, 76, 161, 217, 146, 130]
         );
         let baselines = [
             &canopy_attention,
@@ -6249,6 +6450,24 @@ mod tests {
     }
 
     #[test]
+    fn selected_navigator_rows_use_a_subtle_surface_fill() {
+        for choice in DesktopTheme::ALL {
+            let theme = theme::resolve(PresentationTheme::resolve(choice, SystemAppearance::Dark));
+            let style = list_item_style(&theme, Status::Active, true);
+            assert_eq!(
+                style.background,
+                Some(Background::Color(
+                    theme.extended_palette().background.weak.color
+                ))
+            );
+            let Some(Background::Color(background)) = style.background else {
+                unreachable!();
+            };
+            assert!(background.relative_contrast(style.text_color) >= 4.5);
+        }
+    }
+
+    #[test]
     fn custom_button_styles_remain_readable_and_have_distinct_hover_states() {
         let choices = [
             ("grove", DesktopTheme::Grove, iced::theme::Mode::Light),
@@ -6349,6 +6568,62 @@ mod tests {
     }
 
     #[test]
+    fn add_controls_are_borderless_and_workspace_add_has_ten_pixel_gap() {
+        let theme = theme::resolve(PresentationTheme::resolve(
+            DesktopTheme::Canopy,
+            SystemAppearance::Dark,
+        ));
+        for status in [
+            Status::Active,
+            Status::Hovered,
+            Status::Pressed,
+            Status::Disabled,
+        ] {
+            assert!(borderless_icon_style(&theme, status).border.width.abs() < f32::EPSILON);
+        }
+        assert!(
+            borderless_icon_style(&theme, Status::Active)
+                .background
+                .is_none()
+        );
+        assert!(
+            borderless_icon_style(&theme, Status::Hovered)
+                .background
+                .is_some()
+        );
+        assert!(
+            borderless_icon_style(&theme, Status::Pressed)
+                .background
+                .is_some()
+        );
+
+        let source = include_str!("lib.rs");
+        assert!(source.matches(".style(borderless_icon_style)").count() >= 3);
+        assert!(source.matches("space::horizontal().width(10)").count() >= 2);
+    }
+
+    #[test]
+    fn settings_are_centered_and_bounded_at_every_breakpoint() {
+        let source = include_str!("lib.rs");
+        let view = source
+            .split_once("    fn view(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn top_bar(&self)"))
+            .map(|(body, _)| body)
+            .expect("desktop view source");
+        let settings = source
+            .split_once("    fn settings_view(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn appearance_theme_gallery"))
+            .map(|(body, _)| body)
+            .expect("settings view source");
+        assert!(view.contains(".center_x(Fill)"));
+        assert!(view.contains(".center_y(Fill)"));
+        assert!(view.contains(".padding(16)"));
+        assert!(settings.contains(".max_width(640)"));
+        assert!(settings.contains("scrollable("));
+        assert!(!include_str!("presentation.rs").contains("SettingsMode"));
+    }
+
+    #[test]
     fn iced_button_intents_match_the_presentation_contract() {
         for choice in DesktopTheme::ALL {
             let presentation =
@@ -6382,9 +6657,10 @@ mod tests {
     }
 
     #[test]
-    fn inline_session_rename_retains_input_and_errors_until_resolved() {
+    fn inline_navigator_rename_retains_input_and_errors_until_resolved() {
         let session_id = SessionId::new();
-        let mut rename = InlineSessionRename::new(session_id, "Old name");
+        let mut rename =
+            InlineNavigatorRename::new(NavigatorNodeId::Session(session_id), "Old name");
         rename.update("  New name  ".into());
 
         assert_eq!(rename.begin_submission().as_deref(), Some("New name"));
@@ -6397,16 +6673,17 @@ mod tests {
     }
 
     #[test]
-    fn inline_session_rename_cancels_only_before_submission() {
+    fn inline_navigator_rename_cancels_only_before_submission() {
         let session_id = SessionId::new();
-        let mut rename = Some(InlineSessionRename::new(session_id, "Name"));
-        cancel_inline_session_rename(&mut rename);
+        let target = NavigatorNodeId::Session(session_id);
+        let mut rename = Some(InlineNavigatorRename::new(target, "Name"));
+        cancel_inline_navigator_rename(&mut rename);
         assert!(rename.is_none());
 
-        let mut pending = InlineSessionRename::new(session_id, "Name");
+        let mut pending = InlineNavigatorRename::new(target, "Name");
         assert_eq!(pending.begin_submission().as_deref(), Some("Name"));
         let mut rename = Some(pending);
-        cancel_inline_session_rename(&mut rename);
+        cancel_inline_navigator_rename(&mut rename);
         assert!(
             rename.is_some(),
             "an in-flight rename cannot be cancelled locally"
@@ -6414,13 +6691,16 @@ mod tests {
     }
 
     #[test]
-    fn stale_inline_session_rename_is_discarded_after_refresh() {
-        let session_id = SessionId::new();
-        let mut rename = Some(InlineSessionRename::new(session_id, "Name"));
-        retain_inline_session_rename(&mut rename, [session_id]);
+    fn stale_inline_navigator_rename_is_discarded_after_refresh() {
+        let (app, project_id, _, _, _) = desktop_hierarchy();
+        let mut rename = Some(InlineNavigatorRename::new(
+            NavigatorNodeId::Repository(project_id),
+            "Name",
+        ));
+        retain_inline_navigator_rename(&mut rename, &app.snapshot);
         assert!(rename.is_some());
 
-        retain_inline_session_rename(&mut rename, [SessionId::new()]);
+        retain_inline_navigator_rename(&mut rename, &DaemonSnapshot::default());
         assert!(rename.is_none());
     }
 
@@ -6429,6 +6709,58 @@ mod tests {
         const {
             assert!(FOOTER_TEXT_SIZE >= 12.0);
         }
+        assert!(application_version_text().starts_with("SylvOps v"));
+        assert_eq!(
+            format_application_version(Some("v0.1.0-preview.2"), None, "0.1.0"),
+            "SylvOps v0.1.0-preview.2"
+        );
+        let source = include_str!("lib.rs");
+        let footer = source
+            .split_once("    fn footer(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn process_bridge_events"))
+            .map(|(body, _)| body)
+            .expect("footer source");
+        assert!(footer.matches("footer_context(").count() >= 5);
+        assert!(footer.contains("scrollable(status)"));
+        assert!(footer.contains("scrollable::Direction::Horizontal"));
+        assert!(!footer.contains("Length::Fixed"));
+        assert!(footer.contains("Wrapping::None"));
+    }
+
+    #[test]
+    fn navigator_headers_explain_the_three_step_sequence() {
+        let source = include_str!("lib.rs");
+        let navigator = source
+            .split_once("    fn repositories_column(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn compact_navigator(&self)"))
+            .map(|(body, _)| body)
+            .expect("navigator column source");
+        assert!(navigator.contains("\"Repositories\""));
+        assert!(navigator.contains("\"Checkouts\""));
+        assert!(navigator.contains("\"Sessions\""));
+        assert!(!navigator.contains("Choose a codebase"));
+        assert!(!navigator.contains("Choose a branch checkout"));
+        assert!(!navigator.contains("Choose or start work"));
+        assert!(!navigator.contains("1  Repositories"));
+        assert!(!navigator.contains("2  Checkouts"));
+        assert!(!navigator.contains("3  Sessions"));
+        assert!(!navigator.contains("navigator_actions"));
+        assert!(!navigator.contains("session_indicator_icon"));
+        assert!(source.contains("text(format!(\"· {}\", row.detail))"));
+    }
+
+    #[test]
+    fn bundled_ui_font_has_all_required_weights() {
+        assert_eq!(UI_FONT.family, font::Family::Name("JetBrains Mono"));
+        for bytes in [
+            JETBRAINS_MONO_REGULAR,
+            JETBRAINS_MONO_MEDIUM,
+            JETBRAINS_MONO_SEMIBOLD,
+        ] {
+            assert!(bytes.len() > 200_000);
+            assert_eq!(&bytes[..4], &[0, 1, 0, 0]);
+        }
+        assert_ne!(terminal_font(DesktopTerminalFont::System), UI_FONT);
     }
 
     #[test]
