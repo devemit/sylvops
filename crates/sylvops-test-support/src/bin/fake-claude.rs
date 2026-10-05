@@ -45,21 +45,32 @@ fn run() -> io::Result<()> {
             "managed settings contract is invalid",
         ));
     }
-    let external_id = format!(
-        "fake-claude-{}",
-        env::var("SYLVOPS_SESSION_ID").unwrap_or_else(|_| "session".into())
+    let resumed_id = argument_value(&arguments, "--resume");
+    let mut external_id = resumed_id.map_or_else(
+        || {
+            format!(
+                "fake-claude-{}",
+                env::var("SYLVOPS_SESSION_ID").unwrap_or_else(|_| "session".into())
+            )
+        },
+        str::to_owned,
     );
+    let session_start_source = if resumed_id.is_some() {
+        "resume"
+    } else {
+        "startup"
+    };
     match fixture("session-start", "immediate").as_str() {
         "late" => {
             emit_hook("UserPromptSubmit", &external_id)?;
             let late_id = external_id.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(18));
-                let _ = emit_hook("SessionStart", &late_id);
+                let _ = emit_session_start(&late_id, "startup");
             });
         }
         "none" => {}
-        _ => emit_hook("SessionStart", &external_id)?,
+        _ => emit_session_start(&external_id, session_start_source)?,
     }
     println!("FAKE_CLAUDE_READY={external_id}");
     io::stdout().flush()?;
@@ -67,6 +78,31 @@ fn run() -> io::Result<()> {
     for line in io::stdin().lock().lines() {
         let line = line?;
         match line.trim() {
+            "session-start" => {
+                emit_session_start(&external_id, "startup")?;
+                println!("FAKE_CLAUDE_SESSION_START");
+            }
+            "clear-conversation" => {
+                let replacement = format!("{external_id}-cleared");
+                emit_session_start(&replacement, "clear")?;
+                external_id = replacement;
+                println!("FAKE_CLAUDE_CLEAR");
+            }
+            "resume-conversation" => {
+                let replacement = format!("{external_id}-resumed");
+                emit_session_start(&replacement, "resume")?;
+                external_id = replacement;
+                println!("FAKE_CLAUDE_RESUME_TRANSITION");
+            }
+            "unexpected-id-change" => {
+                let replacement = format!("{external_id}-unexpected");
+                let disposition = if emit_session_start(&replacement, "compact").is_ok() {
+                    "accepted"
+                } else {
+                    "refused"
+                };
+                println!("FAKE_CLAUDE_ID_CHANGE={disposition}");
+            }
             "permission" => {
                 emit_hook("PermissionRequest", &external_id)?;
                 println!("FAKE_CLAUDE_PERMISSION");
@@ -248,6 +284,18 @@ fn emit_hook(event: &str, external_id: &str) -> io::Result<()> {
             "hook_event_name": event,
             "session_id": external_id,
             "source": "startup",
+            "cwd": env::current_dir()?.to_string_lossy()
+        }),
+        None,
+    )
+}
+
+fn emit_session_start(external_id: &str, source: &str) -> io::Result<()> {
+    emit_hook_payload(
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": external_id,
+            "source": source,
             "cwd": env::current_dir()?.to_string_lossy()
         }),
         None,

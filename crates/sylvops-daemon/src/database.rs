@@ -17,6 +17,7 @@ use sylvops_core::domain::{
     WorktreeStatus,
 };
 use sylvops_core::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
+use sylvops_core::status::{ConversationIdentityTransition, ProviderConversationId};
 use sylvops_core::ui::{DesktopState, TuiState};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -161,7 +162,7 @@ enum DatabaseCommand {
     UpdateSessionStatus {
         id: SessionId,
         state: SessionState,
-        external_session_id: Option<String>,
+        conversation_identity: Option<VerifiedConversationIdentityUpdate>,
         reply: oneshot::Sender<Result<(u64, Session)>>,
     },
     MarkSessionLifecycleMissing {
@@ -207,6 +208,27 @@ pub struct NewSession {
     pub cwd: String,
     pub external_session_id: Option<String>,
     pub resumed_from_session_id: Option<SessionId>,
+}
+
+/// One verified provider identity update and its optional documented transition.
+#[derive(Clone, Debug)]
+pub struct VerifiedConversationIdentityUpdate {
+    external_session_id: ProviderConversationId,
+    transition: Option<ConversationIdentityTransition>,
+}
+
+impl VerifiedConversationIdentityUpdate {
+    /// Couples a verified identifier with the transition that authorizes its persistence.
+    #[must_use]
+    pub fn new(
+        external_session_id: ProviderConversationId,
+        transition: Option<ConversationIdentityTransition>,
+    ) -> Self {
+        Self {
+            external_session_id,
+            transition,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -577,13 +599,13 @@ impl DatabaseHandle {
         &self,
         id: SessionId,
         state: SessionState,
-        external_session_id: Option<String>,
+        conversation_identity: Option<VerifiedConversationIdentityUpdate>,
     ) -> Result<(u64, Session)> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::UpdateSessionStatus {
                 id,
                 state,
-                external_session_id,
+                conversation_identity,
                 reply,
             }
         })
@@ -863,14 +885,14 @@ fn database_thread(
             DatabaseCommand::UpdateSessionStatus {
                 id,
                 state,
-                external_session_id,
+                conversation_identity,
                 reply,
             } => {
                 let result = update_session_status(
                     &mut connection,
                     id,
                     state,
-                    external_session_id.as_deref(),
+                    conversation_identity.as_ref(),
                 )
                 .map(|session| {
                     revision = revision.saturating_add(1);
@@ -1637,7 +1659,7 @@ fn update_session_status(
     connection: &mut Connection,
     id: SessionId,
     state: SessionState,
-    external_session_id: Option<&str>,
+    conversation_identity: Option<&VerifiedConversationIdentityUpdate>,
 ) -> Result<Session> {
     if !matches!(
         state,
@@ -1654,6 +1676,8 @@ fn update_session_status(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
+    let external_session_id =
+        conversation_identity.map(|identity| identity.external_session_id.as_str());
     let changed = transaction
         .execute(
             "UPDATE sessions SET state = ?2, external_session_id = COALESCE(?3, external_session_id), \
@@ -1674,6 +1698,18 @@ fn update_session_status(
         "session",
         &id.to_string(),
     )?;
+    if let Some(transition) = conversation_identity.and_then(|identity| identity.transition) {
+        insert_audit_event(
+            &transaction,
+            "provider_conversation_changed",
+            "succeeded",
+            &serde_json::json!({
+                "session_id": id,
+                "transition": transition
+            })
+            .to_string(),
+        )?;
+    }
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(session)

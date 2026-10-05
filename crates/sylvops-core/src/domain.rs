@@ -218,7 +218,10 @@ pub const fn state_allows_resume(state: SessionState) -> bool {
 /// Whether a session is the latest eligible record for a verified provider conversation.
 #[must_use]
 pub fn session_can_resume(session: &Session, sessions: &[Session]) -> bool {
-    if session.provider_kind != ProviderKind::Codex {
+    if !matches!(
+        session.provider_kind,
+        ProviderKind::Codex | ProviderKind::Claude
+    ) {
         return false;
     }
     let Some(external_session_id) = session.external_session_id.as_deref() else {
@@ -227,6 +230,8 @@ pub fn session_can_resume(session: &Session, sessions: &[Session]) -> bool {
     state_allows_resume(session.state)
         && !sessions.iter().any(|candidate| {
             candidate.id != session.id
+                && candidate.provider_kind == session.provider_kind
+                && candidate.worktree_id == session.worktree_id
                 && candidate.external_session_id.as_deref() == Some(external_session_id)
                 && (candidate.created_at, candidate.id.as_uuid())
                     > (session.created_at, session.id.as_uuid())
