@@ -566,7 +566,10 @@ async fn managed_claude_session_inner() {
         .expect("daemon shutdown timeout")
         .expect("daemon task")
         .expect("daemon result");
-    assert!(managed_claude_settings(&paths.runtime_directory).is_empty());
+    assert_eq!(
+        managed_claude_settings(&paths.runtime_directory),
+        Vec::<std::path::PathBuf>::new()
+    );
     assert_no_persisted_text_contains(&paths.database, PROMPT_SENTINEL);
     assert_no_persisted_text_contains(&paths.database, FAILURE_SENTINEL);
     assert_no_persisted_text_contains(&paths.database, MALFORMED_SENTINEL);
@@ -808,7 +811,10 @@ async fn late_session_start_recovers_after_warning() {
         .expect("daemon shutdown timeout")
         .expect("daemon task")
         .expect("daemon result");
-    assert!(managed_claude_settings(&paths.runtime_directory).is_empty());
+    assert_eq!(
+        managed_claude_settings(&paths.runtime_directory),
+        Vec::<std::path::PathBuf>::new()
+    );
 
     let restart_paths = paths.clone();
     let mut restart_task = tokio::spawn(async move { daemon::run(restart_paths).await });
