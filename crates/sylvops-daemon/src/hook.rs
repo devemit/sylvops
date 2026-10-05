@@ -313,6 +313,11 @@ impl HookReceiver {
         self.credentials.clone()
     }
 
+    #[must_use]
+    pub fn endpoint_url(&self) -> &str {
+        &self.credentials.endpoint_url
+    }
+
     pub async fn shutdown(self) {
         self.shutdown.send_replace(true);
         let _ = self.task.await;

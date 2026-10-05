@@ -90,7 +90,7 @@ impl AppConfig {
             )
         }) {
             return Err(
-                "only shell, codex, and Claude health are implemented in this release".into(),
+                "only shell, Codex, and Claude Code are implemented in this release".into(),
             );
         }
         if !self.enabled_providers.contains(&self.default_provider) {

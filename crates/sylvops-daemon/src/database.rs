@@ -164,6 +164,11 @@ enum DatabaseCommand {
         external_session_id: Option<String>,
         reply: oneshot::Sender<Result<(u64, Session)>>,
     },
+    MarkSessionLifecycleMissing {
+        id: SessionId,
+        failure_reason: String,
+        reply: oneshot::Sender<Result<Option<(u64, Session)>>>,
+    },
     Reconcile {
         reply: oneshot::Sender<Result<usize>>,
     },
@@ -585,6 +590,26 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Marks a live Session as needing feedback only while its provider identity is still absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, not-found, transition, or SQLite error.
+    pub async fn mark_session_lifecycle_missing(
+        &self,
+        id: SessionId,
+        failure_reason: String,
+    ) -> Result<Option<(u64, Session)>> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::MarkSessionLifecycleMissing {
+                id,
+                failure_reason,
+                reply,
+            }
+        })
+        .await
+    }
+
     /// Marks persisted active sessions disconnected without trusting stored process IDs.
     ///
     /// # Errors
@@ -851,6 +876,20 @@ fn database_thread(
                     revision = revision.saturating_add(1);
                     (revision, session)
                 });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::MarkSessionLifecycleMissing {
+                id,
+                failure_reason,
+                reply,
+            } => {
+                let result = mark_session_lifecycle_missing(&mut connection, id, &failure_reason)
+                    .map(|session| {
+                        session.map(|session| {
+                            revision = revision.saturating_add(1);
+                            (revision, session)
+                        })
+                    });
                 let _ = reply.send(result);
             }
             DatabaseCommand::Reconcile { reply } => {
@@ -1618,7 +1657,8 @@ fn update_session_status(
     let changed = transaction
         .execute(
             "UPDATE sessions SET state = ?2, external_session_id = COALESCE(?3, external_session_id), \
-             last_activity_at = ?4 WHERE id = ?1 AND state NOT IN ('failed', 'terminated', 'disconnected')",
+             last_activity_at = ?4, failure_reason = NULL \
+             WHERE id = ?1 AND state NOT IN ('failed', 'terminated', 'disconnected')",
             params![id.to_string(), state.to_string(), external_session_id, now],
         )
         .map_err(database_error)?;
@@ -1636,6 +1676,38 @@ fn update_session_status(
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(session)
+}
+
+fn mark_session_lifecycle_missing(
+    connection: &mut Connection,
+    id: SessionId,
+    failure_reason: &str,
+) -> Result<Option<Session>> {
+    let now = now_millis();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE sessions SET state = 'needs_feedback', failure_reason = ?2, \
+             last_activity_at = ?3 WHERE id = ?1 AND external_session_id IS NULL \
+             AND process_id IS NOT NULL AND state IN ('starting', 'running', 'needs_feedback')",
+            params![id.to_string(), failure_reason, now],
+        )
+        .map_err(database_error)?;
+    if changed == 0 {
+        transaction.commit().map_err(database_error)?;
+        return Ok(None);
+    }
+    insert_entity_audit(
+        &transaction,
+        "provider_lifecycle_missing",
+        "needs_feedback",
+        &id.to_string(),
+    )?;
+    let session = load_session(&transaction, id)?;
+    transaction.commit().map_err(database_error)?;
+    Ok(Some(session))
 }
 
 fn load_session(connection: &Connection, id: SessionId) -> Result<Session> {
