@@ -23,7 +23,7 @@ use forms::{Form, FormKind};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use reducer::{Effect, reduce};
 use sylvops_core::{
-    domain::{AttachmentRole, DaemonSnapshot, ProviderKind, SessionState},
+    domain::{AttachmentRole, DaemonSnapshot, SessionState},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, MAX_PTY_CHUNK_SIZE, MAX_TERMINAL_COLUMNS,
@@ -426,7 +426,12 @@ async fn handle_form(
         }
         return Ok(());
     }
+    if matches!(mouse_target, Some(HitTarget::ModalProviderProbe)) {
+        probe_form_provider(client, app).await?;
+        return Ok(());
+    }
     let mut submit = matches!(mouse_target, Some(HitTarget::ModalSubmit));
+    let mut probe_provider = false;
     match input {
         Event::Paste(text) => {
             if let Mode::Modal(form) = &mut app.mode
@@ -446,6 +451,9 @@ async fn handle_form(
                 KeyCode::BackTab | KeyCode::Up => form.next_field(-1),
                 KeyCode::Left if form.is_session() => form.select_next_provider(-1),
                 KeyCode::Right if form.is_session() => form.select_next_provider(1),
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    probe_provider = form.is_session();
+                }
                 KeyCode::Backspace => {
                     if let Some(index) = form.active_field_index() {
                         form.fields[index].value.pop();
@@ -469,6 +477,10 @@ async fn handle_form(
             }
         }
         _ => {}
+    }
+    if probe_provider {
+        probe_form_provider(client, app).await?;
+        return Ok(());
     }
     if !submit {
         return Ok(());
@@ -538,6 +550,50 @@ async fn handle_form(
     Ok(())
 }
 
+async fn probe_form_provider(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
+    let Some(kind) = (match &app.mode {
+        Mode::Modal(form) if form.is_session() => form.provider().map(|provider| provider.kind),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let health = match client
+        .request(&ClientRequest::ProbeProvider { kind })
+        .await?
+    {
+        DaemonResponse::Provider(health) if health.kind == kind => health,
+        DaemonResponse::Error(error) => {
+            if let Mode::Modal(form) = &mut app.mode {
+                form.submission_error = Some(error.message);
+            }
+            return Ok(());
+        }
+        response => {
+            return Err(DaemonError::Lifecycle(format!(
+                "unexpected provider probe response: {response:?}"
+            )));
+        }
+    };
+    if let Some(provider) = app
+        .providers
+        .iter_mut()
+        .find(|provider| provider.kind == kind)
+    {
+        provider.clone_from(&health);
+    }
+    if let Mode::Modal(form) = &mut app.mode {
+        if let Some(provider) = form
+            .providers
+            .iter_mut()
+            .find(|provider| provider.kind == kind)
+        {
+            provider.clone_from(&health);
+        }
+        form.clear_errors();
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome, DaemonError> {
     let optional = |index: usize| {
@@ -576,26 +632,11 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
                 })
                 .await?,
         ),
-        FormKind::CreateSession(worktree_id) => {
-            let provider = form
-                .provider()
-                .ok_or_else(|| DaemonError::Lifecycle("no provider selected".into()))?
-                .kind;
-            (
-                "Session created",
-                client
-                    .request(&ClientRequest::CreateSession {
-                        worktree_id,
-                        provider,
-                        display_name: optional(0),
-                        model: None,
-                        effort: None,
-                        initial_prompt: None,
-                        columns: 80,
-                        rows: 24,
-                    })
-                    .await?,
-            )
+        FormKind::CreateSession(_) => {
+            let request = form
+                .session_request(80, 24)
+                .ok_or_else(|| DaemonError::Lifecycle("no provider selected".into()))?;
+            ("Session created", client.request(&request).await?)
         }
         FormKind::RenameProject(project_id) => (
             "Project renamed",
@@ -1173,7 +1214,7 @@ async fn list_providers(
     match client.request(&ClientRequest::ListProviders).await? {
         DaemonResponse::Providers(providers) => Ok(providers
             .into_iter()
-            .filter(|provider| matches!(provider.kind, ProviderKind::Shell | ProviderKind::Codex))
+            .filter(|provider| provider.capabilities.interactive)
             .collect()),
         DaemonResponse::Error(error) => Err(DaemonError::Lifecycle(error.message)),
         response => Err(DaemonError::Lifecycle(format!(
@@ -1263,7 +1304,32 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sylvops_core::domain::{Project, Session, Workspace, Worktree, WorktreeStatus};
+    use sylvops_core::domain::{
+        Project, ProviderKind, Session, Workspace, Worktree, WorktreeStatus,
+    };
+    use sylvops_core::provider::{AuthenticationRequirement, ProviderCapabilities, ProviderHealth};
+
+    fn provider_health(kind: ProviderKind) -> ProviderHealth {
+        ProviderHealth {
+            kind,
+            available: true,
+            authenticated: true,
+            executable_path: None,
+            version: None,
+            diagnostic: None,
+            capabilities: ProviderCapabilities {
+                interactive: true,
+                resume: kind != ProviderKind::Shell,
+                authentication: if kind == ProviderKind::Shell {
+                    AuthenticationRequirement::None
+                } else {
+                    AuthenticationRequirement::ExistingLogin
+                },
+                ..ProviderCapabilities::default()
+            },
+            checked_at: 0,
+        }
+    }
 
     fn populated_snapshot() -> DaemonSnapshot {
         let workspace_id = WorkspaceId::new();
@@ -1370,7 +1436,7 @@ mod tests {
             .iter()
             .find(|item| item.id == source.id)
             .expect("historical source");
-        assert!(!sylvops_core::domain::session_can_resume(
+        assert!(!sylvops_core::domain::session_record_can_resume(
             historical_source,
             &app.snapshot.sessions
         ));
@@ -1428,6 +1494,45 @@ mod tests {
                 .draw(|frame| render::draw(frame, &mut app))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn session_form_renders_claude_from_daemon_capabilities() {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut claude = provider_health(ProviderKind::Claude);
+        claude.authenticated = false;
+        claude.diagnostic = Some(
+            "Claude Code is not logged in. Run `claude auth login` yourself, then refresh Provider health."
+                .into(),
+        );
+        let providers = vec![
+            provider_health(ProviderKind::Shell),
+            provider_health(ProviderKind::Codex),
+            claude,
+        ];
+        let mut app = App::new(DaemonSnapshot::default(), providers.clone(), None);
+        let mut form = Form::session(WorktreeId::new(), providers);
+        assert!(form.select_provider(ProviderKind::Claude));
+        app.mode = Mode::Modal(form);
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(text.contains("Shell"));
+        assert!(text.contains("Codex"));
+        assert!(text.contains("Claude Code"));
+        assert!(text.contains("setup required"));
+        assert!(text.contains("not logged in"));
+        assert!(text.contains("Check again"));
     }
 
     #[test]
@@ -1533,17 +1638,29 @@ mod tests {
     }
 
     #[test]
-    fn tui_session_form_keeps_advanced_codex_options_cli_only() {
-        let source = include_str!("lib.rs");
-        let create_session = source
-            .split_once("        FormKind::CreateSession(worktree_id) => {")
-            .and_then(|(_, tail)| tail.split_once("        FormKind::RenameProject"))
-            .map(|(body, _)| body)
-            .expect("TUI session submission source");
+    fn tui_claude_session_request_keeps_advanced_options_cli_only() {
+        let worktree_id = WorktreeId::new();
+        let mut form = Form::session(
+            worktree_id,
+            vec![
+                provider_health(ProviderKind::Shell),
+                provider_health(ProviderKind::Claude),
+            ],
+        );
+        assert!(form.select_provider(ProviderKind::Claude));
 
-        assert!(create_session.contains("display_name: optional(0)"));
-        assert!(create_session.contains("model: None"));
-        assert!(create_session.contains("effort: None"));
-        assert!(create_session.contains("initial_prompt: None"));
+        assert_eq!(
+            form.session_request(80, 24),
+            Some(ClientRequest::CreateSession {
+                worktree_id,
+                provider: ProviderKind::Claude,
+                display_name: None,
+                model: None,
+                effort: None,
+                initial_prompt: None,
+                columns: 80,
+                rows: 24,
+            })
+        );
     }
 }

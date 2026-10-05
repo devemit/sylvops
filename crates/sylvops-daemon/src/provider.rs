@@ -1203,9 +1203,12 @@ impl CodexAdapter {
                 executable: Some(path),
                 error: None,
             },
-            Err(error) => CodexDiscovery {
+            Err(_) => CodexDiscovery {
                 executable: None,
-                error: Some(error.to_string()),
+                error: Some(
+                    "Codex is not installed as a supported native CLI. Install Codex, then refresh Provider health."
+                        .into(),
+                ),
             },
         }
     }
@@ -1346,17 +1349,39 @@ impl CodexAdapter {
                 checked_at: now_millis(),
             };
         };
-        let version = run_probe(&executable, &["--version"]).await;
-        let authentication = run_probe(&executable, &["login", "status"]).await;
-        let version_error = version.as_ref().err().cloned();
-        let authentication_error = authentication.as_ref().err().cloned();
+        let Ok(version) = run_probe(&executable, &["--version"]).await else {
+            return ProviderHealth {
+                kind: ProviderKind::Codex,
+                available: false,
+                authenticated: false,
+                executable_path: path_text(&executable).ok(),
+                version: None,
+                diagnostic: Some(
+                    "Codex version could not be verified. Install or update Codex, then refresh Provider health."
+                        .into(),
+                ),
+                capabilities,
+                checked_at: now_millis(),
+            };
+        };
+        let (authenticated, diagnostic) =
+            match run_probe(&executable, &["login", "status"]).await {
+                Ok(_) => (true, None),
+                Err(_) => (
+                    false,
+                    Some(
+                        "Codex authentication could not be verified. Sign in to Codex outside SylvOps or run `codex login status`, then refresh Provider health."
+                            .into(),
+                    ),
+                ),
+            };
         ProviderHealth {
             kind: ProviderKind::Codex,
-            available: version.is_ok(),
-            authenticated: authentication.is_ok(),
+            available: true,
+            authenticated,
             executable_path: path_text(&executable).ok(),
-            version: version.ok(),
-            diagnostic: authentication_error.or(version_error),
+            version: Some(version),
+            diagnostic,
             capabilities,
             checked_at: now_millis(),
         }

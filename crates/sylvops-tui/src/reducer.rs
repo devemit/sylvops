@@ -1,6 +1,6 @@
 //! Pure navigation reducer. Async daemon work is represented as effects.
 
-use sylvops_core::{domain::session_can_resume, ids::SessionId, ui::MainTab};
+use sylvops_core::{ids::SessionId, provider::session_can_resume, ui::MainTab};
 
 use crate::app::{App, ExplorerNode, Flash, FlashKind, FocusZone, Mode, Palette};
 
@@ -79,7 +79,7 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
         Action::Resume => {
             if let Some(session) = app.selected_session()
                 && app.resume_pending.is_none()
-                && session_can_resume(session, &app.snapshot.sessions)
+                && session_can_resume(session, &app.snapshot.sessions, &app.providers)
             {
                 let session_id = session.id;
                 app.resume_pending = Some(session_id);
@@ -112,6 +112,7 @@ mod tests {
     use sylvops_core::{
         domain::{DaemonSnapshot, ProviderKind, Session, SessionState},
         ids::{SessionId, WorktreeId},
+        provider::{AuthenticationRequirement, ProviderCapabilities, ProviderHealth},
     };
 
     fn session(state: SessionState, external_session_id: Option<&str>) -> Session {
@@ -119,12 +120,12 @@ mod tests {
             id: SessionId::new(),
             worktree_id: WorktreeId::new(),
             provider_profile_id: None,
-            provider_kind: ProviderKind::Codex,
-            display_name: "Codex".into(),
+            provider_kind: ProviderKind::Claude,
+            display_name: "Claude".into(),
             state,
             process_id: None,
             external_session_id: external_session_id.map(str::to_owned),
-            command: "codex".into(),
+            command: "claude".into(),
             arguments_json: "[]".into(),
             cwd: "/repo".into(),
             created_at: 1,
@@ -137,9 +138,27 @@ mod tests {
         }
     }
 
+    fn ready_claude() -> ProviderHealth {
+        ProviderHealth {
+            kind: ProviderKind::Claude,
+            available: true,
+            authenticated: true,
+            executable_path: None,
+            version: Some("2.1.145".into()),
+            diagnostic: None,
+            capabilities: ProviderCapabilities {
+                interactive: true,
+                resume: true,
+                authentication: AuthenticationRequirement::ExistingLogin,
+                ..ProviderCapabilities::default()
+            },
+            checked_at: 0,
+        }
+    }
+
     #[test]
     fn tabs_and_focus_are_synchronous_state_changes() {
-        let mut app = App::new(DaemonSnapshot::default(), Vec::new(), None);
+        let mut app = App::new(DaemonSnapshot::default(), vec![ready_claude()], None);
         reduce(&mut app, Action::SelectTab(MainTab::Details));
         assert_eq!(app.main_tab, MainTab::Details);
         assert_eq!(app.focus, FocusZone::Main);
@@ -150,7 +169,7 @@ mod tests {
     fn resume_effect_is_only_offered_for_verified_eligible_sessions() {
         let resumable = session(SessionState::FinishedSeen, Some("verified-id"));
         let resumable_id = resumable.id;
-        let mut app = App::new(DaemonSnapshot::default(), Vec::new(), None);
+        let mut app = App::new(DaemonSnapshot::default(), vec![ready_claude()], None);
         app.snapshot.sessions.push(resumable);
         app.selected_session_id = Some(resumable_id);
 
@@ -171,7 +190,7 @@ mod tests {
         app.snapshot.sessions[0].provider_kind = ProviderKind::Shell;
         assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
 
-        app.snapshot.sessions[0].provider_kind = ProviderKind::Codex;
+        app.snapshot.sessions[0].provider_kind = ProviderKind::Claude;
         let mut successor = app.snapshot.sessions[0].clone();
         successor.id = SessionId::new();
         successor.created_at = 2;

@@ -6,7 +6,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use sylvops_core::{
-    domain::{Session, SessionState, session_can_resume},
+    domain::{Session, SessionState},
+    provider::session_can_resume,
     ui::MainTab,
 };
 
@@ -273,7 +274,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         format!(
             " {} · {} · {}",
             session.display_name,
-            session.provider_kind,
+            session.provider_kind.display_name(),
             status_label(session.state)
         )
     });
@@ -321,7 +322,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             Some(("[ Detach · Ctrl+] ]", HitTarget::Detach)),
         )
     } else if let Some(session) = app.selected_session() {
-        let can_resume = session_can_resume(session, &app.snapshot.sessions);
+        let can_resume = session_can_resume(session, &app.snapshot.sessions, &app.providers);
         (
             " Terminal · detached ".into(),
             format!(
@@ -423,7 +424,7 @@ fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<
         ]),
         Line::from(vec![
             Span::styled("Provider     ", theme.muted),
-            Span::raw(session.provider_kind.to_string()),
+            Span::raw(session.provider_kind.display_name()),
         ]),
         Line::from(vec![
             Span::styled("State        ", theme.muted),
@@ -480,11 +481,13 @@ fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<
         ]),
         Line::from(vec![
             Span::styled("Resume       ", theme.muted),
-            Span::raw(if session_can_resume(session, &app.snapshot.sessions) {
-                "Available · press u"
-            } else {
-                "Unavailable"
-            }),
+            Span::raw(
+                if session_can_resume(session, &app.snapshot.sessions, &app.providers) {
+                    "Available · press u"
+                } else {
+                    "Unavailable"
+                },
+            ),
         ]),
         Line::from(""),
         Line::from(
@@ -550,11 +553,13 @@ fn draw_form(frame: &mut Frame<'_>, form: &Form, hits: &mut HitMap, theme: Theme
                         } else {
                             "○"
                         },
-                        provider.kind,
-                        if provider.available {
-                            ""
-                        } else {
+                        provider.kind.display_name(),
+                        if !provider.available {
                             " (unavailable)"
+                        } else if !provider.can_start_interactive_session() {
+                            " (setup required)"
+                        } else {
+                            ""
                         }
                     )
                 })
@@ -572,6 +577,27 @@ fn draw_form(frame: &mut Frame<'_>, form: &Form, hits: &mut HitMap, theme: Theme
             HitTarget::ModalProvider(0),
         );
         row = row.saturating_add(1);
+        if let Some(error) = form
+            .provider()
+            .and_then(sylvops_core::provider::ProviderHealth::session_start_error)
+        {
+            lines.push(Line::from(Span::styled(error, theme.failure)));
+            row = row.saturating_add(1);
+            lines.push(Line::from(Span::styled(
+                "[ Check again · Ctrl+R ]",
+                theme.focus,
+            )));
+            hits.push(
+                Rect::new(
+                    area.x.saturating_add(1),
+                    row,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+                HitTarget::ModalProviderProbe,
+            );
+            row = row.saturating_add(1);
+        }
     }
     for (visible_position, index) in form.visible_field_indices().into_iter().enumerate() {
         let field = &form.fields[index];

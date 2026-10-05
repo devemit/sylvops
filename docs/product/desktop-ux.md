@@ -12,7 +12,7 @@ The persisted domain model remains `Workspace → Project → Worktree → Sessi
 | Workspace | Workspace | A saved group of repositories used together. |
 | Repository | Project | An existing local Git repository registered with SylvOps. |
 | Checkout | Worktree | The repository's root checkout or an isolated managed Git worktree. |
-| Session | Session | One daemon-owned Shell or Codex process in a checkout. |
+| Session | Session | One daemon-owned Shell, Codex, or Claude Code process in a checkout. |
 | Terminal | Attachment | The live, explicitly attached view of a session's PTY. |
 
 First-run guidance names both the user-facing and domain terms where that distinction matters. Documentation and diagnostics may continue to use `Project` and `Worktree` when referring to the protocol or Git operation precisely.
@@ -33,7 +33,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 - Settings is a scrollable right-side sheet in wide and compact layouts and a full-window scrollable view in narrow layout. Its sections are Appearance, Updates, and Safety.
 - Appearance uses keyboard-reachable preview cards for System, Grove, Canopy, and Midnight. Nord, Tokyo Night, Catppuccin, Dracula, Gruvbox Dark, Solarized Light, and Solarized Dark remain in an expandable Classic group. Preview selection persists without Apply or Cancel semantics. Density, terminal typeface, text size, and cursor remain aligned bounded controls; missing named fonts fall back through the renderer.
 - One application-owned single-stroke icon family supplies brand, disclosure, close, and status marks. Ambiguous, important, and destructive actions retain visible text.
-- The desktop and TUI new-session forms expose the provider picker and optional display name only. Model, effort, and initial prompt remain supported by the CLI and protocol but are not interactive-form settings.
+- The desktop and TUI new-session forms expose capability-driven Shell, Codex, and Claude Code choices plus an optional display name. Model, effort, and initial prompt remain supported by the CLI and protocol but are not interactive-form settings.
 - The footer contains version, current workspace/checkout context, connection health, and essential shortcuts. Internal enum names and keyboard-panel debug state are not user-facing status.
 
 ## Embedded terminal baseline

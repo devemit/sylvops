@@ -8,6 +8,7 @@ use sylvops_core::{
     ids::SessionId,
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     status::NormalizedProviderEvent,
+    ui_forms::Form,
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 
@@ -18,11 +19,108 @@ const MALFORMED_SENTINEL: &str = "SYLVOPS_PRIVATE_MALFORMED_HOOK_75";
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_claude_sessions_cover_attention_terminal_and_hook_recovery() {
     tokio::time::timeout(Duration::from_secs(120), async {
+        interactive_client_request_creates_claude_session().await;
         managed_claude_session_inner().await;
         late_session_start_recovers_after_warning().await;
     })
     .await
     .expect("managed Claude scenarios timeout");
+}
+
+async fn interactive_client_request_creates_claude_session() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let repository = temporary.path().join("repository");
+    initialize_repository(&repository);
+    let bin_directory = temporary.path().join("bin");
+    std::fs::create_dir(&bin_directory).expect("fake provider bin directory");
+    let fake_claude = install_fake_claude(&bin_directory);
+    let _claude_cli_path = EnvironmentGuard::set("CLAUDE_CLI_PATH", fake_claude);
+
+    let paths = RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("paths");
+    paths.prepare().expect("prepare runtime paths");
+    std::fs::write(
+        &paths.config,
+        "enabled_providers = ['shell', 'claude']\nupdate_check_policy = 'disabled'\n",
+    )
+    .expect("Claude-enabled configuration");
+    let daemon_paths = paths.clone();
+    let mut daemon_task = tokio::spawn(async move { daemon::run(daemon_paths).await });
+    let client = tokio::select! {
+        result = &mut daemon_task => panic!("daemon exited before connection: {result:?}"),
+        client = connect_eventually(&paths) => client,
+    };
+
+    let workspace_id = match client
+        .request(&ClientRequest::AddWorkspace {
+            name: "interactive-client".into(),
+        })
+        .await
+        .expect("workspace response")
+    {
+        DaemonResponse::WorkspaceAdded { workspace, .. } => workspace.id,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let worktree_id = match client
+        .request(&ClientRequest::AddProject {
+            workspace_id,
+            repository_path: repository.to_string_lossy().into_owned(),
+        })
+        .await
+        .expect("project response")
+    {
+        DaemonResponse::ProjectAdded { root_worktree, .. } => root_worktree.id,
+        response => panic!("unexpected project response: {response:?}"),
+    };
+    let providers = match client
+        .request(&ClientRequest::ListProviders)
+        .await
+        .expect("provider response")
+    {
+        DaemonResponse::Providers(providers) => providers,
+        response => panic!("unexpected provider response: {response:?}"),
+    };
+    let mut form = Form::session(worktree_id, providers);
+    assert!(form.select_provider(ProviderKind::Claude));
+    form.fields[0].value = "Interactive Claude".into();
+    assert!(form.validate());
+
+    let session = match client
+        .request(&form.session_request(80, 24).expect("session request"))
+        .await
+        .expect("session response")
+    {
+        DaemonResponse::SessionCreated { session, .. } => session,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    assert_eq!(session.provider_kind, ProviderKind::Claude);
+    assert_eq!(session.worktree_id, worktree_id);
+    assert_eq!(session.display_name, "Interactive Claude");
+    assert!(!session.arguments_json.contains("--model"));
+    assert!(!session.arguments_json.contains("--effort"));
+    wait_for_session(&client, session.id, |session| {
+        session.state == SessionState::Running && session.external_session_id.is_some()
+    })
+    .await;
+
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: session.id,
+        })
+        .await
+        .expect("stop response");
+    wait_for_session(&client, session.id, |session| {
+        session.state == SessionState::Terminated && session.process_id.is_none()
+    })
+    .await;
+    client
+        .request(&ClientRequest::ShutdownDaemon)
+        .await
+        .expect("shutdown response");
+    tokio::time::timeout(Duration::from_secs(10), daemon_task)
+        .await
+        .expect("daemon shutdown timeout")
+        .expect("daemon task")
+        .expect("daemon result");
 }
 
 #[allow(clippy::too_many_lines)]

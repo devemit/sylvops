@@ -1591,6 +1591,11 @@ async fn handle_request(
                     "session worktree identity no longer matches".into(),
                 ));
             }
+            let health = state.providers.probe(source.provider_kind).await?;
+            persist_provider_health(state, &health).await?;
+            if let Some(error) = health.resume_error() {
+                return Err(DaemonError::Provider(error));
+            }
             let session_id = SessionId::new();
             let lifecycle_endpoint = if state
                 .providers

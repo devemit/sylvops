@@ -40,6 +40,19 @@ string_enum!(ProviderKind {
     Pi => "pi",
 });
 
+impl ProviderKind {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Shell => "Shell",
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Cursor => "Cursor",
+            Self::Pi => "Pi",
+        }
+    }
+}
+
 #[allow(clippy::derivable_impls)]
 impl Default for ProviderKind {
     fn default() -> Self {
@@ -216,14 +229,10 @@ pub const fn state_allows_resume(state: SessionState) -> bool {
 }
 
 /// Whether a session is the latest eligible record for a verified provider conversation.
+///
+/// Clients must additionally check the current Provider health and resume capability.
 #[must_use]
-pub fn session_can_resume(session: &Session, sessions: &[Session]) -> bool {
-    if !matches!(
-        session.provider_kind,
-        ProviderKind::Codex | ProviderKind::Claude
-    ) {
-        return false;
-    }
+pub fn session_record_can_resume(session: &Session, sessions: &[Session]) -> bool {
     let Some(external_session_id) = session.external_session_id.as_deref() else {
         return false;
     };
@@ -240,7 +249,13 @@ pub fn session_can_resume(session: &Session, sessions: &[Session]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionState, state_allows_resume};
+    use super::{ProviderKind, SessionState, state_allows_resume};
+
+    #[test]
+    fn provider_display_names_are_distinct_from_protocol_values() {
+        assert_eq!(ProviderKind::Claude.to_string(), "claude");
+        assert_eq!(ProviderKind::Claude.display_name(), "Claude Code");
+    }
 
     #[test]
     fn only_inactive_provider_states_allow_resume() {
