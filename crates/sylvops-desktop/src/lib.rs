@@ -35,7 +35,7 @@ use iced::{
     window,
 };
 use iced::{font, font::Weight, widget::button::Status};
-use icons::{LineIcon, line_icon};
+use icons::{LineIcon, danger_line_icon, line_icon};
 use presentation::{
     ActiveTerminalAction, ButtonIntent, ButtonTokens, ControlState, DensityMetrics,
     DesktopPresentation, ExplorerAction, ExplorerAttention, ExplorerIntent, ExplorerKey,
@@ -1308,13 +1308,20 @@ impl DesktopApp {
         for action in actions {
             let action = *action;
             let danger = matches!(action, ExplorerAction::DeleteCheckout(_));
+            let content: Element<'static, Message> = if danger {
+                danger_line_icon(LineIcon::Trash, 16).into()
+            } else {
+                text(explorer_action_label(action))
+                    .size(UI_META_SIZE)
+                    .into()
+            };
             controls = controls.push(
-                button(text(explorer_action_label(action)).size(UI_META_SIZE))
+                button(content)
                     .on_press(Message::RunExplorerAction(action))
                     .height(density.control_height)
                     .padding([4, 7])
                     .style(move |_theme, status| {
-                        button_intent_style(
+                        let mut style = button_intent_style(
                             presentation_theme,
                             if danger {
                                 ButtonIntent::Danger
@@ -1322,7 +1329,14 @@ impl DesktopApp {
                                 ButtonIntent::Quiet
                             },
                             status,
-                        )
+                        );
+                        if danger {
+                            style.border = Border::default();
+                            if matches!(status, Status::Active | Status::Disabled) {
+                                style.background = None;
+                            }
+                        }
+                        style
                     }),
             );
         }

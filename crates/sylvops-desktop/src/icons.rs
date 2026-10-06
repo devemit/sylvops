@@ -6,6 +6,7 @@ use iced::{Length, Theme, widget::svg};
 pub(crate) enum LineIcon {
     Brand,
     Close,
+    Trash,
     ChevronDown,
     ChevronRight,
     Ready,
@@ -22,6 +23,7 @@ impl LineIcon {
         match self {
             Self::Brand => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 21c5-1 9-5 11-11"/><path d="M7 17C3 12 6 5 19 3c1 11-5 15-12 14Z"/></svg>"#,
             Self::Close => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 7 10 10m0-10L7 17"/></svg>"#,
+            Self::Trash => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="m6 7 1 13h10l1-13"/><path d="M10 11v5m4-5v5"/></svg>"#,
             Self::ChevronDown => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#,
             Self::ChevronRight => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>"#,
             Self::Ready => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/></svg>"#,
@@ -44,6 +46,15 @@ pub(crate) fn line_icon(icon: LineIcon, size: u16) -> svg::Svg<'static> {
         })
 }
 
+pub(crate) fn danger_line_icon(icon: LineIcon, size: u16) -> svg::Svg<'static> {
+    svg::Svg::new(svg::Handle::from_memory(icon.source()))
+        .width(Length::Fixed(f32::from(size)))
+        .height(Length::Fixed(f32::from(size)))
+        .style(|theme: &Theme, _status| svg::Style {
+            color: Some(theme.extended_palette().danger.base.color),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::LineIcon;
@@ -53,6 +64,7 @@ mod tests {
         for icon in [
             LineIcon::Brand,
             LineIcon::Close,
+            LineIcon::Trash,
             LineIcon::ChevronDown,
             LineIcon::ChevronRight,
             LineIcon::Ready,
