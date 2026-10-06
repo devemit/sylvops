@@ -27,6 +27,7 @@ First-run guidance names both the user-facing and domain terms where that distin
 - Double-clicking a session row or pressing `R` focuses its inline rename editor. Enter saves through the daemon; Escape or clicking away cancels before submission. The editor has no redundant Save or Cancel buttons. Validation and IPC errors preserve the entered value.
 - Navigator interaction clears terminal keyboard focus without detaching the session. Long single-line navigation labels stay clipped inside their controls. SylvOps does not show hover tooltips; important meaning must be visible in the interface or available through the shortcuts panel.
 - An active managed checkout exposes `Delete checkout` on its selected row. The existing state-bound confirmation still refuses root, external, dirty, missing, invalid, or live-session removal and preserves the Git branch.
+- Matching trash actions delete an empty workspace, unregister an empty repository, or delete a terminal non-resumable session after confirmation. Repository and checkout files remain untouched, and non-empty parents fail closed.
 - Desktop copy says `Open terminal` and `Leave terminal`; the protocol continues to model the operation as explicit attachment and detachment.
 - `Open terminal` / `Leave terminal` and `Stop session` are session-lifecycle actions, so they live at the trailing edge of the active session-tab header rather than beside Terminal/Changes/Details view navigation.
 - The native platform UI family remains the default for cross-platform availability. Body text is 14 px, secondary labels are 12 px, and the footer uses a dedicated 12 px status scale.
@@ -58,9 +59,9 @@ The scrollbar maps the oldest retained history to the top and live output to the
 - First run presents Create workspace, Add repository, and Start session as one in-context checklist. Completed steps remain visibly collapsed; the current step expands and presents the focused required form.
 - Empty states offer one contextual next action and do not advertise planned capabilities.
 - Details uses human-readable dates formatted with the operating-system locale and timezone, and the label `Path`. IDs, raw timestamps, exact quantities, process IDs, and IPC/PTY terminology are under expandable Technical details with bounded copy actions.
-- A Session record remains until user data is removed. Terminal output is separately described as daemon-memory state that is not persisted across daemon restart.
+- A terminal, non-resumable Session record can be explicitly deleted after confirmation. Terminal output is separately described as daemon-memory state that is not persisted across daemon restart.
 - Successful actions use brief non-modal feedback. Operation-labelled errors appear in the action-status region directly below the toolbar and remain visible until dismissed or corrected; diagnostics are control-character stripped, fail-closed when credential markers appear, and bounded to 1,024 characters.
-- Action copy is standardized on `Start shell`, `Start Codex`, `Check again`, `Open terminal`, `Leave terminal`, `Stop session`, and `Delete checkout`.
+- Action copy is standardized on `Start shell`, `Start Codex`, `Check again`, `Open terminal`, `Leave terminal`, `Stop session`, `Delete session`, `Delete checkout`, `Remove repository`, and `Delete workspace`.
 
 ## Accessibility and visual acceptance
 

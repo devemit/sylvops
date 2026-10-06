@@ -1,7 +1,7 @@
 #![allow(clippy::unreadable_literal)] // Six-digit values intentionally mirror CSS RGB notation.
 
 use sylvops_core::{
-    domain::{DaemonSnapshot, Session, SessionState, Worktree, WorktreeStatus, session_can_resume},
+    domain::{DaemonSnapshot, Session, SessionState, Worktree, WorktreeStatus, session_can_delete},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     ui::{DesktopDensity, DesktopState, DesktopTheme, MainTab},
 };
@@ -324,11 +324,13 @@ pub(crate) enum ExplorerAttention {
 pub(crate) enum ExplorerAction {
     CreateCheckout(ProjectId),
     RenameRepository(ProjectId),
+    RemoveRepository(ProjectId),
     CreateSession(WorktreeId),
     RenameCheckout(WorktreeId),
     DeleteCheckout(WorktreeId),
     OpenSession(SessionId),
     RenameSession(SessionId),
+    DeleteSession(SessionId),
 }
 
 impl SessionIndicator {
@@ -747,6 +749,7 @@ fn build_explorer(
             actions: vec![
                 ExplorerAction::CreateCheckout(project.id),
                 ExplorerAction::RenameRepository(project.id),
+                ExplorerAction::RemoveRepository(project.id),
             ],
             expandable: !worktrees.is_empty(),
             expanded: project_expanded,
@@ -801,7 +804,9 @@ fn append_worktree_rows(
             rows.extend(
                 sessions
                     .into_iter()
-                    .map(|session| explorer_session_row(session, worktree_id)),
+                    .map(|session| {
+                        explorer_session_row(session, worktree_id, &daemon.sessions)
+                    }),
             );
         }
     }
@@ -846,11 +851,18 @@ fn explorer_worktree_row(
     }
 }
 
-fn explorer_session_row(session: &Session, worktree_id: ExplorerNodeId) -> ExplorerRow {
-    let actions = vec![
+fn explorer_session_row(
+    session: &Session,
+    worktree_id: ExplorerNodeId,
+    sessions: &[Session],
+) -> ExplorerRow {
+    let mut actions = vec![
         ExplorerAction::OpenSession(session.id),
         ExplorerAction::RenameSession(session.id),
     ];
+    if session_can_delete(session, sessions) {
+        actions.push(ExplorerAction::DeleteSession(session.id));
+    }
     ExplorerRow {
         id: ExplorerNodeId::Session(session.id),
         parent: Some(worktree_id),
@@ -1845,6 +1857,7 @@ mod tests {
             vec![
                 ExplorerAction::CreateCheckout(fixture.project_id),
                 ExplorerAction::RenameRepository(fixture.project_id),
+                ExplorerAction::RemoveRepository(fixture.project_id),
             ]
         );
         assert_eq!(
@@ -1861,6 +1874,44 @@ mod tests {
                 ExplorerAction::OpenSession(fixture.session_id),
                 ExplorerAction::RenameSession(fixture.session_id),
             ]
+        );
+    }
+
+    #[test]
+    fn explorer_only_offers_session_deletion_for_terminal_non_resumable_records() {
+        let mut fixture = hierarchy_fixture(SessionState::Terminated);
+        let project_id = fixture.project_id;
+        let worktree_id = fixture.worktree_id;
+        let session_id = fixture.session_id;
+        let present = |snapshot: &DaemonSnapshot| {
+            DesktopPresentation::build(&PresentationInput {
+                daemon: snapshot,
+                preferences: &DesktopState::default(),
+                viewport: Viewport::new(1_440, 900),
+                system_appearance: SystemAppearance::Dark,
+                interaction: InteractionState {
+                    expanded_project_ids: vec![project_id],
+                    expanded_worktree_ids: vec![worktree_id],
+                    focused_explorer_node: Some(ExplorerNodeId::Session(session_id)),
+                    ..InteractionState::default()
+                },
+            })
+        };
+
+        let terminal = present(&fixture.snapshot);
+        assert!(
+            terminal.explorer.rows[2]
+                .actions
+                .contains(&ExplorerAction::DeleteSession(session_id))
+        );
+
+        fixture.snapshot.sessions[0].state = SessionState::Failed;
+        fixture.snapshot.sessions[0].external_session_id = Some("verified-conversation".into());
+        let resumable = present(&fixture.snapshot);
+        assert!(
+            !resumable.explorer.rows[2]
+                .actions
+                .contains(&ExplorerAction::DeleteSession(session_id))
         );
     }
 

@@ -17,7 +17,7 @@ use subtle::ConstantTimeEq;
 use sylvops_core::{
     domain::{
         DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, WorktreeStatus,
-        state_allows_resume,
+        session_can_delete, state_allows_resume,
     },
     ids::{ProjectId, ProviderProfileId, SessionId, WorktreeId},
     protocol::{
@@ -1109,6 +1109,26 @@ async fn handle_request(
             });
             Ok(())
         }
+        ClientRequest::RemoveWorkspace { workspace_id } => {
+            let (revision, opened_workspace) =
+                state.database.remove_workspace(workspace_id).await?;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::WorkspaceRemoved {
+                    revision,
+                    workspace_id,
+                    opened_workspace: opened_workspace.clone(),
+                },
+            )
+            .await?;
+            let _ = state.events.send(DaemonEvent::WorkspaceRemoved {
+                revision,
+                workspace_id,
+                opened_workspace,
+            });
+            Ok(())
+        }
         ClientRequest::AddProject {
             workspace_id,
             repository_path,
@@ -1253,6 +1273,41 @@ async fn handle_request(
             let _ = state
                 .events
                 .send(DaemonEvent::ProjectUpdated { revision, project });
+            Ok(())
+        }
+        ClientRequest::RemoveProject { project_id } => {
+            let operation_lock = project_operation_lock(state, project_id).await;
+            let operation_guard = operation_lock.lock().await;
+            let worktree_ids = state
+                .database
+                .snapshot()
+                .await?
+                .worktrees
+                .into_iter()
+                .filter(|worktree| worktree.project_id == project_id)
+                .map(|worktree| worktree.id)
+                .collect::<Vec<_>>();
+            let revision = state.database.remove_project(project_id).await?;
+            drop(operation_guard);
+            state.project_locks.write().await.remove(&project_id);
+            let mut worktree_locks = state.worktree_locks.write().await;
+            for worktree_id in worktree_ids {
+                worktree_locks.remove(&worktree_id);
+            }
+            drop(worktree_locks);
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::ProjectRemoved {
+                    revision,
+                    project_id,
+                },
+            )
+            .await?;
+            let _ = state.events.send(DaemonEvent::ProjectRemoved {
+                revision,
+                project_id,
+            });
             Ok(())
         }
         ClientRequest::CreateWorktree {
@@ -1707,6 +1762,49 @@ async fn handle_request(
             let _ = state
                 .events
                 .send(DaemonEvent::SessionUpdated { revision, session });
+            Ok(())
+        }
+        ClientRequest::RemoveSession { session_id } => {
+            let session = state.database.session(session_id).await?;
+            let operation_lock = worktree_operation_lock(state, session.worktree_id).await;
+            let operation_guard = operation_lock.lock().await;
+            let session = state.database.session(session_id).await?;
+            if let Some(managed) = get_managed_session(state, session_id).await
+                && !*managed.completed.borrow()
+            {
+                return Err(DaemonError::InvalidSession(
+                    "live sessions cannot be deleted".into(),
+                ));
+            }
+            let snapshot = state.database.snapshot().await?;
+            if !session_can_delete(&session, &snapshot.sessions) {
+                return Err(DaemonError::InvalidSession(
+                    "only terminal, non-resumable sessions can be deleted".into(),
+                ));
+            }
+            let revision = state.database.remove_session(session_id).await?;
+            drop(operation_guard);
+            if let Some(task) = attachments.remove(&session_id) {
+                task.abort();
+            }
+            let managed = state.sessions.write().await.remove(&session_id);
+            if let Some(managed) = managed {
+                let _ = managed.handle.detach(client_id).await;
+            }
+            state.hook_credentials.invalidate(session_id);
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::SessionRemoved {
+                    revision,
+                    session_id,
+                },
+            )
+            .await?;
+            let _ = state.events.send(DaemonEvent::SessionRemoved {
+                revision,
+                session_id,
+            });
             Ok(())
         }
         ClientRequest::CheckForUpdate => {

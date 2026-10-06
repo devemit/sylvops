@@ -1,5 +1,6 @@
 use sylvops_core::{
     domain::{GitWorktreeState, ProviderKind},
+    ids::{ProjectId, SessionId, WorkspaceId},
     ui_forms::{Form, FormKind},
     upgrade::ActiveUpgradeSession,
 };
@@ -83,6 +84,19 @@ pub(crate) fn first_run_steps(kind: FormKind) -> Option<[FirstRunStep; 3]> {
 
 #[derive(Clone, Debug)]
 pub(crate) enum Confirmation {
+    RemoveWorkspace {
+        workspace_id: WorkspaceId,
+        name: String,
+    },
+    RemoveProject {
+        project_id: ProjectId,
+        name: String,
+        canonical_path: String,
+    },
+    RemoveSession {
+        session_id: SessionId,
+        name: String,
+    },
     StopSession {
         session_name: String,
         cwd: String,

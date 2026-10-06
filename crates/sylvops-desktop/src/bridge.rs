@@ -10,7 +10,7 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, bounded};
 use sylvops_core::{
     domain::{DaemonSnapshot, ProviderKind},
-    ids::{SessionId, WorkspaceId, WorktreeId},
+    ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     provider::ProviderHealth,
 };
@@ -28,13 +28,16 @@ pub(crate) enum Operation {
     ProbeProvider(ProviderKind),
     CreateWorkspace,
     OpenWorkspace(WorkspaceId),
+    RemoveWorkspace(WorkspaceId),
     RegisterProject,
+    RemoveProject(ProjectId),
     CreateWorktree,
     CreateSession(WorktreeId),
     Resume(SessionId),
     RenameProject,
     RenameWorktree,
     RenameSession,
+    RemoveSession(SessionId),
     InspectRemoval(WorktreeId),
     RemoveWorktree,
     Attach(SessionId),

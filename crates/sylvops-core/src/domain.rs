@@ -233,6 +233,19 @@ pub fn session_can_resume(session: &Session, sessions: &[Session]) -> bool {
         })
 }
 
+/// Whether a session record is terminal and cannot start another provider continuation.
+#[must_use]
+pub fn session_can_delete(session: &Session, sessions: &[Session]) -> bool {
+    matches!(
+        session.state,
+        SessionState::FinishedSeen
+            | SessionState::FinishedUnseen
+            | SessionState::Failed
+            | SessionState::Terminated
+            | SessionState::Disconnected
+    ) && !session_can_resume(session, sessions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SessionState, state_allows_resume};

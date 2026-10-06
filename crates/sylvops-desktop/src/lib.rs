@@ -48,7 +48,7 @@ use presentation::{
 use sylvops_core::{
     domain::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
-        Worktree, WorktreeStatus, session_can_resume,
+        Worktree, WorktreeStatus, session_can_delete, session_can_resume,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
@@ -97,6 +97,9 @@ const FEATURED_THEME_COUNT: usize = 4;
 const CHECK_AGAIN_LABEL: &str = "Check again";
 const STOP_SESSION_LABEL: &str = "Stop session";
 const DELETE_CHECKOUT_LABEL: &str = "Delete checkout";
+const DELETE_SESSION_LABEL: &str = "Delete session";
+const DELETE_WORKSPACE_LABEL: &str = "Delete workspace";
+const REMOVE_REPOSITORY_LABEL: &str = "Remove repository";
 const MAX_TECHNICAL_COPY_CHARS: usize = 4_096;
 const MAX_USER_DIAGNOSTIC_CHARS: usize = 1_024;
 #[cfg(test)]
@@ -364,6 +367,7 @@ enum Message {
     Tick,
     Keyboard(keyboard::Event),
     SelectWorkspace(WorkspaceId),
+    RemoveActiveWorkspace,
     SelectExplorerNode(ExplorerNodeId),
     ToggleExplorerNode(ExplorerNodeId),
     OpenExplorerNode(ExplorerNodeId),
@@ -560,6 +564,7 @@ impl DesktopApp {
                     ClientRequest::OpenWorkspace { workspace_id },
                 );
             }
+            Message::RemoveActiveWorkspace => self.open_workspace_removal_confirmation(),
             Message::SelectExplorerNode(node) => self.select_explorer_node(node),
             Message::ToggleExplorerNode(node) => self.toggle_explorer_node(node),
             Message::OpenExplorerNode(node) => self.open_explorer_node(node),
@@ -995,6 +1000,15 @@ impl DesktopApp {
                 ))
                 .placeholder("Choose workspace")
                 .width(Fill),
+                button(danger_line_icon(LineIcon::Trash, 16))
+                    .on_press_maybe(
+                        self.active_workspace()
+                            .is_some()
+                            .then_some(Message::RemoveActiveWorkspace),
+                    )
+                    .height(density.control_height)
+                    .padding([4, 7])
+                    .style(trash_action_style),
                 button(text("+").font(UI_MEDIUM).size(16))
                     .on_press(Message::NewWorkspace)
                     .height(density.control_height)
@@ -1026,6 +1040,16 @@ impl DesktopApp {
             workspace_tabs = workspace_tabs.push(action);
         }
         if !self.snapshot.workspaces.is_empty() {
+            workspace_tabs = workspace_tabs.push(rule::vertical(1));
+        }
+        if self.active_workspace().is_some() {
+            workspace_tabs = workspace_tabs.push(
+                button(danger_line_icon(LineIcon::Trash, 16))
+                    .on_press(Message::RemoveActiveWorkspace)
+                    .height(density.control_height)
+                    .padding([4, 7])
+                    .style(trash_action_style),
+            );
             workspace_tabs = workspace_tabs.push(rule::vertical(1));
         }
         workspace_tabs = workspace_tabs.push(
@@ -1307,7 +1331,12 @@ impl DesktopApp {
                 .align_y(Center);
         for action in actions {
             let action = *action;
-            let danger = matches!(action, ExplorerAction::DeleteCheckout(_));
+            let danger = matches!(
+                action,
+                ExplorerAction::RemoveRepository(_)
+                    | ExplorerAction::DeleteCheckout(_)
+                    | ExplorerAction::DeleteSession(_)
+            );
             let content: Element<'static, Message> = if danger {
                 danger_line_icon(LineIcon::Trash, 16).into()
             } else {
@@ -1320,23 +1349,16 @@ impl DesktopApp {
                     .on_press(Message::RunExplorerAction(action))
                     .height(density.control_height)
                     .padding([4, 7])
-                    .style(move |_theme, status| {
-                        let mut style = button_intent_style(
-                            presentation_theme,
-                            if danger {
-                                ButtonIntent::Danger
-                            } else {
-                                ButtonIntent::Quiet
-                            },
-                            status,
-                        );
+                    .style(move |theme, status| {
                         if danger {
-                            style.border = Border::default();
-                            if matches!(status, Status::Active | Status::Disabled) {
-                                style.background = None;
-                            }
+                            trash_action_style(theme, status)
+                        } else {
+                            button_intent_style(
+                                presentation_theme,
+                                ButtonIntent::Quiet,
+                                status,
+                            )
                         }
-                        style
                     }),
             );
         }
@@ -2360,6 +2382,28 @@ impl DesktopApp {
 
     fn confirmation_view(confirmation: &Confirmation) -> Element<'_, Message> {
         let (title, explanation) = match confirmation {
+            Confirmation::RemoveWorkspace { name, .. } => (
+                DELETE_WORKSPACE_LABEL,
+                format!(
+                    "Delete empty workspace “{name}”? Repository and checkout files are never removed."
+                ),
+            ),
+            Confirmation::RemoveProject {
+                name,
+                canonical_path,
+                ..
+            } => (
+                REMOVE_REPOSITORY_LABEL,
+                format!(
+                    "Remove repository “{name}” at {canonical_path} from SylvOps? The repository and checkout files remain on disk."
+                ),
+            ),
+            Confirmation::RemoveSession { name, .. } => (
+                DELETE_SESSION_LABEL,
+                format!(
+                    "Permanently delete session “{name}” and its retained terminal history from SylvOps?"
+                ),
+            ),
             Confirmation::StopSession { session_name, cwd } => (
                 STOP_SESSION_LABEL,
                 format!(
@@ -2583,6 +2627,18 @@ impl DesktopApp {
                     self.error = Some(contextual_error(operation, &message));
                     return;
                 }
+                if matches!(
+                    operation,
+                    Some(
+                        Operation::RemoveWorkspace(_)
+                            | Operation::RemoveProject(_)
+                            | Operation::RemoveSession(_)
+                    )
+                ) {
+                    self.modal = None;
+                    self.error = Some(contextual_error(operation, &message));
+                    return;
+                }
                 if matches!(&operation, Some(Operation::ProbeProvider(_))) {
                     if let Some(Modal::Form(modal)) = &mut self.modal {
                         modal.provider_probe = None;
@@ -2734,6 +2790,88 @@ impl DesktopApp {
                     *item = workspace;
                 }
                 self.restore_selection();
+                self.request_snapshot();
+            }
+            (
+                Operation::RemoveWorkspace(workspace_id),
+                DaemonResponse::WorkspaceRemoved {
+                    opened_workspace, ..
+                },
+            ) => {
+                self.snapshot
+                    .workspaces
+                    .retain(|workspace| workspace.id != workspace_id);
+                self.snapshot.workspaces.iter_mut().for_each(|workspace| {
+                    workspace.is_open = opened_workspace
+                        .as_ref()
+                        .is_some_and(|opened| opened.id == workspace.id);
+                });
+                if let Some(opened) = opened_workspace
+                    && let Some(workspace) = self
+                        .snapshot
+                        .workspaces
+                        .iter_mut()
+                        .find(|workspace| workspace.id == opened.id)
+                {
+                    *workspace = opened;
+                }
+                self.modal = None;
+                self.restore_selection();
+                self.show_success("Workspace deleted.");
+                if self.snapshot.workspaces.is_empty() {
+                    self.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
+                    self.modal_focus = ModalFocus::Pending;
+                }
+                self.mark_state_dirty();
+                self.request_snapshot();
+            }
+            (
+                Operation::RemoveProject(project_id),
+                DaemonResponse::ProjectRemoved { .. },
+            ) => {
+                let worktree_ids = self
+                    .snapshot
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| worktree.project_id == project_id)
+                    .map(|worktree| worktree.id)
+                    .collect::<HashSet<_>>();
+                self.snapshot
+                    .projects
+                    .retain(|project| project.id != project_id);
+                self.snapshot
+                    .worktrees
+                    .retain(|worktree| worktree.project_id != project_id);
+                self.snapshot
+                    .sessions
+                    .retain(|session| !worktree_ids.contains(&session.worktree_id));
+                self.modal = None;
+                self.restore_selection();
+                self.show_success("Repository removed from SylvOps; files were preserved.");
+                self.mark_state_dirty();
+                self.request_snapshot();
+            }
+            (
+                Operation::RemoveSession(session_id),
+                DaemonResponse::SessionRemoved { .. },
+            ) => {
+                self.snapshot
+                    .sessions
+                    .retain(|session| session.id != session_id);
+                self.open_sessions.retain(|id| *id != session_id);
+                self.terminals.remove(&session_id);
+                self.resume_pending.remove(&session_id);
+                if self.active_session_id == Some(session_id) {
+                    self.active_session_id = self.open_sessions.last().copied();
+                    self.terminal_focus = TerminalFocus::Unfocused;
+                    if let Some(next) = self.active_session_id {
+                        self.select_session_context(next);
+                    }
+                }
+                self.modal = None;
+                self.restore_selection();
+                self.show_success("Session deleted.");
+                self.mark_state_dirty();
                 self.request_snapshot();
             }
             (
@@ -3493,6 +3631,10 @@ impl DesktopApp {
                 self.select_explorer_node(ExplorerNodeId::Repository(project_id));
                 self.open_project_rename_form();
             }
+            ExplorerAction::RemoveRepository(project_id) => {
+                self.select_explorer_node(ExplorerNodeId::Repository(project_id));
+                self.open_project_removal_confirmation(project_id);
+            }
             ExplorerAction::CreateSession(worktree_id) => {
                 self.select_explorer_node(ExplorerNodeId::Checkout(worktree_id));
                 self.open_session_form();
@@ -3508,6 +3650,10 @@ impl DesktopApp {
             ExplorerAction::OpenSession(session_id) => self.select_session(session_id),
             ExplorerAction::RenameSession(session_id) => {
                 return self.begin_session_rename(session_id);
+            }
+            ExplorerAction::DeleteSession(session_id) => {
+                self.select_explorer_node(ExplorerNodeId::Session(session_id));
+                self.open_session_removal_confirmation(session_id);
             }
         }
         Task::none()
@@ -3850,6 +3996,86 @@ impl DesktopApp {
         }));
     }
 
+    fn open_workspace_removal_confirmation(&mut self) {
+        let Some(workspace) = self.active_workspace().cloned() else {
+            self.error = Some("Select a workspace before deleting it.".into());
+            return;
+        };
+        if self
+            .snapshot
+            .projects
+            .iter()
+            .any(|project| project.workspace_id == workspace.id)
+        {
+            self.error = Some(
+                "Workspace still contains repositories. Remove them before deleting the workspace."
+                    .into(),
+            );
+            return;
+        }
+        self.modal = Some(Modal::Confirmation(Confirmation::RemoveWorkspace {
+            workspace_id: workspace.id,
+            name: workspace.name,
+        }));
+    }
+
+    fn open_project_removal_confirmation(&mut self, project_id: ProjectId) {
+        let Some(project) = self
+            .snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .cloned()
+        else {
+            self.error = Some("The selected repository no longer exists.".into());
+            return;
+        };
+        if self.snapshot.worktrees.iter().any(|worktree| {
+            worktree.project_id == project_id
+                && !worktree.is_root_checkout
+                && worktree.status != WorktreeStatus::Removed
+        }) {
+            self.error = Some(
+                "Repository still contains managed checkouts. Delete them before removing the repository."
+                    .into(),
+            );
+            return;
+        }
+        if self.snapshot.sessions.iter().any(|session| {
+            self.snapshot.worktrees.iter().any(|worktree| {
+                worktree.id == session.worktree_id && worktree.project_id == project_id
+            })
+        }) {
+            self.error = Some(
+                "Repository still contains sessions. Delete them before removing the repository."
+                    .into(),
+            );
+            return;
+        }
+        self.modal = Some(Modal::Confirmation(Confirmation::RemoveProject {
+            project_id,
+            name: project.name,
+            canonical_path: project.canonical_repository_path,
+        }));
+    }
+
+    fn open_session_removal_confirmation(&mut self, session_id: SessionId) {
+        let Some(session) = self.session(session_id).cloned() else {
+            self.error = Some("The selected session no longer exists.".into());
+            return;
+        };
+        if !session_can_delete(&session, &self.snapshot.sessions) {
+            self.error = Some(
+                "Only terminal sessions that can no longer be resumed may be deleted.".into(),
+            );
+            return;
+        }
+        self.modal = Some(Modal::Confirmation(Confirmation::RemoveSession {
+            session_id,
+            name: session.display_name,
+        }));
+    }
+
     fn open_data_removal_confirmation(&mut self) {
         self.modal = Some(Modal::DataRemoval(DataRemovalConfirmation::default()));
         self.modal_focus = ModalFocus::Pending;
@@ -3896,6 +4122,27 @@ impl DesktopApp {
             return;
         };
         match confirmation {
+            Confirmation::RemoveWorkspace { workspace_id, .. } => {
+                self.send_request(
+                    Operation::RemoveWorkspace(workspace_id),
+                    ClientRequest::RemoveWorkspace { workspace_id },
+                );
+                self.modal = None;
+            }
+            Confirmation::RemoveProject { project_id, .. } => {
+                self.send_request(
+                    Operation::RemoveProject(project_id),
+                    ClientRequest::RemoveProject { project_id },
+                );
+                self.modal = None;
+            }
+            Confirmation::RemoveSession { session_id, .. } => {
+                self.send_request(
+                    Operation::RemoveSession(session_id),
+                    ClientRequest::RemoveSession { session_id },
+                );
+                self.modal = None;
+            }
             Confirmation::StopSession { .. } => {
                 if let Some(session_id) = self.active_session_id {
                     self.send_request(
@@ -4646,13 +4893,16 @@ const fn operation_error_context(operation: Operation) -> &'static str {
         Operation::ProbeProvider(_) => "Provider check",
         Operation::CreateWorkspace => "Create workspace",
         Operation::OpenWorkspace(_) => "Open workspace",
+        Operation::RemoveWorkspace(_) => DELETE_WORKSPACE_LABEL,
         Operation::RegisterProject => "Add repository",
+        Operation::RemoveProject(_) => REMOVE_REPOSITORY_LABEL,
         Operation::CreateWorktree => "Create checkout",
         Operation::CreateSession(_) => "Start session",
         Operation::Resume(_) => "Resume session",
         Operation::RenameProject => "Rename repository",
         Operation::RenameWorktree => "Rename checkout",
         Operation::RenameSession => "Rename session",
+        Operation::RemoveSession(_) => DELETE_SESSION_LABEL,
         Operation::InspectRemoval(_) | Operation::RemoveWorktree => "Delete checkout",
         Operation::Attach(_) => "Open terminal",
         Operation::Detach(_) => "Leave terminal",
@@ -4771,8 +5021,10 @@ const fn explorer_action_label(action: ExplorerAction) -> &'static str {
         ExplorerAction::RenameRepository(_)
         | ExplorerAction::RenameCheckout(_)
         | ExplorerAction::RenameSession(_) => "Rename",
+        ExplorerAction::RemoveRepository(_) => REMOVE_REPOSITORY_LABEL,
         ExplorerAction::CreateSession(_) => "Start session",
         ExplorerAction::DeleteCheckout(_) => DELETE_CHECKOUT_LABEL,
+        ExplorerAction::DeleteSession(_) => DELETE_SESSION_LABEL,
         ExplorerAction::OpenSession(_) => "Open",
     }
 }
@@ -5281,6 +5533,15 @@ fn focused_danger_action_style(theme: &Theme, status: Status) -> button::Style {
 
 fn flat_danger_style(theme: &Theme, status: Status) -> button::Style {
     danger_action_style(theme, status)
+}
+
+fn trash_action_style(theme: &Theme, status: Status) -> button::Style {
+    let mut style = danger_action_style(theme, status);
+    style.border = Border::default();
+    if matches!(status, Status::Active | Status::Disabled) {
+        style.background = None;
+    }
+    style
 }
 
 fn contrast_safe_text(background: Color, preferred: Color) -> Color {
@@ -5962,6 +6223,61 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn metadata_removal_confirmations_enforce_empty_and_terminal_preconditions() {
+        let (mut app, project_id, _, first_id, _) = desktop_hierarchy();
+
+        app.open_workspace_removal_confirmation();
+        assert!(app.modal.is_none());
+        assert!(app.error.as_deref().is_some_and(|error| error.contains("repositories")));
+
+        app.error = None;
+        app.open_project_removal_confirmation(project_id);
+        assert!(app.modal.is_none());
+        assert!(app.error.as_deref().is_some_and(|error| error.contains("checkouts")));
+
+        app.error = None;
+        app.snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == first_id)
+            .expect("first session")
+            .state = SessionState::Terminated;
+        app.open_session_removal_confirmation(first_id);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirmation(Confirmation::RemoveSession {
+                session_id,
+                ..
+            })) if session_id == first_id
+        ));
+
+        app.modal = None;
+        app.snapshot.sessions.clear();
+        app.snapshot.worktrees[0].is_root_checkout = true;
+        app.open_project_removal_confirmation(project_id);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirmation(Confirmation::RemoveProject {
+                project_id: confirmed,
+                ..
+            })) if confirmed == project_id
+        ));
+
+        app.modal = None;
+        app.snapshot.projects.clear();
+        app.snapshot.worktrees.clear();
+        let workspace_id = app.active_workspace().expect("workspace").id;
+        app.open_workspace_removal_confirmation();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirmation(Confirmation::RemoveWorkspace {
+                workspace_id: confirmed,
+                ..
+            })) if confirmed == workspace_id
+        ));
+    }
+
     #[tokio::test]
     async fn rendered_visual_acceptance_baselines_cover_polished_workflows() {
         let (mut app, _, _, _, _) = desktop_hierarchy();
@@ -6017,7 +6333,7 @@ mod tests {
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [127, 129, 89, 183, 239, 110, 149]
+            [130, 132, 91, 185, 242, 110, 152]
         );
         let baselines = [
             &canopy_attention,
@@ -6227,6 +6543,26 @@ mod tests {
             background.relative_contrast(active.text_color) >= 4.5,
             "selected tab text must remain readable against its fill"
         );
+    }
+
+    #[test]
+    fn trash_actions_are_borderless_with_a_transparent_resting_surface() {
+        let theme = theme::resolve(presentation::PresentationTheme::resolve(
+            DesktopTheme::Canopy,
+            SystemAppearance::Dark,
+        ));
+
+        for status in [
+            Status::Active,
+            Status::Hovered,
+            Status::Pressed,
+            Status::Disabled,
+        ] {
+            assert_eq!(trash_action_style(&theme, status).border.width, 0.0);
+        }
+        assert!(trash_action_style(&theme, Status::Active).background.is_none());
+        assert!(trash_action_style(&theme, Status::Disabled).background.is_none());
+        assert!(trash_action_style(&theme, Status::Hovered).background.is_some());
     }
 
     #[test]

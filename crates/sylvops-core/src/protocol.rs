@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 10;
+pub const PROTOCOL_MINOR: u16 = 11;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -362,6 +362,9 @@ pub enum ClientRequest {
     OpenWorkspace {
         workspace_id: WorkspaceId,
     },
+    RemoveWorkspace {
+        workspace_id: WorkspaceId,
+    },
     AddProject {
         workspace_id: WorkspaceId,
         repository_path: String,
@@ -373,6 +376,9 @@ pub enum ClientRequest {
     RenameProject {
         project_id: ProjectId,
         name: String,
+    },
+    RemoveProject {
+        project_id: ProjectId,
     },
     CreateWorktree {
         project_id: ProjectId,
@@ -431,6 +437,9 @@ pub enum ClientRequest {
         session_id: SessionId,
         name: String,
     },
+    RemoveSession {
+        session_id: SessionId,
+    },
     CheckForUpdate,
     DownloadUpdate,
     CancelUpdateDownload,
@@ -471,6 +480,11 @@ pub enum DaemonResponse {
         revision: u64,
         workspace: Workspace,
     },
+    WorkspaceRemoved {
+        revision: u64,
+        workspace_id: WorkspaceId,
+        opened_workspace: Option<Workspace>,
+    },
     ProjectAdded {
         revision: u64,
         project: Project,
@@ -485,6 +499,10 @@ pub enum DaemonResponse {
     ProjectUpdated {
         revision: u64,
         project: Project,
+    },
+    ProjectRemoved {
+        revision: u64,
+        project_id: ProjectId,
     },
     WorktreeCreated {
         revision: u64,
@@ -511,6 +529,10 @@ pub enum DaemonResponse {
     SessionUpdated {
         revision: u64,
         session: Session,
+    },
+    SessionRemoved {
+        revision: u64,
+        session_id: SessionId,
     },
     UpdateNotAvailable {
         version: String,
@@ -542,6 +564,11 @@ pub enum DaemonEvent {
         revision: u64,
         workspace: Workspace,
     },
+    WorkspaceRemoved {
+        revision: u64,
+        workspace_id: WorkspaceId,
+        opened_workspace: Option<Workspace>,
+    },
     ProjectAdded {
         revision: u64,
         project: Project,
@@ -550,6 +577,10 @@ pub enum DaemonEvent {
     ProjectUpdated {
         revision: u64,
         project: Project,
+    },
+    ProjectRemoved {
+        revision: u64,
+        project_id: ProjectId,
     },
     WorktreeAdded {
         revision: u64,
@@ -573,6 +604,10 @@ pub enum DaemonEvent {
     SessionUpdated {
         revision: u64,
         session: Session,
+    },
+    SessionRemoved {
+        revision: u64,
+        session_id: SessionId,
     },
     UpgradeProgress {
         status: crate::upgrade::UpgradeStatus,
@@ -707,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_10_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_11_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -719,7 +754,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 10);
+        assert_eq!(PROTOCOL_MINOR, 11);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -891,6 +926,26 @@ mod tests {
             ClientRequest::RemoveWorktree {
                 worktree_id: WorktreeId::new(),
                 confirmation_token: "state-bound-token".into(),
+            },
+        ];
+
+        for request in requests {
+            let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
+            assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn protocol_1_11_metadata_removal_requests_round_trip() {
+        let requests = [
+            ClientRequest::RemoveWorkspace {
+                workspace_id: WorkspaceId::new(),
+            },
+            ClientRequest::RemoveProject {
+                project_id: ProjectId::new(),
+            },
+            ClientRequest::RemoveSession {
+                session_id: SessionId::new(),
             },
         ];
 

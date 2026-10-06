@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, 
 use sha2::{Digest, Sha256};
 use sylvops_core::domain::{
     DaemonSnapshot, Project, ProviderProfile, Session, SessionState, Workspace, Worktree,
-    WorktreeStatus,
+    WorktreeStatus, session_can_delete,
 };
 use sylvops_core::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
 use sylvops_core::ui::{DesktopState, TuiState};
@@ -87,6 +87,10 @@ enum DatabaseCommand {
         id: WorkspaceId,
         reply: oneshot::Sender<Result<(u64, Workspace)>>,
     },
+    RemoveWorkspace {
+        id: WorkspaceId,
+        reply: oneshot::Sender<Result<(u64, Option<Workspace>)>>,
+    },
     AddProject {
         registration: RepositoryRegistration,
         reply: oneshot::Sender<Result<(u64, Project, Worktree)>>,
@@ -95,6 +99,10 @@ enum DatabaseCommand {
         id: ProjectId,
         name: String,
         reply: oneshot::Sender<Result<(u64, Project)>>,
+    },
+    RemoveProject {
+        id: ProjectId,
+        reply: oneshot::Sender<Result<u64>>,
     },
     Worktree {
         id: WorktreeId,
@@ -141,6 +149,10 @@ enum DatabaseCommand {
         id: SessionId,
         name: String,
         reply: oneshot::Sender<Result<(u64, Session)>>,
+    },
+    RemoveSession {
+        id: SessionId,
+        reply: oneshot::Sender<Result<u64>>,
     },
     MarkSessionRunning {
         id: SessionId,
@@ -340,6 +352,21 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Deletes one empty workspace and opens a deterministic remaining workspace when needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, not-found, non-empty, transaction, or SQLite error.
+    pub async fn remove_workspace(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<(u64, Option<Workspace>)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::RemoveWorkspace { id, reply }
+        })
+        .await
+    }
+
     /// Inserts a project and root worktree in one transaction.
     ///
     /// # Errors
@@ -364,6 +391,18 @@ impl DatabaseHandle {
     pub async fn rename_project(&self, id: ProjectId, name: String) -> Result<(u64, Project)> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::RenameProject { id, name, reply }
+        })
+        .await
+    }
+
+    /// Unregisters an empty repository without touching repository or checkout paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, not-found, non-empty, transaction, or SQLite error.
+    pub async fn remove_project(&self, id: ProjectId) -> Result<u64> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::RemoveProject { id, reply }
         })
         .await
     }
@@ -503,6 +542,18 @@ impl DatabaseHandle {
     pub async fn rename_session(&self, id: SessionId, name: String) -> Result<(u64, Session)> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::RenameSession { id, name, reply }
+        })
+        .await
+    }
+
+    /// Permanently deletes one terminal, non-resumable session record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, not-found, ineligible-state, transaction, or SQLite error.
+    pub async fn remove_session(&self, id: SessionId) -> Result<u64> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::RemoveSession { id, reply }
         })
         .await
     }
@@ -720,6 +771,13 @@ fn database_thread(
                 });
                 let _ = reply.send(result);
             }
+            DatabaseCommand::RemoveWorkspace { id, reply } => {
+                let result = remove_workspace(&mut connection, id).map(|opened_workspace| {
+                    revision = revision.saturating_add(1);
+                    (revision, opened_workspace)
+                });
+                let _ = reply.send(result);
+            }
             DatabaseCommand::AddProject {
                 registration,
                 reply,
@@ -735,6 +793,13 @@ fn database_thread(
                 let result = rename_project(&mut connection, id, &name).map(|project| {
                     revision = revision.saturating_add(1);
                     (revision, project)
+                });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::RemoveProject { id, reply } => {
+                let result = remove_project(&mut connection, id).map(|()| {
+                    revision = revision.saturating_add(1);
+                    revision
                 });
                 let _ = reply.send(result);
             }
@@ -792,6 +857,13 @@ fn database_thread(
                 let result = rename_session(&mut connection, id, &name).map(|session| {
                     revision = revision.saturating_add(1);
                     (revision, session)
+                });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::RemoveSession { id, reply } => {
+                let result = remove_session(&mut connection, id).map(|()| {
+                    revision = revision.saturating_add(1);
+                    revision
                 });
                 let _ = reply.send(result);
             }
@@ -1031,6 +1103,62 @@ fn open_workspace(connection: &mut Connection, id: WorkspaceId) -> Result<Worksp
     Ok(workspace)
 }
 
+fn remove_workspace(connection: &mut Connection, id: WorkspaceId) -> Result<Option<Workspace>> {
+    let now = now_millis();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let workspace = load_workspace(&transaction, id)?;
+    let project_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM projects WHERE workspace_id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if project_count != 0 {
+        return Err(DaemonError::Database(
+            "workspace still contains repositories; remove them first".into(),
+        ));
+    }
+    transaction
+        .execute("DELETE FROM workspaces WHERE id = ?1", [id.to_string()])
+        .map_err(database_error)?;
+    let mut opened_workspace = if workspace.is_open {
+        transaction
+            .query_row(
+                "SELECT id, name, created_at, updated_at, last_opened_at, is_open \
+                 FROM workspaces ORDER BY last_opened_at DESC, created_at ASC, id ASC LIMIT 1",
+                [],
+                workspace_from_row,
+            )
+            .optional()
+            .map_err(database_error)?
+    } else {
+        None
+    };
+    if let Some(workspace) = &mut opened_workspace {
+        transaction
+            .execute(
+                "UPDATE workspaces SET is_open = 1, last_opened_at = ?2, updated_at = ?2 \
+                 WHERE id = ?1",
+                params![workspace.id.to_string(), now],
+            )
+            .map_err(database_error)?;
+        workspace.is_open = true;
+        workspace.last_opened_at = Some(now);
+        workspace.updated_at = now;
+    }
+    insert_entity_audit(
+        &transaction,
+        "workspace_removed",
+        "workspace",
+        &id.to_string(),
+    )?;
+    transaction.commit().map_err(database_error)?;
+    Ok(opened_workspace)
+}
+
 fn insert_project(
     connection: &mut Connection,
     registration: &RepositoryRegistration,
@@ -1136,6 +1264,54 @@ fn rename_project(connection: &mut Connection, id: ProjectId, name: &str) -> Res
     let project = load_project(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(project)
+}
+
+fn remove_project(connection: &mut Connection, id: ProjectId) -> Result<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    load_project(&transaction, id)?;
+    let session_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sessions \
+             JOIN worktrees ON worktrees.id = sessions.worktree_id \
+             WHERE worktrees.project_id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if session_count != 0 {
+        return Err(DaemonError::Database(
+            "repository still contains sessions; delete them first".into(),
+        ));
+    }
+    let managed_checkout_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM worktrees \
+             WHERE project_id = ?1 AND is_root_checkout = 0 AND status != 'removed'",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if managed_checkout_count != 0 {
+        return Err(DaemonError::Database(
+            "repository still contains managed checkouts; delete them first".into(),
+        ));
+    }
+    transaction
+        .execute("DELETE FROM worktrees WHERE project_id = ?1", [id.to_string()])
+        .map_err(database_error)?;
+    transaction
+        .execute("DELETE FROM projects WHERE id = ?1", [id.to_string()])
+        .map_err(database_error)?;
+    insert_entity_audit(
+        &transaction,
+        "project_removed",
+        "project",
+        &id.to_string(),
+    )?;
+    transaction.commit().map_err(database_error)?;
+    Ok(())
 }
 
 fn load_workspace(connection: &Connection, id: WorkspaceId) -> Result<Workspace> {
@@ -1428,6 +1604,44 @@ fn rename_session(connection: &mut Connection, id: SessionId, name: &str) -> Res
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(session)
+}
+
+fn remove_session(connection: &mut Connection, id: SessionId) -> Result<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let session = load_session(&transaction, id)?;
+    let sessions = query_all(
+        &transaction,
+        "SELECT id, worktree_id, provider_profile_id, provider_kind, display_name, state, \
+         process_id, external_session_id, command, arguments_json, cwd, created_at, \
+         started_at, ended_at, last_activity_at, last_seen_output_sequence, exit_code, \
+         failure_reason FROM sessions ORDER BY last_activity_at DESC",
+        session_from_row,
+    )?;
+    if !session_can_delete(&session, &sessions) {
+        return Err(DaemonError::Database(
+            "only terminal, non-resumable sessions can be deleted".into(),
+        ));
+    }
+    transaction
+        .execute(
+            "DELETE FROM session_resumptions \
+             WHERE source_session_id = ?1 OR successor_session_id = ?1",
+            [id.to_string()],
+        )
+        .map_err(database_error)?;
+    transaction
+        .execute("DELETE FROM sessions WHERE id = ?1", [id.to_string()])
+        .map_err(database_error)?;
+    insert_entity_audit(
+        &transaction,
+        "session_removed",
+        "session",
+        &id.to_string(),
+    )?;
+    transaction.commit().map_err(database_error)?;
+    Ok(())
 }
 
 fn validated_name<'a>(name: &'a str, entity: &str) -> Result<&'a str> {
@@ -2034,10 +2248,27 @@ fn database_error(error: rusqlite::Error) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sylvops_core::domain::ProviderKind;
     use sylvops_core::ui::{
         DesktopDensity, DesktopState, DesktopTerminalCursor, DesktopTerminalFont, DesktopTheme,
         MainTab,
     };
+
+    fn test_registration(
+        workspace_id: WorkspaceId,
+        repository_path: String,
+    ) -> RepositoryRegistration {
+        RepositoryRegistration {
+            workspace_id,
+            name: "repository".into(),
+            canonical_repository_path: repository_path.clone(),
+            repository_path,
+            default_branch: Some("main".into()),
+            remote_url: None,
+            branch: Some("main".into()),
+            base_commit: "deadbeef".into(),
+        }
+    }
 
     #[tokio::test]
     async fn migrates_and_returns_empty_snapshot() {
@@ -2421,6 +2652,145 @@ mod tests {
                 .iter()
                 .any(|workspace| workspace.id == second.id && !workspace.is_open)
         );
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_removal_is_revisioned_and_preserves_repository_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
+        let (_, first) = database.add_workspace("First".into()).await.unwrap();
+        let (_, second) = database.add_workspace("Second".into()).await.unwrap();
+        let (workspace_revision, fallback) =
+            database.remove_workspace(second.id).await.unwrap();
+        assert_eq!(fallback.as_ref().map(|workspace| workspace.id), Some(first.id));
+        assert!(fallback.is_some_and(|workspace| workspace.is_open));
+
+        let repository_path = directory.path().join("repository");
+        std::fs::create_dir(&repository_path).unwrap();
+        let repository_path = repository_path.to_string_lossy().into_owned();
+        let (project_revision, project, _) = database
+            .add_project(test_registration(first.id, repository_path.clone()))
+            .await
+            .unwrap();
+        assert!(project_revision > workspace_revision);
+        assert!(database.remove_workspace(first.id).await.is_err());
+
+        let removed_revision = database.remove_project(project.id).await.unwrap();
+        assert!(removed_revision > project_revision);
+        assert!(std::path::Path::new(&repository_path).is_dir());
+        let snapshot = database.snapshot().await.unwrap();
+        assert!(snapshot.projects.is_empty());
+        assert!(snapshot.worktrees.is_empty());
+
+        let (final_revision, fallback) = database.remove_workspace(first.id).await.unwrap();
+        assert!(final_revision > removed_revision);
+        assert!(fallback.is_none());
+        assert!(database.snapshot().await.unwrap().workspaces.is_empty());
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_live_resumable_and_non_empty_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
+        let (_, workspace) = database.add_workspace("Workspace".into()).await.unwrap();
+        let repository_path = directory.path().join("repository");
+        std::fs::create_dir(&repository_path).unwrap();
+        let repository_path = repository_path.to_string_lossy().into_owned();
+        let (_, project, root) = database
+            .add_project(test_registration(workspace.id, repository_path))
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        database
+            .create_session(NewSession {
+                id: session_id,
+                worktree_id: root.id,
+                display_name: "shell".into(),
+                provider_profile_id: None,
+                provider_kind: ProviderKind::Shell,
+                command: "shell".into(),
+                arguments_json: "[]".into(),
+                cwd: root.canonical_path.clone(),
+                external_session_id: None,
+                resumed_from_session_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(database.remove_session(session_id).await.is_err());
+        assert!(database.remove_project(project.id).await.is_err());
+        database
+            .finish_session(session_id, SessionState::Terminated, None, None)
+            .await
+            .unwrap();
+        database.remove_session(session_id).await.unwrap();
+
+        let resumable_id = SessionId::new();
+        database
+            .create_session(NewSession {
+                id: resumable_id,
+                worktree_id: root.id,
+                display_name: "codex".into(),
+                provider_profile_id: None,
+                provider_kind: ProviderKind::Codex,
+                command: "codex".into(),
+                arguments_json: "[]".into(),
+                cwd: root.canonical_path.clone(),
+                external_session_id: Some("verified-conversation".into()),
+                resumed_from_session_id: None,
+            })
+            .await
+            .unwrap();
+        database
+            .finish_session(resumable_id, SessionState::Failed, Some(1), None)
+            .await
+            .unwrap();
+        assert!(database.remove_session(resumable_id).await.is_err());
+        let successor_id = SessionId::new();
+        database
+            .create_session(NewSession {
+                id: successor_id,
+                worktree_id: root.id,
+                display_name: "codex resumed".into(),
+                provider_profile_id: None,
+                provider_kind: ProviderKind::Codex,
+                command: "codex".into(),
+                arguments_json: "[]".into(),
+                cwd: root.canonical_path.clone(),
+                external_session_id: Some("verified-conversation".into()),
+                resumed_from_session_id: Some(resumable_id),
+            })
+            .await
+            .unwrap();
+        database
+            .finish_session(successor_id, SessionState::Terminated, None, None)
+            .await
+            .unwrap();
+        database.remove_session(resumable_id).await.unwrap();
+        database.remove_session(successor_id).await.unwrap();
+
+        let managed_path = directory.path().join("managed");
+        std::fs::create_dir(&managed_path).unwrap();
+        let managed_path = managed_path.to_string_lossy().into_owned();
+        let managed_id = WorktreeId::new();
+        database
+            .add_worktree(NewManagedWorktree {
+                id: managed_id,
+                project_id: project.id,
+                name: "managed".into(),
+                path: managed_path.clone(),
+                canonical_path: managed_path.clone(),
+                branch: "feature/removal".into(),
+                base_ref: "main".into(),
+                base_commit: "deadbeef".into(),
+            })
+            .await
+            .unwrap();
+        assert!(database.remove_project(project.id).await.is_err());
+        database.mark_worktree_removed(managed_id).await.unwrap();
+        database.remove_project(project.id).await.unwrap();
+        assert!(std::path::Path::new(&managed_path).is_dir());
         database.shutdown().await.unwrap();
     }
 
