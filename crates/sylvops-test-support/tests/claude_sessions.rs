@@ -180,7 +180,7 @@ async fn managed_claude_session_inner() {
         }
         response => panic!("unexpected session response: {response:?}"),
     };
-    let running = wait_for_session(&client, session_id, |session| {
+    let running = wait_for_session_for(&client, session_id, Duration::from_secs(20), |session| {
         session.state == SessionState::Running && session.external_session_id.is_some()
     })
     .await;
