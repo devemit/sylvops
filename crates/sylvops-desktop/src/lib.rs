@@ -1233,7 +1233,10 @@ impl DesktopApp {
             };
             row![
                 line_icon(explorer_attention_icon(attention), 13),
-                text(label).size(UI_META_SIZE).style(text::secondary),
+                text(label)
+                    .size(UI_META_SIZE)
+                    .line_height(1.0)
+                    .style(text::secondary),
             ]
             .spacing(4)
             .align_y(Center)
@@ -1243,6 +1246,7 @@ impl DesktopApp {
                 line_icon(session_indicator_icon(indicator), 13),
                 text(row.detail.clone())
                     .size(UI_META_SIZE)
+                    .line_height(1.0)
                     .style(text::secondary),
             ]
             .spacing(4)
@@ -1251,6 +1255,7 @@ impl DesktopApp {
         } else {
             text(row.detail.clone())
                 .size(UI_META_SIZE)
+                .line_height(1.0)
                 .style(text::secondary)
                 .into()
         };
@@ -1258,6 +1263,7 @@ impl DesktopApp {
             text(row.label.clone())
                 .font(if is_selected { UI_MEDIUM } else { UI_FONT })
                 .size(UI_TEXT_SIZE)
+                .line_height(1.0)
                 .wrapping(text::Wrapping::None),
             detail,
         ]
