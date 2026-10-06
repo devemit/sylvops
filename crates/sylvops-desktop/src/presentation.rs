@@ -1,7 +1,10 @@
 #![allow(clippy::unreadable_literal)] // Six-digit values intentionally mirror CSS RGB notation.
 
 use sylvops_core::{
-    domain::{DaemonSnapshot, Session, SessionState, Worktree, WorktreeStatus, session_can_delete},
+    domain::{
+        DaemonSnapshot, Session, SessionState, Worktree, WorktreeStatus, session_can_delete,
+        session_can_resume,
+    },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     ui::{DesktopDensity, DesktopState, DesktopTheme, MainTab},
 };
