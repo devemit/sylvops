@@ -7,7 +7,7 @@ use toml::Value;
 
 use crate::domain::ProviderKind;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 1;
+pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,7 +45,11 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: CURRENT_CONFIG_VERSION,
-            enabled_providers: vec![ProviderKind::Shell, ProviderKind::Codex],
+            enabled_providers: vec![
+                ProviderKind::Shell,
+                ProviderKind::Codex,
+                ProviderKind::Claude,
+            ],
             default_provider: ProviderKind::Shell,
             default_model: None,
             default_effort: None,
@@ -90,7 +94,7 @@ impl AppConfig {
             )
         }) {
             return Err(
-                "only shell, codex, and Claude health are implemented in this release".into(),
+                "only shell, Codex, and Claude Code are implemented in this release".into(),
             );
         }
         if !self.enabled_providers.contains(&self.default_provider) {
@@ -142,7 +146,18 @@ future_setting = "preserved"
 
     #[test]
     fn default_configuration_is_valid() {
-        AppConfig::default().validate().unwrap();
+        let config = AppConfig::default();
+        config.validate().unwrap();
+        assert_eq!(config.version, 2);
+        assert_eq!(
+            config.enabled_providers,
+            vec![
+                ProviderKind::Shell,
+                ProviderKind::Codex,
+                ProviderKind::Claude,
+            ]
+        );
+        assert_eq!(config.default_provider, ProviderKind::Shell);
     }
 
     #[test]

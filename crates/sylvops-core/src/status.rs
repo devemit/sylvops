@@ -8,6 +8,7 @@ use crate::domain::SessionState;
 
 const MAX_PROVIDER_CONVERSATION_ID_LENGTH: usize = 200;
 const MAX_TURN_FAILURE_CATEGORY_LENGTH: usize = 64;
+const MAX_TRACKED_ACTIVE_SUBAGENTS: usize = 256;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -169,6 +170,7 @@ pub enum NormalizedProviderEvent {
 pub struct SessionStatusMachine {
     state: SessionState,
     active_subagents: HashSet<String>,
+    subagent_capacity_exhausted: bool,
 }
 
 impl SessionStatusMachine {
@@ -177,6 +179,7 @@ impl SessionStatusMachine {
         Self {
             state,
             active_subagents: HashSet::new(),
+            subagent_capacity_exhausted: false,
         }
     }
 
@@ -203,14 +206,23 @@ impl SessionStatusMachine {
                 self.state = SessionState::NeedsFeedback;
             }
             NormalizedProviderEvent::SubagentStarted { agent_id } => {
-                self.active_subagents.insert(agent_id.clone());
+                if !self.active_subagents.contains(agent_id) {
+                    if self.active_subagents.len() < MAX_TRACKED_ACTIVE_SUBAGENTS {
+                        self.active_subagents.insert(agent_id.clone());
+                    } else {
+                        self.subagent_capacity_exhausted = true;
+                    }
+                }
                 self.state = SessionState::Running;
             }
             NormalizedProviderEvent::SubagentStopped { agent_id } => {
                 self.active_subagents.remove(agent_id);
             }
             NormalizedProviderEvent::TurnStopped { remaining_work } => {
-                self.state = if self.active_subagents.is_empty() && remaining_work.is_empty() {
+                self.state = if self.active_subagents.is_empty()
+                    && !self.subagent_capacity_exhausted
+                    && remaining_work.is_empty()
+                {
                     SessionState::FinishedUnseen
                 } else {
                     SessionState::Running
@@ -278,6 +290,29 @@ mod tests {
                 remaining_work: RemainingWork::default(),
             }),
             SessionState::FinishedUnseen
+        );
+    }
+
+    #[test]
+    fn subagent_tracking_is_bounded_and_fails_closed_after_capacity() {
+        let mut machine = SessionStatusMachine::new(SessionState::Running);
+        for index in 0..=MAX_TRACKED_ACTIVE_SUBAGENTS {
+            machine.apply(&NormalizedProviderEvent::SubagentStarted {
+                agent_id: format!("agent-{index}"),
+            });
+        }
+        assert_eq!(machine.active_subagents.len(), MAX_TRACKED_ACTIVE_SUBAGENTS);
+        assert!(machine.subagent_capacity_exhausted);
+        for index in 0..MAX_TRACKED_ACTIVE_SUBAGENTS {
+            machine.apply(&NormalizedProviderEvent::SubagentStopped {
+                agent_id: format!("agent-{index}"),
+            });
+        }
+        assert_eq!(
+            machine.apply(&NormalizedProviderEvent::TurnStopped {
+                remaining_work: RemainingWork::default(),
+            }),
+            SessionState::Running
         );
     }
 

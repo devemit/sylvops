@@ -40,6 +40,19 @@ string_enum!(ProviderKind {
     Pi => "pi",
 });
 
+impl ProviderKind {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Shell => "Shell",
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Cursor => "Cursor",
+            Self::Pi => "Pi",
+        }
+    }
+}
+
 #[allow(clippy::derivable_impls)]
 impl Default for ProviderKind {
     fn default() -> Self {
@@ -216,17 +229,18 @@ pub const fn state_allows_resume(state: SessionState) -> bool {
 }
 
 /// Whether a session is the latest eligible record for a verified provider conversation.
+///
+/// Clients must additionally check the current Provider health and resume capability.
 #[must_use]
-pub fn session_can_resume(session: &Session, sessions: &[Session]) -> bool {
-    if session.provider_kind != ProviderKind::Codex {
-        return false;
-    }
+pub fn session_record_can_resume(session: &Session, sessions: &[Session]) -> bool {
     let Some(external_session_id) = session.external_session_id.as_deref() else {
         return false;
     };
     state_allows_resume(session.state)
         && !sessions.iter().any(|candidate| {
             candidate.id != session.id
+                && candidate.provider_kind == session.provider_kind
+                && candidate.worktree_id == session.worktree_id
                 && candidate.external_session_id.as_deref() == Some(external_session_id)
                 && (candidate.created_at, candidate.id.as_uuid())
                     > (session.created_at, session.id.as_uuid())
@@ -243,12 +257,18 @@ pub fn session_can_delete(session: &Session, sessions: &[Session]) -> bool {
             | SessionState::Failed
             | SessionState::Terminated
             | SessionState::Disconnected
-    ) && !session_can_resume(session, sessions)
+    ) && !session_record_can_resume(session, sessions)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionState, state_allows_resume};
+    use super::{ProviderKind, SessionState, state_allows_resume};
+
+    #[test]
+    fn provider_display_names_are_distinct_from_protocol_values() {
+        assert_eq!(ProviderKind::Claude.to_string(), "claude");
+        assert_eq!(ProviderKind::Claude.display_name(), "Claude Code");
+    }
 
     #[test]
     fn only_inactive_provider_states_allow_resume() {

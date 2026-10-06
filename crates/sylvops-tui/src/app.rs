@@ -115,6 +115,7 @@ pub(crate) enum HitTarget {
     Attention,
     ModalField(usize),
     ModalProvider(usize),
+    ModalProviderProbe,
     ModalSubmit,
     ModalCancel,
     Confirm,

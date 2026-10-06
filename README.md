@@ -6,7 +6,7 @@ SylvOps is a local-first mission control for supervising interactive coding-agen
 
 Install Git yourself and make sure `git --version` works before starting SylvOps. A Rust toolchain is not required for a packaged release.
 
-Codex is optional and separately installed and authenticated. Install the Codex CLI and complete its login using OpenAI's instructions before choosing the Codex provider. SylvOps does not install Git or Codex, run their login commands, copy credentials, or store provider secrets. After SylvOps is running, use `sylvops doctor` and `sylvops provider probe codex` to distinguish a missing executable from a login problem.
+Codex and Claude Code are optional and separately installed and authenticated. Install the provider CLI and complete its login using the provider's instructions before choosing it in SylvOps. SylvOps does not install Git or provider CLIs, run their login commands, copy credentials, or store provider secrets. After SylvOps is running, use `sylvops doctor`, `sylvops provider probe codex`, or `sylvops provider probe claude` to distinguish a missing executable, old version, unsupported authentication, or logged-out state.
 
 Download release files only from the [SylvOps GitHub Releases](https://github.com/devemit/sylvops/releases) page. Keep the release's `SHA256SUMS` beside the downloaded package and verify the named file before opening it. Every asset also has GitHub build-provenance attestations.
 
@@ -169,7 +169,7 @@ The first Codex session is created only after the visible action in step 3; Sylv
 
 These update controls apply only to official signed application releases. Unsigned previews fail closed for signed-update discovery and must be replaced by explicitly installing a later preview or building a newer revision from source.
 
-In **Settings -> Updates**, choose **Check again**, then **Download verified upgrade**, then **Install update**. The desktop shows the target version, human-readable download size, and bounded release notes; exact bytes are available under **Technical details** with a bounded copy action. Periodic checks are on by default at a bounded 24-hour interval and can be disabled with **Periodic checks: Off**. Checks read signed metadata; downloads and installation always require visible user actions.
+In **Settings -> Updates**, use the single available update action: **Check again**, **Download verified upgrade**, or **Install update**, depending on the current status. The desktop shows the target version, human-readable download size, and bounded release notes. Periodic checks are on by default at a bounded 24-hour interval and can be disabled with **Periodic checks: Off**. Checks read signed metadata; downloads and installation always require visible user actions.
 
 The equivalent CLI flow is:
 
@@ -201,7 +201,7 @@ SylvOps-owned data uses these paths:
 - macOS and Linux configuration: `$XDG_CONFIG_HOME/sylvops`, or `~/.config/sylvops` when `XDG_CONFIG_HOME` is unset.
 - macOS and Linux runtime: `$XDG_RUNTIME_DIR/sylvops` when set, otherwise the data directory's `run` subdirectory.
 
-To remove that data deliberately, first stop every session, then use **Settings -> Safety -> Remove SylvOps user data** or:
+To remove that data deliberately, first stop every session, then use **Settings -> Advanced -> Safety and data -> Remove SylvOps user data** or:
 
 ```text
 sylvops data remove --confirm "DELETE SYLVOPS USER DATA"
@@ -211,7 +211,7 @@ The exact phrase is required. The daemon refuses removal while sessions are acti
 
 ## Troubleshooting
 
-- **Provider discovery:** run `sylvops provider probe codex`. A missing executable and a login-required result are distinct. Install or sign in to Codex outside SylvOps; SylvOps never performs either action.
+- **Provider discovery:** run `sylvops provider probe codex` or `sylvops provider probe claude`. Missing installation, old version, unsupported authentication, and logged-out results remain distinct. Install, update, or sign in to the provider outside SylvOps; SylvOps never performs those actions.
 - **Daemon startup:** launch the installed application or run `sylvops daemon start`, then `sylvops daemon status`. If startup still fails, run `sylvops doctor` from the same installation.
 - **Mixed versions:** compare `sylvops --version` with the daemon version printed by `sylvops daemon status` or `sylvops doctor`. If they differ, run `sylvops daemon stop`, then reopen the intended installed application. For a portable copy, invoke that copy explicitly so an older executable on `PATH` is not selected.
 - **Package verification:** never open a file that fails `SHA256SUMS`. Official Windows releases must also report a valid Authenticode signature, while an unsigned preview makes no publisher-trust claim and must display its warning. Official macOS packages must pass `codesign`, `stapler`, and Gatekeeper checks. An installed Debian package can be checked with `sudo dpkg --verify sylvops`.
@@ -251,15 +251,15 @@ The repository now contains a **cross-platform application-release baseline**. I
 - guarded managed-worktree creation, status, and removal;
 - startup reconciliation for missing and externally discovered worktrees;
 - per-project Git mutation serialization and per-worktree session/removal coordination;
-- a provider adapter registry for plain shells and Codex;
-- bounded Codex discovery, version, and authentication probes;
-- application-owned Codex hook profiles plus an authenticated loopback hook relay;
-- deterministic attention states, external Codex session-ID capture, and guarded resume;
+- a provider adapter registry for plain shells, Codex, and Claude Code, all selectable from the CLI, TUI, and desktop;
+- bounded Codex and Claude discovery, version, and authentication probes;
+- application-owned provider hook settings plus an authenticated loopback hook relay;
+- deterministic attention states, verified provider conversation-ID capture, and guarded Codex and Claude resume;
 - a native, mouse-first desktop client with workspace tabs, guided repository/worktree/session management, responsive resizable navigation, a dominant terminal workspace, session tabs, Changes/Details views, persisted appearance and layout, and daemon-backed terminal attachment;
 - a hierarchical Ratatui mission-control client with an explorer, Terminal/Changes/Details tabs, guided forms, keyboard and mouse controls, attention selection, safe embedded terminal rendering, bounded read-only diffs, and restored navigation context;
 - CLI workspace, project, worktree, provider, session, desktop, and TUI commands.
 
-Claude, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
+Claude cloud Sessions, background-agent management, Remote Control, plugins, enterprise authentication, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
 
 The Windows implementation contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The prior cross-platform baseline passed the complete hosted Windows, Linux, and macOS quality gates; the current tree must pass those gates before `v0.1.0` is promoted.
 
@@ -275,12 +275,14 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 ### Desktop essentials
 
 - `sylvops` or `sylvops up [PATH]` opens the native window; closing it leaves daemon-owned sessions running.
-- The top bar switches workspaces. A collapsible Repository -> Checkout -> Session Explorer stays beside the large Terminal/Changes/Details area and becomes a dedicated narrow view below 820 px.
-- Select a session, click **Open terminal**, and interact normally. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
-- The footer always shows the version, workspace, branch, current view, daemon connectivity, and key hints.
-- Settings is a scrollable right-side sheet on wide and compact windows and a full-window view on narrow windows. Appearance offers immediate preview cards for System, Grove, Canopy, and Midnight, with seven Classic themes in an expandable secondary group; density, terminal typeface, 10–22 px text sizing, and Block/Line cursor remain bounded controls.
+- The top bar switches workspaces and uses a borderless **+** control to create one. Wide windows show three independently resizable columns—**Repositories**, **Checkouts**, and **Sessions**—beside the large Terminal/Changes/Details workspace. Compact windows use a tabbed navigator, and narrow windows switch between Navigator and Main.
+- Session rows keep their written state inline with the name, and navigator/footer regions retain stable positions as selection and context change.
+- Select a session once to open it, then click **Open terminal** to interact. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
+- The footer shows the real build or preview tag, local-daemon health, responsive Workspace/Repository/Checkout/Session context, current view, and key hints.
+- Settings is one centered, scrollable modal at every window size. **Essentials** contains signature themes, density, terminal typeface, 10–22 px text sizing, and Block/Line cursor. **Updates** exposes one context-sensitive action. Collapsed **Advanced** contains Classic themes, layout reset, and protected data-removal controls.
+- The desktop interface bundles JetBrains Mono for consistent developer-focused typography across Windows, Linux, and macOS; terminal text keeps its independent font preference.
 - Details shows dates in the operating-system locale and timezone and labels repository locations **Path**. IDs, raw timestamps, process/transport terms, and exact quantities stay under expandable **Technical details** with bounded copy actions. Session-record retention and non-persisted terminal output are described separately.
-- Important actions keep visible text, including **Start shell**, **Start Codex**, **Check again**, **Open terminal**, **Leave terminal**, **Stop session**, and **Delete checkout**. The terminal TUI remains available as a keyboard-first alternative.
+- Universal controls such as add, refresh, full screen, navigator visibility, and close use the bundled line icons. Named and risky actions retain visible text, including **Start shell**, **Start Codex**, **Open terminal**, **Leave terminal**, **Stop session**, and **Delete checkout**. The terminal TUI remains available as a keyboard-first alternative.
 
 ## Current commands
 
@@ -289,6 +291,7 @@ sylvops
 sylvops up .
 sylvops open .
 sylvops open . --provider codex --prompt "..."
+sylvops open . --provider claude --prompt "..."
 sylvops doctor
 sylvops update check
 sylvops update download
@@ -305,8 +308,10 @@ sylvops worktree create --project <project-id> --branch feature/example --base H
 sylvops worktree status <worktree-id>
 sylvops provider list
 sylvops provider probe codex
+sylvops provider probe claude
 sylvops session create --worktree <worktree-id> --provider shell
 sylvops session create --worktree <worktree-id> --provider codex --model <model> --effort high --prompt "..."
+sylvops session create --worktree <worktree-id> --provider claude --model <model> --effort high --prompt "..."
 sylvops session attach <session-id>
 sylvops session resume <session-id>
 sylvops session stop <session-id>
@@ -323,6 +328,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 ```
+
+The default suite is offline. The explicit real-Claude release smoke requires a pre-authenticated host and is documented in [the testing guide](docs/development/testing.md); it is never enabled by the commands above.
 
 See [the MVP definition](docs/product/mvp.md) and [process architecture](docs/architecture/process-model.md).
 

@@ -1,0 +1,25 @@
+name: Real Claude Code smoke
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-claude-code-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, claude-code-smoke]
+    environment: real-claude-smoke
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run bounded real-account smoke
+        env:
+          SYLVOPS_RUN_REAL_CLAUDE_SMOKE: "1"
+        run: cargo test -p sylvops-test-support --test real_claude_smoke -- --ignored --exact real_claude_account_smoke_is_bounded_and_redacted --nocapture

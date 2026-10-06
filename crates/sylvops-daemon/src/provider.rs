@@ -16,21 +16,22 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sylvops_core::{
     domain::ProviderKind,
+    ids::{SessionId, WorktreeId},
     provider::{
         AuthenticationRequirement, LaunchArguments, LaunchContext, LaunchSpec,
-        ProviderCapabilities, ProviderHealth, ProviderLifecycleEvent, ProviderLifecyclePayload,
-        ProviderRuntime, ProviderRuntimeCapabilities, ProviderRuntimeSpec, ResumeContext,
-        provider_error,
+        ProviderCapabilities, ProviderHealth, ProviderLifecycleEndpoint, ProviderLifecycleEvent,
+        ProviderLifecyclePayload, ProviderRuntime, ProviderRuntimeCapabilities,
+        ProviderRuntimeSpec, ResumeContext, provider_error,
     },
     status::{
         ConversationIdentity, ConversationIdentityTransition, NormalizedProviderEvent,
-        ProviderConversationId, RemainingWork,
+        ProviderConversationId, RemainingWork, TurnFailureCategory,
     },
 };
 use tokio::{io::AsyncReadExt, time::timeout};
 
 use crate::{
-    DaemonError, Result, background_process,
+    DaemonError, Result, atomic_file, background_process,
     claude_discovery::{discover_claude_executable, revalidate_claude_executable},
     codex_discovery::discover_codex_executable,
 };
@@ -59,6 +60,32 @@ impl ProviderRegistry {
     ///
     /// Returns an error when the required shell executable cannot be resolved safely.
     pub fn new(hook_relay: Option<&Path>, enabled: &[ProviderKind]) -> Result<Self> {
+        Self::build(hook_relay, None, enabled)
+    }
+
+    /// Builds the authoritative registry with daemon-lifetime Provider hook layers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime directory or a managed Provider layer is unsafe.
+    pub fn new_managed(
+        hook_relay: &Path,
+        runtime_directory: &Path,
+        endpoint_url: &str,
+        enabled: &[ProviderKind],
+    ) -> Result<Self> {
+        Self::build(
+            Some(hook_relay),
+            Some((runtime_directory, endpoint_url)),
+            enabled,
+        )
+    }
+
+    fn build(
+        hook_relay: Option<&Path>,
+        claude_hooks: Option<(&Path, &str)>,
+        enabled: &[ProviderKind],
+    ) -> Result<Self> {
         let mut runtimes = HashMap::new();
         if enabled.contains(&ProviderKind::Shell) {
             runtimes.insert(
@@ -90,9 +117,20 @@ impl ProviderRegistry {
             );
         }
         if enabled.contains(&ProviderKind::Claude) {
+            let runtime = if let (Some(relay), Some((directory, endpoint_url))) =
+                (hook_relay, claude_hooks)
+            {
+                ClaudeAdapter::discover_with_settings(Arc::new(ClaudeSettingsLayer::install_in(
+                    directory,
+                    endpoint_url,
+                    relay,
+                )?))
+            } else {
+                ClaudeAdapter::discover()
+            };
             runtimes.insert(
                 ProviderKind::Claude,
-                Arc::new(ClaudeAdapter::discover()) as Arc<dyn ProviderRuntime>,
+                Arc::new(runtime) as Arc<dyn ProviderRuntime>,
             );
         }
         Ok(Self { runtimes })
@@ -295,13 +333,160 @@ impl ClaudeExecutable {
 #[derive(Debug)]
 struct ClaudeAdapter {
     discovery: RwLock<ClaudeDiscovery>,
+    settings: Option<Arc<ClaudeSettingsLayer>>,
+}
+
+#[derive(Debug)]
+struct ClaudeSettingsLayer {
+    path: PathBuf,
+    directory: PathBuf,
+    checksum: String,
+    endpoint_url: String,
+}
+
+impl ClaudeSettingsLayer {
+    fn install_in(
+        directory: &Path,
+        endpoint_url: &str,
+        hook_relay: &Path,
+    ) -> sylvops_core::Result<Self> {
+        let directory = std::fs::canonicalize(directory).map_err(|error| {
+            provider_error(format!(
+                "cannot canonicalize Claude settings directory: {error}"
+            ))
+        })?;
+        cleanup_stale_claude_settings(&directory);
+        let source = claude_settings_source(endpoint_url, hook_relay)?;
+        let checksum = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let path = directory.join(format!(
+            "sylvops-claude-{}-{checksum}.settings.json",
+            uuid::Uuid::new_v4()
+        ));
+        Self::install_source(path, endpoint_url.to_owned(), &source)
+    }
+
+    #[cfg(test)]
+    fn install(
+        path: PathBuf,
+        endpoint_url: String,
+        hook_relay: &Path,
+    ) -> sylvops_core::Result<Self> {
+        let source = claude_settings_source(&endpoint_url, hook_relay)?;
+        Self::install_source(path, endpoint_url, &source)
+    }
+
+    fn install_source(
+        path: PathBuf,
+        endpoint_url: String,
+        source: &str,
+    ) -> sylvops_core::Result<Self> {
+        let directory = path
+            .parent()
+            .ok_or_else(|| provider_error("Claude settings path has no parent"))?;
+        let directory = std::fs::canonicalize(directory).map_err(|error| {
+            provider_error(format!(
+                "cannot canonicalize Claude settings directory: {error}"
+            ))
+        })?;
+        atomic_file::write(&path, source.as_bytes())
+            .map_err(|error| provider_error(format!("cannot install Claude settings: {error}")))?;
+        let checksum = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let layer = Self {
+            path,
+            directory,
+            checksum,
+            endpoint_url,
+        };
+        layer.revalidate()?;
+        Ok(layer)
+    }
+
+    fn revalidate(&self) -> sylvops_core::Result<PathBuf> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| provider_error("Claude settings path has no parent"))?;
+        let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+            provider_error(format!(
+                "cannot revalidate Claude settings directory: {error}"
+            ))
+        })?;
+        if canonical_parent != self.directory {
+            return Err(provider_error("Claude settings directory identity changed"));
+        }
+        let metadata = std::fs::symlink_metadata(&self.path).map_err(|error| {
+            provider_error(format!("cannot inspect Claude settings file: {error}"))
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > 64 * 1024
+        {
+            return Err(provider_error("Claude settings file identity is invalid"));
+        }
+        let canonical_path = std::fs::canonicalize(&self.path).map_err(|error| {
+            provider_error(format!("cannot canonicalize Claude settings file: {error}"))
+        })?;
+        if canonical_path.parent() != Some(self.directory.as_path()) {
+            return Err(provider_error(
+                "Claude settings file escaped its owned directory",
+            ));
+        }
+        let source = std::fs::read(&canonical_path).map_err(|error| {
+            provider_error(format!("cannot read Claude settings file: {error}"))
+        })?;
+        let checksum = format!("{:x}", Sha256::digest(&source));
+        if checksum != self.checksum {
+            return Err(provider_error(
+                "Claude settings file is no longer application-owned",
+            ));
+        }
+        Ok(canonical_path)
+    }
+}
+
+impl Drop for ClaudeSettingsLayer {
+    fn drop(&mut self) {
+        if let Ok(path) = self.revalidate() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl ClaudeAdapter {
     fn discover() -> Self {
         Self {
             discovery: RwLock::new(Self::discover_now()),
+            settings: None,
         }
+    }
+
+    fn discover_with_settings(settings: Arc<ClaudeSettingsLayer>) -> Self {
+        Self {
+            discovery: RwLock::new(Self::discover_now()),
+            settings: Some(settings),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_executable_with_settings(
+        executable: PathBuf,
+        settings_path: PathBuf,
+        endpoint_url: String,
+    ) -> sylvops_core::Result<Self> {
+        let executable = ClaudeExecutable::discover(executable).map_err(provider_error)?;
+        let hook_relay = std::env::current_exe()
+            .map_err(|error| provider_error(format!("cannot locate hook relay: {error}")))?;
+        Ok(Self {
+            discovery: RwLock::new(ClaudeDiscovery {
+                executable: Some(executable),
+                error: None,
+            }),
+            settings: Some(Arc::new(ClaudeSettingsLayer::install(
+                settings_path,
+                endpoint_url,
+                &hook_relay,
+            )?)),
+        })
     }
 
     fn discover_now() -> ClaudeDiscovery {
@@ -335,9 +520,128 @@ impl ClaudeAdapter {
 
     fn capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
+            interactive: true,
+            resume: true,
+            status_hooks: true,
+            model_selection: true,
+            effort_selection: true,
             authentication: AuthenticationRequirement::ExistingLogin,
-            ..ProviderCapabilities::default()
+            runtime: Some(ProviderRuntimeCapabilities {
+                lifecycle_events: true,
+                conversation_identity_transitions: true,
+                ..ProviderRuntimeCapabilities::default()
+            }),
         }
+    }
+
+    fn executable(&self) -> sylvops_core::Result<PathBuf> {
+        let discovery = self.discovery().map_err(provider_error)?;
+        let executable = discovery.executable.ok_or_else(|| {
+            provider_error(
+                discovery
+                    .error
+                    .unwrap_or_else(|| "Claude Code executable is unavailable".into()),
+            )
+        })?;
+        executable.revalidate().ok_or_else(|| {
+            provider_error(
+                "Claude Code executable identity changed after discovery; refresh Provider health",
+            )
+        })
+    }
+
+    fn build_launch_spec(&self, context: &LaunchContext) -> sylvops_core::Result<LaunchSpec> {
+        validate_claude_model(context.model.as_deref())?;
+        validate_claude_effort(context.effort.as_deref())?;
+        validate_prompt(context.initial_prompt.as_deref())?;
+        let (settings_path, environment) = self.managed_launch_context(
+            context.session_id,
+            context.worktree_id,
+            context.lifecycle_endpoint.as_ref(),
+            false,
+        )?;
+        let mut persisted = vec![OsString::from("--settings"), settings_path.into_os_string()];
+        if let Some(model) = &context.model {
+            persisted.extend([OsString::from("--model"), OsString::from(model)]);
+        }
+        if let Some(effort) = &context.effort {
+            persisted.extend([OsString::from("--effort"), OsString::from(effort)]);
+        }
+        let arguments = context.initial_prompt.as_ref().map_or_else(
+            || LaunchArguments::persisted(persisted.clone()),
+            |prompt| {
+                LaunchArguments::with_transient_tail(
+                    persisted.clone(),
+                    vec![OsString::from(prompt)],
+                )
+            },
+        );
+        Ok(LaunchSpec {
+            executable: self.executable()?,
+            arguments,
+            environment,
+        })
+    }
+
+    fn build_resume_spec(&self, context: &ResumeContext) -> sylvops_core::Result<LaunchSpec> {
+        validate_external_id(&context.external_session_id)?;
+        let (settings_path, environment) = self.managed_launch_context(
+            context.session_id,
+            context.worktree_id,
+            context.lifecycle_endpoint.as_ref(),
+            true,
+        )?;
+        let arguments = LaunchArguments::persisted(vec![
+            OsString::from("--settings"),
+            settings_path.into_os_string(),
+            OsString::from("--resume"),
+            OsString::from(&context.external_session_id),
+        ]);
+        Ok(LaunchSpec {
+            executable: self.executable()?,
+            arguments,
+            environment,
+        })
+    }
+
+    fn managed_launch_context(
+        &self,
+        session_id: SessionId,
+        worktree_id: WorktreeId,
+        lifecycle_endpoint: Option<&ProviderLifecycleEndpoint>,
+        resume: bool,
+    ) -> sylvops_core::Result<(PathBuf, BTreeMap<OsString, OsString>)> {
+        let settings = self
+            .settings
+            .as_ref()
+            .ok_or_else(|| provider_error("Claude Code managed settings are unavailable"))?;
+        let endpoint = lifecycle_endpoint.ok_or_else(|| {
+            provider_error("Claude Code lifecycle endpoint is required for a managed Session")
+        })?;
+        if !endpoint.is_bound_to(ProviderKind::Claude, session_id, worktree_id) {
+            return Err(provider_error(
+                "Claude Code lifecycle endpoint identity does not match the Session",
+            ));
+        }
+        if endpoint.url() != settings.endpoint_url {
+            return Err(provider_error(
+                "Claude Code lifecycle endpoint does not match the daemon settings layer",
+            ));
+        }
+        let settings_path = settings.revalidate()?;
+        let mut environment = safe_environment(session_id, worktree_id, resume);
+        if let Some(config_directory) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+            environment.insert(OsString::from("CLAUDE_CONFIG_DIR"), config_directory);
+        }
+        environment.insert(
+            OsString::from("SYLVOPS_HOOK_ENDPOINT"),
+            OsString::from(endpoint.url()),
+        );
+        environment.insert(
+            OsString::from("SYLVOPS_HOOK_TOKEN"),
+            OsString::from(endpoint.bearer_token()),
+        );
+        Ok((settings_path, environment))
     }
 
     async fn probe_health(&self) -> ProviderHealth {
@@ -510,28 +814,284 @@ impl ProviderRuntime for ClaudeAdapter {
 
     fn configure_launch(
         &self,
-        _context: LaunchContext,
+        context: LaunchContext,
     ) -> sylvops_core::Result<ProviderRuntimeSpec> {
-        Err(provider_error(
-            "Claude Code launch is not available in this release",
-        ))
+        Ok(ProviderRuntimeSpec {
+            launch: self.build_launch_spec(&context)?,
+            owned_paths: Vec::new(),
+        })
     }
 
     fn configure_resume(
         &self,
-        _context: ResumeContext,
+        context: ResumeContext,
     ) -> sylvops_core::Result<Option<ProviderRuntimeSpec>> {
-        Ok(None)
+        Ok(Some(ProviderRuntimeSpec {
+            launch: self.build_resume_spec(&context)?,
+            owned_paths: Vec::new(),
+        }))
     }
 
     fn normalize_lifecycle_event(
         &self,
-        _payload: &ProviderLifecyclePayload,
+        payload: &ProviderLifecyclePayload,
     ) -> sylvops_core::Result<ProviderLifecycleEvent> {
-        Err(provider_error(
-            "Claude Code lifecycle events are not available in this release",
-        ))
+        let payload: serde_json::Value = serde_json::from_slice(payload.as_bytes())
+            .map_err(|_| provider_error("Claude Code lifecycle payload is not valid JSON"))?;
+        let conversation_id = payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| provider_error("Claude Code lifecycle event is missing its session ID"))
+            .and_then(|id| ProviderConversationId::new(id).map_err(provider_error))?;
+        let event_name = payload
+            .get("hook_event_name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| provider_error("Claude Code lifecycle event type is missing"))?;
+        let event = match event_name {
+            "SessionStart" => {
+                let transition = match payload.get("source").and_then(serde_json::Value::as_str) {
+                    Some("startup" | "compact" | "fork") => {
+                        ConversationIdentityTransition::Established
+                    }
+                    Some("resume") => ConversationIdentityTransition::Resumed,
+                    Some("clear") => ConversationIdentityTransition::Cleared,
+                    _ => return Err(provider_error("Claude Code SessionStart source is invalid")),
+                };
+                NormalizedProviderEvent::TurnStarted {
+                    conversation: Some(ConversationIdentity {
+                        id: conversation_id.clone(),
+                        transition,
+                    }),
+                }
+            }
+            "UserPromptSubmit" => NormalizedProviderEvent::PromptSubmitted,
+            "PermissionRequest" => NormalizedProviderEvent::PermissionRequested,
+            "PreToolUse"
+                if matches!(
+                    payload.get("tool_name").and_then(serde_json::Value::as_str),
+                    Some("AskUserQuestion" | "ExitPlanMode")
+                ) =>
+            {
+                NormalizedProviderEvent::UserInputRequested
+            }
+            "SubagentStart" => NormalizedProviderEvent::SubagentStarted {
+                agent_id: claude_bounded_identifier(&payload, "agent_id")?,
+            },
+            "SubagentStop" => NormalizedProviderEvent::SubagentStopped {
+                agent_id: claude_bounded_identifier(&payload, "agent_id")?,
+            },
+            "Stop" => NormalizedProviderEvent::TurnStopped {
+                remaining_work: claude_remaining_work(&payload)?,
+            },
+            "StopFailure" => NormalizedProviderEvent::TurnFailed {
+                category: claude_failure_category(&payload)?,
+            },
+            "SessionEnd" => NormalizedProviderEvent::SessionEnded,
+            _ => return Err(provider_error("unsupported Claude Code lifecycle event")),
+        };
+        Ok(ProviderLifecycleEvent {
+            event: Some(event),
+            conversation_id: Some(conversation_id),
+            turn_id: None,
+        })
     }
+}
+
+fn claude_bounded_identifier(
+    payload: &serde_json::Value,
+    name: &str,
+) -> sylvops_core::Result<String> {
+    let value = payload
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| provider_error(format!("Claude Code lifecycle event is missing {name}")))?;
+    ProviderConversationId::new(value)
+        .map(String::from)
+        .map_err(provider_error)
+}
+
+fn claude_remaining_work(payload: &serde_json::Value) -> sylvops_core::Result<RemainingWork> {
+    let background_tasks = payload
+        .get("background_tasks")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| provider_error("Claude Code Stop background tasks are invalid"))?;
+    let session_crons = payload
+        .get("session_crons")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| provider_error("Claude Code Stop scheduled tasks are invalid"))?;
+    Ok(RemainingWork {
+        active_subagents: background_tasks
+            .iter()
+            .any(|task| task.get("type").and_then(serde_json::Value::as_str) == Some("subagent")),
+        background_tasks: !background_tasks.is_empty(),
+        scheduled_tasks: !session_crons.is_empty(),
+    })
+}
+
+fn claude_failure_category(
+    payload: &serde_json::Value,
+) -> sylvops_core::Result<TurnFailureCategory> {
+    let category = payload
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| provider_error("Claude Code StopFailure category is missing"))?;
+    let bounded = match category {
+        "rate_limit"
+        | "overloaded"
+        | "authentication_failed"
+        | "oauth_org_not_allowed"
+        | "account_on_hold"
+        | "billing_error"
+        | "invalid_request"
+        | "model_not_found"
+        | "server_error"
+        | "max_output_tokens"
+        | "cloud_credential_error"
+        | "unknown" => category,
+        _ => "unknown",
+    };
+    TurnFailureCategory::new(bounded).map_err(provider_error)
+}
+
+fn claude_settings_source(endpoint_url: &str, hook_relay: &Path) -> sylvops_core::Result<String> {
+    let relay = hook_relay
+        .to_str()
+        .ok_or_else(|| provider_error("hook relay path is not valid Unicode"))?;
+    let command = serde_json::json!({
+        "type": "command",
+        "command": relay,
+        "args": ["hook", "emit"],
+        "timeout": 2
+    });
+    let http = serde_json::json!({
+        "type": "http",
+        "url": endpoint_url,
+        "timeout": 2,
+        "headers": {
+            "Authorization": "Bearer $SYLVOPS_HOOK_TOKEN",
+            "X-SylvOps-Session-Id": "$SYLVOPS_SESSION_ID",
+            "X-SylvOps-Worktree-Id": "$SYLVOPS_WORKTREE_ID"
+        },
+        "allowedEnvVars": [
+            "SYLVOPS_HOOK_TOKEN",
+            "SYLVOPS_SESSION_ID",
+            "SYLVOPS_WORKTREE_ID"
+        ]
+    });
+    let mut hooks = serde_json::Map::new();
+    hooks.insert(
+        "SessionStart".into(),
+        serde_json::json!([{ "hooks": [command] }]),
+    );
+    hooks.insert(
+        "PreToolUse".into(),
+        serde_json::json!([{
+            "matcher": "AskUserQuestion|ExitPlanMode",
+            "hooks": [http.clone()]
+        }]),
+    );
+    for event in [
+        "SessionEnd",
+        "UserPromptSubmit",
+        "PermissionRequest",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "StopFailure",
+    ] {
+        hooks.insert(
+            event.into(),
+            serde_json::json!([{ "hooks": [http.clone()] }]),
+        );
+    }
+    serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))
+        .map_err(|error| provider_error(format!("cannot serialize Claude settings: {error}")))
+}
+
+fn cleanup_stale_claude_settings(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(encoded_identity) = name
+            .strip_prefix("sylvops-claude-")
+            .and_then(|name| name.strip_suffix(".settings.json"))
+        else {
+            continue;
+        };
+        let Some((instance, expected_checksum)) = encoded_identity.rsplit_once('-') else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(instance).is_err()
+            || expected_checksum.len() != 64
+            || !expected_checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.len() > 64 * 1024 {
+            continue;
+        }
+        let candidate = entry.path();
+        let Ok(canonical_path) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if canonical_path.parent() != Some(directory) {
+            continue;
+        }
+        let Ok(file_identity) = same_file::Handle::from_path(&canonical_path) else {
+            continue;
+        };
+        let Ok(source) = std::fs::read(&canonical_path) else {
+            continue;
+        };
+        let actual_checksum = format!("{:x}", Sha256::digest(&source));
+        if actual_checksum != expected_checksum {
+            continue;
+        }
+        let Ok(current_identity) = same_file::Handle::from_path(&canonical_path) else {
+            continue;
+        };
+        if current_identity == file_identity {
+            let _ = std::fs::remove_file(canonical_path);
+        }
+    }
+}
+
+fn validate_claude_model(value: Option<&str>) -> sylvops_core::Result<()> {
+    validate_selector(value, "Claude model")?;
+    if value.is_some_and(|value| {
+        !value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+            || !value.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '-' | '_' | '.' | ':' | '[' | ']')
+            })
+    }) {
+        return Err(provider_error("invalid Claude model selector"));
+    }
+    Ok(())
+}
+
+fn validate_claude_effort(value: Option<&str>) -> sylvops_core::Result<()> {
+    if value.is_some_and(|value| !matches!(value, "low" | "medium" | "high" | "xhigh" | "max")) {
+        return Err(provider_error("invalid Claude effort selector"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -643,9 +1203,12 @@ impl CodexAdapter {
                 executable: Some(path),
                 error: None,
             },
-            Err(error) => CodexDiscovery {
+            Err(_) => CodexDiscovery {
                 executable: None,
-                error: Some(error.to_string()),
+                error: Some(
+                    "Codex is not installed as a supported native CLI. Install Codex, then refresh Provider health."
+                        .into(),
+                ),
             },
         }
     }
@@ -786,17 +1349,39 @@ impl CodexAdapter {
                 checked_at: now_millis(),
             };
         };
-        let version = run_probe(&executable, &["--version"]).await;
-        let authentication = run_probe(&executable, &["login", "status"]).await;
-        let version_error = version.as_ref().err().cloned();
-        let authentication_error = authentication.as_ref().err().cloned();
+        let Ok(version) = run_probe(&executable, &["--version"]).await else {
+            return ProviderHealth {
+                kind: ProviderKind::Codex,
+                available: false,
+                authenticated: false,
+                executable_path: path_text(&executable).ok(),
+                version: None,
+                diagnostic: Some(
+                    "Codex version could not be verified. Install or update Codex, then refresh Provider health."
+                        .into(),
+                ),
+                capabilities,
+                checked_at: now_millis(),
+            };
+        };
+        let (authenticated, diagnostic) =
+            match run_probe(&executable, &["login", "status"]).await {
+                Ok(_) => (true, None),
+                Err(_) => (
+                    false,
+                    Some(
+                        "Codex authentication could not be verified. Sign in to Codex outside SylvOps or run `codex login status`, then refresh Provider health."
+                            .into(),
+                    ),
+                ),
+            };
         ProviderHealth {
             kind: ProviderKind::Codex,
-            available: version.is_ok(),
-            authenticated: authentication.is_ok(),
+            available: true,
+            authenticated,
             executable_path: path_text(&executable).ok(),
-            version: version.ok(),
-            diagnostic: authentication_error.or(version_error),
+            version: Some(version),
+            diagnostic,
             capabilities,
             checked_at: now_millis(),
         }
@@ -1528,6 +2113,274 @@ mod tests {
         std::fs::rename(replacement, &executable).expect("replace discovered executable");
 
         assert!(discovered.revalidate().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn claude_launch_uses_structured_arguments_and_managed_settings() {
+        let temporary = tempfile::tempdir().expect("temporary runtime directory");
+        let settings_path = temporary.path().join("claude-settings.json");
+        let executable = temporary.path().join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
+        std::fs::copy(
+            std::env::current_exe().expect("current executable"),
+            &executable,
+        )
+        .expect("fake native Claude executable");
+        let executable = std::fs::canonicalize(executable).expect("canonical executable");
+        let adapter = ClaudeAdapter::from_executable_with_settings(
+            executable,
+            settings_path.clone(),
+            "http://127.0.0.1:3210/v1/events".into(),
+        )
+        .expect("managed Claude settings");
+        let session_id = sylvops_core::ids::SessionId::new();
+        let worktree_id = sylvops_core::ids::WorktreeId::new();
+        let endpoint = sylvops_core::provider::ProviderLifecycleEndpoint::new(
+            ProviderKind::Claude,
+            session_id,
+            worktree_id,
+            "http://127.0.0.1:3210/v1/events",
+            "0123456789abcdef0123456789abcdef",
+        )
+        .expect("lifecycle endpoint");
+        let prompt = "private prompt that must not be persisted";
+
+        let configured = adapter
+            .configure_launch(LaunchContext {
+                session_id,
+                worktree_id,
+                cwd: PathBuf::from("worktree"),
+                model: Some("sonnet".into()),
+                effort: Some("high".into()),
+                initial_prompt: Some(prompt.into()),
+                lifecycle_endpoint: Some(endpoint.clone()),
+            })
+            .expect("configured launch");
+
+        assert_eq!(
+            configured.launch.arguments.all()[0],
+            OsStr::new("--settings")
+        );
+        assert_eq!(
+            configured.launch.arguments.all()[1],
+            std::fs::canonicalize(&settings_path)
+                .expect("canonical settings path")
+                .as_os_str()
+        );
+        assert_eq!(configured.launch.arguments.all()[2], OsStr::new("--model"));
+        assert_eq!(configured.launch.arguments.all()[3], OsStr::new("sonnet"));
+        assert_eq!(configured.launch.arguments.all()[4], OsStr::new("--effort"));
+        assert_eq!(configured.launch.arguments.all()[5], OsStr::new("high"));
+        assert_eq!(
+            configured.launch.arguments.all().last(),
+            Some(&OsString::from(prompt))
+        );
+        assert!(
+            configured
+                .launch
+                .arguments
+                .persisted_values()
+                .iter()
+                .all(|argument| argument != prompt)
+        );
+        assert!(
+            !configured
+                .launch
+                .arguments
+                .all()
+                .iter()
+                .any(|argument| argument == "--permission-mode")
+        );
+        assert_eq!(
+            configured
+                .launch
+                .environment
+                .get(OsStr::new("SYLVOPS_HOOK_ENDPOINT")),
+            Some(&OsString::from(endpoint.url()))
+        );
+        assert_eq!(
+            configured
+                .launch
+                .environment
+                .get(OsStr::new("SYLVOPS_HOOK_TOKEN")),
+            Some(&OsString::from(endpoint.bearer_token()))
+        );
+        assert_eq!(configured.owned_paths, Vec::<PathBuf>::new());
+
+        let source = std::fs::read_to_string(&settings_path).expect("managed settings source");
+        assert!(source.contains("SessionStart"));
+        assert!(source.contains("SessionEnd"));
+        assert!(source.contains("UserPromptSubmit"));
+        assert!(source.contains("PermissionRequest"));
+        assert!(source.contains("AskUserQuestion|ExitPlanMode"));
+        assert!(source.contains("SubagentStart"));
+        assert!(source.contains("SubagentStop"));
+        assert!(source.contains("StopFailure"));
+        assert!(source.contains("SYLVOPS_HOOK_TOKEN"));
+        assert!(!source.contains(endpoint.bearer_token()));
+        assert!(!source.contains("permissionMode"));
+
+        assert!(
+            adapter
+                .configure_launch(LaunchContext {
+                    session_id,
+                    worktree_id,
+                    cwd: PathBuf::from("worktree"),
+                    model: Some("--permission-mode".into()),
+                    effort: None,
+                    initial_prompt: None,
+                    lifecycle_endpoint: Some(endpoint.clone()),
+                })
+                .is_err()
+        );
+        assert!(
+            adapter
+                .configure_launch(LaunchContext {
+                    session_id,
+                    worktree_id,
+                    cwd: PathBuf::from("worktree"),
+                    model: None,
+                    effort: Some("unbounded".into()),
+                    initial_prompt: None,
+                    lifecycle_endpoint: Some(endpoint.clone()),
+                })
+                .is_err()
+        );
+        assert!(
+            adapter
+                .configure_launch(LaunchContext {
+                    session_id,
+                    worktree_id,
+                    cwd: PathBuf::from("worktree"),
+                    model: None,
+                    effort: Some("ultracode".into()),
+                    initial_prompt: None,
+                    lifecycle_endpoint: Some(endpoint.clone()),
+                })
+                .is_err()
+        );
+        for source in ["compact", "fork"] {
+            let payload = ProviderLifecyclePayload::new(
+                serde_json::to_vec(&serde_json::json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "claude-session-1",
+                    "source": source
+                }))
+                .expect("payload JSON"),
+            )
+            .expect("bounded payload");
+            assert!(matches!(
+                adapter
+                    .normalize_lifecycle_event(&payload)
+                    .expect("valid SessionStart source")
+                    .event,
+                Some(NormalizedProviderEvent::TurnStarted { .. })
+            ));
+        }
+        for (event_name, expected) in [
+            ("UserPromptSubmit", NormalizedProviderEvent::PromptSubmitted),
+            (
+                "PermissionRequest",
+                NormalizedProviderEvent::PermissionRequested,
+            ),
+            ("SessionEnd", NormalizedProviderEvent::SessionEnded),
+        ] {
+            let payload = ProviderLifecyclePayload::new(
+                serde_json::to_vec(&serde_json::json!({
+                    "hook_event_name": event_name,
+                    "session_id": "claude-session-1"
+                }))
+                .expect("payload JSON"),
+            )
+            .expect("bounded payload");
+            let normalized = adapter
+                .normalize_lifecycle_event(&payload)
+                .expect("configured HTTP event");
+            assert_eq!(normalized.event, Some(expected));
+            assert_eq!(
+                normalized
+                    .conversation_id
+                    .as_ref()
+                    .map(ProviderConversationId::as_str),
+                Some("claude-session-1")
+            );
+        }
+
+        let stop = ProviderLifecyclePayload::new(
+            serde_json::to_vec(&serde_json::json!({
+                "hook_event_name": "Stop",
+                "session_id": "claude-session-1",
+                "background_tasks": [{"id": "task-1", "type": "subagent"}],
+                "session_crons": [{"id": "cron-1"}]
+            }))
+            .expect("Stop payload JSON"),
+        )
+        .expect("bounded Stop payload");
+        assert!(matches!(
+            adapter
+                .normalize_lifecycle_event(&stop)
+                .expect("valid Stop payload")
+                .event,
+            Some(NormalizedProviderEvent::TurnStopped {
+                remaining_work: RemainingWork {
+                    active_subagents: true,
+                    background_tasks: true,
+                    scheduled_tasks: true,
+                }
+            })
+        ));
+
+        for error in ["rate_limit", "future_private_provider_error"] {
+            let failure = ProviderLifecyclePayload::new(
+                serde_json::to_vec(&serde_json::json!({
+                    "hook_event_name": "StopFailure",
+                    "session_id": "claude-session-1",
+                    "error": error,
+                    "error_details": "private raw provider text"
+                }))
+                .expect("StopFailure payload JSON"),
+            )
+            .expect("bounded StopFailure payload");
+            let normalized = adapter
+                .normalize_lifecycle_event(&failure)
+                .expect("valid StopFailure payload");
+            let Some(NormalizedProviderEvent::TurnFailed { category }) = normalized.event else {
+                panic!("expected recoverable turn failure");
+            };
+            assert_eq!(
+                category.as_str(),
+                if error == "rate_limit" {
+                    "rate_limit"
+                } else {
+                    "unknown"
+                }
+            );
+        }
+
+        for malformed in [
+            serde_json::json!({
+                "hook_event_name": "SubagentStart",
+                "session_id": "claude-session-1"
+            }),
+            serde_json::json!({
+                "hook_event_name": "Stop",
+                "session_id": "claude-session-1",
+                "background_tasks": "invalid",
+                "session_crons": []
+            }),
+        ] {
+            let payload = ProviderLifecyclePayload::new(
+                serde_json::to_vec(&malformed).expect("malformed fixture JSON"),
+            )
+            .expect("bounded malformed fixture");
+            assert!(adapter.normalize_lifecycle_event(&payload).is_err());
+        }
+        drop(adapter);
+        assert!(!settings_path.exists());
     }
 
     #[test]

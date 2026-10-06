@@ -17,6 +17,7 @@ use sylvops_core::domain::{
     WorktreeStatus, session_can_delete,
 };
 use sylvops_core::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
+use sylvops_core::status::{ConversationIdentityTransition, ProviderConversationId};
 use sylvops_core::ui::{DesktopState, TuiState};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -173,8 +174,13 @@ enum DatabaseCommand {
     UpdateSessionStatus {
         id: SessionId,
         state: SessionState,
-        external_session_id: Option<String>,
+        conversation_identity: Option<VerifiedConversationIdentityUpdate>,
         reply: oneshot::Sender<Result<(u64, Session)>>,
+    },
+    MarkSessionLifecycleMissing {
+        id: SessionId,
+        failure_reason: String,
+        reply: oneshot::Sender<Result<Option<(u64, Session)>>>,
     },
     Reconcile {
         reply: oneshot::Sender<Result<usize>>,
@@ -214,6 +220,27 @@ pub struct NewSession {
     pub cwd: String,
     pub external_session_id: Option<String>,
     pub resumed_from_session_id: Option<SessionId>,
+}
+
+/// One verified provider identity update and its optional documented transition.
+#[derive(Clone, Debug)]
+pub struct VerifiedConversationIdentityUpdate {
+    external_session_id: ProviderConversationId,
+    transition: Option<ConversationIdentityTransition>,
+}
+
+impl VerifiedConversationIdentityUpdate {
+    /// Couples a verified identifier with the transition that authorizes its persistence.
+    #[must_use]
+    pub fn new(
+        external_session_id: ProviderConversationId,
+        transition: Option<ConversationIdentityTransition>,
+    ) -> Self {
+        Self {
+            external_session_id,
+            transition,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -623,13 +650,33 @@ impl DatabaseHandle {
         &self,
         id: SessionId,
         state: SessionState,
-        external_session_id: Option<String>,
+        conversation_identity: Option<VerifiedConversationIdentityUpdate>,
     ) -> Result<(u64, Session)> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::UpdateSessionStatus {
                 id,
                 state,
-                external_session_id,
+                conversation_identity,
+                reply,
+            }
+        })
+        .await
+    }
+
+    /// Marks a live Session as needing feedback only while its provider identity is still absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, not-found, transition, or SQLite error.
+    pub async fn mark_session_lifecycle_missing(
+        &self,
+        id: SessionId,
+        failure_reason: String,
+    ) -> Result<Option<(u64, Session)>> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::MarkSessionLifecycleMissing {
+                id,
+                failure_reason,
                 reply,
             }
         })
@@ -910,19 +957,33 @@ fn database_thread(
             DatabaseCommand::UpdateSessionStatus {
                 id,
                 state,
-                external_session_id,
+                conversation_identity,
                 reply,
             } => {
                 let result = update_session_status(
                     &mut connection,
                     id,
                     state,
-                    external_session_id.as_deref(),
+                    conversation_identity.as_ref(),
                 )
                 .map(|session| {
                     revision = revision.saturating_add(1);
                     (revision, session)
                 });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::MarkSessionLifecycleMissing {
+                id,
+                failure_reason,
+                reply,
+            } => {
+                let result = mark_session_lifecycle_missing(&mut connection, id, &failure_reason)
+                    .map(|session| {
+                        session.map(|session| {
+                            revision = revision.saturating_add(1);
+                            (revision, session)
+                        })
+                    });
                 let _ = reply.send(result);
             }
             DatabaseCommand::Reconcile { reply } => {
@@ -1812,7 +1873,7 @@ fn update_session_status(
     connection: &mut Connection,
     id: SessionId,
     state: SessionState,
-    external_session_id: Option<&str>,
+    conversation_identity: Option<&VerifiedConversationIdentityUpdate>,
 ) -> Result<Session> {
     if !matches!(
         state,
@@ -1829,10 +1890,14 @@ fn update_session_status(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
+    let external_session_id =
+        conversation_identity.map(|identity| identity.external_session_id.as_str());
     let changed = transaction
         .execute(
             "UPDATE sessions SET state = ?2, external_session_id = COALESCE(?3, external_session_id), \
-             last_activity_at = ?4 WHERE id = ?1 AND state NOT IN ('failed', 'terminated', 'disconnected')",
+             last_activity_at = ?4, failure_reason = NULL \
+             WHERE id = ?1 AND process_id IS NOT NULL \
+             AND state NOT IN ('failed', 'terminated', 'disconnected')",
             params![id.to_string(), state.to_string(), external_session_id, now],
         )
         .map_err(database_error)?;
@@ -1847,9 +1912,53 @@ fn update_session_status(
         "session",
         &id.to_string(),
     )?;
+    if let Some(transition) = conversation_identity.and_then(|identity| identity.transition) {
+        insert_audit_event(
+            &transaction,
+            "provider_conversation_changed",
+            "succeeded",
+            &serde_json::json!({
+                "session_id": id,
+                "transition": transition
+            })
+            .to_string(),
+        )?;
+    }
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(session)
+}
+
+fn mark_session_lifecycle_missing(
+    connection: &mut Connection,
+    id: SessionId,
+    failure_reason: &str,
+) -> Result<Option<Session>> {
+    let now = now_millis();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE sessions SET state = 'needs_feedback', failure_reason = ?2, \
+             last_activity_at = ?3 WHERE id = ?1 AND external_session_id IS NULL \
+             AND process_id IS NOT NULL AND state IN ('starting', 'running', 'needs_feedback')",
+            params![id.to_string(), failure_reason, now],
+        )
+        .map_err(database_error)?;
+    if changed == 0 {
+        transaction.commit().map_err(database_error)?;
+        return Ok(None);
+    }
+    insert_entity_audit(
+        &transaction,
+        "provider_lifecycle_missing",
+        "needs_feedback",
+        &id.to_string(),
+    )?;
+    let session = load_session(&transaction, id)?;
+    transaction.commit().map_err(database_error)?;
+    Ok(Some(session))
 }
 
 fn load_session(connection: &Connection, id: SessionId) -> Result<Session> {
@@ -2924,6 +3033,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.state, SessionState::FinishedUnseen);
+        assert!(
+            database
+                .update_session_status(session_id, SessionState::Running, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            database.session(session_id).await.unwrap().state,
+            SessionState::FinishedUnseen
+        );
         assert!(
             !database
                 .worktree_has_live_sessions(managed_id)

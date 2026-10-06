@@ -76,7 +76,7 @@ pub(crate) fn first_run_steps(kind: FormKind) -> Option<[FirstRunStep; 3]> {
         },
         FirstRunStep {
             title: "Start session",
-            description: "Start Shell or Codex in the selected checkout.",
+            description: "Start Shell, Codex, or Claude Code in the selected checkout.",
             state: state(2),
         },
     ])

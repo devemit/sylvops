@@ -165,6 +165,14 @@ impl HookCredentials {
             .remove(&session_id);
     }
 
+    #[must_use]
+    pub fn is_registered(&self, session_id: SessionId) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&session_id)
+    }
+
     /// Invalidates every credential during daemon cleanup.
     pub fn invalidate_all(&self) {
         self.sessions
@@ -311,6 +319,11 @@ impl HookReceiver {
     #[must_use]
     pub fn credentials(&self) -> HookCredentials {
         self.credentials.clone()
+    }
+
+    #[must_use]
+    pub fn endpoint_url(&self) -> &str {
+        &self.credentials.endpoint_url
     }
 
     pub async fn shutdown(self) {
@@ -641,6 +654,8 @@ mod tests {
         let shell = receiver
             .register(ProviderKind::Shell, shell_session, shell_worktree)
             .expect("other-provider credential");
+        let credentials = receiver.credentials();
+        assert!(credentials.is_registered(first_session));
         assert_ne!(first.bearer_token(), second.bearer_token());
 
         let body = br#"{"hook_event_name":"FutureEvent"}"#;
@@ -690,6 +705,7 @@ mod tests {
         assert_eq!(shell_delivery.provider, ProviderKind::Shell);
 
         receiver.invalidate(first_session);
+        assert!(!credentials.is_registered(first_session));
         let invalidated = send_test_request(
             &first,
             first.bearer_token(),

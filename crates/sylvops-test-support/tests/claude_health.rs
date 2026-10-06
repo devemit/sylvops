@@ -27,7 +27,10 @@ async fn native_claude_health_is_available_through_the_provider_registry() {
         health.capabilities.authentication,
         AuthenticationRequirement::ExistingLogin
     );
-    assert!(!health.capabilities.interactive);
+    assert!(health.capabilities.interactive);
+    assert!(health.capabilities.status_hooks);
+    assert!(health.capabilities.model_selection);
+    assert!(health.capabilities.effort_selection);
     assert!(health.diagnostic.is_none());
 
     assert_recovery_states(&registry, &fake_claude).await;

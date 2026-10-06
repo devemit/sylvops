@@ -1,12 +1,9 @@
 #![allow(clippy::unreadable_literal)] // Six-digit values intentionally mirror CSS RGB notation.
 
 use sylvops_core::{
-    domain::{
-        DaemonSnapshot, Session, SessionState, Worktree, WorktreeStatus, session_can_delete,
-        session_can_resume,
-    },
+    domain::{DaemonSnapshot, SessionState, WorktreeStatus, session_can_delete},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
-    ui::{DesktopDensity, DesktopState, DesktopTheme, MainTab},
+    ui::{DesktopDensity, DesktopPanel, DesktopState, DesktopTheme, MainTab},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,12 +188,6 @@ pub(crate) enum PresentationLayout {
     Narrow,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SettingsMode {
-    SideSheet,
-    FullWindow,
-}
-
 impl PresentationLayout {
     pub(crate) const fn for_width(width: u16) -> Self {
         if width >= 1_180 {
@@ -205,13 +196,6 @@ impl PresentationLayout {
             Self::Compact
         } else {
             Self::Narrow
-        }
-    }
-
-    pub(crate) const fn settings_mode(self) -> SettingsMode {
-        match self {
-            Self::Wide | Self::Compact => SettingsMode::SideSheet,
-            Self::Narrow => SettingsMode::FullWindow,
         }
     }
 }
@@ -275,10 +259,8 @@ pub(crate) struct InteractionState {
     pub active_session_id: Option<SessionId>,
     pub open_session_ids: Vec<SessionId>,
     pub active_session_attached: bool,
+    pub resumable_session_ids: Vec<SessionId>,
     pub main_tab: MainTab,
-    pub expanded_project_ids: Vec<ProjectId>,
-    pub expanded_worktree_ids: Vec<WorktreeId>,
-    pub focused_explorer_node: Option<ExplorerNodeId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,14 +274,14 @@ pub(crate) struct PresentationSelection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ExplorerNodeId {
+pub(crate) enum NavigatorNodeId {
     Repository(ProjectId),
     Checkout(WorktreeId),
     Session(SessionId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExplorerNodeKind {
+pub(crate) enum NavigatorNodeKind {
     Repository,
     Checkout,
     Session,
@@ -317,22 +299,16 @@ pub(crate) enum SessionIndicator {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ExplorerAttention {
+pub(crate) enum NavigatorAttention {
     Finished,
     NeedsFeedback,
     Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExplorerAction {
-    CreateCheckout(ProjectId),
-    RenameRepository(ProjectId),
+pub(crate) enum NavigatorAction {
     RemoveRepository(ProjectId),
-    CreateSession(WorktreeId),
-    RenameCheckout(WorktreeId),
     DeleteCheckout(WorktreeId),
-    OpenSession(SessionId),
-    RenameSession(SessionId),
     DeleteSession(SessionId),
 }
 
@@ -351,32 +327,32 @@ impl SessionIndicator {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ExplorerRow {
-    pub id: ExplorerNodeId,
-    pub parent: Option<ExplorerNodeId>,
-    pub kind: ExplorerNodeKind,
-    pub depth: u8,
+pub(crate) struct NavigatorRow {
+    pub id: NavigatorNodeId,
+    pub kind: NavigatorNodeKind,
     pub label: String,
     pub detail: String,
+    pub badge: Option<String>,
     pub indicator: Option<SessionIndicator>,
-    pub attention: Option<ExplorerAttention>,
-    pub actions: Vec<ExplorerAction>,
-    pub expandable: bool,
-    pub expanded: bool,
+    pub attention: Option<NavigatorAttention>,
+    pub actions: Vec<NavigatorAction>,
+    pub selected: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ExplorerPresentation {
-    pub rows: Vec<ExplorerRow>,
-    pub selected: Option<ExplorerNodeId>,
-    pub mode: ExplorerMode,
+pub(crate) struct NavigatorPresentation {
+    pub repositories: Vec<NavigatorRow>,
+    pub checkouts: Vec<NavigatorRow>,
+    pub sessions: Vec<NavigatorRow>,
+    pub mode: NavigatorMode,
+    pub active_panel: DesktopPanel,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum ExplorerMode {
+pub(crate) enum NavigatorMode {
     #[default]
-    Resizable,
-    Collapsible,
+    Columns,
+    Tabs,
     Drawer,
 }
 
@@ -418,65 +394,6 @@ pub(crate) struct ActiveSessionContext {
 pub(crate) struct ActiveSessionPresentation {
     pub tabs: Vec<OpenSessionPresentation>,
     pub context: Option<ActiveSessionContext>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExplorerKey {
-    Up,
-    Down,
-    Left,
-    Right,
-    Enter,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExplorerIntent {
-    None,
-    Focus(ExplorerNodeId),
-    Expand(ExplorerNodeId),
-    Collapse(ExplorerNodeId),
-    Open(SessionId),
-}
-
-impl ExplorerPresentation {
-    pub(crate) fn navigate(&self, current: ExplorerNodeId, key: ExplorerKey) -> ExplorerIntent {
-        let Some(index) = self.rows.iter().position(|row| row.id == current) else {
-            return self
-                .rows
-                .first()
-                .map_or(ExplorerIntent::None, |row| ExplorerIntent::Focus(row.id));
-        };
-        let row = &self.rows[index];
-        match key {
-            ExplorerKey::Up => {
-                let previous = index.checked_sub(1).unwrap_or(self.rows.len() - 1);
-                ExplorerIntent::Focus(self.rows[previous].id)
-            }
-            ExplorerKey::Down => {
-                let next = (index + 1) % self.rows.len();
-                ExplorerIntent::Focus(self.rows[next].id)
-            }
-            ExplorerKey::Left if row.expandable && row.expanded => ExplorerIntent::Collapse(row.id),
-            ExplorerKey::Left => row
-                .parent
-                .map_or(ExplorerIntent::None, ExplorerIntent::Focus),
-            ExplorerKey::Right if row.expandable && !row.expanded => ExplorerIntent::Expand(row.id),
-            ExplorerKey::Right if row.expandable => self
-                .rows
-                .get(index + 1)
-                .filter(|child| child.parent == Some(row.id))
-                .map_or(ExplorerIntent::None, |child| {
-                    ExplorerIntent::Focus(child.id)
-                }),
-            ExplorerKey::Right => ExplorerIntent::None,
-            ExplorerKey::Enter => match row.id {
-                ExplorerNodeId::Session(session_id) => ExplorerIntent::Open(session_id),
-                _ if row.expandable && row.expanded => ExplorerIntent::Collapse(row.id),
-                _ if row.expandable => ExplorerIntent::Expand(row.id),
-                _ => ExplorerIntent::None,
-            },
-        }
-    }
 }
 
 pub(crate) struct PresentationInput<'a> {
@@ -610,7 +527,7 @@ pub(crate) struct DesktopPresentation {
     pub density: DensityMetrics,
     pub layout: PresentationLayout,
     pub selection: PresentationSelection,
-    pub explorer: ExplorerPresentation,
+    pub navigator: NavigatorPresentation,
     pub workspace_navigation: WorkspaceNavigation,
     pub active_session: ActiveSessionPresentation,
 }
@@ -651,23 +568,25 @@ impl DesktopPresentation {
                 .iter()
                 .any(|session| session.id == *session_id)
         });
-        let explorer = build_explorer(
+        let navigator = build_navigator(
             input.daemon,
             workspace_id,
-            &input.interaction.expanded_project_ids,
-            &input.interaction.expanded_worktree_ids,
-            input.interaction.focused_explorer_node,
+            project_id,
+            worktree_id,
+            session_id,
             match layout {
-                PresentationLayout::Wide => ExplorerMode::Resizable,
-                PresentationLayout::Compact => ExplorerMode::Collapsible,
-                PresentationLayout::Narrow => ExplorerMode::Drawer,
+                PresentationLayout::Wide => NavigatorMode::Columns,
+                PresentationLayout::Compact => NavigatorMode::Tabs,
+                PresentationLayout::Narrow => NavigatorMode::Drawer,
             },
+            input.preferences.compact_panel,
         );
         let active_session = build_active_session(
             input.daemon,
             &input.interaction.open_session_ids,
             active_session_id,
             input.interaction.active_session_attached,
+            &input.interaction.resumable_session_ids,
         );
         Self {
             theme,
@@ -681,7 +600,7 @@ impl DesktopPresentation {
                 active_session_id,
                 main_tab: input.interaction.main_tab,
             },
-            explorer,
+            navigator,
             workspace_navigation: if layout == PresentationLayout::Narrow {
                 WorkspaceNavigation::LabeledSwitcher
             } else {
@@ -692,15 +611,29 @@ impl DesktopPresentation {
     }
 }
 
-fn build_explorer(
+fn build_navigator(
     daemon: &DaemonSnapshot,
     workspace_id: Option<WorkspaceId>,
-    expanded_project_ids: &[ProjectId],
-    expanded_worktree_ids: &[WorktreeId],
-    focused_node: Option<ExplorerNodeId>,
-    mode: ExplorerMode,
-) -> ExplorerPresentation {
-    let mut rows = Vec::new();
+    selected_project_id: Option<ProjectId>,
+    selected_worktree_id: Option<WorktreeId>,
+    selected_session_id: Option<SessionId>,
+    mode: NavigatorMode,
+    active_panel: DesktopPanel,
+) -> NavigatorPresentation {
+    NavigatorPresentation {
+        repositories: build_repository_rows(daemon, workspace_id, selected_project_id),
+        checkouts: build_checkout_rows(daemon, selected_project_id, selected_worktree_id),
+        sessions: build_session_rows(daemon, selected_worktree_id, selected_session_id),
+        mode,
+        active_panel,
+    }
+}
+
+fn build_repository_rows(
+    daemon: &DaemonSnapshot,
+    workspace_id: Option<WorkspaceId>,
+    selected_project_id: Option<ProjectId>,
+) -> Vec<NavigatorRow> {
     let mut projects: Vec<_> = daemon
         .projects
         .iter()
@@ -713,172 +646,132 @@ fn build_explorer(
             .then_with(|| left.name.cmp(&right.name))
     });
 
-    for project in projects {
-        let project_id = ExplorerNodeId::Repository(project.id);
-        let project_expanded = expanded_project_ids.contains(&project.id);
-        let mut worktrees: Vec<_> = daemon
-            .worktrees
-            .iter()
-            .filter(|worktree| {
-                worktree.project_id == project.id && worktree.status != WorktreeStatus::Removed
-            })
-            .collect();
-        let project_attention = worktrees
-            .iter()
-            .flat_map(|worktree| {
-                daemon
-                    .sessions
-                    .iter()
-                    .filter(move |session| session.worktree_id == worktree.id)
-            })
-            .filter_map(|session| attention_for_state(session.state))
-            .max();
-        worktrees.sort_by(|left, right| {
-            right
-                .is_root_checkout
-                .cmp(&left.is_root_checkout)
-                .then_with(|| right.last_activity_at.cmp(&left.last_activity_at))
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        rows.push(ExplorerRow {
-            id: project_id,
-            parent: None,
-            kind: ExplorerNodeKind::Repository,
-            depth: 0,
-            label: project.name.clone(),
-            detail: String::new(),
-            indicator: None,
-            attention: project_attention,
-            actions: vec![
-                ExplorerAction::CreateCheckout(project.id),
-                ExplorerAction::RenameRepository(project.id),
-                ExplorerAction::RemoveRepository(project.id),
-            ],
-            expandable: !worktrees.is_empty(),
-            expanded: project_expanded,
-        });
-        if !project_expanded {
-            continue;
-        }
-        append_worktree_rows(
-            &mut rows,
-            daemon,
-            project_id,
-            &worktrees,
-            expanded_worktree_ids,
-        );
-    }
-    let selected = focused_node.filter(|node| rows.iter().any(|row| row.id == *node));
-    ExplorerPresentation {
-        rows,
-        selected,
-        mode,
-    }
-}
-
-fn append_worktree_rows(
-    rows: &mut Vec<ExplorerRow>,
-    daemon: &DaemonSnapshot,
-    project_id: ExplorerNodeId,
-    worktrees: &[&Worktree],
-    expanded_worktree_ids: &[WorktreeId],
-) {
-    for worktree in worktrees {
-        let worktree_id = ExplorerNodeId::Checkout(worktree.id);
-        let worktree_expanded = expanded_worktree_ids.contains(&worktree.id);
-        let mut sessions: Vec<_> = daemon
-            .sessions
-            .iter()
-            .filter(|session| session.worktree_id == worktree.id)
-            .collect();
-        sessions.sort_by(|left, right| {
-            right
-                .last_activity_at
-                .cmp(&left.last_activity_at)
-                .then_with(|| left.display_name.cmp(&right.display_name))
-        });
-        rows.push(explorer_worktree_row(
-            worktree,
-            project_id,
-            &sessions,
-            worktree_expanded,
-        ));
-        if worktree_expanded {
-            rows.extend(
-                sessions
-                    .into_iter()
-                    .map(|session| {
-                        explorer_session_row(session, worktree_id, &daemon.sessions)
-                    }),
-            );
-        }
-    }
-}
-
-fn explorer_worktree_row(
-    worktree: &Worktree,
-    project_id: ExplorerNodeId,
-    sessions: &[&Session],
-    expanded: bool,
-) -> ExplorerRow {
-    let mut actions = vec![
-        ExplorerAction::CreateSession(worktree.id),
-        ExplorerAction::RenameCheckout(worktree.id),
-    ];
-    if !worktree.is_root_checkout && worktree.status == WorktreeStatus::Active {
-        actions.push(ExplorerAction::DeleteCheckout(worktree.id));
-    }
-    ExplorerRow {
-        id: ExplorerNodeId::Checkout(worktree.id),
-        parent: Some(project_id),
-        kind: ExplorerNodeKind::Checkout,
-        depth: 1,
-        label: worktree.name.clone(),
-        detail: format!(
-            "{} · {}",
-            worktree.branch.as_deref().unwrap_or("detached"),
-            if worktree.is_root_checkout {
-                "root"
-            } else {
-                "managed"
+    projects
+        .into_iter()
+        .map(|project| {
+            let worktrees: Vec<_> = daemon
+                .worktrees
+                .iter()
+                .filter(|worktree| {
+                    worktree.project_id == project.id && worktree.status != WorktreeStatus::Removed
+                })
+                .collect();
+            let attention = worktrees
+                .iter()
+                .flat_map(|worktree| {
+                    daemon
+                        .sessions
+                        .iter()
+                        .filter(move |session| session.worktree_id == worktree.id)
+                })
+                .filter_map(|session| attention_for_state(session.state))
+                .max();
+            NavigatorRow {
+                id: NavigatorNodeId::Repository(project.id),
+                kind: NavigatorNodeKind::Repository,
+                label: project.name.clone(),
+                detail: "Repository".into(),
+                badge: None,
+                indicator: None,
+                attention,
+                actions: vec![NavigatorAction::RemoveRepository(project.id)],
+                selected: selected_project_id == Some(project.id),
             }
-        ),
-        indicator: None,
-        attention: sessions
-            .iter()
-            .filter_map(|session| attention_for_state(session.state))
-            .max(),
-        actions,
-        expandable: !sessions.is_empty(),
-        expanded,
-    }
+        })
+        .collect()
 }
 
-fn explorer_session_row(
-    session: &Session,
-    worktree_id: ExplorerNodeId,
-    sessions: &[Session],
-) -> ExplorerRow {
-    let mut actions = vec![
-        ExplorerAction::OpenSession(session.id),
-        ExplorerAction::RenameSession(session.id),
-    ];
-    if session_can_delete(session, sessions) {
-        actions.push(ExplorerAction::DeleteSession(session.id));
-    }
-    ExplorerRow {
-        id: ExplorerNodeId::Session(session.id),
-        parent: Some(worktree_id),
-        kind: ExplorerNodeKind::Session,
-        depth: 2,
-        label: session.display_name.clone(),
-        detail: session_state_label(session.state).to_owned(),
-        indicator: Some(SessionIndicator::for_state(session.state)),
-        attention: attention_for_state(session.state),
-        actions,
-        expandable: false,
-        expanded: false,
-    }
+fn build_checkout_rows(
+    daemon: &DaemonSnapshot,
+    selected_project_id: Option<ProjectId>,
+    selected_worktree_id: Option<WorktreeId>,
+) -> Vec<NavigatorRow> {
+    let mut worktrees: Vec<_> = daemon
+        .worktrees
+        .iter()
+        .filter(|worktree| {
+            Some(worktree.project_id) == selected_project_id
+                && worktree.status != WorktreeStatus::Removed
+        })
+        .collect();
+    worktrees.sort_by(|left, right| {
+        right
+            .is_root_checkout
+            .cmp(&left.is_root_checkout)
+            .then_with(|| right.last_activity_at.cmp(&left.last_activity_at))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    worktrees
+        .into_iter()
+        .map(|worktree| {
+            let sessions: Vec<_> = daemon
+                .sessions
+                .iter()
+                .filter(|session| session.worktree_id == worktree.id)
+                .collect();
+            let mut actions = Vec::new();
+            if !worktree.is_root_checkout && worktree.status == WorktreeStatus::Active {
+                actions.push(NavigatorAction::DeleteCheckout(worktree.id));
+            }
+            NavigatorRow {
+                id: NavigatorNodeId::Checkout(worktree.id),
+                kind: NavigatorNodeKind::Checkout,
+                label: worktree.name.clone(),
+                detail: worktree.branch.as_deref().unwrap_or("detached").to_owned(),
+                badge: Some(
+                    if worktree.is_root_checkout {
+                        "Root"
+                    } else {
+                        "Managed"
+                    }
+                    .to_owned(),
+                ),
+                indicator: None,
+                attention: sessions
+                    .iter()
+                    .filter_map(|session| attention_for_state(session.state))
+                    .max(),
+                actions,
+                selected: selected_worktree_id == Some(worktree.id),
+            }
+        })
+        .collect()
+}
+
+fn build_session_rows(
+    daemon: &DaemonSnapshot,
+    selected_worktree_id: Option<WorktreeId>,
+    selected_session_id: Option<SessionId>,
+) -> Vec<NavigatorRow> {
+    let mut sessions: Vec<_> = daemon
+        .sessions
+        .iter()
+        .filter(|session| Some(session.worktree_id) == selected_worktree_id)
+        .collect();
+    sessions.sort_by(|left, right| {
+        right
+            .last_activity_at
+            .cmp(&left.last_activity_at)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+    sessions
+        .into_iter()
+        .map(|session| NavigatorRow {
+            id: NavigatorNodeId::Session(session.id),
+            kind: NavigatorNodeKind::Session,
+            label: session.display_name.clone(),
+            detail: session_state_label(session.state).to_owned(),
+            badge: None,
+            indicator: Some(SessionIndicator::for_state(session.state)),
+            attention: attention_for_state(session.state),
+            actions: if session_can_delete(session, &daemon.sessions) {
+                vec![NavigatorAction::DeleteSession(session.id)]
+            } else {
+                Vec::new()
+            },
+            selected: selected_session_id == Some(session.id),
+        })
+        .collect()
 }
 
 fn build_active_session(
@@ -886,6 +779,7 @@ fn build_active_session(
     open_session_ids: &[SessionId],
     active_session_id: Option<SessionId>,
     active_session_attached: bool,
+    resumable_session_ids: &[SessionId],
 ) -> ActiveSessionPresentation {
     let tabs = open_session_ids
         .iter()
@@ -932,17 +826,17 @@ fn build_active_session(
                 None
             },
             can_stop: session_state_can_stop(session.state),
-            can_resume: session_can_resume(session, &daemon.sessions),
+            can_resume: resumable_session_ids.contains(&session.id),
         })
     });
     ActiveSessionPresentation { tabs, context }
 }
 
-const fn attention_for_state(state: SessionState) -> Option<ExplorerAttention> {
+const fn attention_for_state(state: SessionState) -> Option<NavigatorAttention> {
     match state {
-        SessionState::FinishedUnseen => Some(ExplorerAttention::Finished),
-        SessionState::NeedsFeedback => Some(ExplorerAttention::NeedsFeedback),
-        SessionState::Failed => Some(ExplorerAttention::Failed),
+        SessionState::FinishedUnseen => Some(NavigatorAttention::Finished),
+        SessionState::NeedsFeedback => Some(NavigatorAttention::NeedsFeedback),
+        SessionState::Failed => Some(NavigatorAttention::Failed),
         SessionState::Fresh
         | SessionState::Starting
         | SessionState::Running
@@ -1418,7 +1312,10 @@ mod tests {
                 ("surface", tokens.text, tokens.surface),
                 ("raised surface", tokens.text, tokens.surface_raised),
                 ("sunken surface", tokens.text, tokens.surface_sunken),
-                ("muted", tokens.text_muted, tokens.surface),
+                ("muted canvas", tokens.text_muted, tokens.canvas),
+                ("muted surface", tokens.text_muted, tokens.surface),
+                ("muted raised", tokens.text_muted, tokens.surface_raised),
+                ("muted sunken", tokens.text_muted, tokens.surface_sunken),
                 ("selection", tokens.selection_text, tokens.selection),
                 ("success", tokens.success, tokens.success_surface),
                 ("attention", tokens.attention, tokens.attention_surface),
@@ -1652,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn explorer_flattens_the_domain_hierarchy_with_descriptive_rows() {
+    fn navigator_presents_independent_selected_columns() {
         let fixture = hierarchy_fixture(SessionState::Running);
         let preferences = DesktopState::default();
         let presentation = DesktopPresentation::build(&PresentationInput {
@@ -1666,38 +1563,27 @@ mod tests {
                 selected_session_id: Some(fixture.session_id),
                 active_session_id: Some(fixture.session_id),
                 main_tab: MainTab::Terminal,
-                expanded_project_ids: vec![fixture.project_id],
-                expanded_worktree_ids: vec![fixture.worktree_id],
-                focused_explorer_node: Some(ExplorerNodeId::Session(fixture.session_id)),
                 ..InteractionState::default()
             },
         });
 
+        assert_eq!(presentation.navigator.repositories[0].label, "SylvOps");
+        assert_eq!(presentation.navigator.checkouts[0].detail, "main");
         assert_eq!(
-            presentation
-                .explorer
-                .rows
-                .iter()
-                .map(|row| (row.kind, row.depth, row.label.as_str(), row.detail.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (ExplorerNodeKind::Repository, 0, "SylvOps", ""),
-                (ExplorerNodeKind::Checkout, 1, "Primary", "main · root"),
-                (ExplorerNodeKind::Session, 2, "Review issue 65", "Running"),
-            ]
+            presentation.navigator.checkouts[0].badge.as_deref(),
+            Some("Root")
         );
         assert_eq!(
-            presentation.explorer.selected,
-            Some(ExplorerNodeId::Session(fixture.session_id))
-        );
-        assert_eq!(
-            presentation.explorer.rows[2].indicator,
+            presentation.navigator.sessions[0].indicator,
             Some(SessionIndicator::Working)
         );
+        assert!(presentation.navigator.repositories[0].selected);
+        assert!(presentation.navigator.checkouts[0].selected);
+        assert!(presentation.navigator.sessions[0].selected);
     }
 
     #[test]
-    fn explorer_orders_each_hierarchy_level_deterministically() {
+    fn navigator_orders_each_column_deterministically() {
         let mut fixture = hierarchy_fixture(SessionState::Running);
         let mut recent_project = fixture.snapshot.projects[0].clone();
         recent_project.id = ProjectId::new();
@@ -1725,78 +1611,75 @@ mod tests {
             viewport: Viewport::new(1_440, 900),
             system_appearance: SystemAppearance::Dark,
             interaction: InteractionState {
-                expanded_project_ids: vec![fixture.project_id],
-                expanded_worktree_ids: vec![fixture.worktree_id],
+                selected_project_id: Some(fixture.project_id),
+                selected_worktree_id: Some(fixture.worktree_id),
                 ..InteractionState::default()
             },
         });
 
         assert_eq!(
             presentation
-                .explorer
-                .rows
+                .navigator
+                .repositories
                 .iter()
                 .map(|row| row.label.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "Recent repository",
-                "SylvOps",
-                "Primary",
-                "Newest session",
-                "Review issue 65",
-                "Feature",
-            ]
+            vec!["Recent repository", "SylvOps"]
         );
-    }
-
-    #[test]
-    fn explorer_rolls_urgent_session_state_up_to_collapsed_ancestors() {
-        let fixture = hierarchy_fixture(SessionState::NeedsFeedback);
-        let preferences = DesktopState::default();
-        let collapsed_repository = DesktopPresentation::build(&PresentationInput {
-            daemon: &fixture.snapshot,
-            preferences: &preferences,
-            viewport: Viewport::new(1_440, 900),
-            system_appearance: SystemAppearance::Dark,
-            interaction: InteractionState {
-                focused_explorer_node: Some(ExplorerNodeId::Repository(fixture.project_id)),
-                ..InteractionState::default()
-            },
-        });
-        assert_eq!(collapsed_repository.explorer.rows.len(), 1);
         assert_eq!(
-            collapsed_repository.explorer.rows[0].attention,
-            Some(ExplorerAttention::NeedsFeedback)
-        );
-
-        let collapsed_checkout = DesktopPresentation::build(&PresentationInput {
-            daemon: &fixture.snapshot,
-            preferences: &preferences,
-            viewport: Viewport::new(1_440, 900),
-            system_appearance: SystemAppearance::Dark,
-            interaction: InteractionState {
-                expanded_project_ids: vec![fixture.project_id],
-                focused_explorer_node: Some(ExplorerNodeId::Checkout(fixture.worktree_id)),
-                ..InteractionState::default()
-            },
-        });
-        assert_eq!(collapsed_checkout.explorer.rows.len(), 2);
-        assert_eq!(
-            collapsed_checkout.explorer.rows[1].attention,
-            Some(ExplorerAttention::NeedsFeedback)
-        );
-        assert!(
-            collapsed_checkout
-                .explorer
-                .rows
+            presentation
+                .navigator
+                .checkouts
                 .iter()
-                .all(|row| { !row.label.contains("provider") && !row.detail.contains("provider") })
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Primary", "Feature"]
+        );
+        assert_eq!(
+            presentation
+                .navigator
+                .sessions
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Newest session", "Review issue 65"]
         );
     }
 
     #[test]
-    fn explorer_keyboard_navigation_follows_visible_tree_semantics() {
-        let fixture = hierarchy_fixture(SessionState::Running);
+    fn claude_session_resume_is_presented_from_returned_provider_capability() {
+        let mut fixture = hierarchy_fixture(SessionState::FinishedSeen);
+        let session = &mut fixture.snapshot.sessions[0];
+        session.provider_kind = ProviderKind::Claude;
+        session.external_session_id = Some("verified-claude-id".into());
+        let preferences = DesktopState::default();
+
+        let presentation = DesktopPresentation::build(&PresentationInput {
+            daemon: &fixture.snapshot,
+            preferences: &preferences,
+            viewport: Viewport::new(1_440, 900),
+            system_appearance: SystemAppearance::Dark,
+            interaction: InteractionState {
+                selected_project_id: Some(fixture.project_id),
+                selected_worktree_id: Some(fixture.worktree_id),
+                selected_session_id: Some(fixture.session_id),
+                active_session_id: Some(fixture.session_id),
+                resumable_session_ids: vec![fixture.session_id],
+                ..InteractionState::default()
+            },
+        });
+
+        assert!(
+            presentation
+                .active_session
+                .context
+                .is_some_and(|context| context.can_resume)
+        );
+    }
+
+    #[test]
+    fn navigator_rolls_urgent_session_state_up_to_ancestors() {
+        let fixture = hierarchy_fixture(SessionState::NeedsFeedback);
         let preferences = DesktopState::default();
         let presentation = DesktopPresentation::build(&PresentationInput {
             daemon: &fixture.snapshot,
@@ -1804,42 +1687,23 @@ mod tests {
             viewport: Viewport::new(1_440, 900),
             system_appearance: SystemAppearance::Dark,
             interaction: InteractionState {
-                expanded_project_ids: vec![fixture.project_id],
-                expanded_worktree_ids: vec![fixture.worktree_id],
-                focused_explorer_node: Some(ExplorerNodeId::Repository(fixture.project_id)),
+                selected_project_id: Some(fixture.project_id),
+                selected_worktree_id: Some(fixture.worktree_id),
                 ..InteractionState::default()
             },
         });
-        let repository = ExplorerNodeId::Repository(fixture.project_id);
-        let checkout = ExplorerNodeId::Checkout(fixture.worktree_id);
-        let session = ExplorerNodeId::Session(fixture.session_id);
-
         assert_eq!(
-            presentation
-                .explorer
-                .navigate(repository, ExplorerKey::Right),
-            ExplorerIntent::Focus(checkout)
+            presentation.navigator.repositories[0].attention,
+            Some(NavigatorAttention::NeedsFeedback)
         );
         assert_eq!(
-            presentation.explorer.navigate(checkout, ExplorerKey::Left),
-            ExplorerIntent::Collapse(checkout)
-        );
-        assert_eq!(
-            presentation.explorer.navigate(session, ExplorerKey::Left),
-            ExplorerIntent::Focus(checkout)
-        );
-        assert_eq!(
-            presentation.explorer.navigate(checkout, ExplorerKey::Down),
-            ExplorerIntent::Focus(session)
-        );
-        assert_eq!(
-            presentation.explorer.navigate(session, ExplorerKey::Enter),
-            ExplorerIntent::Open(fixture.session_id)
+            presentation.navigator.checkouts[0].attention,
+            Some(NavigatorAttention::NeedsFeedback)
         );
     }
 
     #[test]
-    fn explorer_rows_publish_contextual_actions_without_hover() {
+    fn navigator_rows_publish_contextual_actions_without_hover() {
         let mut fixture = hierarchy_fixture(SessionState::Running);
         fixture.snapshot.worktrees[0].is_root_checkout = false;
         let preferences = DesktopState::default();
@@ -1849,72 +1713,23 @@ mod tests {
             viewport: Viewport::new(1_440, 900),
             system_appearance: SystemAppearance::Dark,
             interaction: InteractionState {
-                expanded_project_ids: vec![fixture.project_id],
-                expanded_worktree_ids: vec![fixture.worktree_id],
+                selected_project_id: Some(fixture.project_id),
+                selected_worktree_id: Some(fixture.worktree_id),
                 ..InteractionState::default()
             },
         });
 
         assert_eq!(
-            presentation.explorer.rows[0].actions,
-            vec![
-                ExplorerAction::CreateCheckout(fixture.project_id),
-                ExplorerAction::RenameRepository(fixture.project_id),
-                ExplorerAction::RemoveRepository(fixture.project_id),
-            ]
+            presentation.navigator.repositories[0].actions,
+            vec![NavigatorAction::RemoveRepository(fixture.project_id)]
         );
         assert_eq!(
-            presentation.explorer.rows[1].actions,
-            vec![
-                ExplorerAction::CreateSession(fixture.worktree_id),
-                ExplorerAction::RenameCheckout(fixture.worktree_id),
-                ExplorerAction::DeleteCheckout(fixture.worktree_id),
-            ]
+            presentation.navigator.checkouts[0].actions,
+            vec![NavigatorAction::DeleteCheckout(fixture.worktree_id)]
         );
         assert_eq!(
-            presentation.explorer.rows[2].actions,
-            vec![
-                ExplorerAction::OpenSession(fixture.session_id),
-                ExplorerAction::RenameSession(fixture.session_id),
-            ]
-        );
-    }
-
-    #[test]
-    fn explorer_only_offers_session_deletion_for_terminal_non_resumable_records() {
-        let mut fixture = hierarchy_fixture(SessionState::Terminated);
-        let project_id = fixture.project_id;
-        let worktree_id = fixture.worktree_id;
-        let session_id = fixture.session_id;
-        let present = |snapshot: &DaemonSnapshot| {
-            DesktopPresentation::build(&PresentationInput {
-                daemon: snapshot,
-                preferences: &DesktopState::default(),
-                viewport: Viewport::new(1_440, 900),
-                system_appearance: SystemAppearance::Dark,
-                interaction: InteractionState {
-                    expanded_project_ids: vec![project_id],
-                    expanded_worktree_ids: vec![worktree_id],
-                    focused_explorer_node: Some(ExplorerNodeId::Session(session_id)),
-                    ..InteractionState::default()
-                },
-            })
-        };
-
-        let terminal = present(&fixture.snapshot);
-        assert!(
-            terminal.explorer.rows[2]
-                .actions
-                .contains(&ExplorerAction::DeleteSession(session_id))
-        );
-
-        fixture.snapshot.sessions[0].state = SessionState::Failed;
-        fixture.snapshot.sessions[0].external_session_id = Some("verified-conversation".into());
-        let resumable = present(&fixture.snapshot);
-        assert!(
-            !resumable.explorer.rows[2]
-                .actions
-                .contains(&ExplorerAction::DeleteSession(session_id))
+            presentation.navigator.sessions[0].actions,
+            Vec::<NavigatorAction>::new()
         );
     }
 
@@ -1935,34 +1750,34 @@ mod tests {
                     active_session_id: Some(fixture.session_id),
                     open_session_ids: vec![fixture.session_id],
                     active_session_attached: true,
+                    resumable_session_ids: Vec::new(),
                     main_tab: MainTab::Changes,
-                    ..InteractionState::default()
                 },
             })
         };
 
         let wide = present(1_180);
-        assert_eq!(wide.explorer.mode, ExplorerMode::Resizable);
+        assert_eq!(wide.navigator.mode, NavigatorMode::Columns);
         assert_eq!(
             wide.workspace_navigation,
             WorkspaceNavigation::ScrollableTabs
         );
         let compact_edge = present(1_179);
-        assert_eq!(compact_edge.explorer.mode, ExplorerMode::Collapsible);
+        assert_eq!(compact_edge.navigator.mode, NavigatorMode::Tabs);
         let compact = present(900);
-        assert_eq!(compact.explorer.mode, ExplorerMode::Collapsible);
+        assert_eq!(compact.navigator.mode, NavigatorMode::Tabs);
         assert_eq!(
             compact.workspace_navigation,
             WorkspaceNavigation::ScrollableTabs
         );
         let narrow = present(819);
-        assert_eq!(narrow.explorer.mode, ExplorerMode::Drawer);
+        assert_eq!(narrow.navigator.mode, NavigatorMode::Drawer);
         assert_eq!(
             narrow.workspace_navigation,
             WorkspaceNavigation::LabeledSwitcher
         );
         let compact_lower_edge = present(820);
-        assert_eq!(compact_lower_edge.explorer.mode, ExplorerMode::Collapsible);
+        assert_eq!(compact_lower_edge.navigator.mode, NavigatorMode::Tabs);
         assert_eq!(
             compact_lower_edge.workspace_navigation,
             WorkspaceNavigation::ScrollableTabs
@@ -1982,21 +1797,5 @@ mod tests {
         assert_eq!(active.terminal_action, Some(ActiveTerminalAction::Leave));
         assert!(active.can_stop);
         assert_eq!(wide.selection.main_tab, MainTab::Changes);
-    }
-
-    #[test]
-    fn settings_are_a_side_sheet_until_the_shell_becomes_narrow() {
-        assert_eq!(
-            PresentationLayout::Wide.settings_mode(),
-            SettingsMode::SideSheet
-        );
-        assert_eq!(
-            PresentationLayout::Compact.settings_mode(),
-            SettingsMode::SideSheet
-        );
-        assert_eq!(
-            PresentationLayout::Narrow.settings_mode(),
-            SettingsMode::FullWindow
-        );
     }
 }

@@ -2,7 +2,7 @@
 
 use std::{fs, path::Path};
 
-use sylvops_core::config::AppConfig;
+use sylvops_core::config::{AppConfig, CURRENT_CONFIG_VERSION};
 use toml::Value;
 
 use crate::{DaemonError, Result, atomic_file};
@@ -11,8 +11,8 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Loads the primary configuration and overlays the optional machine-local file.
 ///
-/// A missing primary file is initialized atomically with defaults. Existing files are never
-/// rewritten merely by loading them, preserving unknown fields for newer versions.
+/// A missing primary file is initialized atomically with defaults. Version-one primary files are
+/// migrated atomically before machine-local overrides are applied, preserving unknown fields.
 ///
 /// # Errors
 ///
@@ -25,6 +25,10 @@ pub fn load(primary: &Path, machine_local: &Path) -> Result<AppConfig> {
     }
 
     let mut value = read_toml(primary)?;
+    let migrated_primary = migrate_primary(&mut value)?
+        .then(|| toml::to_string_pretty(&value))
+        .transpose()
+        .map_err(|error| DaemonError::Configuration(error.to_string()))?;
     if machine_local.exists() {
         merge(&mut value, read_toml(machine_local)?);
     }
@@ -32,7 +36,43 @@ pub fn load(primary: &Path, machine_local: &Path) -> Result<AppConfig> {
         .try_into()
         .map_err(|error| DaemonError::Configuration(format!("invalid configuration: {error}")))?;
     config.validate().map_err(DaemonError::Configuration)?;
+    if let Some(encoded) = migrated_primary {
+        atomic_file::write(primary, encoded.as_bytes())?;
+    }
     Ok(config)
+}
+
+fn migrate_primary(value: &mut Value) -> Result<bool> {
+    let table = value.as_table_mut().ok_or_else(|| {
+        DaemonError::Configuration("primary configuration must be a TOML table".into())
+    })?;
+    if table.get("version").and_then(Value::as_integer) != Some(1) {
+        return Ok(false);
+    }
+
+    let uses_v1_provider_defaults = table
+        .get("enabled_providers")
+        .and_then(Value::as_array)
+        .is_some_and(|providers| {
+            providers.len() == 2
+                && providers[0].as_str() == Some("shell")
+                && providers[1].as_str() == Some("codex")
+        });
+    if uses_v1_provider_defaults {
+        table.insert(
+            "enabled_providers".into(),
+            Value::Array(vec![
+                Value::String("shell".into()),
+                Value::String("codex".into()),
+                Value::String("claude".into()),
+            ]),
+        );
+    }
+    table.insert(
+        "version".into(),
+        Value::Integer(i64::from(CURRENT_CONFIG_VERSION)),
+    );
+    Ok(true)
 }
 
 fn read_toml(path: &Path) -> Result<Value> {
@@ -68,6 +108,7 @@ fn merge(base: &mut Value, overlay: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sylvops_core::{config::CURRENT_CONFIG_VERSION, domain::ProviderKind};
 
     #[test]
     fn creates_defaults_and_applies_local_override() {
@@ -79,5 +120,74 @@ mod tests {
         let config = load(&primary, &local).unwrap();
         assert_eq!(config.theme, "local");
         assert!(primary.exists());
+    }
+
+    #[test]
+    fn migrates_the_exact_v1_provider_defaults_and_preserves_unknown_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("config.toml");
+        let local = directory.path().join("config.local.toml");
+        fs::write(
+            &primary,
+            "version = 1\nenabled_providers = ['shell', 'codex']\nfuture_setting = 'preserved'\n",
+        )
+        .unwrap();
+
+        let config = load(&primary, &local).unwrap();
+
+        assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(
+            config.enabled_providers,
+            vec![
+                ProviderKind::Shell,
+                ProviderKind::Codex,
+                ProviderKind::Claude,
+            ]
+        );
+        assert_eq!(
+            config.unknown.get("future_setting").and_then(Value::as_str),
+            Some("preserved")
+        );
+        let persisted = fs::read_to_string(primary).unwrap();
+        assert!(persisted.contains("version = 2"));
+        assert!(persisted.contains("future_setting = \"preserved\""));
+    }
+
+    #[test]
+    fn migration_keeps_a_customized_v1_provider_list_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("config.toml");
+        let local = directory.path().join("config.local.toml");
+        fs::write(
+            &primary,
+            "version = 1\nenabled_providers = ['shell']\nfuture_setting = 'preserved'\n",
+        )
+        .unwrap();
+
+        let config = load(&primary, &local).unwrap();
+
+        assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(config.enabled_providers, vec![ProviderKind::Shell]);
+        assert_eq!(
+            config.unknown.get("future_setting").and_then(Value::as_str),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn rejected_v1_migration_leaves_the_primary_file_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("config.toml");
+        let local = directory.path().join("config.local.toml");
+        let source = "version = 1\nenabled_providers = ['shell', 'codex']\nscrollback_capacity_bytes = 1\nfuture_setting = 'preserved'\n";
+        fs::write(&primary, source).unwrap();
+
+        let error = load(&primary, &local).unwrap_err();
+
+        assert!(
+            error.to_string().contains("scrollback capacity"),
+            "unexpected migration error: {error}"
+        );
+        assert_eq!(fs::read_to_string(primary).unwrap(), source);
     }
 }
