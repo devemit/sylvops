@@ -225,6 +225,12 @@ enum SessionCommand {
     },
     /// Stop the session and its complete process tree.
     Stop { session_id: SessionId },
+    /// Permanently delete one inactive Session while preserving its worktree and Git state.
+    Delete {
+        session_id: SessionId,
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -374,6 +380,10 @@ async fn run_command(
                 rows,
             } => resume_session(&paths, session_id, columns, rows).await?,
             SessionCommand::Stop { session_id } => stop_session(&paths, session_id).await?,
+            SessionCommand::Delete {
+                session_id,
+                confirm,
+            } => delete_session(&paths, session_id, confirm).await?,
         },
         Command::Provider { command } => match command {
             ProviderCommand::List => list_providers(&paths).await?,
@@ -1159,6 +1169,58 @@ async fn stop_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_da
     }
 }
 
+async fn delete_session(
+    paths: &RuntimePaths,
+    session_id: SessionId,
+    confirm: bool,
+) -> sylvops_daemon::Result<()> {
+    if !confirm {
+        return Err(DaemonError::Lifecycle(
+            "session deletion requires the explicit --confirm flag".into(),
+        ));
+    }
+    let client = DaemonClient::connect(paths, "sylvops-cli").await?;
+    let inspection = match client
+        .request(&ClientRequest::InspectSessionDeletion { session_id })
+        .await?
+    {
+        DaemonResponse::SessionDeletionInspected(inspection) => inspection,
+        response => return unexpected("session deletion inspection", response),
+    };
+    println!("Delete Session: {}", inspection.session_id);
+    println!(
+        "Preserved: worktree {}, repository files, Git state, and neighboring resume Sessions",
+        inspection.worktree_id
+    );
+    let authorization_token = inspection.authorization_token.ok_or_else(|| {
+        let reason = match inspection.refusal {
+            Some(sylvops_core::protocol::SessionDeletionRefusal::LiveState) => {
+                "the Session is active; stop it and wait for exit"
+            }
+            Some(sylvops_core::protocol::SessionDeletionRefusal::OwnedProcess) => {
+                "the Session still owns a process tree"
+            }
+            Some(sylvops_core::protocol::SessionDeletionRefusal::IneligibleState) | None => {
+                "the Session state is not eligible"
+            }
+        };
+        DaemonError::Lifecycle(format!("session deletion refused: {reason}"))
+    })?;
+    match client
+        .request(&ClientRequest::DeleteSession {
+            session_id,
+            authorization_token,
+        })
+        .await?
+    {
+        DaemonResponse::SessionDeleted { session_id, .. } => {
+            println!("Deleted Session {session_id}");
+            Ok(())
+        }
+        response => unexpected("session deletion", response),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn attach_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_daemon::Result<()> {
     let client = DaemonClient::connect(paths, "sylvops-cli-attach").await?;
@@ -1501,6 +1563,40 @@ mod tests {
                 && effort == "high"
                 && prompt == "Review the current changes"
         ));
+    }
+
+    #[test]
+    fn cli_accepts_confirmed_session_deletion() {
+        let session_id = SessionId::new();
+        let arguments = Arguments::try_parse_from([
+            "sylvops",
+            "session",
+            "delete",
+            &session_id.to_string(),
+            "--confirm",
+        ])
+        .expect("session delete command");
+
+        assert!(matches!(
+            arguments.command,
+            Some(Command::Session {
+                command: SessionCommand::Delete {
+                    session_id: parsed,
+                    confirm: true,
+                }
+            }) if parsed == session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn cli_session_deletion_requires_confirmation_before_connecting() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let paths =
+            RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("runtime paths");
+        let error = delete_session(&paths, SessionId::new(), false)
+            .await
+            .expect_err("missing confirmation must fail");
+        assert!(matches!(error, DaemonError::Lifecycle(message) if message.contains("--confirm")));
     }
 
     #[tokio::test]

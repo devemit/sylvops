@@ -32,6 +32,9 @@ sylvops-core = { path = "../sylvops-core" }
 tempfile = "3"
 tokio.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
 [dev-dependencies]
 async-trait.workspace = true
 rusqlite.workspace = true

@@ -210,12 +210,22 @@ impl ProviderRegistry {
     }
 
     pub fn cleanup_runtime_paths(&self, kind: ProviderKind, paths: &[PathBuf]) {
-        let Ok(runtime) = self.runtime(kind) else {
-            return;
-        };
-        if let Err(error) = runtime.cleanup_runtime_paths(paths) {
+        if let Err(error) = self.cleanup_runtime_paths_checked(kind, paths) {
             tracing::warn!(%error, provider = %kind, "cannot clean provider runtime files");
         }
+    }
+
+    /// Revalidates and removes application-owned Provider runtime files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unavailable-Provider or runtime path validation/removal error.
+    pub fn cleanup_runtime_paths_checked(
+        &self,
+        kind: ProviderKind,
+        paths: &[PathBuf],
+    ) -> Result<()> {
+        Ok(self.runtime(kind)?.cleanup_runtime_paths(paths)?)
     }
 
     fn runtime(&self, kind: ProviderKind) -> Result<&Arc<dyn ProviderRuntime>> {

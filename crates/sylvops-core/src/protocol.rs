@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 10;
+pub const PROTOCOL_MINOR: u16 = 11;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -339,6 +339,73 @@ pub struct ProtocolFailure {
     pub retryable: bool,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionDeletionAuthorization(String);
+
+impl SessionDeletionAuthorization {
+    pub const ENCODED_LENGTH: usize = 64;
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl std::fmt::Debug for SessionDeletionAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionDeletionAuthorization([REDACTED])")
+    }
+}
+
+impl TryFrom<String> for SessionDeletionAuthorization {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        if value.len() != Self::ENCODED_LENGTH
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("session deletion authorization must be 64 hexadecimal characters");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl Serialize for SessionDeletionAuthorization {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionDeletionAuthorization {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SessionDeletionRefusal {
+    LiveState,
+    OwnedProcess,
+    IneligibleState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionDeletionInspection {
+    pub session_id: SessionId,
+    pub worktree_id: WorktreeId,
+    pub state: SessionState,
+    pub authorization_token: Option<SessionDeletionAuthorization>,
+    pub refusal: Option<SessionDeletionRefusal>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ClientRequest {
     Hello(HelloRequest),
@@ -431,6 +498,13 @@ pub enum ClientRequest {
         session_id: SessionId,
         name: String,
     },
+    InspectSessionDeletion {
+        session_id: SessionId,
+    },
+    DeleteSession {
+        session_id: SessionId,
+        authorization_token: SessionDeletionAuthorization,
+    },
     CheckForUpdate,
     DownloadUpdate,
     CancelUpdateDownload,
@@ -512,6 +586,12 @@ pub enum DaemonResponse {
         revision: u64,
         session: Session,
     },
+    SessionDeletionInspected(SessionDeletionInspection),
+    SessionDeleted {
+        revision: u64,
+        session_id: SessionId,
+        worktree_id: WorktreeId,
+    },
     UpdateNotAvailable {
         version: String,
     },
@@ -573,6 +653,11 @@ pub enum DaemonEvent {
     SessionUpdated {
         revision: u64,
         session: Session,
+    },
+    SessionDeleted {
+        revision: u64,
+        session_id: SessionId,
+        worktree_id: WorktreeId,
     },
     UpgradeProgress {
         status: crate::upgrade::UpgradeStatus,
@@ -707,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_10_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_11_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -719,7 +804,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 10);
+        assert_eq!(PROTOCOL_MINOR, 11);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -737,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_10_provider_runtime_data_round_trips() {
+    fn protocol_1_11_provider_runtime_data_round_trips() {
         let capabilities = ProviderCapabilities {
             interactive: true,
             resume: true,
@@ -874,6 +959,53 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+    }
+
+    #[test]
+    fn session_deletion_contract_round_trips() {
+        let session_id = SessionId::new();
+        let worktree_id = WorktreeId::new();
+        let requests = [
+            ClientRequest::InspectSessionDeletion { session_id },
+            ClientRequest::DeleteSession {
+                session_id,
+                authorization_token: "a".repeat(64).try_into().unwrap(),
+            },
+        ];
+        for request in requests {
+            let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
+            assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+
+        let inspection = DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
+            session_id,
+            worktree_id,
+            state: SessionState::FinishedSeen,
+            authorization_token: Some("b".repeat(64).try_into().unwrap()),
+            refusal: None,
+        });
+        let frame = Frame::message(MessageClass::Response, 43, &inspection).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), inspection);
+
+        let event = DaemonEvent::SessionDeleted {
+            revision: 9,
+            session_id,
+            worktree_id,
+        };
+        let frame = Frame::message(MessageClass::Event, 44, &event).unwrap();
+        assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
+    }
+
+    #[test]
+    fn malformed_session_deletion_authorization_is_rejected_during_decode() {
+        let payload = rmp_serde::to_vec(&serde_json::json!({
+            "DeleteSession": {
+                "session_id": SessionId::new(),
+                "authorization_token": "short"
+            }
+        }))
+        .unwrap();
+        assert!(rmp_serde::from_slice::<ClientRequest>(&payload).is_err());
     }
 
     #[test]

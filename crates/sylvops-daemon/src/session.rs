@@ -18,6 +18,8 @@ const LIVE_OUTPUT_CAPACITY: usize = 256;
 const READ_CHUNK_SIZE: usize = 8192;
 const MAX_SCROLLBACK_CHUNKS: usize = 4096;
 const PTY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PROCESS_TREE_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const PROCESS_TREE_REAP_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Exercises the production PTY backend with a bounded, non-shell child process.
 ///
@@ -232,6 +234,7 @@ pub struct SessionHandle {
     commands: mpsc::Sender<Command>,
     live_output: broadcast::Sender<OutputChunk>,
     exit: watch::Receiver<Option<SessionExit>>,
+    process_tree_empty: watch::Receiver<bool>,
     process_id: u32,
 }
 
@@ -271,6 +274,7 @@ impl SessionHandle {
         let (actor_events, actor_event_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
         let (live_output, _) = broadcast::channel(LIVE_OUTPUT_CAPACITY);
         let (exit_tx, exit) = watch::channel(None);
+        let (process_tree_empty_tx, process_tree_empty) = watch::channel(false);
 
         spawn_reader(spawned.reader, actor_events.clone());
         spawn_waiter(spawned.child, actor_events.clone());
@@ -292,6 +296,7 @@ impl SessionHandle {
                 events_tx: actor_events,
                 live_output: live_output.clone(),
                 exit: exit_tx,
+                process_tree_empty: process_tree_empty_tx,
             }
             .run(),
         );
@@ -300,6 +305,7 @@ impl SessionHandle {
             commands,
             live_output,
             exit,
+            process_tree_empty,
             process_id: spawned.process_id,
         })
     }
@@ -495,6 +501,30 @@ impl SessionHandle {
                 .map_err(|_| DaemonError::SessionStopped)?;
         }
     }
+
+    /// Proves whether the daemon-owned process group or Job Object is empty.
+    ///
+    /// A completed explicit stop has already terminated and released the owned tree; any other
+    /// unavailable actor fails closed as non-empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system process-tree inspection error.
+    pub async fn process_tree_is_empty(&self) -> Result<bool> {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::InspectProcessTree { reply })
+            .await
+            .is_err()
+        {
+            return Ok(*self.process_tree_empty.borrow());
+        }
+        match receive.await {
+            Ok(result) => result,
+            Err(_) => Ok(*self.process_tree_empty.borrow()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -540,6 +570,9 @@ enum Command {
     Stop {
         reply: oneshot::Sender<Result<()>>,
     },
+    InspectProcessTree {
+        reply: oneshot::Sender<Result<bool>>,
+    },
 }
 
 #[derive(Debug)]
@@ -577,6 +610,7 @@ struct Actor {
     events_tx: mpsc::Sender<ActorEvent>,
     live_output: broadcast::Sender<OutputChunk>,
     exit: watch::Sender<Option<SessionExit>>,
+    process_tree_empty: watch::Sender<bool>,
 }
 
 impl Actor {
@@ -589,7 +623,9 @@ impl Actor {
             tokio::select! {
             command = self.commands.recv() => {
                 let Some(command) = command else {
-                    let _ = self.process_tree.terminate();
+                    if !*self.process_tree_empty.borrow() {
+                        let _ = self.process_tree.terminate();
+                    }
                     return;
                 };
                 match command {
@@ -680,7 +716,12 @@ impl Actor {
                     }
                     Command::Stop { reply } => {
                         if exit_published {
-                            let _ = reply.send(Ok(()));
+                            let result = self.terminate_process_tree().await;
+                            let finished = result.is_ok();
+                            let _ = reply.send(result);
+                            if finished {
+                                return;
+                            }
                             continue;
                         }
                         if self.stop_requested {
@@ -697,6 +738,13 @@ impl Actor {
                                 let _ = events.send(ActorEvent::ForceStop).await;
                             });
                         }
+                    }
+                    Command::InspectProcessTree { reply } => {
+                        let result = self.process_tree.is_empty();
+                        if matches!(result, Ok(true)) {
+                            self.process_tree_empty.send_replace(true);
+                        }
+                        let _ = reply.send(result);
                     }
                 }
             }
@@ -723,9 +771,6 @@ impl Actor {
                             exit_code,
                             self.controller.is_some() || !self.observers.is_empty(),
                         ));
-                        for reply in self.stop_replies.drain(..) {
-                            let _ = reply.send(Ok(()));
-                        }
                     }
                     ActorEvent::ForceStop => {
                         if pending_exit.is_none()
@@ -745,6 +790,17 @@ impl Actor {
                 && (reader_closed || self.stop_requested)
                 && let Some((exit_code, was_attached)) = pending_exit
             {
+                if self.stop_requested {
+                    if let Err(error) = self.terminate_process_tree().await {
+                        for reply in self.stop_replies.drain(..) {
+                            let _ = reply.send(Err(DaemonError::ProcessTree(error.to_string())));
+                        }
+                        continue;
+                    }
+                    for reply in self.stop_replies.drain(..) {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
                 self.exit.send_replace(Some(SessionExit {
                     exit_code,
                     stop_requested: self.stop_requested,
@@ -763,6 +819,23 @@ impl Actor {
 }
 
 impl Actor {
+    async fn terminate_process_tree(&mut self) -> Result<()> {
+        self.process_tree.terminate()?;
+        let deadline = tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT;
+        loop {
+            if self.process_tree.is_empty()? {
+                self.process_tree_empty.send_replace(true);
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(DaemonError::ProcessTree(
+                    "owned process tree did not become empty before its deadline".into(),
+                ));
+            }
+            tokio::time::sleep(PROCESS_TREE_REAP_POLL).await;
+        }
+    }
+
     fn queue_input(&self, bytes: Vec<u8>, reply: oneshot::Sender<Result<()>>) {
         let Some(writer) = &self.writer else {
             let _ = reply.send(Err(DaemonError::Pty("PTY input is closed".into())));

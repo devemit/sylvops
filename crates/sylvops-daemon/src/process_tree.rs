@@ -5,7 +5,7 @@ use crate::Result;
 #[cfg(unix)]
 mod platform {
     use nix::{
-        sys::signal::{Signal, killpg},
+        sys::signal::{Signal, kill, killpg},
         unistd::{Pid, getpgid},
     };
 
@@ -38,6 +38,14 @@ mod platform {
                 Err(error) => Err(DaemonError::ProcessTree(error.to_string())),
             }
         }
+
+        pub fn is_empty(&self) -> Result<bool> {
+            match kill(Pid::from_raw(-self.process_group.as_raw()), None) {
+                Err(nix::errno::Errno::ESRCH) => Ok(true),
+                Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(false),
+                Err(error) => Err(DaemonError::ProcessTree(error.to_string())),
+            }
+        }
     }
 }
 
@@ -61,8 +69,9 @@ mod platform {
             },
             JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, TerminateJobObject,
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+                QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
             },
             Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
         },
@@ -184,6 +193,27 @@ mod platform {
                 return Err(last_os_error("terminate Windows Job Object"));
             }
             Ok(())
+        }
+
+        pub fn is_empty(&self) -> Result<bool> {
+            // SAFETY: the structure is plain Windows ABI data where zero is a valid baseline.
+            let mut information: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+                unsafe { std::mem::zeroed() };
+            // SAFETY: `job` is valid and the pointer/length describe `information` exactly.
+            if unsafe {
+                QueryInformationJobObject(
+                    self.job.as_raw_handle().cast::<c_void>(),
+                    JobObjectBasicAccountingInformation,
+                    (&raw mut information).cast::<c_void>(),
+                    u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                        .expect("Windows job accounting structure fits u32"),
+                    ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(last_os_error("inspect Windows Job Object"));
+            }
+            Ok(information.ActiveProcesses == 0)
         }
     }
 

@@ -42,6 +42,7 @@ winresource = "=0.1.31"
 ed25519-dalek.workspace = true
 semver.workspace = true
 sha2.workspace = true
+sylvops-test-support = { path = "../sylvops-test-support" }
 tempfile = "3"
 
 [target.'cfg(windows)'.dev-dependencies]

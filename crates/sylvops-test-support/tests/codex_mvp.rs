@@ -100,6 +100,10 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
 
     let terminated_session_id = create_codex_session(&client, worktree_id).await;
     assert_eq!(owned_hook_profile_count(&codex_home), 1);
+    let terminated_profile =
+        codex_home.join(format!("sylvops-{terminated_session_id}.config.toml"));
+    let terminated_profile_source =
+        std::fs::read(&terminated_profile).expect("read owned Codex profile");
     attach(&client, terminated_session_id).await;
     client
         .request(&ClientRequest::SessionInput {
@@ -139,6 +143,33 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         ),
         response => panic!("terminated session unexpectedly resumed: {response:?}"),
     }
+    std::fs::write(&terminated_profile, terminated_profile_source)
+        .expect("restore intact owned Codex profile");
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
+    let authorization_token = match client
+        .request(&ClientRequest::InspectSessionDeletion {
+            session_id: terminated_session_id,
+        })
+        .await
+        .expect("Codex deletion inspection")
+    {
+        DaemonResponse::SessionDeletionInspected(inspection) => inspection
+            .authorization_token
+            .expect("terminated Codex deletion token"),
+        response => panic!("unexpected Codex deletion inspection: {response:?}"),
+    };
+    assert!(matches!(
+        client
+            .request(&ClientRequest::DeleteSession {
+                session_id: terminated_session_id,
+                authorization_token,
+            })
+            .await
+            .expect("Codex deletion response"),
+        DaemonResponse::SessionDeleted { session_id, .. }
+            if session_id == terminated_session_id
+    ));
+    assert_eq!(owned_hook_profile_count(&codex_home), 0);
 
     let source_session_id = create_codex_session(&client, worktree_id).await;
     attach(&client, source_session_id).await;
