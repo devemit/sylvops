@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, 
 use sha2::{Digest, Sha256};
 use sylvops_core::domain::{
     DaemonSnapshot, Project, ProviderProfile, Session, SessionState, Workspace, Worktree,
-    WorktreeStatus,
+    WorktreeStatus, state_allows_deletion,
 };
 use sylvops_core::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
 use sylvops_core::status::{ConversationIdentityTransition, ProviderConversationId};
@@ -169,6 +169,10 @@ enum DatabaseCommand {
         id: SessionId,
         failure_reason: String,
         reply: oneshot::Sender<Result<Option<(u64, Session)>>>,
+    },
+    DeleteSession {
+        expected: Session,
+        reply: oneshot::Sender<Result<(u64, Session)>>,
     },
     Reconcile {
         reply: oneshot::Sender<Result<usize>>,
@@ -632,6 +636,21 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Permanently deletes one unchanged inactive Session and its dependent metadata.
+    ///
+    /// Resume edges incident to the Session are removed in the same transaction. The returned
+    /// value is the deleted record, allowing callers to publish an authoritative bounded event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, not-found, stale-state, live-process, or SQLite transaction error.
+    pub async fn delete_session(&self, expected: Session) -> Result<(u64, Session)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::DeleteSession { expected, reply }
+        })
+        .await
+    }
+
     /// Marks persisted active sessions disconnected without trusting stored process IDs.
     ///
     /// # Errors
@@ -912,6 +931,13 @@ fn database_thread(
                             (revision, session)
                         })
                     });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::DeleteSession { expected, reply } => {
+                let result = delete_session(&mut connection, &expected).map(|session| {
+                    revision = revision.saturating_add(1);
+                    (revision, session)
+                });
                 let _ = reply.send(result);
             }
             DatabaseCommand::Reconcile { reply } => {
@@ -1487,6 +1513,44 @@ fn rename_session(connection: &mut Connection, id: SessionId, name: &str) -> Res
         .map_err(database_error)?;
     insert_entity_audit(&transaction, "session_renamed", "session", &id.to_string())?;
     let session = load_session(&transaction, id)?;
+    transaction.commit().map_err(database_error)?;
+    Ok(session)
+}
+
+fn delete_session(connection: &mut Connection, expected: &Session) -> Result<Session> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let session = load_session(&transaction, expected.id)?;
+    if session != *expected || !state_allows_deletion(session.state) || session.process_id.is_some()
+    {
+        return Err(DaemonError::Database(
+            "session deletion authorization is stale or the session is still live".into(),
+        ));
+    }
+    transaction
+        .execute(
+            "DELETE FROM session_resumptions WHERE source_session_id = ?1 OR successor_session_id = ?1",
+            [session.id.to_string()],
+        )
+        .map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "DELETE FROM sessions WHERE id = ?1 AND state = ?2 AND process_id IS NULL",
+            params![session.id.to_string(), session.state.to_string()],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(DaemonError::Database(
+            "session deletion authorization is stale or the session is still live".into(),
+        ));
+    }
+    insert_entity_audit(
+        &transaction,
+        "session_deleted",
+        "session",
+        &session.id.to_string(),
+    )?;
     transaction.commit().map_err(database_error)?;
     Ok(session)
 }
@@ -2559,6 +2623,146 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn deleting_an_inactive_session_preserves_its_resume_neighbors() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("state.db");
+        let database = DatabaseHandle::open(&database_path).unwrap();
+        let (_, workspace) = database.add_workspace("Deletion".into()).await.unwrap();
+        let repository = directory.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let repository = repository.to_string_lossy().into_owned();
+        let (_, project, worktree) = database
+            .add_project(RepositoryRegistration {
+                workspace_id: workspace.id,
+                name: "repository".into(),
+                repository_path: repository.clone(),
+                canonical_repository_path: repository.clone(),
+                default_branch: Some("main".into()),
+                remote_url: None,
+                branch: Some("main".into()),
+                base_commit: "deadbeef".into(),
+            })
+            .await
+            .unwrap();
+        let ids = [SessionId::new(), SessionId::new(), SessionId::new()];
+        for (index, id) in ids.into_iter().enumerate() {
+            database
+                .create_session(NewSession {
+                    id,
+                    worktree_id: worktree.id,
+                    display_name: format!("session {index}"),
+                    provider_profile_id: None,
+                    provider_kind: sylvops_core::domain::ProviderKind::Codex,
+                    command: "codex".into(),
+                    arguments_json: "[]".into(),
+                    cwd: repository.clone(),
+                    external_session_id: Some(format!("external-{index}")),
+                    resumed_from_session_id: index.checked_sub(1).map(|previous| ids[previous]),
+                })
+                .await
+                .unwrap();
+            database
+                .mark_session_running(id, 100 + u32::try_from(index).unwrap())
+                .await
+                .unwrap();
+            database
+                .finish_session(id, SessionState::FinishedSeen, Some(0), None)
+                .await
+                .unwrap();
+        }
+
+        let stale = database.session(ids[1]).await.unwrap();
+        database
+            .rename_session(ids[1], "changed after inspection".into())
+            .await
+            .unwrap();
+        assert!(database.delete_session(stale).await.is_err());
+
+        let before_snapshot = database.snapshot().await.unwrap();
+        let before = before_snapshot.revision;
+        let project_activity = before_snapshot
+            .projects
+            .iter()
+            .find(|value| value.id == project.id)
+            .unwrap()
+            .last_activity_at;
+        let worktree_activity = before_snapshot
+            .worktrees
+            .iter()
+            .find(|value| value.id == worktree.id)
+            .unwrap()
+            .last_activity_at;
+        let expected = database.session(ids[1]).await.unwrap();
+        let (deleted_revision, deleted) = database.delete_session(expected).await.unwrap();
+        assert!(deleted_revision > before);
+        assert_eq!(deleted.id, ids[1]);
+        let snapshot = database.snapshot().await.unwrap();
+        assert_eq!(snapshot.revision, deleted_revision);
+        assert!(snapshot.sessions.iter().any(|session| session.id == ids[0]));
+        assert!(snapshot.sessions.iter().any(|session| session.id == ids[2]));
+        assert!(!snapshot.sessions.iter().any(|session| session.id == ids[1]));
+        assert_eq!(
+            snapshot
+                .projects
+                .iter()
+                .find(|value| value.id == project.id)
+                .unwrap()
+                .last_activity_at,
+            project_activity
+        );
+        assert_eq!(
+            snapshot
+                .worktrees
+                .iter()
+                .find(|value| value.id == worktree.id)
+                .unwrap()
+                .last_activity_at,
+            worktree_activity
+        );
+        database.shutdown().await.unwrap();
+
+        let connection = Connection::open(&database_path).unwrap();
+        let resume_links: i64 = connection
+            .query_row("SELECT COUNT(*) FROM session_resumptions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(resume_links, 0);
+        let audit_details: String = connection
+            .query_row(
+                "SELECT details_json FROM audit_events WHERE action = 'session_deleted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_details, "{}");
+
+        drop(connection);
+        let reopened = DatabaseHandle::open(&database_path).unwrap();
+        let restarted = reopened.snapshot().await.unwrap();
+        assert!(
+            restarted
+                .sessions
+                .iter()
+                .any(|session| session.id == ids[0])
+        );
+        assert!(
+            restarted
+                .sessions
+                .iter()
+                .any(|session| session.id == ids[2])
+        );
+        assert!(
+            !restarted
+                .sessions
+                .iter()
+                .any(|session| session.id == ids[1])
+        );
+        reopened.shutdown().await.unwrap();
     }
 
     #[tokio::test]

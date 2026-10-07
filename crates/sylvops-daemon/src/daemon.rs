@@ -13,16 +13,18 @@ use std::{
 };
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use sylvops_core::{
     domain::{
         DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, WorktreeStatus,
-        state_allows_resume,
+        state_allows_deletion, state_allows_resume,
     },
     ids::{ProjectId, ProviderProfileId, SessionId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, Frame, HelloRequest, MessageClass,
-        PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolFailure, WelcomeResponse, read_frame,
+        PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolFailure, SessionDeletionAuthorization,
+        SessionDeletionInspection, SessionDeletionRefusal, WelcomeResponse, read_frame,
         validate_terminal_size, write_frame,
     },
     provider::{AuthenticationRequirement, LaunchContext, ProviderRuntimeSpec, ResumeContext},
@@ -140,6 +142,7 @@ struct ManagedSession {
     handle: SessionHandle,
     record: Arc<RwLock<Session>>,
     completed: watch::Receiver<bool>,
+    deleted: watch::Sender<bool>,
     owned_runtime_paths: Arc<Vec<PathBuf>>,
 }
 
@@ -331,6 +334,7 @@ struct DaemonState {
     shutdown: watch::Sender<bool>,
     events: broadcast::Sender<DaemonEvent>,
     sessions: Arc<RwLock<HashMap<SessionId, ManagedSession>>>,
+    session_locks: Arc<RwLock<HashMap<SessionId, Arc<Mutex<()>>>>>,
     project_locks: Arc<RwLock<HashMap<ProjectId, Arc<Mutex<()>>>>>,
     worktree_locks: Arc<RwLock<HashMap<WorktreeId, Arc<Mutex<()>>>>>,
     lifecycle: Arc<LifecycleCoordinator>,
@@ -583,6 +587,7 @@ pub async fn run_with_handoff_launchers(
         shutdown,
         events,
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        session_locks: Arc::new(RwLock::new(HashMap::new())),
         project_locks: Arc::new(RwLock::new(HashMap::new())),
         worktree_locks: Arc::new(RwLock::new(HashMap::new())),
         lifecycle: LifecycleCoordinator::new(),
@@ -1677,6 +1682,8 @@ async fn handle_request(
             columns,
             rows,
         } => {
+            let operation_lock = session_operation_lock(state, session_id).await;
+            let _operation_guard = operation_lock.lock().await;
             validate_terminal_size(columns, rows).map_err(DaemonError::InvalidSession)?;
             let managed = required_session(state, session_id).await?;
             if let Some(existing) = attachments.remove(&session_id) {
@@ -1756,6 +1763,8 @@ async fn handle_request(
             send_response_queue(outgoing, request_id, &DaemonResponse::Acknowledged).await
         }
         ClientRequest::RenameSession { session_id, name } => {
+            let operation_lock = session_operation_lock(state, session_id).await;
+            let _operation_guard = operation_lock.lock().await;
             let (revision, session) = state.database.rename_session(session_id, name).await?;
             if let Some(managed) = state.sessions.read().await.get(&session_id).cloned() {
                 *managed.record.write().await = session.clone();
@@ -1773,6 +1782,61 @@ async fn handle_request(
                 .events
                 .send(DaemonEvent::SessionUpdated { revision, session });
             Ok(())
+        }
+        ClientRequest::InspectSessionDeletion { session_id } => {
+            let session = state.database.session(session_id).await?;
+            let inspection = inspect_session_deletion(state, &session).await;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::SessionDeletionInspected(inspection),
+            )
+            .await
+        }
+        ClientRequest::DeleteSession {
+            session_id,
+            authorization_token,
+        } => {
+            let operation_lock = session_operation_lock(state, session_id).await;
+            let _operation_guard = operation_lock.lock().await;
+            let session = state.database.session(session_id).await?;
+            let inspection = inspect_session_deletion(state, &session).await;
+            let expected = inspection.authorization_token.ok_or_else(|| {
+                DaemonError::InvalidSession(session_deletion_refusal_message(inspection.refusal))
+            })?;
+            if !bool::from(expected.as_bytes().ct_eq(authorization_token.as_bytes())) {
+                return Err(DaemonError::InvalidSession(
+                    "session deletion authorization is stale".into(),
+                ));
+            }
+            let managed = get_managed_session(state, session_id).await;
+            if let Some(managed) = &managed {
+                state.providers.cleanup_runtime_paths_checked(
+                    session.provider_kind,
+                    &managed.owned_runtime_paths,
+                )?;
+            }
+            let (revision, deleted) = state.database.delete_session(session.clone()).await?;
+            if let Some(managed) = state.sessions.write().await.remove(&session_id) {
+                managed.deleted.send_replace(true);
+            }
+            revoke_session_hook_access(state, session_id).await;
+            state.status_machines.lock().await.remove(&session_id);
+            let _ = state.events.send(DaemonEvent::SessionDeleted {
+                revision,
+                session_id,
+                worktree_id: deleted.worktree_id,
+            });
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::SessionDeleted {
+                    revision,
+                    session_id,
+                    worktree_id: deleted.worktree_id,
+                },
+            )
+            .await
         }
         ClientRequest::CheckForUpdate => {
             let _mutation = state.application_mutations.begin()?;
@@ -2183,10 +2247,23 @@ async fn send_attachment(
     let mut live = attachment.live_output;
     let output = outgoing.clone();
     let handle = managed.handle.clone();
+    let mut deleted = managed.deleted.subscribe();
     let task = tokio::spawn(async move {
+        if *deleted.borrow() {
+            return;
+        }
         let mut resync_pending = false;
         loop {
-            match live.recv().await {
+            let received = tokio::select! {
+                changed = deleted.changed() => {
+                    if changed.is_err() || *deleted.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                output = live.recv() => output,
+            };
+            match received {
                 Ok(chunk) => {
                     let event = DaemonEvent::SessionOutput {
                         session_id,
@@ -2323,10 +2400,12 @@ async fn spawn_managed_session(
         }
     };
     let (completed_tx, completed) = watch::channel(false);
+    let (deleted, _) = watch::channel(false);
     let managed = ManagedSession {
         handle: handle.clone(),
         record: Arc::new(RwLock::new(running.clone())),
         completed,
+        deleted,
         owned_runtime_paths,
     };
     state
@@ -2415,6 +2494,8 @@ fn provider_external_id_update(
 
 #[allow(clippy::too_many_lines)]
 async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Result<()> {
+    let operation_lock = session_operation_lock(state, delivery.session_id).await;
+    let _operation_guard = operation_lock.lock().await;
     let persisted = state.database.session(delivery.session_id).await?;
     if persisted.worktree_id != delivery.worktree_id || persisted.provider_kind != delivery.provider
     {
@@ -2812,6 +2893,113 @@ async fn required_session(state: &DaemonState, id: SessionId) -> Result<ManagedS
 
 async fn get_managed_session(state: &DaemonState, id: SessionId) -> Option<ManagedSession> {
     state.sessions.read().await.get(&id).cloned()
+}
+
+async fn inspect_session_deletion(
+    state: &DaemonState,
+    session: &Session,
+) -> SessionDeletionInspection {
+    let managed = get_managed_session(state, session.id).await;
+    let runtime_owned = if let Some(managed) = &managed {
+        !*managed.completed.borrow()
+            || !managed
+                .handle
+                .process_tree_is_empty()
+                .await
+                .unwrap_or(false)
+    } else {
+        false
+    };
+    let refusal = if matches!(
+        session.state,
+        SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
+    ) {
+        Some(SessionDeletionRefusal::LiveState)
+    } else if session.process_id.is_some() || runtime_owned {
+        Some(SessionDeletionRefusal::OwnedProcess)
+    } else if !state_allows_deletion(session.state) {
+        Some(SessionDeletionRefusal::IneligibleState)
+    } else {
+        None
+    };
+    let authorization_token = refusal.is_none().then(|| {
+        session_deletion_token(
+            &state.authentication_token,
+            session,
+            managed.is_some(),
+            runtime_owned,
+        )
+    });
+    SessionDeletionInspection {
+        session_id: session.id,
+        worktree_id: session.worktree_id,
+        state: session.state,
+        authorization_token,
+        refusal,
+    }
+}
+
+fn session_deletion_token(
+    secret: &AuthenticationToken,
+    session: &Session,
+    managed: bool,
+    runtime_owned: bool,
+) -> SessionDeletionAuthorization {
+    let mut digest = Sha256::new();
+    digest.update(b"sylvops-session-deletion-v1\0");
+    digest.update(secret.expose().as_bytes());
+    for value in [
+        session.id.to_string(),
+        session.worktree_id.to_string(),
+        session.provider_kind.to_string(),
+        session.display_name.clone(),
+        session.state.to_string(),
+        session
+            .process_id
+            .map_or_else(String::new, |id| id.to_string()),
+        session
+            .started_at
+            .map_or_else(String::new, |at| at.to_string()),
+        session
+            .ended_at
+            .map_or_else(String::new, |at| at.to_string()),
+        session.last_activity_at.to_string(),
+        managed.to_string(),
+        runtime_owned.to_string(),
+    ] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+        .try_into()
+        .expect("SHA-256 is a valid deletion authorization")
+}
+
+fn session_deletion_refusal_message(refusal: Option<SessionDeletionRefusal>) -> String {
+    match refusal {
+        Some(SessionDeletionRefusal::LiveState) => {
+            "session is active and cannot be deleted; stop it and wait for exit".into()
+        }
+        Some(SessionDeletionRefusal::OwnedProcess) => {
+            "session still owns a process tree and cannot be deleted".into()
+        }
+        Some(SessionDeletionRefusal::IneligibleState) | None => {
+            "session state is not eligible for deletion".into()
+        }
+    }
+}
+
+async fn session_operation_lock(state: &DaemonState, id: SessionId) -> Arc<Mutex<()>> {
+    if let Some(lock) = state.session_locks.read().await.get(&id).cloned() {
+        return lock;
+    }
+    state
+        .session_locks
+        .write()
+        .await
+        .entry(id)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 async fn worktree_has_live_runtime_session(state: &DaemonState, worktree_id: WorktreeId) -> bool {

@@ -228,6 +228,21 @@ pub const fn state_allows_resume(state: SessionState) -> bool {
     )
 }
 
+/// Whether a Session state is eligible for permanent metadata deletion.
+///
+/// The daemon must additionally prove that no owned process tree remains.
+#[must_use]
+pub const fn state_allows_deletion(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::FinishedSeen
+            | SessionState::FinishedUnseen
+            | SessionState::Failed
+            | SessionState::Terminated
+            | SessionState::Disconnected
+    )
+}
+
 /// Whether a session is the latest eligible record for a verified provider conversation.
 ///
 /// Clients must additionally check the current Provider health and resume capability.
@@ -249,7 +264,7 @@ pub fn session_record_can_resume(session: &Session, sessions: &[Session]) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderKind, SessionState, state_allows_resume};
+    use super::{ProviderKind, SessionState, state_allows_deletion, state_allows_resume};
 
     #[test]
     fn provider_display_names_are_distinct_from_protocol_values() {
@@ -277,6 +292,33 @@ mod tests {
             assert!(
                 !state_allows_resume(state),
                 "{state} should not allow resume"
+            );
+        }
+    }
+
+    #[test]
+    fn only_inactive_terminal_states_allow_deletion() {
+        for state in [
+            SessionState::FinishedSeen,
+            SessionState::FinishedUnseen,
+            SessionState::Failed,
+            SessionState::Terminated,
+            SessionState::Disconnected,
+        ] {
+            assert!(
+                state_allows_deletion(state),
+                "{state} should allow deletion"
+            );
+        }
+        for state in [
+            SessionState::Fresh,
+            SessionState::Starting,
+            SessionState::Running,
+            SessionState::NeedsFeedback,
+        ] {
+            assert!(
+                !state_allows_deletion(state),
+                "{state} should not allow deletion"
             );
         }
     }

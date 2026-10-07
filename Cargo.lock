@@ -4598,6 +4598,7 @@ dependencies = [
  "sylvops-core",
  "sylvops-daemon",
  "sylvops-desktop",
+ "sylvops-test-support",
  "sylvops-tui",
  "tempfile",
  "tokio",
@@ -4691,6 +4692,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

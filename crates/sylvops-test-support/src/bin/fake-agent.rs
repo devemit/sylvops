@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
     thread,
     time::Duration,
 };
@@ -42,6 +42,12 @@ fn run() -> io::Result<u8> {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing heartbeat path")
             })?;
             spawn_child(&heartbeat)
+        }
+        "leave-child" => {
+            let heartbeat = arguments.next().map(PathBuf::from).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing heartbeat path")
+            })?;
+            leave_child(&heartbeat)
         }
         "heartbeat" => {
             let heartbeat = arguments.next().map(PathBuf::from).ok_or_else(|| {
@@ -94,6 +100,26 @@ fn spawn_child(heartbeat: &Path) -> io::Result<u8> {
     loop {
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn leave_child(heartbeat: &Path) -> io::Result<u8> {
+    let executable = env::current_exe()?;
+    let mut child = Command::new(executable);
+    child
+        .arg("heartbeat")
+        .arg(heartbeat)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        child.creation_flags(CREATE_NO_WINDOW);
+    }
+    child.spawn()?;
+    Ok(0)
 }
 
 fn heartbeat_forever(path: &Path) -> io::Result<u8> {

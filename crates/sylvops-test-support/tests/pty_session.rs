@@ -102,6 +102,13 @@ async fn stopping_session_terminates_descendant_heartbeat() {
 
     wait_for_output(&session, "CHILD_PID=").await;
     wait_for_file(&heartbeat).await;
+    assert!(
+        !session
+            .process_tree_is_empty()
+            .await
+            .expect("inspect live process tree"),
+        "live descendant must keep the process tree non-empty"
+    );
     session.stop().await.expect("terminate process tree");
     tokio::time::timeout(TEST_TIMEOUT, session.wait())
         .await
@@ -109,6 +116,37 @@ async fn stopping_session_terminates_descendant_heartbeat() {
         .expect("session wait");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
+    let stopped_value = fs::read_to_string(&heartbeat).expect("read heartbeat after stop");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let later_value = fs::read_to_string(&heartbeat).expect("read heartbeat later");
+    assert_eq!(stopped_value, later_value, "descendant remained alive");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_after_root_exit_reaps_the_remaining_process_group() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let heartbeat = directory.path().join("remaining-heartbeat.txt");
+    let mut session = SessionHandle::spawn(&spec(
+        [
+            OsString::from("leave-child"),
+            heartbeat.as_os_str().to_owned(),
+        ],
+        64 * 1024,
+    ))
+    .expect("spawn fake process tree");
+
+    tokio::time::timeout(TEST_TIMEOUT, session.wait())
+        .await
+        .expect("root exit timeout")
+        .expect("root wait");
+    wait_for_file(&heartbeat).await;
+    assert!(!session.process_tree_is_empty().await.unwrap());
+    session
+        .stop()
+        .await
+        .expect("terminate remaining process tree");
+    assert!(session.process_tree_is_empty().await.unwrap());
+
     let stopped_value = fs::read_to_string(&heartbeat).expect("read heartbeat after stop");
     tokio::time::sleep(Duration::from_millis(300)).await;
     let later_value = fs::read_to_string(&heartbeat).expect("read heartbeat later");
