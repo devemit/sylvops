@@ -51,6 +51,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+sylvops-test-support = { path = "../sylvops-test-support" }
 tempfile = "3"
 
 [target.'cfg(windows)'.dev-dependencies]

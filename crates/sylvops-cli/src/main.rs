@@ -167,6 +167,12 @@ enum ProjectCommand {
         workspace: WorkspaceId,
         path: PathBuf,
     },
+    /// Unregister a cleared Project while preserving its repository and Git data.
+    Remove {
+        project_id: ProjectId,
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -341,6 +347,10 @@ async fn run_command(
         },
         Command::Project { command } => match command {
             ProjectCommand::Add { workspace, path } => add_project(&paths, workspace, path).await?,
+            ProjectCommand::Remove {
+                project_id,
+                confirm,
+            } => remove_project(&paths, project_id, confirm).await?,
         },
         Command::Worktree { command } => match command {
             WorktreeCommand::Create {
@@ -619,6 +629,91 @@ async fn add_project(
             Ok(())
         }
         response => unexpected("project registration", response),
+    }
+}
+
+async fn remove_project(
+    paths: &RuntimePaths,
+    project_id: ProjectId,
+    confirm: bool,
+) -> sylvops_daemon::Result<()> {
+    if !confirm {
+        return Err(DaemonError::Lifecycle(
+            "Project removal requires the explicit --confirm flag".into(),
+        ));
+    }
+    let client = DaemonClient::connect(paths, "sylvops-cli").await?;
+    let inspection = match client
+        .request(&ClientRequest::InspectProjectRemoval { project_id })
+        .await?
+    {
+        DaemonResponse::ProjectRemovalInspected(inspection) => inspection,
+        response => return unexpected("Project removal inspection", response),
+    };
+    println!("Remove Project: {}", inspection.project_id);
+    println!(
+        "Preserved: repository root, files, commits, branches, remotes, configuration, and external Worktrees"
+    );
+    let authorization_token = inspection.authorization_token.ok_or_else(|| {
+        for refusal in &inspection.refusals {
+            println!("Blocked: {}", project_removal_refusal_text(refusal));
+        }
+        let reason = inspection.refusals.first().map_or_else(
+            || "the daemon did not authorize removal".into(),
+            project_removal_refusal_text,
+        );
+        DaemonError::Lifecycle(format!("Project removal refused: {reason}"))
+    })?;
+    match client
+        .request(&ClientRequest::RemoveProject {
+            project_id,
+            authorization_token,
+        })
+        .await?
+    {
+        DaemonResponse::ProjectRemoved { project_id, .. } => {
+            println!("Removed Project {project_id}");
+            Ok(())
+        }
+        response => unexpected("Project removal", response),
+    }
+}
+
+fn project_removal_refusal_text(refusal: &sylvops_core::protocol::ProjectRemovalRefusal) -> String {
+    use sylvops_core::protocol::ProjectRemovalRefusal;
+
+    match refusal {
+        ProjectRemovalRefusal::SessionsRemain {
+            count,
+            truncated,
+            ids,
+        } => format!(
+            "{}{count} Session{} remain{}: {}",
+            if *truncated { "at least " } else { "" },
+            if *count == 1 { "" } else { "s" },
+            if *count == 1 { "s" } else { "" },
+            ids.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ProjectRemovalRefusal::ManagedWorktreesRemain {
+            count,
+            truncated,
+            ids,
+        } => format!(
+            "{}{count} managed Worktree{} remain{}: {}",
+            if *truncated { "at least " } else { "" },
+            if *count == 1 { "" } else { "s" },
+            if *count == 1 { "s" } else { "" },
+            ids.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ProjectRemovalRefusal::InconsistentDescendants => {
+            "the Project metadata does not contain exactly one root Worktree".into()
+        }
     }
 }
 
@@ -1586,6 +1681,40 @@ mod tests {
                 }
             }) if parsed == session_id
         ));
+    }
+
+    #[test]
+    fn cli_accepts_confirmed_project_removal() {
+        let project_id = ProjectId::new();
+        let arguments = Arguments::try_parse_from([
+            "sylvops",
+            "project",
+            "remove",
+            &project_id.to_string(),
+            "--confirm",
+        ])
+        .expect("Project remove command");
+
+        assert!(matches!(
+            arguments.command,
+            Some(Command::Project {
+                command: ProjectCommand::Remove {
+                    project_id: parsed,
+                    confirm: true,
+                }
+            }) if parsed == project_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn cli_project_removal_requires_confirmation_before_connecting() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let paths =
+            RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("runtime paths");
+        let error = remove_project(&paths, ProjectId::new(), false)
+            .await
+            .expect_err("missing confirmation must fail");
+        assert!(matches!(error, DaemonError::Lifecycle(message) if message.contains("--confirm")));
     }
 
     #[tokio::test]

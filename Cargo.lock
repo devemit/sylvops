@@ -4650,6 +4650,7 @@ dependencies = [
  "sha2",
  "subtle",
  "sylvops-core",
+ "sylvops-test-support",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

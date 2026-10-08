@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 11;
+pub const PROTOCOL_MINOR: u16 = 12;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -339,56 +339,66 @@ pub struct ProtocolFailure {
     pub retryable: bool,
 }
 
-#[derive(Clone, Eq, PartialEq)]
-pub struct SessionDeletionAuthorization(String);
+macro_rules! opaque_authorization {
+    ($name:ident, $debug_name:literal, $error:literal) => {
+        #[derive(Clone, Eq, PartialEq)]
+        pub struct $name(String);
 
-impl SessionDeletionAuthorization {
-    pub const ENCODED_LENGTH: usize = 64;
+        impl $name {
+            pub const ENCODED_LENGTH: usize = 64;
 
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-}
-
-impl std::fmt::Debug for SessionDeletionAuthorization {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SessionDeletionAuthorization([REDACTED])")
-    }
-}
-
-impl TryFrom<String> for SessionDeletionAuthorization {
-    type Error = &'static str;
-
-    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-        if value.len() != Self::ENCODED_LENGTH
-            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err("session deletion authorization must be 64 hexadecimal characters");
+            #[must_use]
+            pub fn as_bytes(&self) -> &[u8] {
+                self.0.as_bytes()
+            }
         }
-        Ok(Self(value))
-    }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str($debug_name)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = &'static str;
+
+            fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+                if value.len() != Self::ENCODED_LENGTH
+                    || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err($error);
+                }
+                Ok(Self(value))
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                String::deserialize(deserializer)?
+                    .try_into()
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    };
 }
 
-impl Serialize for SessionDeletionAuthorization {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for SessionDeletionAuthorization {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .try_into()
-            .map_err(serde::de::Error::custom)
-    }
-}
+opaque_authorization!(
+    SessionDeletionAuthorization,
+    "SessionDeletionAuthorization([REDACTED])",
+    "session deletion authorization must be 64 hexadecimal characters"
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SessionDeletionRefusal {
@@ -404,6 +414,35 @@ pub struct SessionDeletionInspection {
     pub state: SessionState,
     pub authorization_token: Option<SessionDeletionAuthorization>,
     pub refusal: Option<SessionDeletionRefusal>,
+}
+
+opaque_authorization!(
+    ProjectRemovalAuthorization,
+    "ProjectRemovalAuthorization([REDACTED])",
+    "project removal authorization must be 64 hexadecimal characters"
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProjectRemovalRefusal {
+    SessionsRemain {
+        count: u32,
+        truncated: bool,
+        ids: Vec<SessionId>,
+    },
+    ManagedWorktreesRemain {
+        count: u32,
+        truncated: bool,
+        ids: Vec<WorktreeId>,
+    },
+    InconsistentDescendants,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectRemovalInspection {
+    pub project_id: ProjectId,
+    pub workspace_id: WorkspaceId,
+    pub authorization_token: Option<ProjectRemovalAuthorization>,
+    pub refusals: Vec<ProjectRemovalRefusal>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -440,6 +479,13 @@ pub enum ClientRequest {
     RenameProject {
         project_id: ProjectId,
         name: String,
+    },
+    InspectProjectRemoval {
+        project_id: ProjectId,
+    },
+    RemoveProject {
+        project_id: ProjectId,
+        authorization_token: ProjectRemovalAuthorization,
     },
     CreateWorktree {
         project_id: ProjectId,
@@ -560,6 +606,12 @@ pub enum DaemonResponse {
         revision: u64,
         project: Project,
     },
+    ProjectRemovalInspected(ProjectRemovalInspection),
+    ProjectRemoved {
+        revision: u64,
+        project_id: ProjectId,
+        workspace_id: WorkspaceId,
+    },
     WorktreeCreated {
         revision: u64,
         worktree: Worktree,
@@ -630,6 +682,11 @@ pub enum DaemonEvent {
     ProjectUpdated {
         revision: u64,
         project: Project,
+    },
+    ProjectRemoved {
+        revision: u64,
+        project_id: ProjectId,
+        workspace_id: WorkspaceId,
     },
     WorktreeAdded {
         revision: u64,
@@ -792,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_11_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_12_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -804,7 +861,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 11);
+        assert_eq!(PROTOCOL_MINOR, 12);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -822,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_11_provider_runtime_data_round_trips() {
+    fn protocol_1_12_provider_runtime_data_round_trips() {
         let capabilities = ProviderCapabilities {
             interactive: true,
             resume: true,
@@ -994,6 +1051,65 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Event, 44, &event).unwrap();
         assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
+    }
+
+    #[test]
+    fn project_removal_contract_round_trips() {
+        let project_id = ProjectId::new();
+        let workspace_id = WorkspaceId::new();
+        let session_id = SessionId::new();
+        let worktree_id = WorktreeId::new();
+        let requests = [
+            ClientRequest::InspectProjectRemoval { project_id },
+            ClientRequest::RemoveProject {
+                project_id,
+                authorization_token: "c".repeat(64).try_into().unwrap(),
+            },
+        ];
+        for request in requests {
+            let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
+            assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+
+        let inspection = DaemonResponse::ProjectRemovalInspected(ProjectRemovalInspection {
+            project_id,
+            workspace_id,
+            authorization_token: None,
+            refusals: vec![
+                ProjectRemovalRefusal::SessionsRemain {
+                    count: 1,
+                    truncated: false,
+                    ids: vec![session_id],
+                },
+                ProjectRemovalRefusal::ManagedWorktreesRemain {
+                    count: 1,
+                    truncated: false,
+                    ids: vec![worktree_id],
+                },
+            ],
+        });
+        let frame = Frame::message(MessageClass::Response, 43, &inspection).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), inspection);
+
+        let event = DaemonEvent::ProjectRemoved {
+            revision: 10,
+            project_id,
+            workspace_id,
+        };
+        let frame = Frame::message(MessageClass::Event, 44, &event).unwrap();
+        assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
+    }
+
+    #[test]
+    fn malformed_project_removal_authorization_is_rejected_during_decode() {
+        let payload = rmp_serde::to_vec(&serde_json::json!({
+            "RemoveProject": {
+                "project_id": ProjectId::new(),
+                "authorization_token": "short"
+            }
+        }))
+        .unwrap();
+        assert!(rmp_serde::from_slice::<ClientRequest>(&payload).is_err());
     }
 
     #[test]

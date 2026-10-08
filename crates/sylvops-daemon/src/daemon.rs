@@ -23,7 +23,8 @@ use sylvops_core::{
     ids::{ProjectId, ProviderProfileId, SessionId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, Frame, HelloRequest, MessageClass,
-        PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolFailure, SessionDeletionAuthorization,
+        PROTOCOL_MAJOR, PROTOCOL_MINOR, ProjectRemovalAuthorization, ProjectRemovalInspection,
+        ProjectRemovalRefusal, ProtocolFailure, SessionDeletionAuthorization,
         SessionDeletionInspection, SessionDeletionRefusal, WelcomeResponse, read_frame,
         validate_terminal_size, write_frame,
     },
@@ -47,7 +48,9 @@ use uuid::Uuid;
 use crate::{
     DaemonError, Result, config_store,
     data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan},
-    database::{DatabaseHandle, NewSession, VerifiedConversationIdentityUpdate},
+    database::{
+        DatabaseHandle, NewSession, ProjectRemovalState, VerifiedConversationIdentityUpdate,
+    },
     git,
     hook::{HookCredentials, HookDelivery, HookReceiver},
     ipc::{BoxStream, LocalListener},
@@ -619,7 +622,7 @@ pub async fn run_with_handoff_launchers(
                 let stream = match accepted { Ok(stream) => stream, Err(error) => break Err(error) };
                 let connection_state = state.clone();
                 clients.spawn(async move {
-                    if let Err(error) = serve_client(stream, connection_state).await {
+                    if let Err(error) = Box::pin(serve_client(stream, connection_state)).await {
                         tracing::debug!(%error, "client connection ended");
                     }
                 });
@@ -1314,6 +1317,48 @@ async fn handle_request(
                 .events
                 .send(DaemonEvent::ProjectUpdated { revision, project });
             Ok(())
+        }
+        ClientRequest::InspectProjectRemoval { project_id } => {
+            let removal_state = state.database.project_removal_state(project_id).await?;
+            let inspection = inspect_project_removal(&state.authentication_token, &removal_state);
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::ProjectRemovalInspected(inspection),
+            )
+            .await
+        }
+        ClientRequest::RemoveProject {
+            project_id,
+            authorization_token,
+        } => {
+            let operation_lock = project_operation_lock(state, project_id).await;
+            let _operation_guard = operation_lock.lock().await;
+            let removal_state = state.database.project_removal_state(project_id).await?;
+            let inspection = inspect_project_removal(&state.authentication_token, &removal_state);
+            let expected = inspection.authorization_token.ok_or_else(|| {
+                DaemonError::InvalidProject(
+                    "project is not cleared; inspect removal blockers and remove all Sessions and managed Worktrees"
+                        .into(),
+                )
+            })?;
+            if !bool::from(expected.as_bytes().ct_eq(authorization_token.as_bytes())) {
+                return Err(DaemonError::InvalidProject(
+                    "project removal authorization is stale".into(),
+                ));
+            }
+            let (revision, removed) = state.database.remove_project(removal_state).await?;
+            let response = DaemonResponse::ProjectRemoved {
+                revision,
+                project_id,
+                workspace_id: removed.workspace_id,
+            };
+            let _ = state.events.send(DaemonEvent::ProjectRemoved {
+                revision,
+                project_id,
+                workspace_id: removed.workspace_id,
+            });
+            send_response_queue(outgoing, request_id, &response).await
         }
         ClientRequest::CreateWorktree {
             project_id,
@@ -2895,6 +2940,52 @@ async fn get_managed_session(state: &DaemonState, id: SessionId) -> Option<Manag
     state.sessions.read().await.get(&id).cloned()
 }
 
+fn inspect_project_removal(
+    secret: &AuthenticationToken,
+    state: &ProjectRemovalState,
+) -> ProjectRemovalInspection {
+    let mut refusals = Vec::with_capacity(3);
+    if state.session_count > 0 {
+        refusals.push(ProjectRemovalRefusal::SessionsRemain {
+            count: state.session_count,
+            truncated: state.sessions_truncated,
+            ids: state.session_ids.clone(),
+        });
+    }
+    if state.managed_worktree_count > 0 {
+        refusals.push(ProjectRemovalRefusal::ManagedWorktreesRemain {
+            count: state.managed_worktree_count,
+            truncated: state.managed_worktrees_truncated,
+            ids: state.managed_worktree_ids.clone(),
+        });
+    }
+    if state.root_worktree_count != 1 {
+        refusals.push(ProjectRemovalRefusal::InconsistentDescendants);
+    }
+    let authorization_token = refusals
+        .is_empty()
+        .then(|| project_removal_token(secret, state));
+    ProjectRemovalInspection {
+        project_id: state.project.id,
+        workspace_id: state.project.workspace_id,
+        authorization_token,
+        refusals,
+    }
+}
+
+fn project_removal_token(
+    secret: &AuthenticationToken,
+    state: &ProjectRemovalState,
+) -> ProjectRemovalAuthorization {
+    let mut digest = Sha256::new();
+    digest.update(b"sylvops-project-removal-v1\0");
+    digest.update(secret.expose().as_bytes());
+    digest.update(state.authorization_fingerprint());
+    format!("{:x}", digest.finalize())
+        .try_into()
+        .expect("SHA-256 is a valid project removal authorization")
+}
+
 async fn inspect_session_deletion(
     state: &DaemonState,
     session: &Session,
@@ -3074,6 +3165,7 @@ fn failure_code(error: &DaemonError) -> &'static str {
     match error {
         DaemonError::Protocol(_) => "invalid_request",
         DaemonError::InvalidSession(_) => "session_request_refused",
+        DaemonError::InvalidProject(_) => "project_request_refused",
         DaemonError::Attachment(_) => "attachment_refused",
         DaemonError::Git(_) => "git_validation_failed",
         DaemonError::Provider(_) => "provider_operation_failed",
@@ -3304,13 +3396,27 @@ impl Drop for ClientGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationMutationCoordinator, HookTracking, LifecycleCoordinator,
-        provider_external_id_update,
+        ApplicationMutationCoordinator, CONTROL_OPCODE, HookTracking, LifecycleCoordinator,
+        decode_request, provider_external_id_update,
     };
     use sylvops_core::{
         domain::SessionState,
+        protocol::{ClientRequest, Frame, MessageClass},
         status::{ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId},
     };
+
+    #[test]
+    fn malformed_authenticated_control_request_fails_closed_with_bounded_diagnostics() {
+        let mut frame = Frame::message(
+            MessageClass::Request,
+            CONTROL_OPCODE,
+            &ClientRequest::Health,
+        )
+        .unwrap();
+        frame.payload = vec![0xc1];
+        let error = decode_request(&frame).expect_err("malformed request must be rejected");
+        assert!(error.to_string().len() < 512);
+    }
 
     #[tokio::test]
     async fn lifecycle_quiescing_drains_existing_activity_and_refuses_new_work() {
