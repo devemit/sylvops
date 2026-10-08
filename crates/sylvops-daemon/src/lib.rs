@@ -39,6 +39,8 @@ pub enum DaemonError {
     RequestCancelled,
     #[error("invalid session specification: {0}")]
     InvalidSession(String),
+    #[error("project request refused: {0}")]
+    InvalidProject(String),
     #[error("session attachment refused: {0}")]
     Attachment(String),
     #[error("database operation failed: {0}")]

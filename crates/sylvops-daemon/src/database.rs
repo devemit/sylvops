@@ -11,6 +11,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, types::Type};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sylvops_core::domain::{
     DaemonSnapshot, Project, ProviderProfile, Session, SessionState, Workspace, Worktree,
@@ -31,6 +32,8 @@ const MAX_TUI_STATE_BYTES: usize = 4 * 1024;
 const DESKTOP_STATE_SCOPE: &str = "desktop";
 const DESKTOP_STATE_KEY: &str = "navigation.v1";
 const MAX_DESKTOP_STATE_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_PROJECT_REMOVAL_BLOCKER_IDS: usize = 32;
+const PROJECT_REMOVAL_QUERY_LIMIT: i64 = 33;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
     (
@@ -47,6 +50,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         4,
         "desktop_signature_themes",
         include_str!("../migrations/0004_desktop_signature_themes.sql"),
+    ),
+    (
+        5,
+        "project_removal_generation",
+        include_str!("../migrations/0005_project_removal_generation.sql"),
     ),
 ];
 
@@ -95,6 +103,14 @@ enum DatabaseCommand {
     RenameProject {
         id: ProjectId,
         name: String,
+        reply: oneshot::Sender<Result<(u64, Project)>>,
+    },
+    ProjectRemovalState {
+        id: ProjectId,
+        reply: oneshot::Sender<Result<ProjectRemovalState>>,
+    },
+    RemoveProject {
+        expected: ProjectRemovalState,
         reply: oneshot::Sender<Result<(u64, Project)>>,
     },
     Worktree {
@@ -247,6 +263,52 @@ pub struct NewManagedWorktree {
     pub base_commit: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectRemovalState {
+    pub(crate) project: Project,
+    descendant_generation: i64,
+    root_worktree_ids: Vec<WorktreeId>,
+    pub(crate) session_ids: Vec<SessionId>,
+    pub(crate) session_count: u32,
+    pub(crate) sessions_truncated: bool,
+    pub(crate) managed_worktree_count: u32,
+    pub(crate) managed_worktree_ids: Vec<WorktreeId>,
+    pub(crate) managed_worktrees_truncated: bool,
+    pub(crate) root_worktree_count: u32,
+}
+
+impl ProjectRemovalState {
+    pub(crate) fn is_removable(&self) -> bool {
+        self.session_count == 0 && self.managed_worktree_count == 0 && self.root_worktree_count == 1
+    }
+
+    pub(crate) fn authorization_fingerprint(&self) -> [u8; 32] {
+        #[derive(Serialize)]
+        struct FingerprintMaterial<'a> {
+            project_id: ProjectId,
+            workspace_id: WorkspaceId,
+            descendant_generation: i64,
+            root_worktree_ids: &'a [WorktreeId],
+        }
+
+        let encoded = serde_json::to_vec(&FingerprintMaterial {
+            project_id: self.project.id,
+            workspace_id: self.project.workspace_id,
+            descendant_generation: self.descendant_generation,
+            root_worktree_ids: &self.root_worktree_ids,
+        })
+        .expect("project removal fingerprint material is serializable");
+        Sha256::digest(encoded).into()
+    }
+}
+
+#[derive(Debug)]
+struct BoundedIds<T> {
+    ids: Vec<T>,
+    count: u32,
+    truncated: bool,
+}
+
 impl DatabaseHandle {
     /// Opens the database, applies migrations, and starts its dedicated owner thread.
     ///
@@ -395,6 +457,25 @@ impl DatabaseHandle {
     pub async fn rename_project(&self, id: ProjectId, name: String) -> Result<(u64, Project)> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::RenameProject { id, name, reply }
+        })
+        .await
+    }
+
+    /// Loads the bounded Project identity and exact persisted descendant set used for removal.
+    pub(crate) async fn project_removal_state(&self, id: ProjectId) -> Result<ProjectRemovalState> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::ProjectRemovalState { id, reply }
+        })
+        .await
+    }
+
+    /// Removes one unchanged, cleared Project and all SylvOps-owned descendant metadata.
+    pub(crate) async fn remove_project(
+        &self,
+        expected: ProjectRemovalState,
+    ) -> Result<(u64, Project)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::RemoveProject { expected, reply }
         })
         .await
     }
@@ -799,6 +880,16 @@ fn database_thread(
             }
             DatabaseCommand::RenameProject { id, name, reply } => {
                 let result = rename_project(&mut connection, id, &name).map(|project| {
+                    revision = revision.saturating_add(1);
+                    (revision, project)
+                });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::ProjectRemovalState { id, reply } => {
+                let _ = reply.send(load_project_removal_state(&connection, id));
+            }
+            DatabaseCommand::RemoveProject { expected, reply } => {
+                let result = remove_project(&mut connection, &expected).map(|project| {
                     revision = revision.saturating_add(1);
                     (revision, project)
                 });
@@ -1264,6 +1355,151 @@ fn load_project(connection: &Connection, id: ProjectId) -> Result<Project> {
         .optional()
         .map_err(database_error)?
         .ok_or_else(|| DaemonError::Database(format!("project {id} does not exist")))
+}
+
+fn load_project_removal_state(
+    connection: &Connection,
+    id: ProjectId,
+) -> Result<ProjectRemovalState> {
+    let project = load_project(connection, id)?;
+    let descendant_generation: i64 = connection
+        .query_row(
+            "SELECT removal_generation FROM projects WHERE id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    let sessions = load_project_removal_session_ids(connection, id)?;
+    let managed_worktrees = load_project_removal_managed_worktree_ids(connection, id)?;
+    let root_worktree_ids = load_project_removal_root_worktree_ids(connection, id)?;
+    Ok(ProjectRemovalState {
+        project,
+        descendant_generation,
+        root_worktree_count: u32::try_from(root_worktree_ids.len()).unwrap_or(u32::MAX),
+        root_worktree_ids,
+        session_ids: sessions.ids,
+        session_count: sessions.count,
+        sessions_truncated: sessions.truncated,
+        managed_worktree_ids: managed_worktrees.ids,
+        managed_worktree_count: managed_worktrees.count,
+        managed_worktrees_truncated: managed_worktrees.truncated,
+    })
+}
+
+fn load_project_removal_root_worktree_ids(
+    connection: &Connection,
+    id: ProjectId,
+) -> Result<Vec<WorktreeId>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id FROM worktrees \
+             WHERE project_id = ?1 AND is_root_checkout = 1 ORDER BY id LIMIT 2",
+        )
+        .map_err(database_error)?;
+    statement
+        .query_map([id.to_string()], |row| parse_text(row, 0))
+        .map_err(database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(database_error)
+}
+
+fn load_project_removal_session_ids(
+    connection: &Connection,
+    id: ProjectId,
+) -> Result<BoundedIds<SessionId>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sessions.id FROM sessions \
+                 JOIN worktrees ON worktrees.id = sessions.worktree_id \
+                 WHERE worktrees.project_id = ?1 ORDER BY sessions.id LIMIT ?2",
+        )
+        .map_err(database_error)?;
+    let ids = statement
+        .query_map(
+            params![id.to_string(), PROJECT_REMOVAL_QUERY_LIMIT],
+            |row| parse_text(row, 0),
+        )
+        .map_err(database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(database_error)?;
+    Ok(bound_ids(ids))
+}
+
+fn load_project_removal_managed_worktree_ids(
+    connection: &Connection,
+    id: ProjectId,
+) -> Result<BoundedIds<WorktreeId>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id FROM worktrees \
+             WHERE project_id = ?1 AND is_root_checkout = 0 AND status <> 'removed' \
+             ORDER BY id LIMIT ?2",
+        )
+        .map_err(database_error)?;
+    let ids = statement
+        .query_map(
+            params![id.to_string(), PROJECT_REMOVAL_QUERY_LIMIT],
+            |row| parse_text(row, 0),
+        )
+        .map_err(database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(database_error)?;
+    Ok(bound_ids(ids))
+}
+
+fn bound_ids<T>(mut ids: Vec<T>) -> BoundedIds<T> {
+    let truncated = ids.len() > MAX_PROJECT_REMOVAL_BLOCKER_IDS;
+    let count = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+    ids.truncate(MAX_PROJECT_REMOVAL_BLOCKER_IDS);
+    BoundedIds {
+        ids,
+        count,
+        truncated,
+    }
+}
+
+fn remove_project(connection: &mut Connection, expected: &ProjectRemovalState) -> Result<Project> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let current = load_project_removal_state(&transaction, expected.project.id)?;
+    if current != *expected || !current.is_removable() {
+        return Err(DaemonError::Database(
+            "project removal authorization is stale or descendants remain".into(),
+        ));
+    }
+    transaction
+        .execute(
+            "DELETE FROM pull_request_links WHERE worktree_id IN \
+             (SELECT id FROM worktrees WHERE project_id = ?1)",
+            [expected.project.id.to_string()],
+        )
+        .map_err(database_error)?;
+    transaction
+        .execute(
+            "DELETE FROM worktrees WHERE project_id = ?1",
+            [expected.project.id.to_string()],
+        )
+        .map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "DELETE FROM projects WHERE id = ?1",
+            [expected.project.id.to_string()],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(DaemonError::Database(
+            "project removal authorization is stale".into(),
+        ));
+    }
+    insert_entity_audit(
+        &transaction,
+        "project_removed",
+        "project",
+        &expected.project.id.to_string(),
+    )?;
+    transaction.commit().map_err(database_error)?;
+    Ok(expected.project.clone())
 }
 
 fn insert_worktree(connection: &mut Connection, record: &NewManagedWorktree) -> Result<Worktree> {
@@ -2763,6 +2999,153 @@ mod tests {
                 .any(|session| session.id == ids[1])
         );
         reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn project_removal_revalidates_descendants_and_cleans_owned_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("state.db");
+        let repository_path = directory.path().join("repository");
+        std::fs::create_dir(&repository_path).unwrap();
+        let repository = repository_path.to_string_lossy().into_owned();
+        let database = DatabaseHandle::open(&database_path).unwrap();
+        let (_, workspace) = database.add_workspace("Removal".into()).await.unwrap();
+        let (_, project, root_worktree) = database
+            .add_project(RepositoryRegistration {
+                workspace_id: workspace.id,
+                name: "repository".into(),
+                repository_path: repository.clone(),
+                canonical_repository_path: repository.clone(),
+                default_branch: Some("main".into()),
+                remote_url: None,
+                branch: Some("main".into()),
+                base_commit: "deadbeef".into(),
+            })
+            .await
+            .unwrap();
+
+        let stale = database.project_removal_state(project.id).await.unwrap();
+        let session_id = SessionId::new();
+        database
+            .create_session(NewSession {
+                id: session_id,
+                worktree_id: root_worktree.id,
+                display_name: "blocker".into(),
+                provider_profile_id: None,
+                provider_kind: sylvops_core::domain::ProviderKind::Shell,
+                command: "shell".into(),
+                arguments_json: "[]".into(),
+                cwd: repository.clone(),
+                external_session_id: None,
+                resumed_from_session_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(database.remove_project(stale).await.is_err());
+        let blocked = database.project_removal_state(project.id).await.unwrap();
+        assert_eq!(blocked.session_count, 1);
+        assert_eq!(blocked.session_ids, vec![session_id]);
+        database.mark_session_running(session_id, 42).await.unwrap();
+        database
+            .finish_session(session_id, SessionState::Terminated, Some(0), None)
+            .await
+            .unwrap();
+        let session = database.session(session_id).await.unwrap();
+        database.delete_session(session).await.unwrap();
+
+        let removed_path = directory.path().join("removed-worktree");
+        std::fs::create_dir(&removed_path).unwrap();
+        let removed_path = removed_path.to_string_lossy().into_owned();
+        let removed_id = WorktreeId::new();
+        database
+            .add_worktree(NewManagedWorktree {
+                id: removed_id,
+                project_id: project.id,
+                name: "removed".into(),
+                path: removed_path.clone(),
+                canonical_path: removed_path,
+                branch: "feature/removed".into(),
+                base_ref: "main".into(),
+                base_commit: "deadbeef".into(),
+            })
+            .await
+            .unwrap();
+        let active = database.project_removal_state(project.id).await.unwrap();
+        assert_eq!(active.managed_worktree_count, 1);
+        assert_eq!(active.managed_worktree_ids, vec![removed_id]);
+        database.mark_worktree_removed(removed_id).await.unwrap();
+        database.shutdown().await.unwrap();
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO pull_request_links(id, worktree_id, provider, repository_identity, \
+                 number, url, created_at) VALUES (?1, ?2, 'github', 'devemit/sylvops', 92, \
+                 'https://example.invalid/pr/92', 1)",
+                params![Uuid::now_v7().to_string(), removed_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = DatabaseHandle::open(&database_path).unwrap();
+        let stale = database.project_removal_state(project.id).await.unwrap();
+        assert!(stale.is_removable());
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO pull_request_links(id, worktree_id, provider, repository_identity, \
+                 number, url, created_at) VALUES (?1, ?2, 'github', 'devemit/sylvops', 93, \
+                 'https://example.invalid/pr/93', 2)",
+                params![Uuid::now_v7().to_string(), removed_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(database.remove_project(stale).await.is_err());
+        let expected = database.project_removal_state(project.id).await.unwrap();
+        assert!(expected.is_removable());
+        let before = database.snapshot().await.unwrap().revision;
+        let (revision, removed) = database.remove_project(expected).await.unwrap();
+        assert!(revision > before);
+        assert_eq!(removed.id, project.id);
+        let snapshot = database.snapshot().await.unwrap();
+        assert_eq!(snapshot.revision, revision);
+        assert!(!snapshot.projects.iter().any(|value| value.id == project.id));
+        assert!(
+            !snapshot
+                .worktrees
+                .iter()
+                .any(|value| value.project_id == project.id)
+        );
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .any(|value| value.id == workspace.id)
+        );
+        database.shutdown().await.unwrap();
+
+        let connection = Connection::open(&database_path).unwrap();
+        let pull_request_links: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pull_request_links", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pull_request_links, 0);
+        let audit_details: String = connection
+            .query_row(
+                "SELECT details_json FROM audit_events WHERE action = 'project_removed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_details, "{}");
     }
 
     #[tokio::test]
