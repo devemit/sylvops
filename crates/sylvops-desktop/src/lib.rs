@@ -41,8 +41,9 @@ use presentation::{
     DesktopPresentation, InteractionState as PresentationInteraction, NavigatorAction,
     NavigatorAttention, NavigatorMode, NavigatorNodeId, NavigatorRow, PresentationInput,
     PresentationLayout, PresentationTheme, SystemAppearance, TerminalPalette, Viewport,
-    WorkspaceNavigation, button_visual, session_state_can_replay as session_can_replay,
-    session_state_can_stop as session_can_stop, session_state_label,
+    WorkspaceNavigation, button_visual, human_readable_path,
+    session_state_can_replay as session_can_replay, session_state_can_stop as session_can_stop,
+    session_state_label,
 };
 use sylvops_core::{
     domain::{
@@ -1753,18 +1754,22 @@ impl DesktopApp {
 
     #[allow(clippy::too_many_lines)]
     fn details_view(&self) -> Element<'_, Message> {
-        let selection = self.presentation().selection;
+        let presentation = self.presentation();
+        let selection = presentation.details_selection;
         let mut content = column![text("Selection details").font(UI_SEMIBOLD).size(24)].spacing(12);
         let mut technical = column![].spacing(8);
         let mut has_technical_details = false;
         if let Some(project) = selection
-            .project_id
+            .project
             .and_then(|id| self.snapshot.projects.iter().find(|item| item.id == id))
         {
             has_technical_details = true;
             content = content
                 .push(detail("Repository", project.name.clone()))
-                .push(detail("Path", project.canonical_repository_path.clone()))
+                .push(detail(
+                    "Path",
+                    human_readable_path(&project.canonical_repository_path),
+                ))
                 .push(detail(
                     "Last activity",
                     optional_human_timestamp(Some(project.last_activity_at), "Not recorded"),
@@ -1776,6 +1781,10 @@ impl DesktopApp {
                     project.workspace_id.to_string(),
                 ))
                 .push(technical_detail(
+                    "Canonical repository path",
+                    project.canonical_repository_path.clone(),
+                ))
+                .push(technical_detail(
                     "Created (raw ms)",
                     project.created_at.to_string(),
                 ))
@@ -1784,7 +1793,10 @@ impl DesktopApp {
                     project.last_activity_at.to_string(),
                 ));
         }
-        if let Some(worktree) = self.selected_worktree() {
+        if let Some(worktree) = selection
+            .worktree
+            .and_then(|id| self.snapshot.worktrees.iter().find(|item| item.id == id))
+        {
             has_technical_details = true;
             content = content
                 .push(detail("Checkout", worktree.name.clone()))
@@ -1792,7 +1804,10 @@ impl DesktopApp {
                     "Branch",
                     worktree.branch.clone().unwrap_or_else(|| "Detached".into()),
                 ))
-                .push(detail("Path", worktree.canonical_path.clone()))
+                .push(detail(
+                    "Path",
+                    human_readable_path(&worktree.canonical_path),
+                ))
                 .push(detail(
                     "Created",
                     optional_human_timestamp(Some(worktree.created_at), "Not recorded"),
@@ -1804,6 +1819,10 @@ impl DesktopApp {
                     worktree.project_id.to_string(),
                 ))
                 .push(technical_detail(
+                    "Canonical checkout path",
+                    worktree.canonical_path.clone(),
+                ))
+                .push(technical_detail(
                     "Base commit",
                     worktree.base_commit.clone(),
                 ))
@@ -1812,7 +1831,7 @@ impl DesktopApp {
                     worktree.created_at.to_string(),
                 ));
         }
-        if let Some(session) = selection.active_session_id.and_then(|id| self.session(id)) {
+        if let Some(session) = selection.session.and_then(|id| self.session(id)) {
             has_technical_details = true;
             content = content
                 .push(rule::horizontal(1))
@@ -1822,7 +1841,10 @@ impl DesktopApp {
                     session.provider_kind.display_name().to_owned(),
                 ))
                 .push(detail("State", session_state_label(session.state).into()))
-                .push(detail("Working directory", session.cwd.clone()))
+                .push(detail(
+                    "Working directory",
+                    human_readable_path(&session.cwd),
+                ))
                 .push(detail(
                     "Started",
                     optional_human_timestamp(session.started_at, "Not started"),
@@ -1862,6 +1884,10 @@ impl DesktopApp {
                     session.worktree_id.to_string(),
                 ))
                 .push(technical_detail(
+                    "Canonical working directory",
+                    session.cwd.clone(),
+                ))
+                .push(technical_detail(
                     "Process ID",
                     optional_number(session.process_id, "Not running"),
                 ))
@@ -1896,7 +1922,8 @@ impl DesktopApp {
                 ));
         }
         let mut actions = row![].spacing(8);
-        if let Some(session) = selection.active_session_id.and_then(|id| self.session(id))
+        if let Some(session) = selection.session.and_then(|id| self.session(id))
+            && self.active_session_id == Some(session.id)
             && session_can_stop(session.state)
         {
             actions = actions.push(
@@ -1905,7 +1932,12 @@ impl DesktopApp {
                     .style(flat_danger_style),
             );
         }
-        if self.selected_worktree().is_some_and(worktree_can_delete) {
+        if selection
+            .worktree
+            .and_then(|id| self.snapshot.worktrees.iter().find(|item| item.id == id))
+            .is_some_and(worktree_can_delete)
+            && selection.session.is_none()
+        {
             actions = actions.push(
                 button(DELETE_CHECKOUT_LABEL)
                     .on_press(Message::RemoveSelectedWorktree)
@@ -5730,7 +5762,10 @@ fn detail(label: &str, value: String) -> Element<'_, Message> {
             .width(Length::Fixed(150.0))
             .style(text::secondary),
         text(value)
+            .width(Fill)
+            .wrapping(text::Wrapping::WordOrGlyph)
     ]
+    .width(Fill)
     .align_y(Vertical::Center)
     .into()
 }
@@ -5741,7 +5776,9 @@ fn technical_detail(label: &'static str, value: String) -> Element<'static, Mess
         text(label)
             .width(Length::Fixed(170.0))
             .style(text::secondary),
-        text(value).width(Fill),
+        text(value)
+            .width(Fill)
+            .wrapping(text::Wrapping::WordOrGlyph),
         button("Copy")
             .on_press(Message::CopyTechnicalValue(copy_value))
             .style(chrome_action_style),
@@ -5957,6 +5994,8 @@ mod tests {
         6_252_492_281_865_111_872,
         8_044_612_287_909_611_382,
     ];
+    const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 2] =
+        [18_113_900_177_058_792_484, 4_341_961_485_828_767_128];
 
     async fn render_desktop_baseline(
         app: &DesktopApp,
@@ -6240,6 +6279,37 @@ mod tests {
                 APPROVED_VISUAL_CHECKSUMS
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rendered_details_cover_verbatim_paths_at_responsive_widths() {
+        let (mut app, _, _, _, _) = desktop_hierarchy();
+        let canonical = r"\\?\C:\Users\Mite\Projects\Пројект\a-very-long-checkout-name-that-must-wrap-inside-details";
+        app.snapshot.projects[0].canonical_repository_path = canonical.into();
+        app.snapshot.worktrees[0].canonical_path = canonical.into();
+        app.snapshot.sessions[0].cwd = canonical.into();
+        app.desktop_state.compact_panel = DesktopPanel::Sessions;
+        app.keyboard_panel = DesktopPanel::Sessions;
+        app.select_main_tab(MainTab::Details);
+
+        let compact = render_desktop_baseline(&app, 900, 700).await;
+        app.narrow_main = true;
+        let narrow = render_desktop_baseline(&app, 680, 480).await;
+
+        assert_eq!(
+            [compact.layout_nodes, narrow.layout_nodes],
+            [214, 214],
+            "Details layout changed at a representative width"
+        );
+        assert!(compact.distinct_colors >= 8, "{compact:?}");
+        assert!(narrow.distinct_colors >= 8, "{narrow:?}");
+        assert_eq!(
+            [compact.checksum, narrow.checksum],
+            APPROVED_DETAILS_VISUAL_CHECKSUMS,
+            "Details pixels changed at a representative width"
+        );
+        assert!(!human_readable_path(canonical).contains(r"\\?\"));
+        assert!(!human_readable_path(canonical).contains('\u{fffd}'));
     }
 
     #[test]

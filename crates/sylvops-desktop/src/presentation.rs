@@ -273,6 +273,13 @@ pub(crate) struct PresentationSelection {
     pub main_tab: MainTab,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DetailsSelection {
+    pub project: Option<ProjectId>,
+    pub worktree: Option<WorktreeId>,
+    pub session: Option<SessionId>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum NavigatorNodeId {
     Repository(ProjectId),
@@ -525,6 +532,7 @@ pub(crate) struct DesktopPresentation {
     pub density: DensityMetrics,
     pub layout: PresentationLayout,
     pub selection: PresentationSelection,
+    pub details_selection: DetailsSelection,
     pub navigator: NavigatorPresentation,
     pub workspace_navigation: WorkspaceNavigation,
     pub active_session: ActiveSessionPresentation,
@@ -586,6 +594,22 @@ impl DesktopPresentation {
             input.interaction.active_session_attached,
             &input.interaction.resumable_session_ids,
         );
+        let details_selection = match input.preferences.compact_panel {
+            DesktopPanel::Projects => DetailsSelection {
+                project: project_id,
+                ..DetailsSelection::default()
+            },
+            DesktopPanel::Worktrees => DetailsSelection {
+                project: project_id,
+                worktree: worktree_id,
+                session: None,
+            },
+            DesktopPanel::Sessions => DetailsSelection {
+                project: project_id,
+                worktree: worktree_id,
+                session: session_id,
+            },
+        };
         Self {
             theme,
             density: DensityMetrics::for_choice(input.preferences.density),
@@ -598,6 +622,7 @@ impl DesktopPresentation {
                 active_session_id,
                 main_tab: input.interaction.main_tab,
             },
+            details_selection,
             navigator,
             workspace_navigation: if layout == PresentationLayout::Narrow {
                 WorkspaceNavigation::LabeledSwitcher
@@ -607,6 +632,31 @@ impl DesktopPresentation {
             active_session,
         }
     }
+}
+
+pub(crate) fn human_readable_path(path: &str) -> String {
+    let without_verbatim_prefix = path
+        .get(..8)
+        .filter(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+        .map_or_else(
+            || {
+                path.strip_prefix(r"\\?\")
+                    .filter(|rest| {
+                        let bytes = rest.as_bytes();
+                        bytes.len() >= 3
+                            && bytes[0].is_ascii_alphabetic()
+                            && bytes[1] == b':'
+                            && matches!(bytes[2], b'\\' | b'/')
+                    })
+                    .unwrap_or(path)
+                    .to_owned()
+            },
+            |_| format!(r"\\{}", &path[8..]),
+        );
+    without_verbatim_prefix
+        .chars()
+        .filter(|character| *character != '\u{fffd}')
+        .collect()
 }
 
 fn build_navigator(
@@ -1488,6 +1538,90 @@ mod tests {
         assert_eq!(invalid.selection.session_id, None);
         assert_eq!(invalid.selection.active_session_id, None);
         assert_eq!(invalid.selection.main_tab, MainTab::Details);
+    }
+
+    #[test]
+    fn details_selection_follows_the_explorer_level_and_selected_session() {
+        let mut fixture = hierarchy_fixture(SessionState::Running);
+        let mut unrelated_session = fixture.snapshot.sessions[0].clone();
+        unrelated_session.id = SessionId::new();
+        unrelated_session.display_name = "Unrelated active session".into();
+        fixture.snapshot.sessions.push(unrelated_session.clone());
+        let mut preferences = DesktopState {
+            compact_panel: DesktopPanel::Projects,
+            ..DesktopState::default()
+        };
+        let interaction = InteractionState {
+            selected_project_id: Some(fixture.project_id),
+            selected_worktree_id: Some(fixture.worktree_id),
+            selected_session_id: Some(fixture.session_id),
+            active_session_id: Some(unrelated_session.id),
+            main_tab: MainTab::Details,
+            ..InteractionState::default()
+        };
+        let present = |preferences: &DesktopState| {
+            DesktopPresentation::build(&PresentationInput {
+                daemon: &fixture.snapshot,
+                preferences,
+                viewport: Viewport::new(1_440, 900),
+                system_appearance: SystemAppearance::Dark,
+                interaction: interaction.clone(),
+            })
+        };
+
+        let project = present(&preferences);
+        assert_eq!(
+            project.details_selection,
+            DetailsSelection {
+                project: Some(fixture.project_id),
+                worktree: None,
+                session: None,
+            }
+        );
+
+        preferences.compact_panel = DesktopPanel::Worktrees;
+        let worktree = present(&preferences);
+        assert_eq!(
+            worktree.details_selection,
+            DetailsSelection {
+                project: Some(fixture.project_id),
+                worktree: Some(fixture.worktree_id),
+                session: None,
+            }
+        );
+
+        preferences.compact_panel = DesktopPanel::Sessions;
+        let session = present(&preferences);
+        assert_eq!(
+            session.details_selection,
+            DetailsSelection {
+                project: Some(fixture.project_id),
+                worktree: Some(fixture.worktree_id),
+                session: Some(fixture.session_id),
+            }
+        );
+        assert_ne!(
+            session.details_selection.session,
+            Some(unrelated_session.id)
+        );
+    }
+
+    #[test]
+    fn display_paths_hide_windows_verbatim_syntax_without_changing_other_paths() {
+        let local = r"\\?\C:\Users\Mite\Пројект";
+        let unc = r"\\?\UNC\server\share\数据";
+        let normal_windows = r"D:\repos\sylvops";
+        let unix = "/srv/repos/sylvops";
+
+        assert_eq!(human_readable_path(local), r"C:\Users\Mite\Пројект");
+        assert_eq!(human_readable_path(unc), r"\\server\share\数据");
+        assert_eq!(human_readable_path(normal_windows), normal_windows);
+        assert_eq!(human_readable_path(unix), unix);
+        assert_eq!(
+            human_readable_path("\\\\?\\C:\\repo\u{fffd}\\src"),
+            r"C:\repo\src"
+        );
+        assert_eq!(local, r"\\?\C:\Users\Mite\Пројект");
     }
 
     #[test]
