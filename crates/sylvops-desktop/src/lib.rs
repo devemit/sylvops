@@ -237,6 +237,7 @@ struct DesktopApp {
     navigator_visibility: NavigatorVisibility,
     keyboard_panel: DesktopPanel,
     hovered_navigator_node: Option<NavigatorNodeId>,
+    pending_navigator_reveal: Option<DesktopPanel>,
     terminal_focus: TerminalFocus,
     terminal_viewport: Option<iced::Size>,
     terminal_pointer: Option<Point>,
@@ -492,6 +493,7 @@ impl DesktopApp {
             navigator_visibility: NavigatorVisibility::Shown,
             keyboard_panel: DesktopPanel::Projects,
             hovered_navigator_node: None,
+            pending_navigator_reveal: None,
             terminal_focus: TerminalFocus::Unfocused,
             terminal_viewport: None,
             terminal_pointer: None,
@@ -772,6 +774,7 @@ impl DesktopApp {
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.keyboard_panel = panel;
                 self.desktop_state.compact_panel = panel;
+                self.pending_navigator_reveal = Some(panel);
                 self.mark_state_dirty();
             }
             Message::ToggleNavigator => {
@@ -809,6 +812,7 @@ impl DesktopApp {
             Message::ShowNarrowNavigator => {
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.narrow_main = false;
+                self.pending_navigator_reveal = Some(self.keyboard_panel);
             }
             Message::ShowNarrowMain => {
                 self.inline_navigator_rename = None;
@@ -817,7 +821,7 @@ impl DesktopApp {
             }
             Message::ClearError => self.error = None,
         }
-        Task::none()
+        self.take_navigator_reveal_task()
     }
 
     fn theme(&self) -> Theme {
@@ -1165,12 +1169,7 @@ impl DesktopApp {
     fn repositories_column(&self) -> Element<'_, Message> {
         let presentation = self.presentation();
         let density = presentation.density;
-        let mut items = column![navigator_heading(
-            "Repositories",
-            Some((LineIcon::Add, Message::NewProject)),
-            density,
-        )]
-        .spacing(2);
+        let mut items = column![].spacing(2);
         for row in &presentation.navigator.repositories {
             if self
                 .inline_navigator_rename
@@ -1197,7 +1196,14 @@ impl DesktopApp {
                 )
             });
         }
-        panel(scrollable(items), 190.0)
+        navigator_panel(
+            "Repositories",
+            Some((LineIcon::Add, Message::NewProject)),
+            selected_navigator_actions(&presentation.navigator.repositories),
+            density,
+            items,
+            DesktopPanel::Projects,
+        )
     }
 
     fn checkouts_column(&self) -> Element<'_, Message> {
@@ -1207,7 +1213,7 @@ impl DesktopApp {
             .selection
             .project_id
             .map(|_| (LineIcon::Add, Message::NewWorktree));
-        let mut items = column![navigator_heading("Checkouts", create, density,)].spacing(2);
+        let mut items = column![].spacing(2);
         for row in &presentation.navigator.checkouts {
             if self
                 .inline_navigator_rename
@@ -1228,7 +1234,14 @@ impl DesktopApp {
                 Message::NewWorktree,
             ));
         }
-        panel(scrollable(items), 225.0)
+        navigator_panel(
+            "Checkouts",
+            create,
+            selected_navigator_actions(&presentation.navigator.checkouts),
+            density,
+            items,
+            DesktopPanel::Worktrees,
+        )
     }
 
     fn sessions_column(&self) -> Element<'_, Message> {
@@ -1238,7 +1251,7 @@ impl DesktopApp {
             .selection
             .worktree_id
             .map(|_| (LineIcon::Add, Message::NewSession));
-        let mut items = column![navigator_heading("Sessions", create, density,)].spacing(2);
+        let mut items = column![].spacing(2);
         for row in &presentation.navigator.sessions {
             if self
                 .inline_navigator_rename
@@ -1259,7 +1272,14 @@ impl DesktopApp {
                 Message::NewSession,
             ));
         }
-        panel(scrollable(items), 255.0)
+        navigator_panel(
+            "Sessions",
+            create,
+            selected_navigator_actions(&presentation.navigator.sessions),
+            density,
+            items,
+            DesktopPanel::Sessions,
+        )
     }
 
     fn compact_navigator(&self) -> Element<'_, Message> {
@@ -1318,53 +1338,30 @@ impl DesktopApp {
             .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
             .size(UI_TEXT_SIZE)
             .wrapping(text::Wrapping::None);
-        let labels: Element<'static, Message> = if matches!(row.id, NavigatorNodeId::Session(_)) {
-            row![
-                name,
-                text(format!("· {}", row.detail))
-                    .size(UI_META_SIZE)
-                    .style(text::secondary)
-                    .wrapping(text::Wrapping::None),
-            ]
-            .spacing(5)
-            .align_y(Center)
-            .width(Fill)
-            .into()
-        } else {
+        let labels: Element<'static, Message> = {
             let mut title = row![name].spacing(5).align_y(Center);
-            if let Some(badge) = &row.badge {
-                title = title.push(
-                    container(text(badge.clone()).font(UI_MEDIUM).size(10))
-                        .padding([1, 4])
-                        .style(navigator_badge_style),
-                );
-            }
-            if let Some(attention) = row.attention {
-                title = title.push(
-                    row![
-                        line_icon(navigator_attention_icon(attention), 13),
-                        text(navigator_attention_label(attention))
-                            .size(10)
-                            .style(text::secondary),
-                    ]
-                    .spacing(3)
-                    .align_y(Center),
-                );
+            if !matches!(row.id, NavigatorNodeId::Session(_)) {
+                if let Some(badge) = &row.badge {
+                    title = title.push(
+                        container(text(badge.clone()).font(UI_MEDIUM).size(10))
+                            .padding([1, 4])
+                            .style(navigator_badge_style),
+                    );
+                }
+                if let Some(attention) = row.attention {
+                    title = title.push(
+                        row![
+                            line_icon(navigator_attention_icon(attention), 13),
+                            text(navigator_attention_label(attention))
+                                .size(10)
+                                .style(text::secondary),
+                        ]
+                        .spacing(3)
+                        .align_y(Center),
+                    );
+                }
             }
             title = title.push(space::horizontal());
-            if is_selected
-                && let Some(NavigatorAction::DeleteCheckout(worktree_id)) = row.actions.first()
-            {
-                title = title.push(
-                    button(icon_text_label(LineIcon::Delete, "Delete", UI_META_SIZE))
-                        .on_press(Message::RunNavigatorAction(
-                            NavigatorAction::DeleteCheckout(*worktree_id),
-                        ))
-                        .height(density.control_height)
-                        .padding([3, 6])
-                        .style(flat_danger_style),
-                );
-            }
             column![
                 title,
                 text(row.detail.clone())
@@ -1378,7 +1375,7 @@ impl DesktopApp {
         };
         let content = container(row![labels].spacing(3).align_y(Center))
             .width(Fill)
-            .height(density.row_height.max(44))
+            .height(density.control_height + 14)
             .padding([4, 6])
             .clip(true)
             .style(move |theme| navigator_row_container_style(theme, is_selected, is_hovered));
@@ -3723,6 +3720,7 @@ impl DesktopApp {
         self.narrow_main = false;
         self.terminal_focus = TerminalFocus::Unfocused;
         Task::batch([
+            self.take_navigator_reveal_task(),
             widget::operation::focus(input_id.clone()),
             widget::operation::select_all(input_id),
         ])
@@ -4448,6 +4446,7 @@ impl DesktopApp {
 
     fn select_project(&mut self, project_id: ProjectId) {
         self.unfocus_terminal();
+        self.pending_navigator_reveal = Some(DesktopPanel::Projects);
         if self.selected_project_id == Some(project_id) {
             self.keyboard_panel = DesktopPanel::Projects;
             self.desktop_state.compact_panel = DesktopPanel::Projects;
@@ -4467,6 +4466,7 @@ impl DesktopApp {
 
     fn select_worktree(&mut self, worktree_id: WorktreeId) {
         self.unfocus_terminal();
+        self.pending_navigator_reveal = Some(DesktopPanel::Worktrees);
         if self.selected_worktree_id == Some(worktree_id) {
             self.keyboard_panel = DesktopPanel::Worktrees;
             self.desktop_state.compact_panel = DesktopPanel::Worktrees;
@@ -4489,6 +4489,7 @@ impl DesktopApp {
 
     fn select_session(&mut self, session_id: SessionId) {
         self.unfocus_terminal();
+        self.pending_navigator_reveal = Some(DesktopPanel::Sessions);
         if self.selected_session_id == Some(session_id)
             && self.active_session_id == Some(session_id)
         {
@@ -4530,6 +4531,28 @@ impl DesktopApp {
                 .find(|worktree| worktree.id == worktree_id)
                 .map(|worktree| worktree.project_id);
         }
+    }
+
+    fn take_navigator_reveal_task(&mut self) -> Task<Message> {
+        let Some(panel) = self.pending_navigator_reveal.take() else {
+            return Task::none();
+        };
+        let presentation = self.presentation();
+        let rows = match panel {
+            DesktopPanel::Projects => &presentation.navigator.repositories,
+            DesktopPanel::Worktrees => &presentation.navigator.checkouts,
+            DesktopPanel::Sessions => &presentation.navigator.sessions,
+        };
+        let Some(index) = rows.iter().position(|row| row.selected) else {
+            return Task::none();
+        };
+        widget::operation::snap_to(
+            navigator_scroll_id(panel),
+            widget::operation::RelativeOffset {
+                x: None,
+                y: Some(navigator_reveal_offset(index, rows.len())),
+            },
+        )
     }
 
     fn active_workspace(&self) -> Option<&Workspace> {
@@ -4782,13 +4805,54 @@ const fn terminal_font(choice: DesktopTerminalFont) -> Font {
     }
 }
 
-fn panel<'a>(content: impl Into<Element<'a, Message>>, _width: f32) -> Element<'a, Message> {
-    container(content)
+fn selected_navigator_actions(rows: &[NavigatorRow]) -> &[NavigatorAction] {
+    rows.iter()
+        .find(|row| row.selected)
+        .map_or(&[], |row| row.actions.as_slice())
+}
+
+fn navigator_panel<'a>(
+    title: &'static str,
+    heading_action: Option<(LineIcon, Message)>,
+    actions: &[NavigatorAction],
+    density: DensityMetrics,
+    items: impl Into<Element<'a, Message>>,
+    panel: DesktopPanel,
+) -> Element<'a, Message> {
+    container(
+        column![
+            navigator_heading(title, heading_action, density),
+            navigator_action_strip(actions, density),
+            scrollable(items)
+                .id(navigator_scroll_id(panel))
+                .height(Fill),
+        ]
         .width(Fill)
-        .height(Fill)
-        .padding([4, 5])
-        .style(panel_surface)
-        .into()
+        .height(Fill),
+    )
+    .width(Fill)
+    .height(Fill)
+    .padding([4, 5])
+    .style(panel_surface)
+    .into()
+}
+
+fn navigator_scroll_id(panel: DesktopPanel) -> widget::Id {
+    widget::Id::new(match panel {
+        DesktopPanel::Projects => "navigator-repositories",
+        DesktopPanel::Worktrees => "navigator-checkouts",
+        DesktopPanel::Sessions => "navigator-sessions",
+    })
+}
+
+fn navigator_reveal_offset(index: usize, row_count: usize) -> f32 {
+    let last = row_count.saturating_sub(1);
+    if last == 0 {
+        return 0.0;
+    }
+    let index = u16::try_from(index.min(last)).unwrap_or(u16::MAX);
+    let last = u16::try_from(last).unwrap_or(u16::MAX);
+    f32::from(index) / f32::from(last)
 }
 
 fn navigator_heading(
@@ -4814,6 +4878,38 @@ fn navigator_heading(
         .width(Fill)
         .align_y(Vertical::Center)
         .into()
+}
+
+fn navigator_action_strip(
+    actions: &[NavigatorAction],
+    density: DensityMetrics,
+) -> Element<'static, Message> {
+    let mut controls = row![].spacing(4).align_y(Center);
+    for action in actions.iter().copied() {
+        controls = controls.push(match action {
+            NavigatorAction::DeleteCheckout(_) => button(icon_text_label(
+                LineIcon::Delete,
+                DELETE_CHECKOUT_LABEL,
+                UI_META_SIZE,
+            ))
+            .on_press(Message::RunNavigatorAction(action))
+            .height(density.control_height)
+            .padding([3, 7])
+            .style(flat_danger_style),
+        });
+    }
+    container(
+        scrollable(controls)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::hidden(),
+            ))
+            .width(Fill)
+            .height(density.control_height),
+    )
+    .width(Fill)
+    .height(density.control_height + 8)
+    .padding([4, 7])
+    .into()
 }
 
 fn compact_panel_button(
@@ -5841,7 +5937,7 @@ mod tests {
         Layout,
         layout::{Limits, Node},
         renderer::{Headless, Renderer as _},
-        widget::Tree,
+        widget::{Operation as WidgetOperation, Tree},
     };
     use sylvops_core::provider::{AuthenticationRequirement, ProviderCapabilities};
 
@@ -5965,34 +6061,40 @@ mod tests {
     }
 
     #[cfg(windows)]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        6_984_639_791_195_575_364,
-        15_224_806_857_697_282_047,
-        16_392_266_689_671_405_100,
-        10_448_167_447_137_816_396,
-        1_071_659_710_684_271_305,
-        6_252_492_281_865_111_872,
-        8_044_612_287_909_611_382,
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 9] = [
+        1_235_580_465_930_515_981,
+        684_521_762_925_822_029,
+        5_686_679_588_026_358_842,
+        14_761_951_164_573_712_012,
+        5_019_121_441_122_480_153,
+        3_931_679_346_670_316_763,
+        16_836_225_591_476_701_733,
+        1_823_448_962_296_347_469,
+        2_077_028_866_629_943_630,
     ];
     #[cfg(target_os = "macos")]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        6_984_639_791_195_575_364,
-        15_224_806_857_697_282_047,
-        16_392_266_689_671_405_100,
-        10_448_167_447_137_816_396,
-        1_071_659_710_684_271_305,
-        6_252_492_281_865_111_872,
-        8_044_612_287_909_611_382,
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 9] = [
+        1_235_580_465_930_515_981,
+        684_521_762_925_822_029,
+        5_686_679_588_026_358_842,
+        14_761_951_164_573_712_012,
+        5_019_121_441_122_480_153,
+        3_931_679_346_670_316_763,
+        16_836_225_591_476_701_733,
+        1_823_448_962_296_347_469,
+        2_077_028_866_629_943_630,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 7] = [
-        6_984_639_791_195_575_364,
-        15_224_806_857_697_282_047,
-        16_392_266_689_671_405_100,
-        10_448_167_447_137_816_396,
-        1_071_659_710_684_271_305,
-        6_252_492_281_865_111_872,
-        8_044_612_287_909_611_382,
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 9] = [
+        1_235_580_465_930_515_981,
+        684_521_762_925_822_029,
+        5_686_679_588_026_358_842,
+        14_761_951_164_573_712_012,
+        5_019_121_441_122_480_153,
+        3_931_679_346_670_316_763,
+        16_836_225_591_476_701_733,
+        1_823_448_962_296_347_469,
+        2_077_028_866_629_943_630,
     ];
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 2] =
         [18_113_900_177_058_792_484, 4_341_961_485_828_767_128];
@@ -6002,14 +6104,22 @@ mod tests {
         width: u16,
         height: u16,
     ) -> RenderedBaseline {
+        let theme = app.theme();
+        render_element_baseline(app.view(), &theme, width, height).await
+    }
+
+    async fn render_element_baseline(
+        mut element: Element<'_, Message>,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> RenderedBaseline {
         load_bundled_ui_fonts_for_rendering();
         let mut renderer =
             <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
                 .await
                 .expect("tiny-skia headless renderer");
         assert_eq!(renderer.name(), "tiny-skia");
-        let theme = app.theme();
-        let mut element = app.view();
         let mut tree = Tree::new(&element);
         let size = iced::Size::new(f32::from(width), f32::from(height));
         let limits = Limits::new(size, size);
@@ -6022,7 +6132,7 @@ mod tests {
         element.as_widget().draw(
             &tree,
             &mut renderer,
-            &theme,
+            theme,
             &iced::advanced::renderer::Style::default(),
             Layout::new(&node),
             iced::mouse::Cursor::Unavailable,
@@ -6055,6 +6165,226 @@ mod tests {
 
     fn layout_node_count(node: &Node) -> usize {
         1 + node.children().iter().map(layout_node_count).sum::<usize>()
+    }
+
+    async fn layout_element(mut element: Element<'_, Message>, width: f32, height: f32) -> Node {
+        load_bundled_ui_fonts_for_rendering();
+        let renderer = <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
+            .await
+            .expect("tiny-skia headless renderer");
+        let mut tree = Tree::new(&element);
+        element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &Limits::new(iced::Size::ZERO, iced::Size::new(width, height)),
+        )
+    }
+
+    fn layout_origins(node: &Node, origins: &mut Vec<Point>) {
+        origins.push(node.bounds().position());
+        for child in node.children() {
+            layout_origins(child, origins);
+        }
+    }
+
+    fn max_layout_width(node: &Node) -> f32 {
+        node.children()
+            .iter()
+            .map(max_layout_width)
+            .fold(node.bounds().width, f32::max)
+    }
+
+    struct ScrollableSnapshot {
+        target: widget::Id,
+        viewport: Option<(iced::Rectangle, iced::Rectangle, iced::Vector)>,
+    }
+
+    impl WidgetOperation for ScrollableSnapshot {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+            operate(self);
+        }
+
+        fn scrollable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            content_bounds: iced::Rectangle,
+            translation: iced::Vector,
+            _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+        ) {
+            if id == Some(&self.target) {
+                self.viewport = Some((bounds, content_bounds, translation));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_and_unselected_navigator_rows_keep_identical_geometry() {
+        let (mut app, _, _, _, _) = desktop_hierarchy();
+        for density_choice in [DesktopDensity::Comfortable, DesktopDensity::Compact] {
+            app.desktop_state.density = density_choice;
+            let presentation = app.presentation();
+            let expected_height = f32::from(
+                u16::try_from(presentation.density.control_height + 14)
+                    .expect("bounded navigator row height"),
+            );
+            let rows = presentation
+                .navigator
+                .repositories
+                .into_iter()
+                .chain(presentation.navigator.checkouts)
+                .chain(presentation.navigator.sessions);
+            for mut row in rows {
+                row.selected = false;
+                let unselected = layout_element(app.navigator_row(&row), 225.0, 100.0).await;
+                row.selected = true;
+                let selected = layout_element(app.navigator_row(&row), 225.0, 100.0).await;
+
+                assert_eq!(selected.bounds(), unselected.bounds(), "{:?}", row.kind);
+                assert!(
+                    (selected.bounds().height - expected_height).abs() <= f32::EPSILON,
+                    "{:?}",
+                    row.kind
+                );
+                let mut selected_origins = Vec::new();
+                let mut unselected_origins = Vec::new();
+                layout_origins(&selected, &mut selected_origins);
+                layout_origins(&unselected, &mut unselected_origins);
+                assert_eq!(
+                    selected_origins, unselected_origins,
+                    "selection must not move {:?} title/detail coordinates or insert row content",
+                    row.kind
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn navigator_action_strip_keeps_the_tree_origin_fixed() {
+        let (mut app, _, worktree_id, _, _) = desktop_hierarchy();
+        let with_action = layout_element(app.checkouts_column(), 225.0, 220.0).await;
+
+        app.snapshot
+            .worktrees
+            .iter_mut()
+            .find(|worktree| worktree.id == worktree_id)
+            .expect("managed checkout")
+            .is_root_checkout = true;
+        let without_action = layout_element(app.checkouts_column(), 225.0, 220.0).await;
+
+        let with_action_panel = &with_action.children()[0];
+        let without_action_panel = &without_action.children()[0];
+        assert_eq!(
+            with_action_panel.children().len(),
+            3,
+            "navigator panels must place the heading, reserved action strip, and tree in separate rows"
+        );
+        assert_eq!(without_action_panel.children().len(), 3);
+        let action_strip = &with_action_panel.children()[1];
+        let empty_action_strip = &without_action_panel.children()[1];
+        assert_eq!(action_strip.bounds(), empty_action_strip.bounds());
+        let expected_strip_height = f32::from(
+            u16::try_from(app.presentation().density.control_height)
+                .expect("bounded control height"),
+        ) + 8.0;
+        assert!((action_strip.bounds().height - expected_strip_height).abs() <= f32::EPSILON);
+        assert!(layout_node_count(action_strip) > layout_node_count(empty_action_strip));
+        assert_eq!(
+            with_action_panel.children()[2].bounds().position(),
+            without_action_panel.children()[2].bounds().position(),
+            "changing strip contents must not move the tree origin"
+        );
+
+        let overflow_actions = [NavigatorAction::DeleteCheckout(worktree_id); 4];
+        let overflow_strip = layout_element(
+            navigator_action_strip(&overflow_actions, app.presentation().density),
+            90.0,
+            100.0,
+        )
+        .await;
+        assert!((overflow_strip.bounds().width - 90.0).abs() <= f32::EPSILON);
+        assert!(
+            (overflow_strip.bounds().height - action_strip.bounds().height).abs() <= f32::EPSILON
+        );
+        assert!(max_layout_width(&overflow_strip) > overflow_strip.bounds().width);
+    }
+
+    #[test]
+    fn selecting_the_bottom_row_requests_a_complete_reveal() {
+        let (mut app, _, _, _, _) = desktop_hierarchy();
+        let template = app.snapshot.worktrees[0].clone();
+        app.snapshot.worktrees.clear();
+        let mut ids = Vec::new();
+        for index in 0..8 {
+            let mut worktree = template.clone();
+            worktree.id = WorktreeId::new();
+            worktree.name = format!("Checkout {index}");
+            worktree.last_activity_at = i64::from(8 - index);
+            ids.push(worktree.id);
+            app.snapshot.worktrees.push(worktree);
+        }
+        app.selected_worktree_id = ids.first().copied();
+
+        app.select_worktree(*ids.last().expect("bottom checkout"));
+
+        assert_eq!(app.pending_navigator_reveal, Some(DesktopPanel::Worktrees));
+        assert!((navigator_reveal_offset(7, 8) - 1.0).abs() <= f32::EPSILON);
+        assert!(navigator_reveal_offset(0, 8).abs() <= f32::EPSILON);
+
+        app.pending_navigator_reveal = None;
+        app.select_worktree(*ids.last().expect("bottom checkout"));
+        assert_eq!(app.pending_navigator_reveal, Some(DesktopPanel::Worktrees));
+    }
+
+    #[tokio::test]
+    async fn bottom_row_reveal_reaches_the_end_of_a_constrained_tree_viewport() {
+        let (mut app, _, _, _, _) = desktop_hierarchy();
+        let template = app.snapshot.worktrees[0].clone();
+        app.snapshot.worktrees.clear();
+        for index in 0..8 {
+            let mut worktree = template.clone();
+            worktree.id = WorktreeId::new();
+            worktree.name = format!("Checkout {index}");
+            worktree.last_activity_at = i64::from(8 - index);
+            app.selected_worktree_id = Some(worktree.id);
+            app.snapshot.worktrees.push(worktree);
+        }
+
+        load_bundled_ui_fonts_for_rendering();
+        let renderer = <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
+            .await
+            .expect("tiny-skia headless renderer");
+        let mut element = app.checkouts_column();
+        let mut tree = Tree::new(&element);
+        let size = iced::Size::new(225.0, 220.0);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &Limits::new(size, size));
+        let scroll_id = navigator_scroll_id(DesktopPanel::Worktrees);
+        let mut reveal = iced::advanced::widget::operation::scrollable::snap_to::<()>(
+            scroll_id.clone(),
+            iced::advanced::widget::operation::scrollable::RelativeOffset {
+                x: None,
+                y: Some(1.0),
+            },
+        );
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut reveal);
+        let mut snapshot = ScrollableSnapshot {
+            target: scroll_id,
+            viewport: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut snapshot);
+        let (bounds, content_bounds, translation) =
+            snapshot.viewport.expect("checkout tree viewport");
+
+        assert!(content_bounds.height > bounds.height);
+        assert!(translation.y > 0.0);
+        let revealed_bottom = content_bounds.y + content_bounds.height - translation.y;
+        assert!((revealed_bottom - (bounds.y + bounds.height)).abs() <= f32::EPSILON);
     }
 
     fn assert_button_contrast(
@@ -6218,6 +6548,30 @@ mod tests {
         app.modal = Some(Modal::Settings);
         let narrow_settings = render_desktop_baseline(&app, 680, 480).await;
 
+        let (mut long_label_app, _, worktree_id, _, _) = desktop_hierarchy();
+        long_label_app.desktop_state.window_width = 680;
+        long_label_app.desktop_state.window_height = 480;
+        long_label_app.snapshot.projects[0].name = "Repository name that remains clipped inside the navigator panel instead of changing row geometry".into();
+        long_label_app.snapshot.worktrees[0].name =
+            "Managed checkout with an intentionally long descriptive label".into();
+        long_label_app.snapshot.sessions[0].display_name =
+            "Session with a long label that cannot grow the row".into();
+        long_label_app.narrow_main = false;
+        let long_labels = render_desktop_baseline(&long_label_app, 680, 480).await;
+
+        let overflow_actions = [NavigatorAction::DeleteCheckout(worktree_id); 4];
+        let overflow_theme = long_label_app.theme();
+        let overflow_height =
+            u16::try_from(long_label_app.presentation().density.control_height + 8)
+                .expect("bounded action strip height");
+        let overflowing_actions = render_element_baseline(
+            navigator_action_strip(&overflow_actions, long_label_app.presentation().density),
+            &overflow_theme,
+            90,
+            overflow_height,
+        )
+        .await;
+
         app.desktop_state.window_width = 900;
         app.desktop_state.window_height = 700;
         app.disclosures.classic_themes = true;
@@ -6250,17 +6604,21 @@ mod tests {
                 compact.layout_nodes,
                 narrow_explorer.layout_nodes,
                 narrow_settings.layout_nodes,
+                long_labels.layout_nodes,
+                overflowing_actions.layout_nodes,
                 theme_gallery.layout_nodes,
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [155, 110, 76, 161, 217, 146, 130]
+            [171, 118, 84, 169, 84, 19, 225, 158, 138]
         );
         let baselines = [
             &canopy_attention,
             &compact,
             &narrow_explorer,
             &narrow_settings,
+            &long_labels,
+            &overflowing_actions,
             &theme_gallery,
             &grove_first_run,
             &confirmation_error,
@@ -6814,9 +7172,10 @@ mod tests {
         assert!(!navigator.contains("1  Repositories"));
         assert!(!navigator.contains("2  Checkouts"));
         assert!(!navigator.contains("3  Sessions"));
-        assert!(!navigator.contains("navigator_actions"));
+        assert!(navigator.matches("navigator_panel").count() >= 3);
+        assert!(source.contains("navigator_action_strip(actions, density)"));
         assert!(!navigator.contains("session_indicator_icon"));
-        assert!(source.contains("text(format!(\"· {}\", row.detail))"));
+        assert!(!source.contains("text(format!(\"· {}\", row.detail))"));
     }
 
     #[test]
