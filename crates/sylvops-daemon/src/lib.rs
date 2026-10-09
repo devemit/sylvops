@@ -41,6 +41,8 @@ pub enum DaemonError {
     InvalidSession(String),
     #[error("project request refused: {0}")]
     InvalidProject(String),
+    #[error("workspace request refused: {0}")]
+    InvalidWorkspace(String),
     #[error("session attachment refused: {0}")]
     Attachment(String),
     #[error("database operation failed: {0}")]

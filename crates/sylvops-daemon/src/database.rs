@@ -32,8 +32,8 @@ const MAX_TUI_STATE_BYTES: usize = 4 * 1024;
 const DESKTOP_STATE_SCOPE: &str = "desktop";
 const DESKTOP_STATE_KEY: &str = "navigation.v1";
 const MAX_DESKTOP_STATE_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_PROJECT_REMOVAL_BLOCKER_IDS: usize = 32;
-const PROJECT_REMOVAL_QUERY_LIMIT: i64 = 33;
+pub(crate) const MAX_REMOVAL_BLOCKER_IDS: usize = 32;
+const REMOVAL_QUERY_LIMIT: i64 = 33;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
     (
@@ -55,6 +55,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         5,
         "project_removal_generation",
         include_str!("../migrations/0005_project_removal_generation.sql"),
+    ),
+    (
+        6,
+        "workspace_deletion_generation",
+        include_str!("../migrations/0006_workspace_deletion_generation.sql"),
     ),
 ];
 
@@ -95,6 +100,14 @@ enum DatabaseCommand {
     OpenWorkspace {
         id: WorkspaceId,
         reply: oneshot::Sender<Result<(u64, Workspace)>>,
+    },
+    WorkspaceDeletionState {
+        id: WorkspaceId,
+        reply: oneshot::Sender<Result<WorkspaceDeletionState>>,
+    },
+    DeleteWorkspace {
+        expected: WorkspaceDeletionState,
+        reply: oneshot::Sender<Result<(u64, Workspace, Option<Workspace>)>>,
     },
     AddProject {
         registration: RepositoryRegistration,
@@ -277,6 +290,43 @@ pub(crate) struct ProjectRemovalState {
     pub(crate) root_worktree_count: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceDeletionState {
+    pub(crate) workspace: Workspace,
+    removal_generation: i64,
+    pub(crate) project_ids: Vec<ProjectId>,
+    pub(crate) project_count: u32,
+    pub(crate) projects_truncated: bool,
+    pub(crate) fallback_workspace_id: Option<WorkspaceId>,
+}
+
+impl WorkspaceDeletionState {
+    pub(crate) fn is_deletable(&self) -> bool {
+        self.project_count == 0
+    }
+
+    pub(crate) fn authorization_fingerprint(&self) -> [u8; 32] {
+        #[derive(Serialize)]
+        struct FingerprintMaterial<'a> {
+            workspace_id: WorkspaceId,
+            removal_generation: i64,
+            project_ids: &'a [ProjectId],
+            is_open: bool,
+            fallback_workspace_id: Option<WorkspaceId>,
+        }
+
+        let encoded = serde_json::to_vec(&FingerprintMaterial {
+            workspace_id: self.workspace.id,
+            removal_generation: self.removal_generation,
+            project_ids: &self.project_ids,
+            is_open: self.workspace.is_open,
+            fallback_workspace_id: self.fallback_workspace_id,
+        })
+        .expect("workspace deletion fingerprint material is serializable");
+        Sha256::digest(encoded).into()
+    }
+}
+
 impl ProjectRemovalState {
     pub(crate) fn is_removable(&self) -> bool {
         self.session_count == 0 && self.managed_worktree_count == 0 && self.root_worktree_count == 1
@@ -429,6 +479,28 @@ impl DatabaseHandle {
     pub async fn open_workspace(&self, id: WorkspaceId) -> Result<(u64, Workspace)> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::OpenWorkspace { id, reply }
+        })
+        .await
+    }
+
+    /// Loads the bounded Workspace identity and exact Project-membership generation for deletion.
+    pub(crate) async fn workspace_deletion_state(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<WorkspaceDeletionState> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::WorkspaceDeletionState { id, reply }
+        })
+        .await
+    }
+
+    /// Deletes one unchanged, empty Workspace and selects its deterministic fallback atomically.
+    pub(crate) async fn delete_workspace(
+        &self,
+        expected: WorkspaceDeletionState,
+    ) -> Result<(u64, Workspace, Option<Workspace>)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::DeleteWorkspace { expected, reply }
         })
         .await
     }
@@ -865,6 +937,17 @@ fn database_thread(
                     revision = revision.saturating_add(1);
                     (revision, workspace)
                 });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::WorkspaceDeletionState { id, reply } => {
+                let _ = reply.send(load_workspace_deletion_state(&connection, id));
+            }
+            DatabaseCommand::DeleteWorkspace { expected, reply } => {
+                let result =
+                    delete_workspace(&mut connection, &expected).map(|(workspace, opened)| {
+                        revision = revision.saturating_add(1);
+                        (revision, workspace, opened)
+                    });
                 let _ = reply.send(result);
             }
             DatabaseCommand::AddProject {
@@ -1329,6 +1412,52 @@ fn load_workspace(connection: &Connection, id: WorkspaceId) -> Result<Workspace>
         .ok_or_else(|| DaemonError::Database(format!("workspace {id} does not exist")))
 }
 
+fn load_workspace_deletion_state(
+    connection: &Connection,
+    id: WorkspaceId,
+) -> Result<WorkspaceDeletionState> {
+    let workspace = load_workspace(connection, id)?;
+    let removal_generation: i64 = connection
+        .query_row(
+            "SELECT removal_generation FROM workspaces WHERE id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    let mut statement = connection
+        .prepare("SELECT id FROM projects WHERE workspace_id = ?1 ORDER BY id LIMIT ?2")
+        .map_err(database_error)?;
+    let project_ids = statement
+        .query_map(params![id.to_string(), REMOVAL_QUERY_LIMIT], |row| {
+            parse_text(row, 0)
+        })
+        .map_err(database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(database_error)?;
+    let projects = bound_ids(project_ids);
+    let fallback_workspace_id = if workspace.is_open {
+        connection
+            .query_row(
+                "SELECT id FROM workspaces WHERE id <> ?1 \
+                 ORDER BY last_opened_at DESC, id ASC LIMIT 1",
+                [id.to_string()],
+                |row| parse_text(row, 0),
+            )
+            .optional()
+            .map_err(database_error)?
+    } else {
+        None
+    };
+    Ok(WorkspaceDeletionState {
+        workspace,
+        removal_generation,
+        project_ids: projects.ids,
+        project_count: projects.count,
+        projects_truncated: projects.truncated,
+        fallback_workspace_id,
+    })
+}
+
 fn load_worktree(connection: &Connection, id: WorktreeId) -> Result<Worktree> {
     connection
         .query_row(
@@ -1415,10 +1544,9 @@ fn load_project_removal_session_ids(
         )
         .map_err(database_error)?;
     let ids = statement
-        .query_map(
-            params![id.to_string(), PROJECT_REMOVAL_QUERY_LIMIT],
-            |row| parse_text(row, 0),
-        )
+        .query_map(params![id.to_string(), REMOVAL_QUERY_LIMIT], |row| {
+            parse_text(row, 0)
+        })
         .map_err(database_error)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(database_error)?;
@@ -1437,10 +1565,9 @@ fn load_project_removal_managed_worktree_ids(
         )
         .map_err(database_error)?;
     let ids = statement
-        .query_map(
-            params![id.to_string(), PROJECT_REMOVAL_QUERY_LIMIT],
-            |row| parse_text(row, 0),
-        )
+        .query_map(params![id.to_string(), REMOVAL_QUERY_LIMIT], |row| {
+            parse_text(row, 0)
+        })
         .map_err(database_error)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(database_error)?;
@@ -1448,9 +1575,9 @@ fn load_project_removal_managed_worktree_ids(
 }
 
 fn bound_ids<T>(mut ids: Vec<T>) -> BoundedIds<T> {
-    let truncated = ids.len() > MAX_PROJECT_REMOVAL_BLOCKER_IDS;
+    let truncated = ids.len() > MAX_REMOVAL_BLOCKER_IDS;
     let count = u32::try_from(ids.len()).unwrap_or(u32::MAX);
-    ids.truncate(MAX_PROJECT_REMOVAL_BLOCKER_IDS);
+    ids.truncate(MAX_REMOVAL_BLOCKER_IDS);
     BoundedIds {
         ids,
         count,
@@ -1500,6 +1627,61 @@ fn remove_project(connection: &mut Connection, expected: &ProjectRemovalState) -
     )?;
     transaction.commit().map_err(database_error)?;
     Ok(expected.project.clone())
+}
+
+fn delete_workspace(
+    connection: &mut Connection,
+    expected: &WorkspaceDeletionState,
+) -> Result<(Workspace, Option<Workspace>)> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let current = load_workspace_deletion_state(&transaction, expected.workspace.id)?;
+    if current != *expected || !current.is_deletable() {
+        return Err(DaemonError::Database(
+            "workspace deletion authorization is stale or Projects remain".into(),
+        ));
+    }
+    let changed = transaction
+        .execute(
+            "DELETE FROM workspaces WHERE id = ?1",
+            [expected.workspace.id.to_string()],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(DaemonError::Database(
+            "workspace deletion authorization is stale".into(),
+        ));
+    }
+    let opened = if let Some(fallback_id) = expected.fallback_workspace_id {
+        let now = now_millis();
+        transaction
+            .execute("UPDATE workspaces SET is_open = 0 WHERE is_open = 1", [])
+            .map_err(database_error)?;
+        let changed = transaction
+            .execute(
+                "UPDATE workspaces SET is_open = 1, last_opened_at = ?2, updated_at = ?2 \
+                 WHERE id = ?1",
+                params![fallback_id.to_string(), now],
+            )
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(DaemonError::Database(
+                "workspace deletion fallback changed".into(),
+            ));
+        }
+        Some(load_workspace(&transaction, fallback_id)?)
+    } else {
+        None
+    };
+    insert_entity_audit(
+        &transaction,
+        "workspace_deleted",
+        "workspace",
+        &expected.workspace.id.to_string(),
+    )?;
+    transaction.commit().map_err(database_error)?;
+    Ok((expected.workspace.clone(), opened))
 }
 
 fn insert_worktree(connection: &mut Connection, record: &NewManagedWorktree) -> Result<Worktree> {
@@ -2830,6 +3012,133 @@ mod tests {
                 .iter()
                 .any(|workspace| workspace.id == second.id && !workspace.is_open)
         );
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_deletion_revalidates_projects_and_selects_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("state.db");
+        let repository_path = directory.path().join("repository");
+        std::fs::create_dir(&repository_path).unwrap();
+        let repository = repository_path.to_string_lossy().into_owned();
+        let database = DatabaseHandle::open(&database_path).unwrap();
+        let (_, first) = database.add_workspace("First".into()).await.unwrap();
+        let (_, removable) = database.add_workspace("Removable".into()).await.unwrap();
+        let (_, recent) = database.add_workspace("Recent".into()).await.unwrap();
+
+        let stale = database
+            .workspace_deletion_state(removable.id)
+            .await
+            .unwrap();
+        let (_, project, _) = database
+            .add_project(RepositoryRegistration {
+                workspace_id: removable.id,
+                name: "repository".into(),
+                repository_path: repository.clone(),
+                canonical_repository_path: repository,
+                default_branch: Some("main".into()),
+                remote_url: None,
+                branch: Some("main".into()),
+                base_commit: "deadbeef".into(),
+            })
+            .await
+            .unwrap();
+        assert!(database.delete_workspace(stale.clone()).await.is_err());
+        let blocked = database
+            .workspace_deletion_state(removable.id)
+            .await
+            .unwrap();
+        assert_eq!(blocked.project_count, 1);
+        assert_eq!(blocked.project_ids, vec![project.id]);
+        let project_state = database.project_removal_state(project.id).await.unwrap();
+        database.remove_project(project_state).await.unwrap();
+        assert!(
+            database.delete_workspace(stale).await.is_err(),
+            "a Project registration invalidates confirmation even after membership is empty again"
+        );
+
+        database.open_workspace(recent.id).await.unwrap();
+        let removable_state = database
+            .workspace_deletion_state(removable.id)
+            .await
+            .unwrap();
+        let (_, deleted, opened) = database.delete_workspace(removable_state).await.unwrap();
+        assert_eq!(deleted.id, removable.id);
+        assert!(
+            opened.is_none(),
+            "deleting an inactive Workspace changes no navigation"
+        );
+
+        database.open_workspace(first.id).await.unwrap();
+        let first_state = database.workspace_deletion_state(first.id).await.unwrap();
+        assert_eq!(first_state.fallback_workspace_id, Some(recent.id));
+        let (revision, deleted, opened) = database.delete_workspace(first_state).await.unwrap();
+        assert_eq!(deleted.id, first.id);
+        assert_eq!(
+            opened.as_ref().map(|workspace| workspace.id),
+            Some(recent.id)
+        );
+        let snapshot = database.snapshot().await.unwrap();
+        assert_eq!(snapshot.revision, revision);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert!(snapshot.workspaces[0].is_open);
+
+        let final_state = database.workspace_deletion_state(recent.id).await.unwrap();
+        assert!(final_state.fallback_workspace_id.is_none());
+        let (_, _, opened) = database.delete_workspace(final_state).await.unwrap();
+        assert!(opened.is_none());
+        assert!(database.snapshot().await.unwrap().workspaces.is_empty());
+        database.shutdown().await.unwrap();
+
+        let connection = Connection::open(database_path).unwrap();
+        let audit_details: Vec<String> = connection
+            .prepare("SELECT details_json FROM audit_events WHERE action = 'workspace_deleted'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(audit_details, vec!["{}", "{}", "{}"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_project_registration_prevents_workspace_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
+        let (_, workspace) = database.add_workspace("Concurrent".into()).await.unwrap();
+        let stale = database
+            .workspace_deletion_state(workspace.id)
+            .await
+            .unwrap();
+        let repository = directory
+            .path()
+            .join("repository")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir(&repository).unwrap();
+        let registration = database.add_project(RepositoryRegistration {
+            workspace_id: workspace.id,
+            name: "repository".into(),
+            repository_path: repository.clone(),
+            canonical_repository_path: repository,
+            default_branch: Some("main".into()),
+            remote_url: None,
+            branch: Some("main".into()),
+            base_commit: "deadbeef".into(),
+        });
+        let deletion = database.delete_workspace(stale);
+        let (registered, deleted) = tokio::join!(biased; registration, deletion);
+        let (_, project, _) = registered.unwrap();
+        assert!(deleted.is_err());
+        let snapshot = database.snapshot().await.unwrap();
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .any(|value| value.id == workspace.id)
+        );
+        assert!(snapshot.projects.iter().any(|value| value.id == project.id));
         database.shutdown().await.unwrap();
     }
 
