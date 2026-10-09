@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use iced::keyboard::{self, Key, key::Named};
 use sylvops_core::domain::AttachmentRole;
 use sylvops_core::protocol::MAX_PTY_CHUNK_SIZE;
@@ -38,6 +40,32 @@ pub(crate) struct DisplayRun {
     pub style: TerminalStyle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayContext {
+    rows: u16,
+    columns: u16,
+    scrollback: usize,
+    alternate_screen: bool,
+    cursor_row: u16,
+    cursor_column: u16,
+    show_cursor: bool,
+    focused: bool,
+    cursor_style: DesktopTerminalCursor,
+}
+
+#[derive(Default)]
+struct CachedRow {
+    cells: Vec<Option<vt100::Cell>>,
+    occupied: bool,
+    runs: Vec<DisplayRun>,
+}
+
+#[derive(Default)]
+struct DisplayCache {
+    context: Option<DisplayContext>,
+    rows: Vec<CachedRow>,
+}
+
 pub(crate) struct TerminalState {
     pub role: AttachmentRole,
     pub parser: vt100::Parser,
@@ -49,6 +77,7 @@ pub(crate) struct TerminalState {
     scrollback_extent: usize,
     selection_anchor: Option<CellPosition>,
     selection_focus: Option<CellPosition>,
+    display_cache: RefCell<DisplayCache>,
 }
 
 impl TerminalState {
@@ -69,6 +98,7 @@ impl TerminalState {
             scrollback_extent: 0,
             selection_anchor: None,
             selection_focus: None,
+            display_cache: RefCell::new(DisplayCache::default()),
         }
     }
 
@@ -82,6 +112,7 @@ impl TerminalState {
         self.rows = rows;
         self.columns = columns;
         self.refresh_scrollback_extent();
+        self.invalidate_display_cache();
     }
 
     pub(crate) fn scroll_lines(&mut self, lines: f32) {
@@ -108,6 +139,7 @@ impl TerminalState {
             current.saturating_sub(whole_lines)
         };
         self.parser.screen_mut().set_scrollback(next);
+        self.invalidate_display_cache();
     }
 
     pub(crate) fn wheel_action(&mut self, lines: f32, row: u16, column: u16) -> WheelAction {
@@ -155,6 +187,7 @@ impl TerminalState {
         };
         self.parser.screen_mut().set_scrollback(next);
         self.scroll_fraction = 0.0;
+        self.invalidate_display_cache();
     }
 
     pub(crate) fn scroll_to_oldest(&mut self) {
@@ -162,6 +195,7 @@ impl TerminalState {
             .screen_mut()
             .set_scrollback(self.scrollback_extent);
         self.scroll_fraction = 0.0;
+        self.invalidate_display_cache();
     }
 
     pub(crate) fn set_scrollback_position(&mut self, rows: usize) {
@@ -203,11 +237,13 @@ impl TerminalState {
         let position = self.clamp_position(row, column);
         self.selection_anchor = Some(position);
         self.selection_focus = Some(position);
+        self.invalidate_display_cache();
     }
 
     pub(crate) fn update_selection(&mut self, row: u16, column: u16) {
         if self.selection_anchor.is_some() {
             self.selection_focus = Some(self.clamp_position(row, column));
+            self.invalidate_display_cache();
         }
     }
 
@@ -220,6 +256,7 @@ impl TerminalState {
     pub(crate) fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.selection_focus = None;
+        self.invalidate_display_cache();
     }
 
     pub(crate) fn selected_text(&self) -> Option<String> {
@@ -282,6 +319,10 @@ impl TerminalState {
             let position = CellPosition { row, column };
             position >= start && position <= end
         })
+    }
+
+    fn invalidate_display_cache(&self) {
+        self.display_cache.borrow_mut().context = None;
     }
 }
 
@@ -400,66 +441,184 @@ pub(crate) fn display_runs(
         && terminal.role == AttachmentRole::Controller
         && !terminal.is_scrolled_back()
         && !screen.hide_cursor();
-
-    let mut last_row = cursor_row;
-    for row in 0..terminal.rows {
-        if (0..terminal.columns).any(|column| {
-            terminal.is_selected(row, column)
-                || screen.cell(row, column).is_some_and(|cell| {
-                    cell.has_contents() || cell.bgcolor() != vt100::Color::Default
-                })
-        }) {
-            last_row = row;
-        }
+    let context = DisplayContext {
+        rows: terminal.rows,
+        columns: terminal.columns,
+        scrollback: screen.scrollback(),
+        alternate_screen: screen.alternate_screen(),
+        cursor_row,
+        cursor_column,
+        show_cursor,
+        focused,
+        cursor_style,
+    };
+    let mut cache = terminal.display_cache.borrow_mut();
+    let previous = cache.context;
+    let rebuild_all = previous.is_none_or(|previous| {
+        previous.rows != context.rows
+            || previous.columns != context.columns
+            || previous.scrollback != context.scrollback
+            || previous.alternate_screen != context.alternate_screen
+    });
+    if cache.rows.len() != usize::from(terminal.rows) {
+        cache
+            .rows
+            .resize_with(usize::from(terminal.rows), CachedRow::default);
+    }
+    let mut cursor_rows = [None, None];
+    if let Some(previous) = previous
+        && (previous.cursor_row != context.cursor_row
+            || previous.cursor_column != context.cursor_column
+            || previous.show_cursor != context.show_cursor
+            || previous.focused != context.focused
+            || previous.cursor_style != context.cursor_style)
+    {
+        cursor_rows = [
+            previous.show_cursor.then_some(previous.cursor_row),
+            context.show_cursor.then_some(context.cursor_row),
+        ];
     }
 
+    for row in 0..terminal.rows {
+        let cached = &cache.rows[usize::from(row)];
+        let cells_changed = cached.cells.len() != usize::from(terminal.columns)
+            || (0..terminal.columns).any(|column| {
+                cached.cells[usize::from(column)].as_ref() != screen.cell(row, column)
+            });
+        if rebuild_all || cells_changed || cursor_rows.contains(&Some(row)) {
+            let (runs, occupied) = display_row_runs(terminal, row, &context);
+            cache.rows[usize::from(row)] = CachedRow {
+                cells: (0..terminal.columns)
+                    .map(|column| screen.cell(row, column).cloned())
+                    .collect(),
+                occupied,
+                runs,
+            };
+        }
+    }
+    cache.context = Some(context);
+
+    let last_row = cache
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.occupied)
+        .map(|(row, _)| u16::try_from(row).expect("terminal row count fits in u16"))
+        .fold(cursor_row, u16::max)
+        .min(terminal.rows.saturating_sub(1));
     let mut runs = Vec::new();
-    for row in 0..=last_row.min(terminal.rows.saturating_sub(1)) {
-        let last_column = (0..terminal.columns)
-            .rfind(|column| {
-                (show_cursor && row == cursor_row && *column == cursor_column)
-                    || terminal.is_selected(row, *column)
-                    || screen.cell(row, *column).is_some_and(|cell| {
-                        cell.has_contents() || cell.bgcolor() != vt100::Color::Default
-                    })
-            })
-            .unwrap_or(0);
-        for column in 0..=last_column {
-            let cell = screen.cell(row, column);
-            if cell.is_some_and(vt100::Cell::is_wide_continuation) {
-                continue;
-            }
-            let cursor = show_cursor && row == cursor_row && column == cursor_column;
-            let text = if cursor {
-                match (cursor_style, focused) {
-                    (DesktopTerminalCursor::Block, true) => "█",
-                    (DesktopTerminalCursor::Block, false) => "▯",
-                    (DesktopTerminalCursor::Line, true) => "│",
-                    (DesktopTerminalCursor::Line, false) => "┆",
-                }
-            } else if let Some(cell) = cell.filter(|cell| cell.has_contents()) {
-                cell.contents()
-            } else {
-                " "
-            };
-            let style = TerminalStyle {
-                foreground: cell.map_or(vt100::Color::Default, vt100::Cell::fgcolor),
-                background: cell.map_or(vt100::Color::Default, vt100::Cell::bgcolor),
-                bold: cell.is_some_and(vt100::Cell::bold),
-                dim: cell.is_some_and(vt100::Cell::dim),
-                italic: cell.is_some_and(vt100::Cell::italic),
-                underline: cell.is_some_and(vt100::Cell::underline),
-                inverse: cell.is_some_and(vt100::Cell::inverse),
-                selected: terminal.is_selected(row, column),
-                cursor: cursor && focused,
-            };
-            push_run(&mut runs, text, style);
+    for row in 0..=last_row {
+        for run in &cache.rows[usize::from(row)].runs {
+            push_run(&mut runs, &run.text, run.style);
         }
         if row < last_row {
             push_run(&mut runs, "\n", TerminalStyle::default());
         }
     }
     runs
+}
+
+#[cfg(test)]
+pub(crate) fn display_runs_uncached(
+    terminal: &TerminalState,
+    focused: bool,
+    cursor_style: DesktopTerminalCursor,
+) -> Vec<DisplayRun> {
+    let screen = terminal.parser.screen();
+    let (cursor_row, cursor_column) = screen.cursor_position();
+    let context = DisplayContext {
+        rows: terminal.rows,
+        columns: terminal.columns,
+        scrollback: screen.scrollback(),
+        alternate_screen: screen.alternate_screen(),
+        cursor_row,
+        cursor_column,
+        show_cursor: terminal.attached
+            && terminal.role == AttachmentRole::Controller
+            && !terminal.is_scrolled_back()
+            && !screen.hide_cursor(),
+        focused,
+        cursor_style,
+    };
+    let last_row = (0..terminal.rows)
+        .filter(|row| {
+            (0..terminal.columns).any(|column| {
+                terminal.is_selected(*row, column)
+                    || screen.cell(*row, column).is_some_and(|cell| {
+                        cell.has_contents() || cell.bgcolor() != vt100::Color::Default
+                    })
+            })
+        })
+        .fold(cursor_row, u16::max)
+        .min(terminal.rows.saturating_sub(1));
+    let mut runs = Vec::new();
+    for row in 0..=last_row {
+        let (row_runs, _) = display_row_runs(terminal, row, &context);
+        for run in row_runs {
+            push_run(&mut runs, &run.text, run.style);
+        }
+        if row < last_row {
+            push_run(&mut runs, "\n", TerminalStyle::default());
+        }
+    }
+    runs
+}
+
+fn display_row_runs(
+    terminal: &TerminalState,
+    row: u16,
+    context: &DisplayContext,
+) -> (Vec<DisplayRun>, bool) {
+    let screen = terminal.parser.screen();
+    let occupied = (0..terminal.columns).any(|column| {
+        terminal.is_selected(row, column)
+            || screen
+                .cell(row, column)
+                .is_some_and(|cell| cell.has_contents() || cell.bgcolor() != vt100::Color::Default)
+    });
+    let last_column = (0..terminal.columns)
+        .rfind(|column| {
+            (context.show_cursor && row == context.cursor_row && *column == context.cursor_column)
+                || terminal.is_selected(row, *column)
+                || screen.cell(row, *column).is_some_and(|cell| {
+                    cell.has_contents() || cell.bgcolor() != vt100::Color::Default
+                })
+        })
+        .unwrap_or(0);
+    let mut runs = Vec::new();
+    for column in 0..=last_column {
+        let cell = screen.cell(row, column);
+        if cell.is_some_and(vt100::Cell::is_wide_continuation) {
+            continue;
+        }
+        let cursor =
+            context.show_cursor && row == context.cursor_row && column == context.cursor_column;
+        let text = if cursor {
+            match (context.cursor_style, context.focused) {
+                (DesktopTerminalCursor::Block, true) => "█",
+                (DesktopTerminalCursor::Block, false) => "▯",
+                (DesktopTerminalCursor::Line, true) => "│",
+                (DesktopTerminalCursor::Line, false) => "┆",
+            }
+        } else if let Some(cell) = cell.filter(|cell| cell.has_contents()) {
+            cell.contents()
+        } else {
+            " "
+        };
+        let style = TerminalStyle {
+            foreground: cell.map_or(vt100::Color::Default, vt100::Cell::fgcolor),
+            background: cell.map_or(vt100::Color::Default, vt100::Cell::bgcolor),
+            bold: cell.is_some_and(vt100::Cell::bold),
+            dim: cell.is_some_and(vt100::Cell::dim),
+            italic: cell.is_some_and(vt100::Cell::italic),
+            underline: cell.is_some_and(vt100::Cell::underline),
+            inverse: cell.is_some_and(vt100::Cell::inverse),
+            selected: terminal.is_selected(row, column),
+            cursor: cursor && context.focused,
+        };
+        push_run(&mut runs, text, style);
+    }
+    (runs, occupied)
 }
 
 fn push_run(runs: &mut Vec<DisplayRun>, text: &str, style: TerminalStyle) {
@@ -492,6 +651,17 @@ fn display_contents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_cached_matches_uncached(
+        terminal: &TerminalState,
+        focused: bool,
+        cursor_style: DesktopTerminalCursor,
+    ) {
+        assert_eq!(
+            display_runs(terminal, focused, cursor_style),
+            display_runs_uncached(terminal, focused, cursor_style)
+        );
+    }
 
     #[test]
     fn detach_is_reserved_outside_encoder_and_navigation_is_encoded() {
@@ -587,6 +757,48 @@ mod tests {
             run.text == "error" && run.style.bold && run.style.foreground == vt100::Color::Idx(1)
         }));
         assert!(runs.iter().any(|run| run.text.contains("plain")));
+    }
+
+    #[test]
+    fn cached_and_uncached_rendering_match_across_terminal_invalidation_boundaries() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 4, 16, 100);
+        terminal.process("\x1b[1;31mred 界\x1b[0m\r\nplain".as_bytes());
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+
+        terminal.process(b"\x1b[1;1H\x1b[3;34;46mX\x1b[0m\x1b[2;3H");
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+        assert_cached_matches_uncached(&terminal, false, DesktopTerminalCursor::Line);
+
+        terminal.begin_selection(0, 0);
+        terminal.update_selection(1, 4);
+        terminal.finish_selection();
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Line);
+        assert!(
+            display_runs(&terminal, true, DesktopTerminalCursor::Line)
+                .iter()
+                .any(|run| run.style.selected)
+        );
+
+        terminal.process(b"\r\none\r\ntwo\r\nthree\r\nfour");
+        terminal.scroll_lines(2.0);
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+        terminal.scroll_page(-1);
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+        terminal.scroll_to_oldest();
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+        terminal.set_scrollback_position(0);
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+
+        terminal.resize(6, 20);
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+        terminal.process(b"\x1b[?1049h\x1b[2J\x1b[1;1H\x1b[7;35malt\x1b[0m");
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+        terminal.process(b"\x1b[?1049l");
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
+
+        terminal.attached = false;
+        assert_cached_matches_uncached(&terminal, true, DesktopTerminalCursor::Block);
     }
 
     #[test]
