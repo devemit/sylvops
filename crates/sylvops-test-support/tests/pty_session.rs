@@ -1,12 +1,22 @@
+#![allow(unsafe_code)]
+
 use std::{
     ffi::OsString,
     fs,
     path::Path,
+    process::Command,
     time::{Duration, Instant},
 };
 
+use sylvops_core::{
+    domain::ProviderKind,
+    protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+};
 use sylvops_daemon::{
     DaemonError,
+    client::DaemonClient,
+    daemon,
+    runtime::RuntimePaths,
     session::{SessionHandle, SessionSpec},
 };
 
@@ -93,12 +103,75 @@ async fn session_accepts_input_and_replays_after_detach() {
     assert_eq!(exit.exit_code, 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fake_provider_preserves_two_hundred_tagged_inputs_and_reports_echo_latency() {
-    let mut session =
-        SessionHandle::spawn(&spec(["interactive"], 256 * 1024)).expect("spawn fake agent");
-    wait_for_output(&session, "FAKE_AGENT_READY").await;
-    let mut output = session.subscribe();
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let repository = temporary.path().join("repository");
+    initialize_repository(&repository);
+    let bin_directory = temporary.path().join("bin");
+    fs::create_dir(&bin_directory).expect("fake provider bin directory");
+    let fake_codex = install_fake_codex(&bin_directory);
+    let _codex_cli_path = EnvironmentGuard::set("CODEX_CLI_PATH", fake_codex);
+    let _codex_home = EnvironmentGuard::set("CODEX_HOME", temporary.path().join("codex-home"));
+
+    let paths = RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("paths");
+    let daemon_paths = paths.clone();
+    let mut daemon_task = tokio::spawn(async move { daemon::run(daemon_paths).await });
+    let client = tokio::select! {
+        result = &mut daemon_task => panic!("daemon exited before connection: {result:?}"),
+        client = connect_eventually(&paths) => client,
+    };
+    let workspace_id = match client
+        .request(&ClientRequest::AddWorkspace {
+            name: "terminal-latency".into(),
+        })
+        .await
+        .expect("workspace response")
+    {
+        DaemonResponse::WorkspaceAdded { workspace, .. } => workspace.id,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let worktree_id = match client
+        .request(&ClientRequest::AddProject {
+            workspace_id,
+            repository_path: repository.to_string_lossy().into_owned(),
+        })
+        .await
+        .expect("project response")
+    {
+        DaemonResponse::ProjectAdded { root_worktree, .. } => root_worktree.id,
+        response => panic!("unexpected project response: {response:?}"),
+    };
+    let mut output = client.subscribe();
+    let session_id = match client
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Codex,
+            display_name: Some("IPC latency".into()),
+            model: None,
+            effort: None,
+            initial_prompt: None,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("session response")
+    {
+        DaemonResponse::SessionCreated { session, .. } => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    assert!(matches!(
+        client
+            .request(&ClientRequest::AttachSession {
+                session_id,
+                from_sequence: 0,
+                columns: 80,
+                rows: 24,
+            })
+            .await
+            .expect("attach response"),
+        DaemonResponse::Attached { .. }
+    ));
     let mut observed = String::new();
     let mut latencies = Vec::with_capacity(200);
     let mut echoes = Vec::with_capacity(200);
@@ -106,12 +179,32 @@ async fn fake_provider_preserves_two_hundred_tagged_inputs_and_reports_echo_late
     tokio::time::timeout(TEST_TIMEOUT, async {
         for index in 0..200 {
             let tag = format!("SYLVOPS_INPUT_{index:03}");
-            let expected = format!("ECHO:{tag}");
+            let expected = format!("FAKE_CODEX_ECHO={tag}");
             let started = Instant::now();
-            session.input(input_line(&tag)).await.expect("tagged input");
+            assert!(matches!(
+                client
+                    .request(&ClientRequest::SessionInput {
+                        session_id,
+                        bytes: input_line(&tag),
+                    })
+                    .await
+                    .expect("tagged IPC input"),
+                DaemonResponse::Acknowledged
+            ));
             loop {
-                let chunk = output.recv().await.expect("fake-provider output");
-                observed.push_str(&String::from_utf8_lossy(&chunk.bytes));
+                let event = output.recv().await.expect("fake-provider output");
+                let DaemonEvent::SessionOutput {
+                    session_id: output_session_id,
+                    bytes,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if output_session_id != session_id {
+                    continue;
+                }
+                observed.push_str(&String::from_utf8_lossy(&bytes));
                 if observed.len() > TAGGED_ECHO_BUFFER_BYTES {
                     let mut keep_from = observed.len() - TAGGED_ECHO_BUFFER_BYTES;
                     while !observed.is_char_boundary(keep_from) {
@@ -133,24 +226,36 @@ async fn fake_provider_preserves_two_hundred_tagged_inputs_and_reports_echo_late
 
     assert_eq!(echoes.len(), 200);
     for (index, echo) in echoes.iter().enumerate() {
-        assert_eq!(echo, &format!("ECHO:SYLVOPS_INPUT_{index:03}"));
+        assert_eq!(echo, &format!("FAKE_CODEX_ECHO=SYLVOPS_INPUT_{index:03}"));
     }
     latencies.sort_unstable();
     let p95 = latencies[latencies.len() * 95 / 100];
     let maximum = *latencies.last().expect("echo latencies");
     println!(
-        "fake_provider_echo samples={} p95_us={} max_us={}",
+        "fake_provider_ipc_echo samples={} p95_us={} max_us={}",
         latencies.len(),
         p95.as_micros(),
         maximum.as_micros()
     );
 
-    session.input(input_line("exit")).await.expect("exit input");
-    let exit = tokio::time::timeout(TEST_TIMEOUT, session.wait())
+    assert!(matches!(
+        client
+            .request(&ClientRequest::SessionInput {
+                session_id,
+                bytes: input_line("finish"),
+            })
+            .await
+            .expect("finish input"),
+        DaemonResponse::Acknowledged
+    ));
+    client
+        .request(&ClientRequest::ShutdownDaemon)
         .await
-        .expect("tagged session exit timeout")
-        .expect("tagged session wait");
-    assert_eq!(exit.exit_code, 0);
+        .expect("shutdown response");
+    daemon_task
+        .await
+        .expect("daemon task")
+        .expect("daemon exit");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -344,4 +449,80 @@ async fn wait_for_file(path: &Path) {
     })
     .await
     .expect("heartbeat file was not created");
+}
+
+async fn connect_eventually(paths: &RuntimePaths) -> DaemonClient {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Ok(client) = DaemonClient::connect(paths, "terminal-latency-smoke").await {
+                return client;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon connection timeout")
+}
+
+fn install_fake_codex(directory: &Path) -> std::path::PathBuf {
+    let target = directory.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+    let source = std::env::var_os("SYLVOPS_TEST_FAKE_CODEX").map_or_else(
+        || std::path::PathBuf::from(env!("CARGO_BIN_EXE_fake-codex")),
+        std::path::PathBuf::from,
+    );
+    fs::copy(source, &target).expect("copy fake Codex");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&target).expect("fake metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&target, permissions).expect("fake executable permissions");
+    }
+    target
+}
+
+fn initialize_repository(path: &Path) {
+    fs::create_dir(path).expect("repository directory");
+    run_git(path, &["init", "--initial-branch=main"]);
+    run_git(path, &["config", "user.name", "SylvOps Test"]);
+    run_git(path, &["config", "user.email", "sylvops@example.invalid"]);
+    fs::write(path.join("README.md"), "fixture\n").expect("fixture file");
+    run_git(path, &["add", "README.md"]);
+    run_git(path, &["commit", "-m", "fixture"]);
+}
+
+fn run_git(path: &Path, arguments: &[&str]) {
+    let status = Command::new("git")
+        .args(arguments)
+        .current_dir(path)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {arguments:?} failed");
+}
+
+struct EnvironmentGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvironmentGuard {
+    fn set(name: &'static str, value: impl Into<OsString>) -> Self {
+        let previous = std::env::var_os(name);
+        // SAFETY: this integration-test process owns and restores its environment changes.
+        unsafe { std::env::set_var(name, value.into()) };
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvironmentGuard {
+    fn drop(&mut self) {
+        // SAFETY: this integration-test process owns and restores its environment changes.
+        unsafe {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
 }

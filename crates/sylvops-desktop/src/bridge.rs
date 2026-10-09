@@ -750,6 +750,8 @@ mod tests {
         batches: Mutex<Vec<Vec<u8>>>,
     }
 
+    struct DisconnectedInputTransport;
+
     impl TerminalInputTransport for RecordingInputTransport {
         fn send_terminal_input(
             &self,
@@ -759,6 +761,64 @@ mod tests {
             self.batches.lock().expect("batch lock").push(bytes);
             std::future::ready(Ok(DaemonResponse::Acknowledged))
         }
+    }
+
+    impl TerminalInputTransport for DisconnectedInputTransport {
+        fn send_terminal_input(
+            &self,
+            _session_id: SessionId,
+            _bytes: Vec<u8>,
+        ) -> impl Future<Output = Result<DaemonResponse, String>> {
+            std::future::ready(Err(format!("connection closed\n{}", "x".repeat(1_024))))
+        }
+    }
+
+    #[test]
+    fn terminal_input_queue_reports_saturation_and_closed_receivers() {
+        let (bridge, harness) = Bridge::harness();
+        let session_id = SessionId::new();
+        for _ in 0..COMMAND_CAPACITY {
+            bridge
+                .terminal_input(session_id, vec![b'x'])
+                .expect("bounded input slot");
+        }
+        assert_eq!(
+            bridge.terminal_input(session_id, vec![b'y']),
+            Err(TerminalInputError::Saturated)
+        );
+        drop(harness);
+        assert_eq!(
+            bridge.terminal_input(session_id, vec![b'z']),
+            Err(TerminalInputError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_input_transport_emits_bounded_persistent_feedback() {
+        let (bridge, harness) = Bridge::harness();
+        let (_commands, mut command_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let session_id = SessionId::new();
+
+        let next = send_terminal_input_batch(
+            &DisconnectedInputTransport,
+            &harness.events,
+            &mut command_rx,
+            session_id,
+            vec![b'x'],
+        )
+        .await;
+
+        assert!(matches!(next, NextCommand::InputFailed));
+        assert!(matches!(
+            bridge.drain(1).as_slice(),
+            [BridgeEvent::Error {
+                operation: Some(Operation::Input(id)),
+                message,
+            }] if *id == session_id
+                && message.starts_with("terminal input transport failed")
+                && !message.contains('\n')
+                && message.chars().count() <= 620
+        ));
     }
 
     #[tokio::test]
