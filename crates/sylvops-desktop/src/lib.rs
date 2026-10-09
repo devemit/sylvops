@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bridge::{Bridge, BridgeEvent, Operation};
+use bridge::{Bridge, BridgeEvent, Operation, TerminalInputError};
 use chrono::{DateTime, Local, Locale};
 use forms::{
     Confirmation, DataRemovalConfirmation, FirstRunStepState, FormModal, Modal, first_run_steps,
@@ -410,7 +410,10 @@ enum Message {
     TerminalPointerMoved(Point),
     TerminalSelectionStarted,
     TerminalSelectionEnded,
-    TerminalPaste(Option<String>),
+    TerminalPaste {
+        session_id: SessionId,
+        contents: Option<String>,
+    },
     ScrollTerminal(mouse::ScrollDelta),
     SetTerminalScrollback(u32),
     LatestTerminal,
@@ -605,7 +608,7 @@ impl DesktopApp {
                 self.mark_state_dirty();
             }
             Message::CloseSessionTab(session_id) => {
-                self.terminal_focus = TerminalFocus::Unfocused;
+                self.unfocus_terminal();
                 if self
                     .terminals
                     .get(&session_id)
@@ -629,7 +632,7 @@ impl DesktopApp {
             Message::SelectMainTab(tab) => self.select_main_tab(tab),
             Message::NewWorkspace => {
                 self.inline_navigator_rename = None;
-                self.terminal_focus = TerminalFocus::Unfocused;
+                self.unfocus_terminal();
                 self.modal = Some(Modal::Form(if self.snapshot.workspaces.is_empty() {
                     FormModal::first_run(Form::workspace())
                 } else {
@@ -669,7 +672,10 @@ impl DesktopApp {
             Message::TerminalPointerMoved(point) => self.move_terminal_pointer(point),
             Message::TerminalSelectionStarted => self.start_terminal_selection(),
             Message::TerminalSelectionEnded => self.finish_terminal_selection(),
-            Message::TerminalPaste(contents) => self.paste_terminal(contents),
+            Message::TerminalPaste {
+                session_id,
+                contents,
+            } => self.paste_terminal(session_id, contents),
             Message::ScrollTerminal(delta) => self.scroll_terminal(delta),
             Message::SetTerminalScrollback(position) => {
                 self.set_terminal_scrollback(position);
@@ -772,7 +778,7 @@ impl DesktopApp {
             }
             Message::SelectCompactPanel(panel) => {
                 self.inline_navigator_rename = None;
-                self.terminal_focus = TerminalFocus::Unfocused;
+                self.unfocus_terminal();
                 self.keyboard_panel = panel;
                 self.desktop_state.compact_panel = panel;
                 self.pending_navigator_reveal = Some(panel);
@@ -780,7 +786,7 @@ impl DesktopApp {
             }
             Message::ToggleNavigator => {
                 self.inline_navigator_rename = None;
-                self.terminal_focus = TerminalFocus::Unfocused;
+                self.unfocus_terminal();
                 self.navigator_visibility = match self.navigator_visibility {
                     NavigatorVisibility::Shown => NavigatorVisibility::Collapsed,
                     NavigatorVisibility::Collapsed => NavigatorVisibility::Shown,
@@ -811,13 +817,13 @@ impl DesktopApp {
                 }
             }
             Message::ShowNarrowNavigator => {
-                self.terminal_focus = TerminalFocus::Unfocused;
+                self.unfocus_terminal();
                 self.narrow_main = false;
                 self.pending_navigator_reveal = Some(self.keyboard_panel);
             }
             Message::ShowNarrowMain => {
                 self.inline_navigator_rename = None;
-                self.terminal_focus = TerminalFocus::Unfocused;
+                self.unfocus_terminal();
                 self.narrow_main = true;
             }
             Message::ClearError => self.error = None,
@@ -2670,6 +2676,10 @@ impl DesktopApp {
             }
             BridgeEvent::Error { operation, message } => {
                 let message = bounded_redacted_diagnostic(&message);
+                if matches!(operation, Some(Operation::Input(_))) {
+                    self.terminal_focus = TerminalFocus::Unfocused;
+                    self.terminal_selection_state = TerminalSelectionState::Idle;
+                }
                 if let Some(Operation::Resume(session_id)) = operation {
                     self.resume_pending.remove(&session_id);
                 }
@@ -2746,6 +2756,8 @@ impl DesktopApp {
             },
             BridgeEvent::Closed => {
                 self.connection = ConnectionState::Disconnected;
+                self.terminal_focus = TerminalFocus::Unfocused;
+                self.terminal_selection_state = TerminalSelectionState::Idle;
                 self.error = Some("The daemon connection closed. Sessions remain daemon-owned; reopen SylvOps or restart the daemon.".into());
             }
         }
@@ -2946,12 +2958,6 @@ impl DesktopApp {
                 } else {
                     diff.text
                 });
-            }
-            (Operation::Input(session_id), DaemonResponse::Acknowledged) => {
-                if !self.terminals.contains_key(&session_id) {
-                    self.error =
-                        Some("Terminal input was acknowledged after the tab closed.".into());
-                }
             }
             (Operation::Resize, DaemonResponse::Acknowledged)
             | (Operation::PrepareDataRemoval, DaemonResponse::DataRemovalPrepared) => {}
@@ -3175,6 +3181,48 @@ impl DesktopApp {
         }
     }
 
+    fn queue_terminal_input(&mut self, session_id: SessionId, bytes: Vec<u8>) {
+        if let Err(error) = self.bridge.terminal_input(session_id, bytes) {
+            self.terminal_focus = TerminalFocus::Unfocused;
+            self.terminal_selection_state = TerminalSelectionState::Idle;
+            self.report_terminal_input_rejection(error);
+        }
+    }
+
+    fn report_terminal_input_rejection(&mut self, error: TerminalInputError) {
+        let detail = match error {
+            TerminalInputError::Saturated => {
+                "the bounded input queue is full; input focus was cleared before the rejected bytes could be accepted"
+            }
+            TerminalInputError::Closed => {
+                "the input transport is closed; input focus was cleared and no bytes were accepted"
+            }
+            TerminalInputError::Oversized => {
+                "the input exceeded the protocol byte limit; input focus was cleared and no bytes were accepted"
+            }
+        };
+        self.error = Some(bounded_redacted_diagnostic(&format!(
+            "Terminal input: {detail}"
+        )));
+    }
+
+    fn report_terminal_input_flush_failure(&mut self, error: TerminalInputError) {
+        let detail = match error {
+            TerminalInputError::Saturated => {
+                "the bounded input queue is full; input focus was cleared and the queued input will retain its existing byte/time flush boundary"
+            }
+            TerminalInputError::Closed => {
+                "the input transport closed before the pending input boundary could be queued; input focus was cleared"
+            }
+            TerminalInputError::Oversized => {
+                "an invalid oversized input boundary was rejected; input focus was cleared"
+            }
+        };
+        self.error = Some(bounded_redacted_diagnostic(&format!(
+            "Terminal input: {detail}"
+        )));
+    }
+
     fn send_install_request(&mut self, confirmed_active_sessions: Vec<SessionId>) {
         self.install_request = if self.bridge.request(
             Operation::InstallUpdate,
@@ -3246,7 +3294,13 @@ impl DesktopApp {
                 Some(selected.map_or_else(Task::none, clipboard::write))
             }
             Key::Character(value) if value.eq_ignore_ascii_case("v") => {
-                Some(clipboard::read().map(Message::TerminalPaste))
+                let session_id = self.active_session_id?;
+                Some(
+                    clipboard::read().map(move |contents| Message::TerminalPaste {
+                        session_id,
+                        contents,
+                    }),
+                )
             }
             _ => None,
         }
@@ -3271,21 +3325,23 @@ impl DesktopApp {
         }
         if self.terminal_focus.is_focused() {
             let Some(session_id) = self.active_session_id else {
-                self.terminal_focus = TerminalFocus::Unfocused;
+                self.unfocus_terminal();
                 return;
             };
-            let Some(terminal) = self.terminals.get_mut(&session_id) else {
-                self.terminal_focus = TerminalFocus::Unfocused;
-                return;
-            };
-            if !terminal.attached || terminal.role != AttachmentRole::Controller {
-                self.terminal_focus = TerminalFocus::Unfocused;
+            if !self.terminals.get(&session_id).is_some_and(|terminal| {
+                terminal.attached && terminal.role == AttachmentRole::Controller
+            }) {
+                self.unfocus_terminal();
                 return;
             }
             if modifiers.control() && matches!(key.as_ref(), Key::Character("]")) {
                 self.detach_active();
                 return;
             }
+            let terminal = self
+                .terminals
+                .get_mut(&session_id)
+                .expect("validated terminal must remain available during one UI update");
             if modifiers.shift() {
                 match key.as_ref() {
                     Key::Named(Named::PageUp) => {
@@ -3311,10 +3367,7 @@ impl DesktopApp {
                 return;
             };
             terminal.prepare_for_input();
-            self.send_request(
-                Operation::Input(session_id),
-                ClientRequest::SessionInput { session_id, bytes },
-            );
+            self.queue_terminal_input(session_id, bytes);
             return;
         }
 
@@ -3512,7 +3565,7 @@ impl DesktopApp {
 
     fn open_settings(&mut self) {
         self.inline_navigator_rename = None;
-        self.terminal_focus = TerminalFocus::Unfocused;
+        self.unfocus_terminal();
         self.disclosures.classic_themes = false;
         self.disclosures.settings_theme_focus =
             theme_gallery_index(self.desktop_state.theme).min(FEATURED_THEME_COUNT - 1);
@@ -3588,7 +3641,7 @@ impl DesktopApp {
     }
 
     fn shortcut_new(&mut self) {
-        self.terminal_focus = TerminalFocus::Unfocused;
+        self.unfocus_terminal();
         match self.keyboard_panel {
             DesktopPanel::Projects => self.open_project_form(),
             DesktopPanel::Worktrees => self.open_worktree_form(),
@@ -3597,12 +3650,12 @@ impl DesktopApp {
     }
 
     fn shortcut_rename(&mut self) {
-        self.terminal_focus = TerminalFocus::Unfocused;
+        self.unfocus_terminal();
         let _ = self.begin_selected_navigator_rename();
     }
 
     fn shortcut_delete(&mut self) {
-        self.terminal_focus = TerminalFocus::Unfocused;
+        self.unfocus_terminal();
         match self.keyboard_panel {
             DesktopPanel::Projects => {
                 self.error = Some("Repository removal is intentionally unavailable.".into());
@@ -3632,6 +3685,7 @@ impl DesktopApp {
     }
 
     fn open_project_form(&mut self) {
+        self.unfocus_terminal();
         self.inline_navigator_rename = None;
         let Some(workspace_id) = self.active_workspace().map(|workspace| workspace.id) else {
             self.error = Some("Create a workspace before registering a repository.".into());
@@ -3656,6 +3710,7 @@ impl DesktopApp {
     }
 
     fn open_worktree_form(&mut self) {
+        self.unfocus_terminal();
         self.inline_navigator_rename = None;
         let Some(project_id) = self.selected_project_id else {
             self.error = Some("Select a repository before creating a checkout.".into());
@@ -3666,6 +3721,7 @@ impl DesktopApp {
     }
 
     fn open_session_form(&mut self) {
+        self.unfocus_terminal();
         self.inline_navigator_rename = None;
         let Some(worktree_id) = self.selected_worktree_id else {
             self.error = Some("Select a checkout before starting a session.".into());
@@ -3718,7 +3774,7 @@ impl DesktopApp {
         let input_id = rename.input_id.clone();
         self.inline_navigator_rename = Some(rename);
         self.narrow_main = false;
-        self.terminal_focus = TerminalFocus::Unfocused;
+        self.unfocus_terminal();
         Task::batch([
             self.take_navigator_reveal_task(),
             widget::operation::focus(input_id.clone()),
@@ -3957,6 +4013,7 @@ impl DesktopApp {
             ));
             return;
         }
+        self.unfocus_terminal();
         self.modal = Some(Modal::Confirmation(Confirmation::StopSession {
             session_name: session.display_name.clone(),
             cwd: session.cwd.clone(),
@@ -3964,6 +4021,7 @@ impl DesktopApp {
     }
 
     fn open_data_removal_confirmation(&mut self) {
+        self.unfocus_terminal();
         self.modal = Some(Modal::DataRemoval(DataRemovalConfirmation::default()));
         self.modal_focus = ModalFocus::Pending;
     }
@@ -4081,7 +4139,7 @@ impl DesktopApp {
     }
 
     fn detach_active(&mut self) {
-        self.terminal_focus = TerminalFocus::Unfocused;
+        self.unfocus_terminal();
         if let Some(session_id) = self.active_session_id {
             self.send_request(
                 Operation::Detach(session_id),
@@ -4113,8 +4171,12 @@ impl DesktopApp {
     }
 
     fn unfocus_terminal(&mut self) {
+        let was_focused = self.terminal_focus.is_focused();
         self.terminal_focus = TerminalFocus::Unfocused;
         self.terminal_selection_state = TerminalSelectionState::Idle;
+        if was_focused && let Err(error) = self.bridge.flush_terminal_input() {
+            self.report_terminal_input_flush_failure(error);
+        }
     }
 
     fn move_terminal_pointer(&mut self, point: Point) {
@@ -4172,13 +4234,17 @@ impl DesktopApp {
         }
     }
 
-    fn paste_terminal(&mut self, contents: Option<String>) {
+    fn paste_terminal(&mut self, session_id: SessionId, contents: Option<String>) {
         let Some(contents) = contents.filter(|contents| !contents.is_empty()) else {
             return;
         };
-        let Some(session_id) = self.active_session_id else {
+        if self.active_session_id != Some(session_id) || !self.terminal_focus.is_focused() {
+            self.error = Some(
+                "Terminal input: paste cancelled because the active input target changed while reading the clipboard."
+                    .into(),
+            );
             return;
-        };
+        }
         let Some(terminal) = self.terminals.get_mut(&session_id) else {
             return;
         };
@@ -4187,10 +4253,7 @@ impl DesktopApp {
         }
         let bytes = encode_terminal_paste(&contents, terminal.parser.screen().bracketed_paste());
         terminal.prepare_for_input();
-        self.send_request(
-            Operation::Input(session_id),
-            ClientRequest::SessionInput { session_id, bytes },
-        );
+        self.queue_terminal_input(session_id, bytes);
     }
 
     fn scroll_terminal(&mut self, delta: mouse::ScrollDelta) {
@@ -4216,10 +4279,11 @@ impl DesktopApp {
             terminal.wheel_action(lines, row, column)
         });
         match action {
-            Some(WheelAction::Application(bytes)) if !bytes.is_empty() => self.send_request(
-                Operation::Input(session_id),
-                ClientRequest::SessionInput { session_id, bytes },
-            ),
+            Some(WheelAction::Application(bytes))
+                if !bytes.is_empty() && self.terminal_focus.is_focused() =>
+            {
+                self.queue_terminal_input(session_id, bytes);
+            }
             Some(WheelAction::Local) => {
                 if let Some(terminal) = self.terminals.get_mut(&session_id) {
                     terminal.clear_selection();
@@ -4344,6 +4408,7 @@ impl DesktopApp {
 
     fn begin_close(&mut self) {
         if self.closing_since.is_none() {
+            self.unfocus_terminal();
             let now = Instant::now();
             self.closing_since = Some(now);
             self.state_dirty_at = Some(now.checked_sub(SAVE_DEBOUNCE).unwrap_or(now));
