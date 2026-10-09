@@ -1637,11 +1637,7 @@ impl DesktopApp {
                     "This session is no longer running. Details are retained, but terminal output is not persisted.",
                 ));
             }
-            return observed_terminal_viewport(centered_action(
-                "Session ready. Open its terminal to begin.",
-                "Open terminal",
-                Message::Attach,
-            ));
+            return observed_terminal_viewport(open_terminal_action(presentation.density));
         };
         let scrollback_rows = terminal.scrollback_rows();
         let role = if scrollback_rows > 0 {
@@ -1968,7 +1964,7 @@ impl DesktopApp {
         match modal {
             Modal::Settings => self.settings_view(),
             Modal::Shortcuts => Self::shortcuts_view(self.presentation().density),
-            Modal::Form(form) => Self::form_view(form),
+            Modal::Form(form) => Self::form_view(form, self.presentation().density),
             Modal::Confirmation(confirmation) => Self::confirmation_view(confirmation),
             Modal::DataRemoval(confirmation) => Self::data_removal_view(confirmation),
         }
@@ -2281,7 +2277,7 @@ impl DesktopApp {
         .into()
     }
 
-    fn form_view(modal: &FormModal) -> Element<'_, Message> {
+    fn form_view(modal: &FormModal, density: DensityMetrics) -> Element<'_, Message> {
         let form = &modal.form;
         let mut fields = column![].spacing(10);
         if modal.first_run {
@@ -2327,6 +2323,14 @@ impl DesktopApp {
                 .is_some_and(|provider| provider.kind == kind)
         });
         let submit = form_submit_label(form, modal.pending, selected_provider_checking);
+        let mut submit_button = button(submit)
+            .on_press_maybe(
+                (!modal.pending && !selected_provider_checking).then_some(Message::SubmitForm),
+            )
+            .style(primary_action_style);
+        if form.is_session() {
+            submit_button = submit_button.height(density.control_height);
+        }
         container(
             column![
                 text(&form.title).font(UI_SEMIBOLD).size(22),
@@ -2335,12 +2339,7 @@ impl DesktopApp {
                     space::horizontal(),
                     button("Cancel")
                         .on_press_maybe((!modal.pending).then_some(Message::CancelModal)),
-                    button(submit)
-                        .on_press_maybe(
-                            (!modal.pending && !selected_provider_checking)
-                                .then_some(Message::SubmitForm),
-                        )
-                        .style(primary_action_style),
+                    submit_button,
                 ]
                 .spacing(8),
             ]
@@ -5231,17 +5230,18 @@ fn centered_message(message: &str) -> Element<'_, Message> {
         .into()
 }
 
-fn centered_action(
-    message: &'static str,
-    label: &'static str,
-    action: Message,
-) -> Element<'static, Message> {
+fn open_terminal_action(density: DensityMetrics) -> Element<'static, Message> {
     container(
         column![
-            text(message).style(text::secondary),
-            button(centered_button_label(label, UI_TEXT_SIZE, UI_MEDIUM))
-                .on_press(action)
-                .style(primary_action_style),
+            text("Session ready. Open its terminal to begin.").style(text::secondary),
+            button(centered_button_label(
+                "Open terminal",
+                UI_TEXT_SIZE,
+                UI_MEDIUM
+            ))
+            .on_press(Message::Attach)
+            .height(density.control_height)
+            .style(primary_action_style),
         ]
         .spacing(12)
         .align_x(Center),
@@ -6061,43 +6061,55 @@ mod tests {
     }
 
     #[cfg(windows)]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 9] = [
-        1_235_580_465_930_515_981,
-        684_521_762_925_822_029,
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 13] = [
+        426_262_926_778_126_858,
+        1_503_165_031_025_874_429,
         5_686_679_588_026_358_842,
         14_761_951_164_573_712_012,
+        7_129_090_979_179_955_617,
+        13_544_107_981_426_698_952,
+        1_748_718_398_488_552_422,
+        5_448_511_970_848_490_064,
         5_019_121_441_122_480_153,
         3_931_679_346_670_316_763,
-        16_836_225_591_476_701_733,
-        1_823_448_962_296_347_469,
-        2_077_028_866_629_943_630,
+        17_325_232_898_887_675_372,
+        282_116_067_056_645_007,
+        5_196_752_353_597_121_531,
     ];
     #[cfg(target_os = "macos")]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 9] = [
-        1_235_580_465_930_515_981,
-        684_521_762_925_822_029,
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 13] = [
+        426_262_926_778_126_858,
+        1_503_165_031_025_874_429,
         5_686_679_588_026_358_842,
         14_761_951_164_573_712_012,
+        7_129_090_979_179_955_617,
+        13_544_107_981_426_698_952,
+        1_748_718_398_488_552_422,
+        5_448_511_970_848_490_064,
         5_019_121_441_122_480_153,
         3_931_679_346_670_316_763,
-        16_836_225_591_476_701_733,
-        1_823_448_962_296_347_469,
-        2_077_028_866_629_943_630,
+        17_325_232_898_887_675_372,
+        282_116_067_056_645_007,
+        5_196_752_353_597_121_531,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 9] = [
-        1_235_580_465_930_515_981,
-        684_521_762_925_822_029,
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 13] = [
+        426_262_926_778_126_858,
+        1_503_165_031_025_874_429,
         5_686_679_588_026_358_842,
         14_761_951_164_573_712_012,
+        7_129_090_979_179_955_617,
+        13_544_107_981_426_698_952,
+        1_748_718_398_488_552_422,
+        5_448_511_970_848_490_064,
         5_019_121_441_122_480_153,
         3_931_679_346_670_316_763,
-        16_836_225_591_476_701_733,
-        1_823_448_962_296_347_469,
-        2_077_028_866_629_943_630,
+        17_325_232_898_887_675_372,
+        282_116_067_056_645_007,
+        5_196_752_353_597_121_531,
     ];
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 2] =
-        [18_113_900_177_058_792_484, 4_341_961_485_828_767_128];
+        [7_826_771_872_323_314_152, 16_142_488_885_153_956_544];
 
     async fn render_desktop_baseline(
         app: &DesktopApp,
@@ -6108,24 +6120,31 @@ mod tests {
         render_element_baseline(app.view(), &theme, width, height).await
     }
 
-    async fn render_element_baseline(
+    async fn layout_test_element(
         mut element: Element<'_, Message>,
+        limits: Limits,
+    ) -> (Element<'_, Message>, iced::Renderer, Tree, Node) {
+        load_bundled_ui_fonts_for_rendering();
+        let renderer = <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
+            .await
+            .expect("tiny-skia headless renderer");
+        assert_eq!(renderer.name(), "tiny-skia");
+        let mut tree = Tree::new(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        (element, renderer, tree, node)
+    }
+
+    async fn render_element_baseline(
+        element: Element<'_, Message>,
         theme: &Theme,
         width: u16,
         height: u16,
     ) -> RenderedBaseline {
-        load_bundled_ui_fonts_for_rendering();
-        let mut renderer =
-            <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
-                .await
-                .expect("tiny-skia headless renderer");
-        assert_eq!(renderer.name(), "tiny-skia");
-        let mut tree = Tree::new(&element);
         let size = iced::Size::new(f32::from(width), f32::from(height));
         let limits = Limits::new(size, size);
-        let node = element
-            .as_widget_mut()
-            .layout(&mut tree, &renderer, &limits);
+        let (element, mut renderer, tree, node) = layout_test_element(element, limits).await;
         assert_eq!(node.size(), size);
         let viewport = iced::Rectangle::new(iced::Point::ORIGIN, size);
         renderer.reset(viewport);
@@ -6163,21 +6182,70 @@ mod tests {
         }
     }
 
+    async fn render_session_action_baselines() -> [RenderedBaseline; 4] {
+        let (mut app, _, worktree_id, _, _) = desktop_hierarchy();
+        app.desktop_state.window_width = 680;
+        app.desktop_state.window_height = 480;
+        app.narrow_main = true;
+        let narrow_terminal_action = render_desktop_baseline(&app, 680, 480).await;
+
+        app.modal = Some(Modal::Form(FormModal::new(Form::session(
+            worktree_id,
+            vec![provider_health(ProviderKind::Shell, true, true)],
+        ))));
+        app.desktop_state.window_width = 1_440;
+        app.desktop_state.window_height = 900;
+        let wide_session_form = render_desktop_baseline(&app, 1_440, 900).await;
+        app.desktop_state.window_width = 900;
+        app.desktop_state.window_height = 700;
+        let compact_session_form = render_desktop_baseline(&app, 900, 700).await;
+        app.desktop_state.window_width = 680;
+        app.desktop_state.window_height = 480;
+        let narrow_session_form = render_desktop_baseline(&app, 680, 480).await;
+
+        [
+            narrow_terminal_action,
+            wide_session_form,
+            compact_session_form,
+            narrow_session_form,
+        ]
+    }
+
+    async fn render_navigator_edge_baselines() -> [RenderedBaseline; 2] {
+        let (mut app, _, worktree_id, _, _) = desktop_hierarchy();
+        app.desktop_state.window_width = 680;
+        app.desktop_state.window_height = 480;
+        app.snapshot.projects[0].name = "Repository name that remains clipped inside the navigator panel instead of changing row geometry".into();
+        app.snapshot.worktrees[0].name =
+            "Managed checkout with an intentionally long descriptive label".into();
+        app.snapshot.sessions[0].display_name =
+            "Session with a long label that cannot grow the row".into();
+        app.narrow_main = false;
+        let long_labels = render_desktop_baseline(&app, 680, 480).await;
+
+        let overflow_actions = [NavigatorAction::DeleteCheckout(worktree_id); 4];
+        let theme = app.theme();
+        let overflow_height = u16::try_from(app.presentation().density.control_height + 8)
+            .expect("bounded action strip height");
+        let overflowing_actions = render_element_baseline(
+            navigator_action_strip(&overflow_actions, app.presentation().density),
+            &theme,
+            90,
+            overflow_height,
+        )
+        .await;
+
+        [long_labels, overflowing_actions]
+    }
+
     fn layout_node_count(node: &Node) -> usize {
         1 + node.children().iter().map(layout_node_count).sum::<usize>()
     }
 
-    async fn layout_element(mut element: Element<'_, Message>, width: f32, height: f32) -> Node {
-        load_bundled_ui_fonts_for_rendering();
-        let renderer = <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
-            .await
-            .expect("tiny-skia headless renderer");
-        let mut tree = Tree::new(&element);
-        element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &Limits::new(iced::Size::ZERO, iced::Size::new(width, height)),
-        )
+    async fn layout_element(element: Element<'_, Message>, width: f32, height: f32) -> Node {
+        let limits = Limits::new(iced::Size::ZERO, iced::Size::new(width, height));
+        let (_, _, _, node) = layout_test_element(element, limits).await;
+        node
     }
 
     fn layout_origins(node: &Node, origins: &mut Vec<Point>) {
@@ -6215,6 +6283,108 @@ mod tests {
             if id == Some(&self.target) {
                 self.viewport = Some((bounds, content_bounds, translation));
             }
+        }
+    }
+
+    struct ButtonBoundsByLabel<'a> {
+        label: &'a str,
+        last_container: Option<iced::Rectangle>,
+        bounds: Option<iced::Rectangle>,
+    }
+
+    impl WidgetOperation for ButtonBoundsByLabel<'_> {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+            operate(self);
+        }
+
+        fn container(&mut self, _id: Option<&widget::Id>, bounds: iced::Rectangle) {
+            self.last_container = Some(bounds);
+        }
+
+        fn text(&mut self, _id: Option<&widget::Id>, _bounds: iced::Rectangle, text: &str) {
+            if text == self.label {
+                self.bounds = self.last_container;
+            }
+        }
+    }
+
+    async fn button_bounds_by_label(
+        element: Element<'_, Message>,
+        label: &str,
+        size: iced::Size,
+    ) -> iced::Rectangle {
+        let (mut element, renderer, mut tree, node) =
+            layout_test_element(element, Limits::new(size, size)).await;
+        let mut operation = ButtonBoundsByLabel {
+            label,
+            last_container: None,
+            bounds: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut operation);
+        operation.bounds.expect("button label in rendered layout")
+    }
+
+    #[tokio::test]
+    async fn session_action_buttons_use_the_density_control_height() {
+        let (mut app, _, worktree_id, _, _) = desktop_hierarchy();
+        let providers = vec![
+            provider_health(ProviderKind::Shell, true, true),
+            provider_health(ProviderKind::Codex, true, true),
+        ];
+
+        for density_choice in [DesktopDensity::Comfortable, DesktopDensity::Compact] {
+            app.desktop_state.density = density_choice;
+            let expected_height = f32::from(
+                u16::try_from(app.presentation().density.control_height)
+                    .expect("bounded density control height"),
+            );
+            for (provider, label) in [
+                (ProviderKind::Shell, "Start shell"),
+                (ProviderKind::Codex, "Start Codex"),
+            ] {
+                let mut modal = FormModal::new(Form::session(worktree_id, providers.clone()));
+                assert!(modal.form.select_provider(provider));
+                app.modal = Some(Modal::Form(modal));
+                let bounds =
+                    button_bounds_by_label(app.view(), label, iced::Size::new(900.0, 700.0)).await;
+                assert!(
+                    (bounds.height - expected_height).abs() <= f32::EPSILON,
+                    "{density_choice:?} {label} height was {}",
+                    bounds.height
+                );
+            }
+
+            let mut pending = FormModal::new(Form::session(worktree_id, providers.clone()));
+            pending.pending = true;
+            app.modal = Some(Modal::Form(pending));
+            let pending_bounds =
+                button_bounds_by_label(app.view(), "Working…", iced::Size::new(900.0, 700.0)).await;
+            assert!((pending_bounds.height - expected_height).abs() <= f32::EPSILON);
+
+            let mut checking = FormModal::new(Form::session(worktree_id, providers.clone()));
+            checking.provider_probe = Some(ProviderKind::Shell);
+            app.modal = Some(Modal::Form(checking));
+            let checking_bounds = button_bounds_by_label(
+                app.view(),
+                "Checking provider…",
+                iced::Size::new(900.0, 700.0),
+            )
+            .await;
+            assert!((checking_bounds.height - expected_height).abs() <= f32::EPSILON);
+
+            let bounds = button_bounds_by_label(
+                app.terminal_view(),
+                "Open terminal",
+                iced::Size::new(600.0, 400.0),
+            )
+            .await;
+            assert!(
+                (bounds.height - expected_height).abs() <= f32::EPSILON,
+                "{density_choice:?} Open terminal height was {}",
+                bounds.height
+            );
         }
     }
 
@@ -6350,16 +6520,9 @@ mod tests {
             app.snapshot.worktrees.push(worktree);
         }
 
-        load_bundled_ui_fonts_for_rendering();
-        let renderer = <iced::Renderer as Headless>::new(UI_FONT, 16.0.into(), Some("tiny-skia"))
-            .await
-            .expect("tiny-skia headless renderer");
-        let mut element = app.checkouts_column();
-        let mut tree = Tree::new(&element);
         let size = iced::Size::new(225.0, 220.0);
-        let node = element
-            .as_widget_mut()
-            .layout(&mut tree, &renderer, &Limits::new(size, size));
+        let (mut element, renderer, mut tree, node) =
+            layout_test_element(app.checkouts_column(), Limits::new(size, size)).await;
         let scroll_id = navigator_scroll_id(DesktopPanel::Worktrees);
         let mut reveal = iced::advanced::widget::operation::scrollable::snap_to::<()>(
             scroll_id.clone(),
@@ -6548,29 +6711,14 @@ mod tests {
         app.modal = Some(Modal::Settings);
         let narrow_settings = render_desktop_baseline(&app, 680, 480).await;
 
-        let (mut long_label_app, _, worktree_id, _, _) = desktop_hierarchy();
-        long_label_app.desktop_state.window_width = 680;
-        long_label_app.desktop_state.window_height = 480;
-        long_label_app.snapshot.projects[0].name = "Repository name that remains clipped inside the navigator panel instead of changing row geometry".into();
-        long_label_app.snapshot.worktrees[0].name =
-            "Managed checkout with an intentionally long descriptive label".into();
-        long_label_app.snapshot.sessions[0].display_name =
-            "Session with a long label that cannot grow the row".into();
-        long_label_app.narrow_main = false;
-        let long_labels = render_desktop_baseline(&long_label_app, 680, 480).await;
+        let [
+            narrow_terminal_action,
+            wide_session_form,
+            compact_session_form,
+            narrow_session_form,
+        ] = render_session_action_baselines().await;
 
-        let overflow_actions = [NavigatorAction::DeleteCheckout(worktree_id); 4];
-        let overflow_theme = long_label_app.theme();
-        let overflow_height =
-            u16::try_from(long_label_app.presentation().density.control_height + 8)
-                .expect("bounded action strip height");
-        let overflowing_actions = render_element_baseline(
-            navigator_action_strip(&overflow_actions, long_label_app.presentation().density),
-            &overflow_theme,
-            90,
-            overflow_height,
-        )
-        .await;
+        let [long_labels, overflowing_actions] = render_navigator_edge_baselines().await;
 
         app.desktop_state.window_width = 900;
         app.desktop_state.window_height = 700;
@@ -6604,19 +6752,27 @@ mod tests {
                 compact.layout_nodes,
                 narrow_explorer.layout_nodes,
                 narrow_settings.layout_nodes,
+                narrow_terminal_action.layout_nodes,
+                wide_session_form.layout_nodes,
+                compact_session_form.layout_nodes,
+                narrow_session_form.layout_nodes,
                 long_labels.layout_nodes,
                 overflowing_actions.layout_nodes,
                 theme_gallery.layout_nodes,
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [171, 118, 84, 169, 84, 19, 225, 158, 138]
+            [171, 118, 84, 169, 81, 197, 144, 107, 84, 19, 225, 158, 138]
         );
         let baselines = [
             &canopy_attention,
             &compact,
             &narrow_explorer,
             &narrow_settings,
+            &narrow_terminal_action,
+            &wide_session_form,
+            &compact_session_form,
+            &narrow_session_form,
             &long_labels,
             &overflowing_actions,
             &theme_gallery,
@@ -6656,7 +6812,7 @@ mod tests {
 
         assert_eq!(
             [compact.layout_nodes, narrow.layout_nodes],
-            [214, 214],
+            [230, 230],
             "Details layout changed at a representative width"
         );
         assert!(compact.distinct_colors >= 8, "{compact:?}");
