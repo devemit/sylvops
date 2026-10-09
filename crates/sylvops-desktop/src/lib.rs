@@ -67,11 +67,11 @@ use terminal::{
     encode_key as encode_terminal_key, encode_paste as encode_terminal_paste,
 };
 
-const EVENT_TICK: Duration = Duration::from_millis(16);
+const TIMER_TICK: Duration = Duration::from_millis(16);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(75);
 const SUCCESS_DURATION: Duration = Duration::from_secs(4);
-const MAX_EVENTS_PER_TICK: usize = 512;
+const MAX_EVENTS_PER_WAKE: usize = 512;
 const UI_TEXT_SIZE: f32 = 14.0;
 const UI_META_SIZE: f32 = 12.0;
 const FOOTER_TEXT_SIZE: f32 = 12.0;
@@ -376,6 +376,7 @@ impl TerminalFocus {
 #[derive(Clone, Debug)]
 enum Message {
     Tick,
+    BridgeReady,
     Keyboard(keyboard::Event),
     SelectWorkspace(WorkspaceId),
     SelectProject(ProjectId),
@@ -512,7 +513,6 @@ impl DesktopApp {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
-                self.process_bridge_events();
                 self.flush_timers();
                 if self.modal_focus == ModalFocus::Pending {
                     self.modal_focus = ModalFocus::Idle;
@@ -533,6 +533,7 @@ impl DesktopApp {
                     return window::close(window_id);
                 }
             }
+            Message::BridgeReady => self.process_bridge_events(),
             Message::Keyboard(event) => {
                 if let Some(task) = self.handle_terminal_clipboard(&event) {
                     return task;
@@ -2635,7 +2636,7 @@ impl DesktopApp {
                 );
             }
         }
-        for event in self.bridge.drain(MAX_EVENTS_PER_TICK) {
+        for event in self.bridge.drain(MAX_EVENTS_PER_WAKE) {
             self.handle_bridge_event(event);
         }
     }
@@ -4621,9 +4622,10 @@ impl DesktopApp {
     }
 }
 
-fn subscription(_: &DesktopApp) -> Subscription<Message> {
+fn subscription(app: &DesktopApp) -> Subscription<Message> {
     Subscription::batch([
-        time::every(EVENT_TICK).map(|_| Message::Tick),
+        app.bridge.subscription().map(|()| Message::BridgeReady),
+        time::every(TIMER_TICK).map(|_| Message::Tick),
         keyboard::listen().map(Message::Keyboard),
         window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
         window::close_requests().map(Message::CloseRequested),
