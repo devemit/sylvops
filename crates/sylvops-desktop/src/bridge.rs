@@ -18,14 +18,16 @@ use iced::{
 use sylvops_core::{
     domain::{DaemonSnapshot, ProviderKind},
     ids::{SessionId, WorkspaceId, WorktreeId},
-    protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+    protocol::{ClientRequest, DaemonEvent, DaemonResponse, MAX_PTY_CHUNK_SIZE},
     provider::ProviderHealth,
 };
 use sylvops_daemon::data_removal::wait_for_removal_completion;
 use sylvops_daemon::{client::DaemonClient, runtime::RuntimePaths};
 use tokio::sync::mpsc;
 
-const COMMAND_CAPACITY: usize = 128;
+const COMMAND_CAPACITY: usize = 512;
+const TERMINAL_INPUT_BATCH_BYTES: usize = 16 * 1024;
+const TERMINAL_INPUT_BATCH_DELAY: Duration = Duration::from_millis(2);
 const CRITICAL_EVENT_CAPACITY: usize = 256;
 const TERMINAL_EVENT_CAPACITY: usize = 4_096;
 const WAKE_CAPACITY: usize = 1;
@@ -69,8 +71,30 @@ enum BridgeCommand {
     RemoveUserData {
         confirmation: String,
     },
+    TerminalInput {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+    },
+    FlushTerminalInput,
     Shutdown,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalInputError {
+    Saturated,
+    Closed,
+    Oversized,
+}
+
+enum NextCommand {
+    Pending(BridgeCommand),
+    PendingAfterInputFailure(BridgeCommand),
+    Await,
+    InputFailed,
+    Closed,
+}
+
+struct TerminalInputDeliveryFailed;
 
 #[derive(Clone, Debug)]
 pub(crate) enum BridgeEvent {
@@ -99,6 +123,7 @@ pub(crate) struct Bridge {
     wakeups: Receiver<()>,
     wakeup: Sender<()>,
     overflowed: Arc<AtomicBool>,
+    input_closed: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -122,6 +147,7 @@ impl Bridge {
         let (terminal_tx, terminal_events) = bounded(TERMINAL_EVENT_CAPACITY);
         let (wakeup, wakeups) = bounded(WAKE_CAPACITY);
         let overflowed = Arc::new(AtomicBool::new(false));
+        let input_closed = Arc::new(AtomicBool::new(false));
         let events = EventSink {
             critical: critical_tx,
             terminal: terminal_tx,
@@ -130,7 +156,10 @@ impl Bridge {
         };
         thread::Builder::new()
             .name("sylvops-desktop-ipc".into())
-            .spawn(move || run_worker(paths, command_rx, events))
+            .spawn({
+                let input_closed = input_closed.clone();
+                move || run_worker(paths, command_rx, events, input_closed)
+            })
             .expect("desktop IPC worker thread must start");
         Self {
             commands,
@@ -139,13 +168,45 @@ impl Bridge {
             wakeups,
             wakeup,
             overflowed,
+            input_closed,
         }
     }
 
     pub(crate) fn request(&self, operation: Operation, request: ClientRequest) -> bool {
+        if matches!(&request, ClientRequest::SessionInput { .. }) {
+            return false;
+        }
         self.commands
             .try_send(BridgeCommand::Request { operation, request })
             .is_ok()
+    }
+
+    pub(crate) fn terminal_input(
+        &self,
+        session_id: SessionId,
+        bytes: Vec<u8>,
+    ) -> Result<(), TerminalInputError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.input_closed.load(Ordering::Acquire) {
+            return Err(TerminalInputError::Closed);
+        }
+        if bytes.len() > MAX_PTY_CHUNK_SIZE {
+            return Err(TerminalInputError::Oversized);
+        }
+        self.commands
+            .try_send(BridgeCommand::TerminalInput { session_id, bytes })
+            .map_err(terminal_input_send_error)
+    }
+
+    pub(crate) fn flush_terminal_input(&self) -> Result<(), TerminalInputError> {
+        if self.input_closed.load(Ordering::Acquire) {
+            return Err(TerminalInputError::Closed);
+        }
+        self.commands
+            .try_send(BridgeCommand::FlushTerminalInput)
+            .map_err(terminal_input_send_error)
     }
 
     pub(crate) fn remove_user_data(&self, confirmation: String) -> bool {
@@ -189,11 +250,17 @@ impl Bridge {
 
 impl Drop for Bridge {
     fn drop(&mut self) {
+        let _ = self.commands.try_send(BridgeCommand::FlushTerminalInput);
         let _ = self.commands.try_send(BridgeCommand::Shutdown);
     }
 }
 
-fn run_worker(paths: RuntimePaths, commands: mpsc::Receiver<BridgeCommand>, events: EventSink) {
+fn run_worker(
+    paths: RuntimePaths,
+    commands: mpsc::Receiver<BridgeCommand>,
+    events: EventSink,
+    input_closed: Arc<AtomicBool>,
+) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -205,10 +272,12 @@ fn run_worker(paths: RuntimePaths, commands: mpsc::Receiver<BridgeCommand>, even
                 operation: None,
                 message: format!("cannot initialize desktop IPC runtime: {error}"),
             });
+            input_closed.store(true, Ordering::Release);
             return;
         }
     };
-    runtime.block_on(run_worker_async(paths, commands, events));
+    runtime.block_on(run_worker_async(paths, commands, events, &input_closed));
+    input_closed.store(true, Ordering::Release);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -216,6 +285,7 @@ async fn run_worker_async(
     paths: RuntimePaths,
     mut commands: mpsc::Receiver<BridgeCommand>,
     events: EventSink,
+    input_closed: &AtomicBool,
 ) {
     let client = match DaemonClient::connect(&paths, "sylvops-desktop").await {
         Ok(client) => client,
@@ -278,76 +348,236 @@ async fn run_worker_async(
     }
 
     let mut daemon_events = client.subscribe();
+    let mut deferred_command = None;
+    let mut terminal_input_open = true;
     loop {
-        tokio::select! {
-            command = commands.recv() => {
-                match command {
-                    Some(BridgeCommand::Request { operation, request }) => {
-                        let request_client = client.clone();
-                        let request_events = events.clone();
-                        tokio::spawn(async move {
-                            let event = match request_client.request(&request).await {
-                                Ok(response) => BridgeEvent::Response { operation, response },
-                                Err(error) => BridgeEvent::Error {
-                                    operation: Some(operation),
-                                    message: error.to_string(),
-                                },
-                            };
-                            request_events.send_critical(event);
+        let command = if let Some(command) = deferred_command.take() {
+            Some(command)
+        } else {
+            tokio::select! {
+                command = commands.recv() => command,
+                event = daemon_events.recv() => {
+                    match event {
+                        Ok(event) => {
+                            if matches!(event, DaemonEvent::SessionOutput { .. }) {
+                                events.send_terminal(BridgeEvent::Daemon(event));
+                            } else {
+                                events.send_critical(BridgeEvent::Daemon(event));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            events.mark_overflowed();
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                    continue;
+                }
+            }
+        };
+        let Some(command) = command else {
+            break;
+        };
+        match command {
+            BridgeCommand::Request { operation, request } => {
+                let request_client = client.clone();
+                let request_events = events.clone();
+                tokio::spawn(async move {
+                    let event = match request_client.request(&request).await {
+                        Ok(response) => BridgeEvent::Response {
+                            operation,
+                            response,
+                        },
+                        Err(error) => BridgeEvent::Error {
+                            operation: Some(operation),
+                            message: error.to_string(),
+                        },
+                    };
+                    request_events.send_critical(event);
+                });
+            }
+            BridgeCommand::RemoveUserData { confirmation } => {
+                let response = client
+                    .request(&ClientRequest::PrepareDataRemoval {
+                        confirmation: confirmation.clone(),
+                    })
+                    .await;
+                match response {
+                    Ok(response) => {
+                        let prepared = matches!(response, DaemonResponse::DataRemovalPrepared);
+                        events.send_critical(BridgeEvent::Response {
+                            operation: Operation::PrepareDataRemoval,
+                            response,
+                        });
+                        if prepared {
+                            drop(daemon_events);
+                            drop(client);
+                            let result = wait_for_removal_completion(&paths).await;
+                            let result = result.map_err(|error| error.to_string());
+                            events.send_critical(BridgeEvent::DataRemovalFinished(result));
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        events.send_critical(BridgeEvent::Error {
+                            operation: Some(Operation::PrepareDataRemoval),
+                            message: error.to_string(),
                         });
                     }
-                    Some(BridgeCommand::RemoveUserData { confirmation }) => {
-                        let response = client
-                            .request(&ClientRequest::PrepareDataRemoval {
-                                confirmation: confirmation.clone(),
-                            })
-                            .await;
-                        match response {
-                            Ok(response) => {
-                                let prepared = matches!(response, DaemonResponse::DataRemovalPrepared);
-                                events.send_critical(BridgeEvent::Response {
-                                    operation: Operation::PrepareDataRemoval,
-                                    response,
-                                });
-                                if prepared {
-                                    drop(daemon_events);
-                                    drop(client);
-                                    let result = wait_for_removal_completion(&paths)
-                                        .await
-                                        .map_err(|error| error.to_string());
-                                    events.send_critical(BridgeEvent::DataRemovalFinished(result));
-                                    return;
-                                }
-                            }
-                            Err(error) => {
-                                events.send_critical(BridgeEvent::Error {
-                                    operation: Some(Operation::PrepareDataRemoval),
-                                    message: error.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    Some(BridgeCommand::Shutdown) | None => break,
                 }
             }
-            event = daemon_events.recv() => {
-                match event {
-                    Ok(event) => {
-                        if matches!(event, DaemonEvent::SessionOutput { .. }) {
-                            events.send_terminal(BridgeEvent::Daemon(event));
-                        } else {
-                            events.send_critical(BridgeEvent::Daemon(event));
+            BridgeCommand::TerminalInput { session_id, bytes } => {
+                if terminal_input_open {
+                    match send_terminal_input_batch(
+                        &client,
+                        &events,
+                        &mut commands,
+                        session_id,
+                        bytes,
+                    )
+                    .await
+                    {
+                        NextCommand::Pending(command) => {
+                            deferred_command = Some(command);
                         }
+                        NextCommand::PendingAfterInputFailure(command) => {
+                            deferred_command = Some(command);
+                            terminal_input_open = false;
+                        }
+                        NextCommand::Await => {}
+                        NextCommand::InputFailed => terminal_input_open = false,
+                        NextCommand::Closed => break,
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        events.mark_overflowed();
+                    if !terminal_input_open {
+                        input_closed.store(true, Ordering::Release);
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
+            BridgeCommand::FlushTerminalInput => {}
+            BridgeCommand::Shutdown => break,
         }
     }
     events.send_critical(BridgeEvent::Closed);
+}
+
+async fn send_terminal_input_batch(
+    client: &DaemonClient,
+    events: &EventSink,
+    commands: &mut mpsc::Receiver<BridgeCommand>,
+    session_id: SessionId,
+    bytes: Vec<u8>,
+) -> NextCommand {
+    let deadline = tokio::time::Instant::now() + TERMINAL_INPUT_BATCH_DELAY;
+    let mut batch = Vec::with_capacity(TERMINAL_INPUT_BATCH_BYTES);
+    let mut input_bytes = bytes;
+    let mut offset = 0;
+
+    loop {
+        let available = TERMINAL_INPUT_BATCH_BYTES.saturating_sub(batch.len());
+        let take = available.min(input_bytes.len().saturating_sub(offset));
+        batch.extend_from_slice(&input_bytes[offset..offset + take]);
+        offset += take;
+
+        if batch.len() == TERMINAL_INPUT_BATCH_BYTES
+            && flush_terminal_input_batch(client, events, session_id, &mut batch)
+                .await
+                .is_err()
+        {
+            return NextCommand::InputFailed;
+        }
+        if offset < input_bytes.len() {
+            continue;
+        }
+
+        match tokio::time::timeout_at(deadline, commands.recv()).await {
+            Ok(Some(BridgeCommand::TerminalInput {
+                session_id: next_session_id,
+                bytes: next_bytes,
+            })) if next_session_id == session_id => {
+                input_bytes = next_bytes;
+                offset = 0;
+            }
+            Ok(Some(command)) => {
+                return if flush_terminal_input_batch(client, events, session_id, &mut batch)
+                    .await
+                    .is_ok()
+                {
+                    NextCommand::Pending(command)
+                } else {
+                    NextCommand::PendingAfterInputFailure(command)
+                };
+            }
+            Ok(None) => {
+                let _ = flush_terminal_input_batch(client, events, session_id, &mut batch).await;
+                return NextCommand::Closed;
+            }
+            Err(_) => {
+                return if flush_terminal_input_batch(client, events, session_id, &mut batch)
+                    .await
+                    .is_ok()
+                {
+                    NextCommand::Await
+                } else {
+                    NextCommand::InputFailed
+                };
+            }
+        }
+    }
+}
+
+async fn flush_terminal_input_batch(
+    client: &DaemonClient,
+    events: &EventSink,
+    session_id: SessionId,
+    batch: &mut Vec<u8>,
+) -> Result<(), TerminalInputDeliveryFailed> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let bytes = std::mem::take(batch);
+    match client
+        .request(&ClientRequest::SessionInput { session_id, bytes })
+        .await
+    {
+        Ok(DaemonResponse::Acknowledged) => Ok(()),
+        Ok(_) => {
+            events.send_critical(BridgeEvent::Error {
+                operation: Some(Operation::Input(session_id)),
+                message: "the daemon returned an unexpected input acknowledgement; terminal input was stopped before any later queued bytes could be sent".into(),
+            });
+            Err(TerminalInputDeliveryFailed)
+        }
+        Err(error) => {
+            events.send_critical(BridgeEvent::Error {
+                operation: Some(Operation::Input(session_id)),
+                message: bounded_input_error(&error.to_string()),
+            });
+            Err(TerminalInputDeliveryFailed)
+        }
+    }
+}
+
+fn terminal_input_send_error<T>(error: mpsc::error::TrySendError<T>) -> TerminalInputError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => TerminalInputError::Saturated,
+        mpsc::error::TrySendError::Closed(_) => TerminalInputError::Closed,
+    }
+}
+
+fn bounded_input_error(message: &str) -> String {
+    let detail: String = message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(512)
+        .collect();
+    format!(
+        "terminal input transport failed; terminal input was stopped before any later queued bytes could be sent: {detail}"
+    )
 }
 
 fn send_startup_error(events: &EventSink, message: String) {
