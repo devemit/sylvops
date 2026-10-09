@@ -1,4 +1,9 @@
-use std::{ffi::OsString, fs, path::Path, time::Duration};
+use std::{
+    ffi::OsString,
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use sylvops_daemon::{
     DaemonError,
@@ -6,6 +11,7 @@ use sylvops_daemon::{
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+const TAGGED_ECHO_BUFFER_BYTES: usize = 4 * 1024;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_spawns_under_process_tree_control() {
@@ -84,6 +90,66 @@ async fn session_accepts_input_and_replays_after_detach() {
         .await
         .expect("session exit timeout")
         .expect("session wait");
+    assert_eq!(exit.exit_code, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_provider_preserves_two_hundred_tagged_inputs_and_reports_echo_latency() {
+    let mut session =
+        SessionHandle::spawn(&spec(["interactive"], 256 * 1024)).expect("spawn fake agent");
+    wait_for_output(&session, "FAKE_AGENT_READY").await;
+    let mut output = session.subscribe();
+    let mut observed = String::new();
+    let mut latencies = Vec::with_capacity(200);
+    let mut echoes = Vec::with_capacity(200);
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for index in 0..200 {
+            let tag = format!("SYLVOPS_INPUT_{index:03}");
+            let expected = format!("ECHO:{tag}");
+            let started = Instant::now();
+            session.input(input_line(&tag)).await.expect("tagged input");
+            loop {
+                let chunk = output.recv().await.expect("fake-provider output");
+                observed.push_str(&String::from_utf8_lossy(&chunk.bytes));
+                if observed.len() > TAGGED_ECHO_BUFFER_BYTES {
+                    let mut keep_from = observed.len() - TAGGED_ECHO_BUFFER_BYTES;
+                    while !observed.is_char_boundary(keep_from) {
+                        keep_from += 1;
+                    }
+                    observed.drain(..keep_from);
+                }
+                if observed.contains(&expected) {
+                    latencies.push(started.elapsed());
+                    echoes.push(expected);
+                    observed.clear();
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("tagged echo timeout");
+
+    assert_eq!(echoes.len(), 200);
+    for (index, echo) in echoes.iter().enumerate() {
+        assert_eq!(echo, &format!("ECHO:SYLVOPS_INPUT_{index:03}"));
+    }
+    latencies.sort_unstable();
+    let p95 = latencies[latencies.len() * 95 / 100];
+    let maximum = *latencies.last().expect("echo latencies");
+    println!(
+        "fake_provider_echo samples={} p95_us={} max_us={}",
+        latencies.len(),
+        p95.as_micros(),
+        maximum.as_micros()
+    );
+
+    session.input(input_line("exit")).await.expect("exit input");
+    let exit = tokio::time::timeout(TEST_TIMEOUT, session.wait())
+        .await
+        .expect("tagged session exit timeout")
+        .expect("tagged session wait");
     assert_eq!(exit.exit_code, 0);
 }
 
