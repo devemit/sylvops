@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 12;
+pub const PROTOCOL_MINOR: u16 = 13;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -422,6 +422,30 @@ opaque_authorization!(
     "project removal authorization must be 64 hexadecimal characters"
 );
 
+opaque_authorization!(
+    WorkspaceDeletionAuthorization,
+    "WorkspaceDeletionAuthorization([REDACTED])",
+    "workspace deletion authorization must be 64 hexadecimal characters"
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorkspaceDeletionRefusal {
+    ProjectsRemain {
+        count: u32,
+        truncated: bool,
+        ids: Vec<ProjectId>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceDeletionInspection {
+    pub workspace_id: WorkspaceId,
+    pub is_open: bool,
+    pub fallback_workspace_id: Option<WorkspaceId>,
+    pub authorization_token: Option<WorkspaceDeletionAuthorization>,
+    pub refusals: Vec<WorkspaceDeletionRefusal>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProjectRemovalRefusal {
     SessionsRemain {
@@ -467,6 +491,13 @@ pub enum ClientRequest {
     },
     OpenWorkspace {
         workspace_id: WorkspaceId,
+    },
+    InspectWorkspaceDeletion {
+        workspace_id: WorkspaceId,
+    },
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+        authorization_token: WorkspaceDeletionAuthorization,
     },
     AddProject {
         workspace_id: WorkspaceId,
@@ -591,6 +622,12 @@ pub enum DaemonResponse {
         revision: u64,
         workspace: Workspace,
     },
+    WorkspaceDeletionInspected(WorkspaceDeletionInspection),
+    WorkspaceDeleted {
+        revision: u64,
+        workspace_id: WorkspaceId,
+        opened_workspace_id: Option<WorkspaceId>,
+    },
     ProjectAdded {
         revision: u64,
         project: Project,
@@ -673,6 +710,11 @@ pub enum DaemonEvent {
     WorkspaceOpened {
         revision: u64,
         workspace: Workspace,
+    },
+    WorkspaceDeleted {
+        revision: u64,
+        workspace_id: WorkspaceId,
+        opened_workspace_id: Option<WorkspaceId>,
     },
     ProjectAdded {
         revision: u64,
@@ -849,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_12_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_13_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -861,7 +903,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 12);
+        assert_eq!(PROTOCOL_MINOR, 13);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1098,6 +1140,58 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Event, 44, &event).unwrap();
         assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
+    }
+
+    #[test]
+    fn workspace_deletion_contract_round_trips() {
+        let workspace_id = WorkspaceId::new();
+        let fallback_workspace_id = WorkspaceId::new();
+        let project_id = ProjectId::new();
+        let requests = [
+            ClientRequest::InspectWorkspaceDeletion { workspace_id },
+            ClientRequest::DeleteWorkspace {
+                workspace_id,
+                authorization_token: "d".repeat(64).try_into().unwrap(),
+            },
+        ];
+        for request in requests {
+            let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
+            assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+
+        let inspection = DaemonResponse::WorkspaceDeletionInspected(WorkspaceDeletionInspection {
+            workspace_id,
+            is_open: true,
+            fallback_workspace_id: Some(fallback_workspace_id),
+            authorization_token: None,
+            refusals: vec![WorkspaceDeletionRefusal::ProjectsRemain {
+                count: 1,
+                truncated: false,
+                ids: vec![project_id],
+            }],
+        });
+        let frame = Frame::message(MessageClass::Response, 43, &inspection).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), inspection);
+
+        let event = DaemonEvent::WorkspaceDeleted {
+            revision: 11,
+            workspace_id,
+            opened_workspace_id: Some(fallback_workspace_id),
+        };
+        let frame = Frame::message(MessageClass::Event, 44, &event).unwrap();
+        assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
+    }
+
+    #[test]
+    fn malformed_workspace_deletion_authorization_is_rejected_during_decode() {
+        let payload = rmp_serde::to_vec(&serde_json::json!({
+            "DeleteWorkspace": {
+                "workspace_id": WorkspaceId::new(),
+                "authorization_token": "short"
+            }
+        }))
+        .unwrap();
+        assert!(rmp_serde::from_slice::<ClientRequest>(&payload).is_err());
     }
 
     #[test]

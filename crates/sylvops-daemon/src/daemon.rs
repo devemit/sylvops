@@ -25,8 +25,9 @@ use sylvops_core::{
         ClientRequest, DaemonEvent, DaemonResponse, Frame, HelloRequest, MessageClass,
         PROTOCOL_MAJOR, PROTOCOL_MINOR, ProjectRemovalAuthorization, ProjectRemovalInspection,
         ProjectRemovalRefusal, ProtocolFailure, SessionDeletionAuthorization,
-        SessionDeletionInspection, SessionDeletionRefusal, WelcomeResponse, read_frame,
-        validate_terminal_size, write_frame,
+        SessionDeletionInspection, SessionDeletionRefusal, WelcomeResponse,
+        WorkspaceDeletionAuthorization, WorkspaceDeletionInspection, WorkspaceDeletionRefusal,
+        read_frame, validate_terminal_size, write_frame,
     },
     provider::{AuthenticationRequirement, LaunchContext, ProviderRuntimeSpec, ResumeContext},
     status::{
@@ -50,6 +51,7 @@ use crate::{
     data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan},
     database::{
         DatabaseHandle, NewSession, ProjectRemovalState, VerifiedConversationIdentityUpdate,
+        WorkspaceDeletionState,
     },
     git,
     hook::{HookCredentials, HookDelivery, HookReceiver},
@@ -1171,6 +1173,55 @@ async fn handle_request(
                 workspace,
             });
             Ok(())
+        }
+        ClientRequest::InspectWorkspaceDeletion { workspace_id } => {
+            let deletion_state = state
+                .database
+                .workspace_deletion_state(workspace_id)
+                .await?;
+            let inspection =
+                inspect_workspace_deletion(&state.authentication_token, &deletion_state);
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::WorkspaceDeletionInspected(inspection),
+            )
+            .await
+        }
+        ClientRequest::DeleteWorkspace {
+            workspace_id,
+            authorization_token,
+        } => {
+            let deletion_state = state
+                .database
+                .workspace_deletion_state(workspace_id)
+                .await?;
+            let inspection =
+                inspect_workspace_deletion(&state.authentication_token, &deletion_state);
+            let expected = inspection.authorization_token.ok_or_else(|| {
+                DaemonError::InvalidWorkspace(
+                    "Workspace is not empty; inspect deletion blockers and remove every Project"
+                        .into(),
+                )
+            })?;
+            if !bool::from(expected.as_bytes().ct_eq(authorization_token.as_bytes())) {
+                return Err(DaemonError::InvalidWorkspace(
+                    "Workspace deletion authorization is stale".into(),
+                ));
+            }
+            let (revision, _, opened) = state.database.delete_workspace(deletion_state).await?;
+            let opened_workspace_id = opened.as_ref().map(|workspace| workspace.id);
+            let response = DaemonResponse::WorkspaceDeleted {
+                revision,
+                workspace_id,
+                opened_workspace_id,
+            };
+            let _ = state.events.send(DaemonEvent::WorkspaceDeleted {
+                revision,
+                workspace_id,
+                opened_workspace_id,
+            });
+            send_response_queue(outgoing, request_id, &response).await
         }
         ClientRequest::AddProject {
             workspace_id,
@@ -2973,6 +3024,44 @@ fn inspect_project_removal(
     }
 }
 
+fn inspect_workspace_deletion(
+    secret: &AuthenticationToken,
+    state: &WorkspaceDeletionState,
+) -> WorkspaceDeletionInspection {
+    let refusals = if state.project_count == 0 {
+        Vec::new()
+    } else {
+        vec![WorkspaceDeletionRefusal::ProjectsRemain {
+            count: state.project_count,
+            truncated: state.projects_truncated,
+            ids: state.project_ids.clone(),
+        }]
+    };
+    let authorization_token = refusals
+        .is_empty()
+        .then(|| workspace_deletion_token(secret, state));
+    WorkspaceDeletionInspection {
+        workspace_id: state.workspace.id,
+        is_open: state.workspace.is_open,
+        fallback_workspace_id: state.fallback_workspace_id,
+        authorization_token,
+        refusals,
+    }
+}
+
+fn workspace_deletion_token(
+    secret: &AuthenticationToken,
+    state: &WorkspaceDeletionState,
+) -> WorkspaceDeletionAuthorization {
+    let mut digest = Sha256::new();
+    digest.update(b"sylvops-workspace-deletion-v1\0");
+    digest.update(secret.expose().as_bytes());
+    digest.update(state.authorization_fingerprint());
+    format!("{:x}", digest.finalize())
+        .try_into()
+        .expect("SHA-256 is a valid Workspace deletion authorization")
+}
+
 fn project_removal_token(
     secret: &AuthenticationToken,
     state: &ProjectRemovalState,
@@ -3166,6 +3255,7 @@ fn failure_code(error: &DaemonError) -> &'static str {
         DaemonError::Protocol(_) => "invalid_request",
         DaemonError::InvalidSession(_) => "session_request_refused",
         DaemonError::InvalidProject(_) => "project_request_refused",
+        DaemonError::InvalidWorkspace(_) => "workspace_request_refused",
         DaemonError::Attachment(_) => "attachment_refused",
         DaemonError::Git(_) => "git_validation_failed",
         DaemonError::Provider(_) => "provider_operation_failed",

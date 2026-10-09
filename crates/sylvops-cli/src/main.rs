@@ -157,6 +157,12 @@ enum Command {
 enum WorkspaceCommand {
     /// Create a workspace.
     Add { name: String },
+    /// Delete an empty Workspace while preserving repositories and Worktrees.
+    Delete {
+        workspace_id: WorkspaceId,
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -344,6 +350,10 @@ async fn run_command(
         Command::Snapshot => show_snapshot(&paths).await?,
         Command::Workspace { command } => match command {
             WorkspaceCommand::Add { name } => add_workspace(&paths, name).await?,
+            WorkspaceCommand::Delete {
+                workspace_id,
+                confirm,
+            } => delete_workspace(&paths, workspace_id, confirm).await?,
         },
         Command::Project { command } => match command {
             ProjectCommand::Add { workspace, path } => add_project(&paths, workspace, path).await?,
@@ -599,6 +609,94 @@ async fn add_workspace(paths: &RuntimePaths, name: String) -> sylvops_daemon::Re
             Ok(())
         }
         response => unexpected("workspace creation", response),
+    }
+}
+
+async fn delete_workspace(
+    paths: &RuntimePaths,
+    workspace_id: WorkspaceId,
+    confirm: bool,
+) -> sylvops_daemon::Result<()> {
+    if !confirm {
+        return Err(DaemonError::Lifecycle(
+            "Workspace deletion requires the explicit --confirm flag".into(),
+        ));
+    }
+    let client = DaemonClient::connect(paths, "sylvops-cli").await?;
+    let inspection = match client
+        .request(&ClientRequest::InspectWorkspaceDeletion { workspace_id })
+        .await?
+    {
+        DaemonResponse::WorkspaceDeletionInspected(inspection) => inspection,
+        response => return unexpected("Workspace deletion inspection", response),
+    };
+    println!("Delete Workspace: {}", inspection.workspace_id);
+    println!(
+        "Preserved: repository roots, managed and external Worktrees, branches, and filesystem content"
+    );
+    if inspection.is_open {
+        if let Some(fallback) = inspection.fallback_workspace_id {
+            println!("Navigation: Workspace {fallback} will open after deletion");
+        } else {
+            println!(
+                "Navigation: no Workspace will remain open; first-run empty state will be shown"
+            );
+        }
+    } else {
+        println!("Navigation: the currently open Workspace will not change");
+    }
+    let authorization_token = inspection.authorization_token.ok_or_else(|| {
+        for refusal in &inspection.refusals {
+            println!("Blocked: {}", workspace_deletion_refusal_text(refusal));
+        }
+        let reason = inspection.refusals.first().map_or_else(
+            || "the daemon did not authorize deletion".into(),
+            workspace_deletion_refusal_text,
+        );
+        DaemonError::Lifecycle(format!("Workspace deletion refused: {reason}"))
+    })?;
+    match client
+        .request(&ClientRequest::DeleteWorkspace {
+            workspace_id,
+            authorization_token,
+        })
+        .await?
+    {
+        DaemonResponse::WorkspaceDeleted {
+            workspace_id,
+            opened_workspace_id,
+            ..
+        } => {
+            println!("Deleted Workspace {workspace_id}");
+            if let Some(opened) = opened_workspace_id {
+                println!("Opened Workspace {opened}");
+            }
+            Ok(())
+        }
+        response => unexpected("Workspace deletion", response),
+    }
+}
+
+fn workspace_deletion_refusal_text(
+    refusal: &sylvops_core::protocol::WorkspaceDeletionRefusal,
+) -> String {
+    use sylvops_core::protocol::WorkspaceDeletionRefusal;
+
+    match refusal {
+        WorkspaceDeletionRefusal::ProjectsRemain {
+            count,
+            truncated,
+            ids,
+        } => format!(
+            "{}{count} Project{} remain{}: {}",
+            if *truncated { "at least " } else { "" },
+            if *count == 1 { "" } else { "s" },
+            if *count == 1 { "s" } else { "" },
+            ids.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -1704,6 +1802,40 @@ mod tests {
                 }
             }) if parsed == project_id
         ));
+    }
+
+    #[test]
+    fn cli_accepts_confirmed_workspace_deletion() {
+        let workspace_id = WorkspaceId::new();
+        let arguments = Arguments::try_parse_from([
+            "sylvops",
+            "workspace",
+            "delete",
+            &workspace_id.to_string(),
+            "--confirm",
+        ])
+        .expect("Workspace delete command");
+
+        assert!(matches!(
+            arguments.command,
+            Some(Command::Workspace {
+                command: WorkspaceCommand::Delete {
+                    workspace_id: parsed,
+                    confirm: true,
+                }
+            }) if parsed == workspace_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn cli_workspace_deletion_requires_confirmation_before_connecting() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let paths =
+            RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("runtime paths");
+        let error = delete_workspace(&paths, WorkspaceId::new(), false)
+            .await
+            .expect_err("missing confirmation must fail");
+        assert!(matches!(error, DaemonError::Lifecycle(message) if message.contains("--confirm")));
     }
 
     #[tokio::test]
