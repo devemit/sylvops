@@ -1,4 +1,6 @@
 use std::{
+    any::TypeId,
+    hash::Hash,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -8,6 +10,11 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, bounded};
+use iced::{
+    Subscription,
+    advanced::subscription::{EventStream, Hasher, Recipe},
+    futures::stream::BoxStream,
+};
 use sylvops_core::{
     domain::{DaemonSnapshot, ProviderKind},
     ids::{SessionId, WorkspaceId, WorktreeId},
@@ -19,7 +26,9 @@ use sylvops_daemon::{client::DaemonClient, runtime::RuntimePaths};
 use tokio::sync::mpsc;
 
 const COMMAND_CAPACITY: usize = 128;
-const EVENT_CAPACITY: usize = 4_096;
+const CRITICAL_EVENT_CAPACITY: usize = 256;
+const TERMINAL_EVENT_CAPACITY: usize = 4_096;
+const WAKE_CAPACITY: usize = 1;
 const CRITICAL_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
@@ -85,23 +94,50 @@ pub(crate) enum BridgeEvent {
 
 pub(crate) struct Bridge {
     commands: mpsc::Sender<BridgeCommand>,
-    events: Receiver<BridgeEvent>,
+    critical_events: Receiver<BridgeEvent>,
+    terminal_events: Receiver<BridgeEvent>,
+    wakeups: Receiver<()>,
+    wakeup: Sender<()>,
     overflowed: Arc<AtomicBool>,
 }
+
+#[derive(Clone)]
+struct EventSink {
+    critical: Sender<BridgeEvent>,
+    terminal: Sender<BridgeEvent>,
+    wakeup: Sender<()>,
+    overflowed: Arc<AtomicBool>,
+}
+
+struct BridgeWake {
+    receiver: Receiver<()>,
+}
+
+struct CancelOnDrop(Sender<()>);
 
 impl Bridge {
     pub(crate) fn spawn(paths: RuntimePaths) -> Self {
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
-        let (events_tx, events) = bounded(EVENT_CAPACITY);
+        let (critical_tx, critical_events) = bounded(CRITICAL_EVENT_CAPACITY);
+        let (terminal_tx, terminal_events) = bounded(TERMINAL_EVENT_CAPACITY);
+        let (wakeup, wakeups) = bounded(WAKE_CAPACITY);
         let overflowed = Arc::new(AtomicBool::new(false));
-        let worker_overflowed = overflowed.clone();
+        let events = EventSink {
+            critical: critical_tx,
+            terminal: terminal_tx,
+            wakeup: wakeup.clone(),
+            overflowed: overflowed.clone(),
+        };
         thread::Builder::new()
             .name("sylvops-desktop-ipc".into())
-            .spawn(move || run_worker(paths, command_rx, events_tx, worker_overflowed))
+            .spawn(move || run_worker(paths, command_rx, events))
             .expect("desktop IPC worker thread must start");
         Self {
             commands,
-            events,
+            critical_events,
+            terminal_events,
+            wakeups,
+            wakeup,
             overflowed,
         }
     }
@@ -119,11 +155,35 @@ impl Bridge {
     }
 
     pub(crate) fn drain(&self, limit: usize) -> Vec<BridgeEvent> {
-        self.events.try_iter().take(limit).collect()
+        let mut events = Vec::with_capacity(limit);
+        while events.len() < limit {
+            let event = self
+                .critical_events
+                .try_recv()
+                .or_else(|_| self.terminal_events.try_recv());
+            let Ok(event) = event else {
+                break;
+            };
+            events.push(event);
+        }
+        if !self.critical_events.is_empty() || !self.terminal_events.is_empty() {
+            self.wake();
+        }
+        events
     }
 
     pub(crate) fn take_overflowed(&self) -> bool {
         self.overflowed.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn subscription(&self) -> Subscription<()> {
+        iced::advanced::subscription::from_recipe(BridgeWake {
+            receiver: self.wakeups.clone(),
+        })
+    }
+
+    fn wake(&self) {
+        coalesce_wakeup(&self.wakeup);
     }
 }
 
@@ -133,12 +193,7 @@ impl Drop for Bridge {
     }
 }
 
-fn run_worker(
-    paths: RuntimePaths,
-    commands: mpsc::Receiver<BridgeCommand>,
-    events: Sender<BridgeEvent>,
-    overflowed: Arc<AtomicBool>,
-) {
+fn run_worker(paths: RuntimePaths, commands: mpsc::Receiver<BridgeCommand>, events: EventSink) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -146,27 +201,26 @@ fn run_worker(
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = events.send(BridgeEvent::Error {
+            events.send_critical(BridgeEvent::Error {
                 operation: None,
                 message: format!("cannot initialize desktop IPC runtime: {error}"),
             });
             return;
         }
     };
-    runtime.block_on(run_worker_async(paths, commands, events, overflowed));
+    runtime.block_on(run_worker_async(paths, commands, events));
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_worker_async(
     paths: RuntimePaths,
     mut commands: mpsc::Receiver<BridgeCommand>,
-    events: Sender<BridgeEvent>,
-    overflowed: Arc<AtomicBool>,
+    events: EventSink,
 ) {
     let client = match DaemonClient::connect(&paths, "sylvops-desktop").await {
         Ok(client) => client,
         Err(error) => {
-            let _ = events.send(BridgeEvent::Error {
+            events.send_critical(BridgeEvent::Error {
                 operation: None,
                 message: format!("cannot connect to the SylvOps daemon: {error}"),
             });
@@ -215,17 +269,11 @@ async fn run_worker_async(
             return;
         }
     };
-    if events
-        .send_timeout(
-            BridgeEvent::Connected {
-                snapshot,
-                providers,
-                desktop_state,
-            },
-            CRITICAL_EVENT_TIMEOUT,
-        )
-        .is_err()
-    {
+    if !events.send_critical(BridgeEvent::Connected {
+        snapshot,
+        providers,
+        desktop_state,
+    }) {
         return;
     }
 
@@ -245,7 +293,7 @@ async fn run_worker_async(
                                     message: error.to_string(),
                                 },
                             };
-                            let _ = request_events.send_timeout(event, CRITICAL_EVENT_TIMEOUT);
+                            request_events.send_critical(event);
                         });
                     }
                     Some(BridgeCommand::RemoveUserData { confirmation }) => {
@@ -257,34 +305,25 @@ async fn run_worker_async(
                         match response {
                             Ok(response) => {
                                 let prepared = matches!(response, DaemonResponse::DataRemovalPrepared);
-                                let _ = events.send_timeout(
-                                    BridgeEvent::Response {
-                                        operation: Operation::PrepareDataRemoval,
-                                        response,
-                                    },
-                                    CRITICAL_EVENT_TIMEOUT,
-                                );
+                                events.send_critical(BridgeEvent::Response {
+                                    operation: Operation::PrepareDataRemoval,
+                                    response,
+                                });
                                 if prepared {
                                     drop(daemon_events);
                                     drop(client);
                                     let result = wait_for_removal_completion(&paths)
                                         .await
                                         .map_err(|error| error.to_string());
-                                    let _ = events.send_timeout(
-                                        BridgeEvent::DataRemovalFinished(result),
-                                        CRITICAL_EVENT_TIMEOUT,
-                                    );
+                                    events.send_critical(BridgeEvent::DataRemovalFinished(result));
                                     return;
                                 }
                             }
                             Err(error) => {
-                                let _ = events.send_timeout(
-                                    BridgeEvent::Error {
-                                        operation: Some(Operation::PrepareDataRemoval),
-                                        message: error.to_string(),
-                                    },
-                                    CRITICAL_EVENT_TIMEOUT,
-                                );
+                                events.send_critical(BridgeEvent::Error {
+                                    operation: Some(Operation::PrepareDataRemoval),
+                                    message: error.to_string(),
+                                });
                             }
                         }
                     }
@@ -294,35 +333,100 @@ async fn run_worker_async(
             event = daemon_events.recv() => {
                 match event {
                     Ok(event) => {
-                        let terminal_output = matches!(event, DaemonEvent::SessionOutput { .. });
-                        let delivered = if terminal_output {
-                            events.try_send(BridgeEvent::Daemon(event)).is_ok()
+                        if matches!(event, DaemonEvent::SessionOutput { .. }) {
+                            events.send_terminal(BridgeEvent::Daemon(event));
                         } else {
-                            events
-                                .send_timeout(BridgeEvent::Daemon(event), CRITICAL_EVENT_TIMEOUT)
-                                .is_ok()
-                        };
-                        if !delivered {
-                            overflowed.store(true, Ordering::Release);
+                            events.send_critical(BridgeEvent::Daemon(event));
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        overflowed.store(true, Ordering::Release);
+                        events.mark_overflowed();
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
     }
-    let _ = events.send_timeout(BridgeEvent::Closed, CRITICAL_EVENT_TIMEOUT);
+    events.send_critical(BridgeEvent::Closed);
 }
 
-fn send_startup_error(events: &Sender<BridgeEvent>, message: String) {
-    let _ = events.send_timeout(
-        BridgeEvent::Error {
-            operation: None,
-            message,
-        },
-        CRITICAL_EVENT_TIMEOUT,
-    );
+fn send_startup_error(events: &EventSink, message: String) {
+    events.send_critical(BridgeEvent::Error {
+        operation: None,
+        message,
+    });
+}
+
+impl EventSink {
+    fn send_critical(&self, event: BridgeEvent) -> bool {
+        let delivered = self
+            .critical
+            .send_timeout(event, CRITICAL_EVENT_TIMEOUT)
+            .is_ok();
+        if !delivered {
+            self.overflowed.store(true, Ordering::Release);
+        }
+        self.wake();
+        delivered
+    }
+
+    fn send_terminal(&self, event: BridgeEvent) {
+        if self.terminal.try_send(event).is_err() {
+            self.overflowed.store(true, Ordering::Release);
+        }
+        self.wake();
+    }
+
+    fn mark_overflowed(&self) {
+        self.overflowed.store(true, Ordering::Release);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        coalesce_wakeup(&self.wakeup);
+    }
+}
+
+impl Recipe for BridgeWake {
+    type Output = ();
+
+    fn hash(&self, state: &mut Hasher) {
+        TypeId::of::<Self>().hash(state);
+    }
+
+    fn stream(self: Box<Self>, _input: EventStream) -> BoxStream<'static, Self::Output> {
+        Box::pin(iced::stream::channel(1, async move |mut output| {
+            let receiver = self.receiver;
+            let (cancel, cancelled) = bounded(1);
+            let _cancel_on_drop = CancelOnDrop(cancel);
+            let _ = tokio::task::spawn_blocking(move || {
+                loop {
+                    crossbeam_channel::select! {
+                        recv(cancelled) -> _ => break,
+                        recv(receiver) -> wake => {
+                            if wake.is_err() {
+                                break;
+                            }
+                            if let Err(error) = output.try_send(())
+                                && error.is_disconnected()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await;
+        }))
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
+}
+
+fn coalesce_wakeup(wakeup: &Sender<()>) {
+    let _ = wakeup.try_send(());
 }
