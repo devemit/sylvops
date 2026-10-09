@@ -96,6 +96,26 @@ enum NextCommand {
 
 struct TerminalInputDeliveryFailed;
 
+trait TerminalInputTransport {
+    async fn send_terminal_input(
+        &self,
+        session_id: SessionId,
+        bytes: Vec<u8>,
+    ) -> Result<DaemonResponse, String>;
+}
+
+impl TerminalInputTransport for DaemonClient {
+    async fn send_terminal_input(
+        &self,
+        session_id: SessionId,
+        bytes: Vec<u8>,
+    ) -> Result<DaemonResponse, String> {
+        self.request(&ClientRequest::SessionInput { session_id, bytes })
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum BridgeEvent {
     Connected {
@@ -126,6 +146,13 @@ pub(crate) struct Bridge {
     input_closed: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
+pub(crate) struct BridgeHarness {
+    commands: mpsc::Receiver<BridgeCommand>,
+    events: EventSink,
+    wakeups: Receiver<()>,
+}
+
 #[derive(Clone)]
 struct EventSink {
     critical: Sender<BridgeEvent>,
@@ -142,6 +169,16 @@ struct CancelOnDrop(Sender<()>);
 
 impl Bridge {
     pub(crate) fn spawn(paths: RuntimePaths) -> Self {
+        let (bridge, command_rx, events) = Self::channels();
+        let input_closed = bridge.input_closed.clone();
+        thread::Builder::new()
+            .name("sylvops-desktop-ipc".into())
+            .spawn(move || run_worker(paths, command_rx, events, &input_closed))
+            .expect("desktop IPC worker thread must start");
+        bridge
+    }
+
+    fn channels() -> (Self, mpsc::Receiver<BridgeCommand>, EventSink) {
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (critical_tx, critical_events) = bounded(CRITICAL_EVENT_CAPACITY);
         let (terminal_tx, terminal_events) = bounded(TERMINAL_EVENT_CAPACITY);
@@ -154,22 +191,33 @@ impl Bridge {
             wakeup: wakeup.clone(),
             overflowed: overflowed.clone(),
         };
-        thread::Builder::new()
-            .name("sylvops-desktop-ipc".into())
-            .spawn({
-                let input_closed = input_closed.clone();
-                move || run_worker(paths, command_rx, events, input_closed)
-            })
-            .expect("desktop IPC worker thread must start");
-        Self {
-            commands,
-            critical_events,
-            terminal_events,
-            wakeups,
-            wakeup,
-            overflowed,
-            input_closed,
-        }
+        (
+            Self {
+                commands,
+                critical_events,
+                terminal_events,
+                wakeups,
+                wakeup,
+                overflowed,
+                input_closed,
+            },
+            command_rx,
+            events,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn harness() -> (Self, BridgeHarness) {
+        let (bridge, commands, events) = Self::channels();
+        let wakeups = bridge.wakeups.clone();
+        (
+            bridge,
+            BridgeHarness {
+                commands,
+                events,
+                wakeups,
+            },
+        )
     }
 
     pub(crate) fn request(&self, operation: Operation, request: ClientRequest) -> bool {
@@ -197,7 +245,7 @@ impl Bridge {
         }
         self.commands
             .try_send(BridgeCommand::TerminalInput { session_id, bytes })
-            .map_err(terminal_input_send_error)
+            .map_err(|error| terminal_input_send_error(&error))
     }
 
     pub(crate) fn flush_terminal_input(&self) -> Result<(), TerminalInputError> {
@@ -206,7 +254,7 @@ impl Bridge {
         }
         self.commands
             .try_send(BridgeCommand::FlushTerminalInput)
-            .map_err(terminal_input_send_error)
+            .map_err(|error| terminal_input_send_error(&error))
     }
 
     pub(crate) fn remove_user_data(&self, confirmation: String) -> bool {
@@ -248,6 +296,40 @@ impl Bridge {
     }
 }
 
+#[cfg(test)]
+impl BridgeHarness {
+    pub(crate) fn send_critical(&self, event: BridgeEvent) {
+        assert!(self.events.send_critical(event));
+    }
+
+    pub(crate) fn send_terminal(&self, event: BridgeEvent) {
+        self.events.send_terminal(event);
+    }
+
+    pub(crate) fn take_wakeup(&self) -> bool {
+        self.wakeups.try_recv().is_ok()
+    }
+
+    pub(crate) fn drain_terminal_input(&mut self, expected_session_id: SessionId) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            match self.commands.try_recv() {
+                Ok(BridgeCommand::TerminalInput {
+                    session_id,
+                    bytes: next,
+                }) => {
+                    assert_eq!(session_id, expected_session_id);
+                    bytes.extend(next);
+                }
+                Ok(command) => panic!("unexpected harness command: {command:?}"),
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    return bytes;
+                }
+            }
+        }
+    }
+}
+
 impl Drop for Bridge {
     fn drop(&mut self) {
         let _ = self.commands.try_send(BridgeCommand::FlushTerminalInput);
@@ -259,7 +341,7 @@ fn run_worker(
     paths: RuntimePaths,
     commands: mpsc::Receiver<BridgeCommand>,
     events: EventSink,
-    input_closed: Arc<AtomicBool>,
+    input_closed: &AtomicBool,
 ) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -276,7 +358,7 @@ fn run_worker(
             return;
         }
     };
-    runtime.block_on(run_worker_async(paths, commands, events, &input_closed));
+    runtime.block_on(run_worker_async(paths, commands, events, input_closed));
     input_closed.store(true, Ordering::Release);
 }
 
@@ -460,7 +542,7 @@ async fn run_worker_async(
 }
 
 async fn send_terminal_input_batch(
-    client: &DaemonClient,
+    client: &impl TerminalInputTransport,
     events: &EventSink,
     commands: &mut mpsc::Receiver<BridgeCommand>,
     session_id: SessionId,
@@ -525,7 +607,7 @@ async fn send_terminal_input_batch(
 }
 
 async fn flush_terminal_input_batch(
-    client: &DaemonClient,
+    client: &impl TerminalInputTransport,
     events: &EventSink,
     session_id: SessionId,
     batch: &mut Vec<u8>,
@@ -534,10 +616,7 @@ async fn flush_terminal_input_batch(
         return Ok(());
     }
     let bytes = std::mem::take(batch);
-    match client
-        .request(&ClientRequest::SessionInput { session_id, bytes })
-        .await
-    {
+    match client.send_terminal_input(session_id, bytes).await {
         Ok(DaemonResponse::Acknowledged) => Ok(()),
         Ok(_) => {
             events.send_critical(BridgeEvent::Error {
@@ -549,14 +628,14 @@ async fn flush_terminal_input_batch(
         Err(error) => {
             events.send_critical(BridgeEvent::Error {
                 operation: Some(Operation::Input(session_id)),
-                message: bounded_input_error(&error.to_string()),
+                message: bounded_input_error(&error),
             });
             Err(TerminalInputDeliveryFailed)
         }
     }
 }
 
-fn terminal_input_send_error<T>(error: mpsc::error::TrySendError<T>) -> TerminalInputError {
+fn terminal_input_send_error<T>(error: &mpsc::error::TrySendError<T>) -> TerminalInputError {
     match error {
         mpsc::error::TrySendError::Full(_) => TerminalInputError::Saturated,
         mpsc::error::TrySendError::Closed(_) => TerminalInputError::Closed,
@@ -659,4 +738,108 @@ impl Drop for CancelOnDrop {
 
 fn coalesce_wakeup(wakeup: &Sender<()>) {
     let _ = wakeup.try_send(());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingInputTransport {
+        batches: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl TerminalInputTransport for RecordingInputTransport {
+        fn send_terminal_input(
+            &self,
+            _session_id: SessionId,
+            bytes: Vec<u8>,
+        ) -> impl Future<Output = Result<DaemonResponse, String>> {
+            self.batches.lock().expect("batch lock").push(bytes);
+            std::future::ready(Ok(DaemonResponse::Acknowledged))
+        }
+    }
+
+    #[tokio::test]
+    async fn two_hundred_keys_use_the_ordered_batch_and_consume_successful_acknowledgement() {
+        let (bridge, harness) = Bridge::harness();
+        let (commands, mut command_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let session_id = SessionId::new();
+        let expected: Vec<u8> = (0..200)
+            .map(|index| b'0' + u8::try_from(index % 10).expect("decimal digit"))
+            .collect();
+        for byte in expected.iter().skip(1) {
+            commands
+                .try_send(BridgeCommand::TerminalInput {
+                    session_id,
+                    bytes: vec![*byte],
+                })
+                .expect("bounded test input");
+        }
+        commands
+            .try_send(BridgeCommand::FlushTerminalInput)
+            .expect("flush boundary");
+        let transport = RecordingInputTransport::default();
+
+        let next = send_terminal_input_batch(
+            &transport,
+            &harness.events,
+            &mut command_rx,
+            session_id,
+            vec![expected[0]],
+        )
+        .await;
+
+        assert!(matches!(
+            next,
+            NextCommand::Pending(BridgeCommand::FlushTerminalInput)
+        ));
+        assert_eq!(
+            transport.batches.into_inner().expect("batch lock"),
+            vec![expected]
+        );
+        assert!(bridge.drain(1).is_empty());
+        assert!(!harness.take_wakeup());
+    }
+
+    #[test]
+    fn heavy_terminal_output_stays_bounded_and_cannot_starve_critical_events() {
+        let (bridge, harness) = Bridge::harness();
+        let session_id = SessionId::new();
+        for sequence in 1..=TERMINAL_EVENT_CAPACITY as u64 {
+            harness.send_terminal(BridgeEvent::Daemon(DaemonEvent::SessionOutput {
+                session_id,
+                sequence,
+                bytes: vec![b'x'],
+                replay: false,
+            }));
+        }
+        harness.send_terminal(BridgeEvent::Daemon(DaemonEvent::SessionOutput {
+            session_id,
+            sequence: TERMINAL_EVENT_CAPACITY as u64 + 1,
+            bytes: vec![b'y'],
+            replay: false,
+        }));
+        harness.send_critical(BridgeEvent::Error {
+            operation: None,
+            message: "critical".into(),
+        });
+
+        assert!(harness.take_wakeup());
+        assert!(
+            !harness.take_wakeup(),
+            "wakeups must coalesce while pending"
+        );
+        assert!(matches!(
+            bridge.drain(1).as_slice(),
+            [BridgeEvent::Error { message, .. }] if message == "critical"
+        ));
+        assert_eq!(bridge.drain(512).len(), 512);
+        assert!(bridge.take_overflowed());
+        assert!(
+            harness.take_wakeup(),
+            "a partial drain must schedule the bounded remainder"
+        );
+    }
 }

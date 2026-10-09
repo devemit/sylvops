@@ -57,6 +57,8 @@ The desktop terminal renders the daemon-owned VT screen; it does not print raw p
 
 The scrollbar maps the oldest retained history to the top and live output to the bottom. Typing or pasting while viewing history returns to live output before the input is forwarded, so the real provider-owned input remains visible. The scrollbar is not an outer application scroll view and does not alter PTY ownership.
 
+Terminal output wakes the desktop instead of waiting for the periodic timer. Keyboard, paste, and supported mouse bytes share one bounded, ordered input pump; successful acknowledgements remain outside the UI reducer and provider-owned PTY output is the only source of visible text. Deterministic phase-offset and 200-key harnesses enforce an eight-millisecond application-added echo budget. Large styled screens use a bounded derived dirty-row display cache without moving VT, scrollback, selection, cursor, or palette authority out of the terminal state.
+
 `Ctrl+]` remains the explicit leave-terminal shortcut. Click and drag mouse-protocol forwarding remains unavailable so desktop text selection stays native; only requested wheel events are forwarded. Scrollback persistence across daemon restart remains an explicit current limitation.
 
 ## Guidance, details, and feedback

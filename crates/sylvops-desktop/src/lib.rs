@@ -62,6 +62,8 @@ use sylvops_core::{
     upgrade::{InstallDisposition, UpgradeStatus},
 };
 use sylvops_daemon::runtime::RuntimePaths;
+#[cfg(test)]
+use terminal::display_runs_uncached as terminal_display_runs_uncached;
 use terminal::{
     DisplayRun, TerminalState, WheelAction, display_runs as terminal_display_runs,
     encode_key as encode_terminal_key, encode_paste as encode_terminal_paste,
@@ -452,6 +454,10 @@ enum Message {
 
 impl DesktopApp {
     fn new(paths: RuntimePaths) -> Self {
+        Self::with_bridge(Bridge::spawn(paths))
+    }
+
+    fn with_bridge(bridge: Bridge) -> Self {
         let (mut panes, projects) = pane_grid::State::new(DesktopPane::Projects);
         let (worktrees, first) = panes
             .split(pane_grid::Axis::Vertical, projects, DesktopPane::Worktrees)
@@ -467,7 +473,7 @@ impl DesktopApp {
         panes.resize(second, f32::from(defaults.panel_ratios[1]) / 1000.0);
         panes.resize(third, f32::from(defaults.panel_ratios[2]) / 1000.0);
         Self {
-            bridge: Bridge::spawn(paths),
+            bridge,
             snapshot: DaemonSnapshot::default(),
             providers: Vec::new(),
             connection: ConnectionState::Connecting,
@@ -2676,7 +2682,8 @@ impl DesktopApp {
             }
             BridgeEvent::Error { operation, message } => {
                 let message = bounded_redacted_diagnostic(&message);
-                if matches!(operation, Some(Operation::Input(_))) {
+                if matches!(operation, Some(Operation::Input(session_id)) if self.active_session_id == Some(session_id))
+                {
                     self.terminal_focus = TerminalFocus::Unfocused;
                     self.terminal_selection_state = TerminalSelectionState::Idle;
                 }
@@ -4013,10 +4020,12 @@ impl DesktopApp {
             ));
             return;
         }
+        let session_name = session.display_name.clone();
+        let cwd = session.cwd.clone();
         self.unfocus_terminal();
         self.modal = Some(Modal::Confirmation(Confirmation::StopSession {
-            session_name: session.display_name.clone(),
-            cwd: session.cwd.clone(),
+            session_name,
+            cwd,
         }));
     }
 
@@ -6006,6 +6015,7 @@ mod tests {
         renderer::{Headless, Renderer as _},
         widget::{Operation as WidgetOperation, Tree},
     };
+    use std::time::Duration;
     use sylvops_core::provider::{AuthenticationRequirement, ProviderCapabilities};
 
     fn session(state: SessionState, external_session_id: Option<&str>) -> Session {
@@ -6116,6 +6126,251 @@ mod tests {
         app.connection = ConnectionState::Connected;
         app.desktop_state.theme = DesktopTheme::Canopy;
         (app, project_id, worktree_id, first_id, second_id)
+    }
+
+    #[derive(Default)]
+    struct FakeClock {
+        elapsed: Duration,
+    }
+
+    impl FakeClock {
+        fn at(duration: Duration) -> Self {
+            Self { elapsed: duration }
+        }
+
+        fn advance(&mut self, duration: Duration) {
+            self.elapsed += duration;
+        }
+
+        fn advance_to(&mut self, duration: Duration) {
+            self.elapsed = self.elapsed.max(duration);
+        }
+    }
+
+    #[test]
+    fn wake_driven_echo_meets_every_phase_offset_and_preserves_a_200_key_burst() {
+        let (bridge, mut harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let session_id = SessionId::new();
+        app.active_session_id = Some(session_id);
+        app.terminal_focus = TerminalFocus::Focused;
+        app.terminals.insert(
+            session_id,
+            TerminalState::new(AttachmentRole::Controller, 24, 80, 10_000),
+        );
+        let mut sequence = 0_u64;
+
+        for phase in 0_u64..16 {
+            let mut clock = FakeClock::at(Duration::from_millis(phase));
+            let key = b'a' + u8::try_from(phase).expect("phase fits in a byte");
+            app.queue_terminal_input(session_id, vec![key]);
+            assert!(
+                terminal_display_runs(
+                    app.terminals.get(&session_id).expect("terminal"),
+                    true,
+                    DesktopTerminalCursor::Block,
+                )
+                .iter()
+                .all(|run| !run.text.as_bytes().contains(&key))
+            );
+
+            clock.advance(Duration::from_millis(1));
+            let arrived = clock.elapsed;
+            sequence += 1;
+            harness.send_terminal(BridgeEvent::Daemon(DaemonEvent::SessionOutput {
+                session_id,
+                sequence,
+                bytes: vec![key],
+                replay: false,
+            }));
+            let next_poll = Duration::from_millis(
+                u64::try_from(arrived.as_millis().div_ceil(16)).expect("bounded fake time") * 16,
+            );
+            if !harness.take_wakeup() {
+                clock.advance_to(next_poll);
+            }
+            let _ = app.update(Message::BridgeReady);
+            let visible = clock.elapsed;
+
+            assert!(visible.saturating_sub(arrived) <= Duration::from_millis(8));
+            assert!(
+                terminal_display_runs(
+                    app.terminals.get(&session_id).expect("terminal"),
+                    true,
+                    DesktopTerminalCursor::Block,
+                )
+                .iter()
+                .any(|run| run.text.as_bytes().contains(&key))
+            );
+        }
+        assert_eq!(
+            harness.drain_terminal_input(session_id),
+            (b'a'..=b'p').collect::<Vec<_>>()
+        );
+
+        let burst: Vec<u8> = (0..200)
+            .map(|index| b'0' + u8::try_from(index % 10).expect("decimal digit"))
+            .collect();
+        for byte in &burst {
+            app.queue_terminal_input(session_id, vec![*byte]);
+        }
+        assert_eq!(harness.drain_terminal_input(session_id), burst);
+
+        let mut clock = FakeClock::default();
+        clock.advance(Duration::from_millis(1));
+        let arrived = clock.elapsed;
+        sequence += 1;
+        harness.send_terminal(BridgeEvent::Daemon(DaemonEvent::SessionOutput {
+            session_id,
+            sequence,
+            bytes: burst.clone(),
+            replay: false,
+        }));
+        assert!(harness.take_wakeup());
+        let _ = app.update(Message::BridgeReady);
+        let visible = clock.elapsed;
+        assert!(visible.saturating_sub(arrived) <= Duration::from_millis(8));
+
+        let visible_text: String = terminal_display_runs(
+            app.terminals.get(&session_id).expect("terminal"),
+            true,
+            DesktopTerminalCursor::Block,
+        )
+        .into_iter()
+        .map(|run| run.text)
+        .collect::<String>()
+        .chars()
+        .filter(|character| !matches!(character, '\n' | '█' | '▯' | '│' | '┆'))
+        .collect();
+        assert!(visible_text.contains(std::str::from_utf8(&burst).expect("ASCII burst")));
+    }
+
+    #[test]
+    #[ignore = "release-mode measurement; run with --ignored --nocapture"]
+    fn large_styled_terminal_frame_benchmark() {
+        const ROWS: u16 = 200;
+        const COLUMNS: u16 = 300;
+        const STYLED_COLUMNS: u16 = 240;
+        const WARMUP_FRAMES: usize = 5;
+        const MEASURED_FRAMES: usize = 40;
+
+        let mut contents = Vec::with_capacity(
+            usize::from(ROWS) * usize::from(STYLED_COLUMNS) * b"\x1b[31;44mA".len(),
+        );
+        for row in 1..=ROWS {
+            contents.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+            for column in 0..STYLED_COLUMNS {
+                contents.extend_from_slice(if column % 2 == 0 {
+                    b"\x1b[1;31;44mA"
+                } else {
+                    b"\x1b[3;32;45mB"
+                });
+            }
+        }
+        let palette =
+            PresentationTheme::resolve(DesktopTheme::Canopy, SystemAppearance::Dark).terminal;
+        let (baseline, baseline_runs) = measure_styled_terminal_frames(
+            &contents,
+            palette,
+            WARMUP_FRAMES,
+            MEASURED_FRAMES,
+            false,
+            ROWS,
+            COLUMNS,
+        );
+        let (cached, cached_runs) = measure_styled_terminal_frames(
+            &contents,
+            palette,
+            WARMUP_FRAMES,
+            MEASURED_FRAMES,
+            true,
+            ROWS,
+            COLUMNS,
+        );
+        assert_eq!(baseline_runs, cached_runs);
+        assert!(cached_runs >= usize::from(ROWS) * usize::from(STYLED_COLUMNS));
+        println!(
+            "terminal_frame_budget rows={ROWS} columns={COLUMNS} styled_cells={} runs={cached_runs} samples={MEASURED_FRAMES} baseline_p50_us={} baseline_p95_us={} baseline_max_us={} cached_p50_us={} cached_p95_us={} cached_max_us={}",
+            usize::from(ROWS) * usize::from(STYLED_COLUMNS),
+            baseline[0].as_micros(),
+            baseline[1].as_micros(),
+            baseline[2].as_micros(),
+            cached[0].as_micros(),
+            cached[1].as_micros(),
+            cached[2].as_micros(),
+        );
+    }
+
+    fn measure_styled_terminal_frames(
+        contents: &[u8],
+        palette: TerminalPalette,
+        warmup_frames: usize,
+        measured_frames: usize,
+        cached: bool,
+        rows: u16,
+        columns: u16,
+    ) -> ([Duration; 3], usize) {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, rows, columns, 10_000);
+        terminal.process(contents);
+        let mut samples = Vec::with_capacity(measured_frames);
+        let mut last_run_count = 0_usize;
+        for frame in 0..warmup_frames + measured_frames {
+            let row = u16::try_from(frame % usize::from(rows)).expect("bounded row") + 1;
+            let update = format!("\x1b[{row};1H\x1b[38;5;{}mX", 16 + frame % 200);
+            let started = Instant::now();
+            terminal.process(update.as_bytes());
+            let runs = std::hint::black_box(if cached {
+                terminal_display_runs(&terminal, true, DesktopTerminalCursor::Block)
+            } else {
+                terminal_display_runs_uncached(&terminal, true, DesktopTerminalCursor::Block)
+            });
+            last_run_count = runs.len();
+            let spans = terminal_spans(
+                runs,
+                palette,
+                terminal_font(DesktopTerminalFont::JetBrainsMono),
+                DesktopTerminalCursor::Block,
+            );
+            std::hint::black_box(spans.len());
+            if frame >= warmup_frames {
+                samples.push(started.elapsed());
+            }
+        }
+        samples.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+        let maximum = *samples.last().expect("measured frames");
+        ([p50, p95, maximum], last_run_count)
+    }
+
+    #[test]
+    fn terminal_palette_is_applied_after_cached_display_runs() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 2, 20, 100);
+        terminal.process(b"\x1b[44mplain");
+        let runs = terminal_display_runs(&terminal, true, DesktopTerminalCursor::Block);
+        let cached_runs = terminal_display_runs(&terminal, true, DesktopTerminalCursor::Block);
+        assert_eq!(runs, cached_runs);
+
+        let canopy = PresentationTheme::resolve(DesktopTheme::Canopy, SystemAppearance::Dark);
+        let grove = PresentationTheme::resolve(DesktopTheme::Grove, SystemAppearance::Light);
+        let canopy_spans = terminal_spans(
+            runs,
+            canopy.terminal,
+            terminal_font(DesktopTerminalFont::JetBrainsMono),
+            DesktopTerminalCursor::Block,
+        );
+        let grove_spans = terminal_spans(
+            cached_runs,
+            grove.terminal,
+            terminal_font(DesktopTerminalFont::JetBrainsMono),
+            DesktopTerminalCursor::Block,
+        );
+
+        assert_ne!(canopy_spans[0].color, grove_spans[0].color);
+        assert_ne!(
+            canopy_spans[0].highlight, grove_spans[0].highlight,
+            "background palette changes must be applied after display-run caching"
+        );
     }
 
     #[derive(Debug, Eq, PartialEq)]
