@@ -6246,6 +6246,28 @@ mod tests {
     }
 
     #[test]
+    fn saturated_terminal_input_clears_focus_and_keeps_actionable_feedback() {
+        let (bridge, _harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let session_id = SessionId::new();
+        app.terminal_focus = TerminalFocus::Focused;
+
+        for _ in 0..1_024 {
+            app.queue_terminal_input(session_id, vec![b'x']);
+            if app.error.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(app.terminal_focus, TerminalFocus::Unfocused);
+        assert!(matches!(
+            app.error.as_deref(),
+            Some(message) if message.contains("bounded input queue is full")
+                && message.contains("rejected bytes")
+        ));
+    }
+
+    #[test]
     #[ignore = "release-mode measurement; run with --ignored --nocapture"]
     fn large_styled_terminal_frame_benchmark() {
         const ROWS: u16 = 200;
@@ -6373,7 +6395,7 @@ mod tests {
         );
     }
 
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct RenderedBaseline {
         width: u16,
         height: u16,
@@ -6383,11 +6405,12 @@ mod tests {
     }
 
     #[cfg(windows)]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 13] = [
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
         426_262_926_778_126_858,
-        1_503_165_031_025_874_429,
-        5_686_679_588_026_358_842,
+        12_460_750_425_549_756_926,
+        15_610_355_618_498_917_946,
         14_761_951_164_573_712_012,
+        1_503_165_031_025_874_429,
         7_129_090_979_179_955_617,
         13_544_107_981_426_698_952,
         1_748_718_398_488_552_422,
@@ -6395,15 +6418,16 @@ mod tests {
         5_019_121_441_122_480_153,
         3_931_679_346_670_316_763,
         17_325_232_898_887_675_372,
-        282_116_067_056_645_007,
+        1_823_448_962_296_347_469,
         5_196_752_353_597_121_531,
     ];
     #[cfg(target_os = "macos")]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 13] = [
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
         426_262_926_778_126_858,
-        1_503_165_031_025_874_429,
-        5_686_679_588_026_358_842,
+        12_460_750_425_549_756_926,
+        15_610_355_618_498_917_946,
         14_761_951_164_573_712_012,
+        1_503_165_031_025_874_429,
         7_129_090_979_179_955_617,
         13_544_107_981_426_698_952,
         1_748_718_398_488_552_422,
@@ -6411,15 +6435,16 @@ mod tests {
         5_019_121_441_122_480_153,
         3_931_679_346_670_316_763,
         17_325_232_898_887_675_372,
-        282_116_067_056_645_007,
+        1_823_448_962_296_347_469,
         5_196_752_353_597_121_531,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 13] = [
+    const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
         426_262_926_778_126_858,
-        1_503_165_031_025_874_429,
-        5_686_679_588_026_358_842,
+        12_460_750_425_549_756_926,
+        15_610_355_618_498_917_946,
         14_761_951_164_573_712_012,
+        1_503_165_031_025_874_429,
         7_129_090_979_179_955_617,
         13_544_107_981_426_698_952,
         1_748_718_398_488_552_422,
@@ -6427,11 +6452,22 @@ mod tests {
         5_019_121_441_122_480_153,
         3_931_679_346_670_316_763,
         17_325_232_898_887_675_372,
-        282_116_067_056_645_007,
+        1_823_448_962_296_347_469,
         5_196_752_353_597_121_531,
     ];
-    const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 2] =
-        [7_826_771_872_323_314_152, 16_142_488_885_153_956_544];
+    const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
+        15_304_512_929_896_993_386,
+        3_595_588_349_229_771_115,
+        7_616_081_701_853_463_696,
+    ];
+    const APPROVED_NAVIGATOR_EDGE_CHECKSUMS: [u64; 6] = [
+        4_769_257_926_951_293_117,
+        9_774_601_490_458_083_685,
+        18_271_488_173_735_487_813,
+        14_842_523_538_734_881_931,
+        10_626_101_491_264_947_513,
+        1_324_656_990_215_672_508,
+    ];
 
     async fn render_desktop_baseline(
         app: &DesktopApp,
@@ -6504,8 +6540,67 @@ mod tests {
         }
     }
 
-    async fn render_session_action_baselines() -> [RenderedBaseline; 4] {
+    async fn render_scrolled_element_baseline(
+        element: Element<'_, Message>,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+        scroll_id: widget::Id,
+    ) -> RenderedBaseline {
+        let size = iced::Size::new(f32::from(width), f32::from(height));
+        let limits = Limits::new(size, size);
+        let (mut element, mut renderer, mut tree, node) =
+            layout_test_element(element, limits).await;
+        let mut reveal = iced::advanced::widget::operation::scrollable::snap_to::<()>(
+            scroll_id,
+            iced::advanced::widget::operation::scrollable::RelativeOffset {
+                x: None,
+                y: Some(1.0),
+            },
+        );
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut reveal);
+        let viewport = iced::Rectangle::new(iced::Point::ORIGIN, size);
+        renderer.reset(viewport);
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            theme,
+            &iced::advanced::renderer::Style::default(),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let pixels = renderer.screenshot(
+            iced::Size::new(u32::from(width), u32::from(height)),
+            1.0,
+            theme.palette().background,
+        );
+        let distinct_colors = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let checksum = pixels.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        RenderedBaseline {
+            width,
+            height,
+            layout_nodes: layout_node_count(&node),
+            distinct_colors,
+            checksum,
+        }
+    }
+
+    async fn render_session_action_baselines() -> [RenderedBaseline; 5] {
         let (mut app, _, worktree_id, _, _) = desktop_hierarchy();
+        app.desktop_state.window_width = 900;
+        app.desktop_state.window_height = 700;
+        let compact_terminal_action = render_desktop_baseline(&app, 900, 700).await;
         app.desktop_state.window_width = 680;
         app.desktop_state.window_height = 480;
         app.narrow_main = true;
@@ -6526,6 +6621,7 @@ mod tests {
         let narrow_session_form = render_desktop_baseline(&app, 680, 480).await;
 
         [
+            compact_terminal_action,
             narrow_terminal_action,
             wide_session_form,
             compact_session_form,
@@ -6558,6 +6654,81 @@ mod tests {
         .await;
 
         [long_labels, overflowing_actions]
+    }
+
+    async fn render_responsive_navigator_edge_baselines() -> [RenderedBaseline; 6] {
+        let (mut app, _, worktree_id, _, _) = desktop_hierarchy();
+        let template = app.snapshot.worktrees[0].clone();
+        app.snapshot.worktrees.clear();
+        for index in 0..8 {
+            let mut worktree = template.clone();
+            worktree.id = WorktreeId::new();
+            worktree.name = format!("Checkout {index}");
+            worktree.last_activity_at = i64::from(8 - index);
+            app.selected_worktree_id = Some(worktree.id);
+            app.snapshot.worktrees.push(worktree);
+        }
+        let theme = app.theme();
+        let [wide_width, compact_width, narrow_width] = [225_u16, 300, 680];
+        let viewport_height = 220;
+        let wide_bottom = render_scrolled_element_baseline(
+            app.checkouts_column(),
+            &theme,
+            wide_width,
+            viewport_height,
+            navigator_scroll_id(DesktopPanel::Worktrees),
+        )
+        .await;
+        let compact_bottom = render_scrolled_element_baseline(
+            app.checkouts_column(),
+            &theme,
+            compact_width,
+            viewport_height,
+            navigator_scroll_id(DesktopPanel::Worktrees),
+        )
+        .await;
+        let narrow_bottom = render_scrolled_element_baseline(
+            app.checkouts_column(),
+            &theme,
+            narrow_width,
+            viewport_height,
+            navigator_scroll_id(DesktopPanel::Worktrees),
+        )
+        .await;
+
+        let overflow_actions = [NavigatorAction::DeleteCheckout(worktree_id); 8];
+        let overflow_height = u16::try_from(app.presentation().density.control_height + 8)
+            .expect("bounded action strip height");
+        let wide_overflow = render_element_baseline(
+            navigator_action_strip(&overflow_actions, app.presentation().density),
+            &theme,
+            wide_width,
+            overflow_height,
+        )
+        .await;
+        let compact_overflow = render_element_baseline(
+            navigator_action_strip(&overflow_actions, app.presentation().density),
+            &theme,
+            compact_width,
+            overflow_height,
+        )
+        .await;
+        let narrow_overflow = render_element_baseline(
+            navigator_action_strip(&overflow_actions, app.presentation().density),
+            &theme,
+            narrow_width,
+            overflow_height,
+        )
+        .await;
+
+        [
+            wide_bottom,
+            compact_bottom,
+            narrow_bottom,
+            wide_overflow,
+            compact_overflow,
+            narrow_overflow,
+        ]
     }
 
     fn layout_node_count(node: &Node) -> usize {
@@ -6612,6 +6783,51 @@ mod tests {
         label: &'a str,
         last_container: Option<iced::Rectangle>,
         bounds: Option<iced::Rectangle>,
+    }
+
+    #[derive(Default)]
+    struct RenderedText {
+        values: Vec<String>,
+    }
+
+    struct TextBoundsByLabel<'a> {
+        label: &'a str,
+        bounds: Option<iced::Rectangle>,
+    }
+
+    impl WidgetOperation for RenderedText {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+            operate(self);
+        }
+
+        fn text(&mut self, _id: Option<&widget::Id>, _bounds: iced::Rectangle, text: &str) {
+            self.values.push(text.to_owned());
+        }
+    }
+
+    impl WidgetOperation for TextBoundsByLabel<'_> {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+            operate(self);
+        }
+
+        fn text(&mut self, _id: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+            if text == self.label {
+                self.bounds = Some(bounds);
+            }
+        }
+    }
+
+    async fn rendered_text(element: Element<'_, Message>, size: iced::Size) -> Vec<String> {
+        let (mut element, renderer, mut tree, node) =
+            layout_test_element(element, Limits::new(size, size)).await;
+        let mut text_capture = RenderedText::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut text_capture,
+        );
+        text_capture.values
     }
 
     impl WidgetOperation for ButtonBoundsByLabel<'_> {
@@ -6837,6 +7053,9 @@ mod tests {
             let mut worktree = template.clone();
             worktree.id = WorktreeId::new();
             worktree.name = format!("Checkout {index}");
+            if index == 7 {
+                worktree.branch = Some("bottom-branch".into());
+            }
             worktree.last_activity_at = i64::from(8 - index);
             app.selected_worktree_id = Some(worktree.id);
             app.snapshot.worktrees.push(worktree);
@@ -6865,6 +7084,28 @@ mod tests {
             .operate(&mut tree, Layout::new(&node), &renderer, &mut snapshot);
         let (bounds, content_bounds, translation) =
             snapshot.viewport.expect("checkout tree viewport");
+
+        for label in ["Checkout 7", "bottom-branch"] {
+            let mut text_bounds = TextBoundsByLabel {
+                label,
+                bounds: None,
+            };
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut text_bounds,
+            );
+            let text_bounds = text_bounds
+                .bounds
+                .unwrap_or_else(|| panic!("rendered bottom-row text {label:?}"));
+            let visible_y = text_bounds.y - translation.y;
+            assert!(visible_y >= bounds.y, "{label:?} was clipped above");
+            assert!(
+                visible_y + text_bounds.height <= bounds.y + bounds.height,
+                "{label:?} was clipped below"
+            );
+        }
 
         assert!(content_bounds.height > bounds.height);
         assert!(translation.y > 0.0);
@@ -7020,20 +7261,25 @@ mod tests {
 
         app.desktop_state.window_width = 1_440;
         app.desktop_state.window_height = 900;
-        let canopy_attention = render_desktop_baseline(&app, 1_440, 900).await;
+        let wide_terminal_and_selected_checkout = render_desktop_baseline(&app, 1_440, 900).await;
 
+        app.desktop_state.compact_panel = DesktopPanel::Worktrees;
+        app.keyboard_panel = DesktopPanel::Worktrees;
         app.desktop_state.window_width = 900;
         app.desktop_state.window_height = 700;
-        let compact = render_desktop_baseline(&app, 900, 700).await;
+        let compact_selected_checkout = render_desktop_baseline(&app, 900, 700).await;
 
         app.desktop_state.window_width = 680;
         app.desktop_state.window_height = 480;
         app.narrow_main = false;
-        let narrow_explorer = render_desktop_baseline(&app, 680, 480).await;
+        let narrow_selected_checkout = render_desktop_baseline(&app, 680, 480).await;
+        app.desktop_state.compact_panel = DesktopPanel::Sessions;
+        app.keyboard_panel = DesktopPanel::Sessions;
         app.modal = Some(Modal::Settings);
         let narrow_settings = render_desktop_baseline(&app, 680, 480).await;
 
         let [
+            compact_terminal_action,
             narrow_terminal_action,
             wide_session_form,
             compact_session_form,
@@ -7070,10 +7316,11 @@ mod tests {
 
         assert_eq!(
             [
-                canopy_attention.layout_nodes,
-                compact.layout_nodes,
-                narrow_explorer.layout_nodes,
+                wide_terminal_and_selected_checkout.layout_nodes,
+                compact_selected_checkout.layout_nodes,
+                narrow_selected_checkout.layout_nodes,
                 narrow_settings.layout_nodes,
+                compact_terminal_action.layout_nodes,
                 narrow_terminal_action.layout_nodes,
                 wide_session_form.layout_nodes,
                 compact_session_form.layout_nodes,
@@ -7084,13 +7331,16 @@ mod tests {
                 grove_first_run.layout_nodes,
                 confirmation_error.layout_nodes,
             ],
-            [171, 118, 84, 169, 81, 197, 144, 107, 84, 19, 225, 158, 138]
+            [
+                171, 120, 86, 169, 118, 81, 197, 144, 107, 84, 19, 225, 158, 138
+            ]
         );
         let baselines = [
-            &canopy_attention,
-            &compact,
-            &narrow_explorer,
+            &wide_terminal_and_selected_checkout,
+            &compact_selected_checkout,
+            &narrow_selected_checkout,
             &narrow_settings,
+            &compact_terminal_action,
             &narrow_terminal_action,
             &wide_session_form,
             &compact_session_form,
@@ -7118,34 +7368,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rendered_navigator_edge_states_cover_all_breakpoints() {
+        let baselines = render_responsive_navigator_edge_baselines().await;
+        assert_eq!(
+            baselines.map(|baseline| baseline.layout_nodes),
+            [89, 89, 89, 35, 35, 35],
+            "responsive navigator edge-state layout changed"
+        );
+        for baseline in &baselines {
+            assert!(baseline.distinct_colors >= 4, "{baseline:?}");
+        }
+        assert_eq!(
+            baselines.map(|baseline| baseline.checksum),
+            APPROVED_NAVIGATOR_EDGE_CHECKSUMS,
+            "responsive bottom-row or action-overflow pixels changed"
+        );
+    }
+
+    #[tokio::test]
     async fn rendered_details_cover_verbatim_paths_at_responsive_widths() {
-        let (mut app, _, _, _, _) = desktop_hierarchy();
-        let canonical = r"\\?\C:\Users\Mite\Projects\Пројект\a-very-long-checkout-name-that-must-wrap-inside-details";
-        app.snapshot.projects[0].canonical_repository_path = canonical.into();
-        app.snapshot.worktrees[0].canonical_path = canonical.into();
-        app.snapshot.sessions[0].cwd = canonical.into();
+        let (mut app, _, _, selected_session_id, active_session_id) = desktop_hierarchy();
+        let canonical_repository = r"\\?\C:\Users\Mite\Projects\Пројект";
+        let canonical_checkout = r"\\?\UNC\server\share\团队\managed-checkout";
+        let canonical_working_directory = r"\\?\D:\work\selected-session";
+        app.snapshot.projects[0].canonical_repository_path = canonical_repository.into();
+        app.snapshot.worktrees[0].canonical_path = canonical_checkout.into();
+        app.snapshot.sessions[0].display_name = "Selected session".into();
+        app.snapshot.sessions[0].cwd = canonical_working_directory.into();
+        app.snapshot.sessions[1].display_name = "Unrelated active session".into();
+        app.selected_session_id = Some(selected_session_id);
+        app.active_session_id = Some(active_session_id);
         app.desktop_state.compact_panel = DesktopPanel::Sessions;
         app.keyboard_panel = DesktopPanel::Sessions;
+        app.disclosures.technical_details = true;
         app.select_main_tab(MainTab::Details);
 
+        let details_text = rendered_text(app.details_view(), iced::Size::new(900.0, 700.0)).await;
+        assert!(details_text.iter().any(|value| value == "Selected session"));
+        assert!(
+            !details_text
+                .iter()
+                .any(|value| value == "Unrelated active session"),
+            "Details must describe one coherent explorer selection"
+        );
+        for expected in [
+            r"C:\Users\Mite\Projects\Пројект",
+            r"\\server\share\团队\managed-checkout",
+            r"D:\work\selected-session",
+            canonical_repository,
+            canonical_checkout,
+            canonical_working_directory,
+        ] {
+            assert!(
+                details_text.iter().any(|value| value == expected),
+                "missing rendered Details value {expected:?}: {details_text:?}"
+            );
+        }
+        assert!(details_text.iter().all(|value| !value.contains('\u{fffd}')));
+
+        app.desktop_state.window_width = 1_440;
+        app.desktop_state.window_height = 900;
+        let wide = render_desktop_baseline(&app, 1_440, 900).await;
+        app.desktop_state.window_width = 900;
+        app.desktop_state.window_height = 700;
         let compact = render_desktop_baseline(&app, 900, 700).await;
+        app.desktop_state.window_width = 680;
+        app.desktop_state.window_height = 480;
         app.narrow_main = true;
         let narrow = render_desktop_baseline(&app, 680, 480).await;
 
         assert_eq!(
-            [compact.layout_nodes, narrow.layout_nodes],
-            [230, 230],
+            [wide.layout_nodes, compact.layout_nodes, narrow.layout_nodes],
+            [329, 276, 239],
             "Details layout changed at a representative width"
         );
+        assert!(wide.distinct_colors >= 8, "{wide:?}");
         assert!(compact.distinct_colors >= 8, "{compact:?}");
         assert!(narrow.distinct_colors >= 8, "{narrow:?}");
         assert_eq!(
-            [compact.checksum, narrow.checksum],
+            [wide.checksum, compact.checksum, narrow.checksum],
             APPROVED_DETAILS_VISUAL_CHECKSUMS,
             "Details pixels changed at a representative width"
         );
-        assert!(!human_readable_path(canonical).contains(r"\\?\"));
-        assert!(!human_readable_path(canonical).contains('\u{fffd}'));
     }
 
     #[test]
