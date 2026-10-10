@@ -314,7 +314,9 @@ pub(crate) enum NavigatorAttention {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NavigatorAction {
+    RemoveRepository(ProjectId),
     DeleteCheckout(WorktreeId),
+    DeleteSession(SessionId),
 }
 
 impl SessionIndicator {
@@ -722,7 +724,7 @@ fn build_repository_rows(
                 badge: None,
                 indicator: None,
                 attention,
-                actions: Vec::new(),
+                actions: vec![NavigatorAction::RemoveRepository(project.id)],
                 selected: selected_project_id == Some(project.id),
             }
         })
@@ -757,10 +759,6 @@ fn build_checkout_rows(
                 .iter()
                 .filter(|session| session.worktree_id == worktree.id)
                 .collect();
-            let mut actions = Vec::new();
-            if !worktree.is_root_checkout && worktree.status == WorktreeStatus::Active {
-                actions.push(NavigatorAction::DeleteCheckout(worktree.id));
-            }
             NavigatorRow {
                 id: NavigatorNodeId::Checkout(worktree.id),
                 kind: NavigatorNodeKind::Checkout,
@@ -779,7 +777,7 @@ fn build_checkout_rows(
                     .iter()
                     .filter_map(|session| attention_for_state(session.state))
                     .max(),
-                actions,
+                actions: vec![NavigatorAction::DeleteCheckout(worktree.id)],
                 selected: selected_worktree_id == Some(worktree.id),
             }
         })
@@ -812,7 +810,7 @@ fn build_session_rows(
             badge: None,
             indicator: Some(SessionIndicator::for_state(session.state)),
             attention: attention_for_state(session.state),
-            actions: Vec::new(),
+            actions: vec![NavigatorAction::DeleteSession(session.id)],
             selected: selected_session_id == Some(session.id),
         })
         .collect()
@@ -1849,7 +1847,7 @@ mod tests {
 
         assert_eq!(
             presentation.navigator.repositories[0].actions,
-            Vec::<NavigatorAction>::new()
+            vec![NavigatorAction::RemoveRepository(fixture.project_id)]
         );
         assert_eq!(
             presentation.navigator.checkouts[0].actions,
@@ -1857,7 +1855,7 @@ mod tests {
         );
         assert_eq!(
             presentation.navigator.sessions[0].actions,
-            Vec::<NavigatorAction>::new()
+            vec![NavigatorAction::DeleteSession(fixture.session_id)]
         );
     }
 
