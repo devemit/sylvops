@@ -17,7 +17,7 @@ use iced::{
 };
 use sylvops_core::{
     domain::{DaemonSnapshot, ProviderKind},
-    ids::{SessionId, WorkspaceId, WorktreeId},
+    ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse, MAX_PTY_CHUNK_SIZE},
     provider::ProviderHealth,
 };
@@ -39,13 +39,19 @@ pub(crate) enum Operation {
     ProbeProvider(ProviderKind),
     CreateWorkspace,
     OpenWorkspace(WorkspaceId),
+    InspectWorkspaceDeletion(WorkspaceId),
+    DeleteWorkspace,
     RegisterProject,
+    InspectProjectRemoval(ProjectId),
+    RemoveProject,
     CreateWorktree,
     CreateSession(WorktreeId),
     Resume(SessionId),
     RenameProject,
     RenameWorktree,
     RenameSession,
+    InspectSessionDeletion(SessionId),
+    DeleteSession,
     InspectRemoval(WorktreeId),
     RemoveWorktree,
     Attach(SessionId),

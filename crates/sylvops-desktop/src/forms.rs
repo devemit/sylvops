@@ -1,5 +1,6 @@
 use sylvops_core::{
     domain::{GitWorktreeState, ProviderKind},
+    protocol::{ProjectRemovalInspection, SessionDeletionInspection, WorkspaceDeletionInspection},
     ui_forms::{Form, FormKind},
     upgrade::ActiveUpgradeSession,
 };
@@ -86,11 +87,26 @@ pub(crate) enum Confirmation {
     StopSession {
         session_name: String,
         cwd: String,
+        delete_after_stop: bool,
     },
     RemoveWorktree {
         state: GitWorktreeState,
         name: String,
         canonical_path: String,
+    },
+    DeleteWorkspace {
+        inspection: WorkspaceDeletionInspection,
+        name: String,
+    },
+    RemoveProject {
+        inspection: ProjectRemovalInspection,
+        name: String,
+        canonical_path: String,
+    },
+    DeleteSession {
+        inspection: SessionDeletionInspection,
+        name: String,
+        cwd: String,
     },
     InstallUpdate {
         version: String,
