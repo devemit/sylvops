@@ -16,7 +16,7 @@ Use one collapsible `Workspace → Project → Worktree → Session` explorer be
 
 The TUI supports semantic focus zones, responsive single-pane behavior below 72 columns, keyboard and mouse hit-testing, explicit attachment, guided provider-aware forms, inline failures, and four-second success/info feedback. Labels and symbols remain authoritative when color is unavailable.
 
-Protocol 1.6 adds bounded `GetTuiState` and `SaveTuiState` operations. The daemon stores only selected entity IDs and the selected main tab in `ui_state/navigation.v1`. Writes are debounced by 500 ms, occur again on clean exit, and do not change the entity revision. Invalid JSON, stale IDs, and hierarchy mismatches fall back to the first valid visible context.
+Protocol 1.6 adds bounded `GetTuiState` and `SaveTuiState` operations. The daemon stores only selected entity IDs and the selected main tab in `ui_state/navigation.v1`. Writes are debounced by 500 ms, occur again on clean exit, and do not change the entity revision. Invalid JSON and persisted hierarchy mismatches fall back to the first valid visible context. When an entity disappears from a live snapshot, selection moves to the nearest surviving sibling, then its nearest surviving parent, and never retains a stale identifier.
 
 ## Consequences
 
