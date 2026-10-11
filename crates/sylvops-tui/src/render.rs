@@ -105,40 +105,65 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         app.snapshot.sessions.len(),
         app.attention_count()
     );
+    let removal_action = match app.selected_node() {
+        Some(ExplorerNode::Workspace(_)) => "Delete Workspace",
+        Some(ExplorerNode::Project(_)) => "Remove Project",
+        Some(ExplorerNode::Worktree(_)) => "Remove Worktree",
+        Some(ExplorerNode::Session(_)) => {
+            app.selected_session().map_or("Delete Session", |session| {
+                if matches!(
+                    session.state,
+                    SessionState::Fresh
+                        | SessionState::Starting
+                        | SessionState::Running
+                        | SessionState::NeedsFeedback
+                ) {
+                    "Stop Session"
+                } else {
+                    "Delete Session"
+                }
+            })
+        }
+        None => "Stop/Remove",
+    };
     let rows = vec![
         Line::from(vec![
             Span::styled(" SylvOps ", theme.focus),
             Span::raw(format!("{workspace}  /  {repository}  /  {branch}")),
         ]),
         Line::from(vec![
+            Span::styled(format!(" [d] {removal_action} "), theme.failure),
             Span::styled(" [n] New ", theme.success),
-            Span::raw(" [r] Rename  [d] Stop/Remove  [/ ] Commands  "),
+            Span::raw(" [r] Rename  [/ ] Commands  "),
             Span::styled(status, theme.muted),
         ]),
     ];
     frame.render_widget(Paragraph::new(rows), area);
-    let button_width = area.width.min(35);
+    let delete_width = u16::try_from(removal_action.len().saturating_add(6))
+        .unwrap_or(u16::MAX)
+        .min(area.width);
     app.hit_map.push(
-        Rect::new(area.x, area.y.saturating_add(1), button_width / 3, 1),
+        Rect::new(area.x, area.y.saturating_add(1), delete_width, 1),
+        HitTarget::Delete,
+    );
+    let new_x = area.x.saturating_add(delete_width);
+    let new_width = 9.min(area.width.saturating_sub(delete_width));
+    app.hit_map.push(
+        Rect::new(new_x, area.y.saturating_add(1), new_width, 1),
         HitTarget::New,
     );
+    let rename_x = new_x.saturating_add(new_width);
     app.hit_map.push(
         Rect::new(
-            area.x.saturating_add(button_width / 3),
+            rename_x,
             area.y.saturating_add(1),
-            button_width / 3,
+            12.min(
+                area.width
+                    .saturating_sub(delete_width.saturating_add(new_width)),
+            ),
             1,
         ),
         HitTarget::Rename,
-    );
-    app.hit_map.push(
-        Rect::new(
-            area.x.saturating_add((button_width / 3) * 2),
-            area.y.saturating_add(1),
-            button_width / 3,
-            1,
-        ),
-        HitTarget::Delete,
     );
 }
 
@@ -162,40 +187,7 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     } else {
         rows.iter()
             .map(|row| {
-                let (label, suffix) = match row.node {
-                    ExplorerNode::Project(id) => app
-                        .snapshot
-                        .projects
-                        .iter()
-                        .find(|item| item.id == id)
-                        .map_or(("Missing project".into(), String::new()), |item| {
-                            (item.name.clone(), String::new())
-                        }),
-                    ExplorerNode::Worktree(id) => app
-                        .snapshot
-                        .worktrees
-                        .iter()
-                        .find(|item| item.id == id)
-                        .map_or(("Missing worktree".into(), String::new()), |item| {
-                            (
-                                item.name.clone(),
-                                item.branch
-                                    .as_ref()
-                                    .map_or(String::new(), |branch| format!("  {branch}")),
-                            )
-                        }),
-                    ExplorerNode::Session(id) => app
-                        .snapshot
-                        .sessions
-                        .iter()
-                        .find(|item| item.id == id)
-                        .map_or(("Missing session".into(), String::new()), |item| {
-                            (
-                                format!("{} {}", status_symbol(item.state), item.display_name),
-                                format!("  {}", status_label(item.state)),
-                            )
-                        }),
-                };
+                let (label, suffix) = explorer_label(app, row.node);
                 let disclosure = if row.expandable {
                     if row.expanded { "▼" } else { "▶" }
                 } else {
@@ -251,6 +243,51 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             ),
             HitTarget::ExplorerRow(index),
         );
+    }
+}
+
+fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
+    match node {
+        ExplorerNode::Workspace(id) => app
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|item| item.id == id)
+            .map_or(("Missing workspace".into(), String::new()), |item| {
+                (item.name.clone(), "  workspace".into())
+            }),
+        ExplorerNode::Project(id) => app
+            .snapshot
+            .projects
+            .iter()
+            .find(|item| item.id == id)
+            .map_or(("Missing project".into(), String::new()), |item| {
+                (item.name.clone(), String::new())
+            }),
+        ExplorerNode::Worktree(id) => app
+            .snapshot
+            .worktrees
+            .iter()
+            .find(|item| item.id == id)
+            .map_or(("Missing worktree".into(), String::new()), |item| {
+                (
+                    item.name.clone(),
+                    item.branch
+                        .as_ref()
+                        .map_or(String::new(), |branch| format!("  {branch}")),
+                )
+            }),
+        ExplorerNode::Session(id) => app
+            .snapshot
+            .sessions
+            .iter()
+            .find(|item| item.id == id)
+            .map_or(("Missing session".into(), String::new()), |item| {
+                (
+                    format!("{} {}", status_symbol(item.state), item.display_name),
+                    format!("  {}", status_label(item.state)),
+                )
+            }),
     }
 }
 
@@ -403,6 +440,11 @@ fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             Line::from(format!("Repository: {}", project.name)),
             Line::from(format!("Path: {}", project.canonical_repository_path)),
         ]
+    } else if app.selected_workspace {
+        app.active_workspace().map_or_else(
+            || vec![Line::from("No Workspace is open.")],
+            |workspace| vec![Line::from(format!("Workspace: {}", workspace.name))],
+        )
     } else {
         vec![Line::from(
             "Select an item in the explorer to view its details.",

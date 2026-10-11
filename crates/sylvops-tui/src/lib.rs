@@ -27,7 +27,8 @@ use sylvops_core::{
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, MAX_PTY_CHUNK_SIZE, MAX_TERMINAL_COLUMNS,
-        MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS,
+        MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal,
+        SessionDeletionRefusal, WorkspaceDeletionRefusal,
     },
     ui::{MainTab, TuiState},
     upgrade::UpgradeStatus,
@@ -47,6 +48,13 @@ struct FormOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TuiExit {
     Quit,
+}
+
+fn event_requires_snapshot_refresh(event: &DaemonEvent) -> bool {
+    !matches!(
+        event,
+        DaemonEvent::SessionOutput { .. } | DaemonEvent::ResynchronizationRequired { .. }
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -128,7 +136,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 Ok(DaemonEvent::UpgradeProgress {
                     status: UpgradeStatus::Installing { .. },
                 }) => return Ok(TuiExit::Quit),
-                Ok(_) => refresh = true,
+                Ok(event) => refresh |= event_requires_snapshot_refresh(&event),
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
                     refresh = true;
                     resynchronize_terminal(&client, &mut app).await?;
@@ -141,8 +149,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             }
         }
         if refresh {
-            app.snapshot = snapshot(&client).await?;
-            app.restore_selection();
+            app.replace_snapshot(snapshot(&client).await?);
         }
         save_debounced(&client, &mut app).await?;
         if matches!(app.mode, Mode::TerminalAttached) {
@@ -237,13 +244,29 @@ async fn execute_effects(
 }
 
 fn selected_node(app: &App) -> Option<ExplorerNode> {
-    app.explorer_rows()
-        .get(app.explorer_index)
-        .map(|row| row.node)
+    app.selected_node()
+}
+
+fn removal_inspection_request(app: &App) -> Option<ClientRequest> {
+    match selected_node(app)? {
+        ExplorerNode::Workspace(workspace_id) => {
+            Some(ClientRequest::InspectWorkspaceDeletion { workspace_id })
+        }
+        ExplorerNode::Project(project_id) => {
+            Some(ClientRequest::InspectProjectRemoval { project_id })
+        }
+        ExplorerNode::Worktree(worktree_id) => {
+            Some(ClientRequest::GetWorktreeStatus { worktree_id })
+        }
+        ExplorerNode::Session(session_id) => {
+            Some(ClientRequest::InspectSessionDeletion { session_id })
+        }
+    }
 }
 
 fn open_create_form(app: &mut App) {
     app.mode = match selected_node(app) {
+        Some(ExplorerNode::Workspace(id)) => Mode::Modal(Form::repository(id)),
         Some(ExplorerNode::Session(id)) => app
             .snapshot
             .sessions
@@ -293,7 +316,7 @@ fn open_rename_form(app: &mut App) {
                     FormKind::RenameSession(id),
                 )
             }),
-        None => None,
+        Some(ExplorerNode::Workspace(_)) | None => None,
     };
     if let Some(form) = form {
         app.mode = Mode::Modal(form);
@@ -308,89 +331,270 @@ async fn open_destructive_confirmation(
     client: &DaemonClient,
     app: &mut App,
 ) -> Result<(), DaemonError> {
-    match selected_node(app) {
-        Some(ExplorerNode::Project(_)) => {
-            app.flash = Some(Flash::error(
-                "Project deletion is intentionally unavailable.",
-            ));
+    let Some(request) = removal_inspection_request(app) else {
+        app.flash = Some(Flash::error("Nothing is selected."));
+        return Ok(());
+    };
+    let response = client.request(&request).await?;
+    apply_removal_inspection(app, response);
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_removal_inspection(app: &mut App, response: DaemonResponse) {
+    match response {
+        DaemonResponse::WorkspaceDeletionInspected(inspection) => {
+            let Some(workspace) = app
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|item| item.id == inspection.workspace_id)
+            else {
+                app.flash = Some(Flash::error(
+                    "Workspace deletion target is no longer visible.",
+                ));
+                return;
+            };
+            let Some(token) = inspection.authorization_token else {
+                let reason = inspection.refusals.first().map_or_else(
+                    || "The daemon did not authorize Workspace deletion.".into(),
+                    workspace_deletion_refusal_text,
+                );
+                app.flash = Some(Flash::error(bounded_feedback(format!(
+                    "Delete Workspace refused: {reason}"
+                ))));
+                return;
+            };
+            let fallback = if inspection.is_open {
+                inspection.fallback_workspace_id.map_or_else(
+                    || "No Workspace will remain open.".into(),
+                    |id| format!("Workspace {id} will become active."),
+                )
+            } else {
+                "The active Workspace will not change.".into()
+            };
+            app.mode = Mode::Confirmation(Confirmation {
+                title: "Delete Workspace?".into(),
+                detail: format!(
+                    "Delete Workspace '{}' ({}) exactly? Only SylvOps metadata is deleted; repositories, Worktrees, branches, and filesystem content is preserved. {fallback}",
+                    workspace.name, workspace.id
+                ),
+                action: ConfirmAction::DeleteWorkspace {
+                    workspace_id: workspace.id,
+                    token,
+                },
+            });
         }
-        Some(ExplorerNode::Worktree(id)) => {
+        DaemonResponse::ProjectRemovalInspected(inspection) => {
+            let Some(project) = app
+                .snapshot
+                .projects
+                .iter()
+                .find(|item| item.id == inspection.project_id)
+            else {
+                app.flash = Some(Flash::error("Project removal target is no longer visible."));
+                return;
+            };
+            let Some(token) = inspection.authorization_token else {
+                let reason = if inspection.refusals.is_empty() {
+                    "The daemon did not authorize Project removal.".into()
+                } else {
+                    inspection
+                        .refusals
+                        .iter()
+                        .map(project_removal_refusal_text)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                app.flash = Some(Flash::error(bounded_feedback(format!(
+                    "Remove Project refused: {reason}"
+                ))));
+                return;
+            };
+            app.mode = Mode::Confirmation(Confirmation {
+                title: "Remove Project?".into(),
+                detail: format!(
+                    "Remove Project '{}' ({}) exactly? The repository at {} and all filesystem and Git content are preserved.",
+                    project.name, project.id, project.canonical_repository_path
+                ),
+                action: ConfirmAction::RemoveProject {
+                    project_id: project.id,
+                    token,
+                },
+            });
+        }
+        DaemonResponse::WorktreeStatus(status) => {
             let Some(worktree) = app
                 .snapshot
                 .worktrees
                 .iter()
-                .find(|item| item.id == id)
-                .cloned()
+                .find(|item| item.id == status.worktree_id)
             else {
-                return Ok(());
+                app.flash = Some(Flash::error(
+                    "Worktree removal target is no longer visible.",
+                ));
+                return;
             };
             if worktree.is_root_checkout {
                 app.flash = Some(Flash::error(
-                    "The root checkout cannot be removed by SylvOps.",
+                    "Remove Worktree refused: the repository root checkout is preserved.",
                 ));
-                return Ok(());
+                return;
             }
-            match client
-                .request(&ClientRequest::GetWorktreeStatus { worktree_id: id })
-                .await?
-            {
-                DaemonResponse::WorktreeStatus(status) if status.clean => {
-                    if let Some(token) = status.removal_confirmation_token {
-                        app.mode = Mode::Confirmation(Confirmation {
-                            title: "Remove clean worktree?".into(),
-                            detail: format!(
-                                "Remove exactly {}? The Git branch is preserved.",
-                                worktree.canonical_path
-                            ),
-                            action: ConfirmAction::RemoveWorktree {
-                                worktree_id: id,
-                                token,
-                            },
-                        });
-                    } else {
-                        app.flash = Some(Flash::error("No clean-state removal token was issued."));
-                    }
-                }
-                DaemonResponse::WorktreeStatus(status) => {
-                    app.flash = Some(Flash::error(format!(
-                        "Removal refused: {} tracked, {} untracked, {} ignored entries. Clean the worktree and try again.",
-                        status.tracked_changes, status.untracked_files, status.ignored_files
-                    )));
-                }
-                response => {
-                    app.flash = Some(Flash::error(response_message("worktree status", response)));
-                }
+            if worktree.status != sylvops_core::domain::WorktreeStatus::Active {
+                app.flash = Some(Flash::error(format!(
+                    "Remove Worktree refused: '{}' is not active (state: {}).",
+                    worktree.name, worktree.status
+                )));
+                return;
             }
+            if app.snapshot.sessions.iter().any(|session| {
+                session.worktree_id == worktree.id
+                    && matches!(
+                        session.state,
+                        SessionState::Fresh
+                            | SessionState::Starting
+                            | SessionState::Running
+                            | SessionState::NeedsFeedback
+                    )
+            }) {
+                app.flash = Some(Flash::error(
+                    "Remove Worktree refused: an active Session remains. Stop it and wait for exit first.",
+                ));
+                return;
+            }
+            let Some(token) = status.removal_confirmation_token.filter(|_| status.clean) else {
+                app.flash = Some(Flash::error(bounded_feedback(format!(
+                    "Remove Worktree refused: {} tracked, {} untracked, and {} ignored entries remain. Clean the Worktree and try again.",
+                    status.tracked_changes, status.untracked_files, status.ignored_files
+                ))));
+                return;
+            };
+            app.mode = Mode::Confirmation(Confirmation {
+                title: "Remove Worktree?".into(),
+                detail: format!(
+                    "Remove Worktree '{}' ({}) exactly? The managed Worktree directory and its filesystem content at {} are removed; the Git branch is preserved.",
+                    worktree.name, worktree.id, worktree.canonical_path
+                ),
+                action: ConfirmAction::RemoveWorktree {
+                    worktree_id: worktree.id,
+                    token,
+                },
+            });
         }
-        Some(ExplorerNode::Session(id)) => {
-            let Some(session) = app.snapshot.sessions.iter().find(|item| item.id == id) else {
-                return Ok(());
+        DaemonResponse::SessionDeletionInspected(inspection) => {
+            let Some(session) = app
+                .snapshot
+                .sessions
+                .iter()
+                .find(|item| item.id == inspection.session_id)
+            else {
+                app.flash = Some(Flash::error("Session removal target is no longer visible."));
+                return;
             };
             if matches!(
-                session.state,
+                inspection.state,
                 SessionState::Fresh
                     | SessionState::Starting
                     | SessionState::Running
                     | SessionState::NeedsFeedback
             ) {
                 app.mode = Mode::Confirmation(Confirmation {
-                    title: "Stop session process tree?".into(),
+                    title: "Stop Session?".into(),
                     detail: format!(
-                        "Stop '{}' and all descendant processes? Session history remains visible.",
-                        session.display_name
+                        "Stop Session '{}' ({}) and its descendant processes? Session history, Worktree, and filesystem content are preserved.",
+                        session.display_name, session.id
                     ),
-                    action: ConfirmAction::StopSession(id),
+                    action: ConfirmAction::StopSession(session.id),
                 });
-            } else {
-                app.flash = Some(Flash::transient(
-                    FlashKind::Info,
-                    "That session is inactive; its history is retained.",
-                ));
+                return;
             }
+            let Some(token) = inspection.authorization_token else {
+                let reason = session_deletion_refusal_text(inspection.refusal, inspection.state);
+                app.flash = Some(Flash::error(bounded_feedback(format!(
+                    "Delete Session refused: {reason}"
+                ))));
+                return;
+            };
+            app.mode = Mode::Confirmation(Confirmation {
+                title: "Delete Session?".into(),
+                detail: format!(
+                    "Delete Session '{}' ({}) exactly? Only Session history and metadata are deleted; Worktree {} and filesystem content are preserved.",
+                    session.display_name, session.id, inspection.worktree_id
+                ),
+                action: ConfirmAction::DeleteSession {
+                    session_id: session.id,
+                    token,
+                },
+            });
         }
-        None => app.flash = Some(Flash::error("Nothing is selected.")),
+        response => {
+            app.flash = Some(Flash::error(response_message(
+                "removal inspection",
+                response,
+            )));
+        }
     }
-    Ok(())
+}
+
+fn workspace_deletion_refusal_text(refusal: &WorkspaceDeletionRefusal) -> String {
+    match refusal {
+        WorkspaceDeletionRefusal::ProjectsRemain {
+            count, truncated, ..
+        } => format!(
+            "{}{count} Project{} remain. Remove every Project first.",
+            if *truncated { "At least " } else { "" },
+            if *count == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+fn project_removal_refusal_text(refusal: &ProjectRemovalRefusal) -> String {
+    match refusal {
+        ProjectRemovalRefusal::SessionsRemain {
+            count, truncated, ..
+        } => format!(
+            "{}{count} Session{} remain. Stop active Sessions and delete inactive Sessions first.",
+            if *truncated { "At least " } else { "" },
+            if *count == 1 { "" } else { "s" }
+        ),
+        ProjectRemovalRefusal::ManagedWorktreesRemain {
+            count, truncated, ..
+        } => format!(
+            "{}{count} managed Worktree{} remain. Remove every managed Worktree first.",
+            if *truncated { "At least " } else { "" },
+            if *count == 1 { "" } else { "s" }
+        ),
+        ProjectRemovalRefusal::InconsistentDescendants => {
+            "Project metadata is inconsistent; refresh before trying again.".into()
+        }
+    }
+}
+
+fn session_deletion_refusal_text(
+    refusal: Option<SessionDeletionRefusal>,
+    state: SessionState,
+) -> String {
+    match refusal {
+        Some(SessionDeletionRefusal::LiveState) => {
+            "the Session is active. Stop it and wait for exit first.".into()
+        }
+        Some(SessionDeletionRefusal::OwnedProcess) => {
+            "the Session still owns a process tree. Stop it and wait for exit first.".into()
+        }
+        Some(SessionDeletionRefusal::IneligibleState) | None => {
+            format!("state {state} is not eligible for deletion.")
+        }
+    }
+}
+
+fn bounded_feedback(mut text: String) -> String {
+    const MAX_CHARS: usize = 512;
+    if let Some((index, _)) = text.char_indices().nth(MAX_CHARS) {
+        text.truncate(index);
+        text.push_str("...");
+    }
+    text
 }
 
 #[allow(clippy::too_many_lines)]
@@ -501,8 +705,7 @@ async fn handle_form(
         Ok(outcome) => {
             app.mode = Mode::Navigation;
             app.flash = Some(Flash::transient(FlashKind::Success, outcome.message));
-            app.snapshot = snapshot(client).await?;
-            app.restore_selection();
+            app.replace_snapshot(snapshot(client).await?);
             if let Some(selection) = outcome.selection {
                 match selection {
                     ExplorerNode::Worktree(id) => {
@@ -536,7 +739,7 @@ async fn handle_form(
                             }
                         }
                     }
-                    ExplorerNode::Project(_) => {}
+                    ExplorerNode::Workspace(_) | ExplorerNode::Project(_) => {}
                 }
                 app.select_node(selection);
             }
@@ -685,55 +888,132 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
     }
 }
 
-async fn handle_confirmation(
-    client: &DaemonClient,
-    app: &mut App,
-    input: Event,
-) -> Result<(), DaemonError> {
-    let clicked = if let Event::Mouse(mouse) = &input
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfirmationDecision {
+    Confirm,
+    Cancel,
+    Ignore,
+}
+
+fn confirmation_decision(app: &App, input: &Event) -> ConfirmationDecision {
+    let clicked = if let Event::Mouse(mouse) = input
         && mouse.kind == MouseEventKind::Down(MouseButton::Left)
     {
         app.hit_map.target_at(mouse.column, mouse.row)
     } else {
         None
     };
-    let confirm = matches!(clicked, Some(HitTarget::Confirm))
-        || matches!(&input, Event::Key(key) if key.code == KeyCode::Char('y'));
-    let cancel = matches!(clicked, Some(HitTarget::Cancel))
-        || matches!(&input, Event::Key(key) if matches!(key.code, KeyCode::Esc | KeyCode::Char('n')));
-    if cancel {
-        app.mode = Mode::Navigation;
-        return Ok(());
+    if matches!(clicked, Some(HitTarget::Confirm))
+        || matches!(input, Event::Key(key) if key.code == KeyCode::Char('y'))
+    {
+        ConfirmationDecision::Confirm
+    } else if matches!(clicked, Some(HitTarget::Cancel))
+        || matches!(input, Event::Key(key) if matches!(key.code, KeyCode::Esc | KeyCode::Char('n')))
+    {
+        ConfirmationDecision::Cancel
+    } else {
+        ConfirmationDecision::Ignore
     }
-    if !confirm {
-        return Ok(());
+}
+
+fn dismiss_confirmation(app: &mut App) {
+    app.mode = Mode::Navigation;
+}
+
+fn confirmation_request(action: &ConfirmAction) -> ClientRequest {
+    match action {
+        ConfirmAction::DeleteWorkspace {
+            workspace_id,
+            token,
+        } => ClientRequest::DeleteWorkspace {
+            workspace_id: *workspace_id,
+            authorization_token: token.clone(),
+        },
+        ConfirmAction::RemoveProject { project_id, token } => ClientRequest::RemoveProject {
+            project_id: *project_id,
+            authorization_token: token.clone(),
+        },
+        ConfirmAction::RemoveWorktree { worktree_id, token } => ClientRequest::RemoveWorktree {
+            worktree_id: *worktree_id,
+            confirmation_token: token.clone(),
+        },
+        ConfirmAction::StopSession(session_id) => ClientRequest::StopSession {
+            session_id: *session_id,
+        },
+        ConfirmAction::DeleteSession { session_id, token } => ClientRequest::DeleteSession {
+            session_id: *session_id,
+            authorization_token: token.clone(),
+        },
+    }
+}
+
+fn confirmation_success_message(
+    action: &ConfirmAction,
+    response: DaemonResponse,
+) -> Result<&'static str, String> {
+    if let DaemonResponse::Error(error) = response {
+        return Err(error.message);
+    }
+    match (action, response) {
+        (
+            ConfirmAction::DeleteWorkspace { workspace_id, .. },
+            DaemonResponse::WorkspaceDeleted {
+                workspace_id: deleted,
+                ..
+            },
+        ) if workspace_id == &deleted => Ok("Workspace deleted."),
+        (
+            ConfirmAction::RemoveProject { project_id, .. },
+            DaemonResponse::ProjectRemoved {
+                project_id: removed,
+                ..
+            },
+        ) if project_id == &removed => Ok("Project removed; repository preserved."),
+        (
+            ConfirmAction::RemoveWorktree { worktree_id, .. },
+            DaemonResponse::WorktreeRemoved { worktree, .. },
+        ) if worktree_id == &worktree.id => Ok("Worktree removed; branch preserved."),
+        (ConfirmAction::StopSession(_), DaemonResponse::Acknowledged) => Ok("Session stopped."),
+        (
+            ConfirmAction::DeleteSession { session_id, .. },
+            DaemonResponse::SessionDeleted {
+                session_id: deleted,
+                ..
+            },
+        ) if session_id == &deleted => Ok("Session deleted."),
+        (_, response) => Err(format!(
+            "unexpected removal confirmation response: {response:?}"
+        )),
+    }
+}
+
+async fn handle_confirmation(
+    client: &DaemonClient,
+    app: &mut App,
+    input: Event,
+) -> Result<(), DaemonError> {
+    match confirmation_decision(app, &input) {
+        ConfirmationDecision::Cancel => {
+            dismiss_confirmation(app);
+            return Ok(());
+        }
+        ConfirmationDecision::Ignore => return Ok(()),
+        ConfirmationDecision::Confirm => {}
     }
     let Mode::Confirmation(dialog) = app.mode.clone() else {
         return Ok(());
     };
-    let response = match dialog.action {
-        ConfirmAction::RemoveWorktree { worktree_id, token } => {
-            client
-                .request(&ClientRequest::RemoveWorktree {
-                    worktree_id,
-                    confirmation_token: token,
-                })
-                .await?
+    let response = client
+        .request(&confirmation_request(&dialog.action))
+        .await?;
+    dismiss_confirmation(app);
+    match confirmation_success_message(&dialog.action, response) {
+        Ok(message) => {
+            app.flash = Some(Flash::transient(FlashKind::Success, message));
+            app.replace_snapshot(snapshot(client).await?);
         }
-        ConfirmAction::StopSession(session_id) => {
-            client
-                .request(&ClientRequest::StopSession { session_id })
-                .await?
-        }
-    };
-    if let DaemonResponse::Error(error) = response {
-        app.flash = Some(Flash::error(error.message));
-    } else {
-        app.flash = Some(Flash::transient(FlashKind::Success, "Operation completed."));
-        app.snapshot = snapshot(client).await?;
-        app.restore_selection();
+        Err(message) => app.flash = Some(Flash::error(bounded_feedback(message))),
     }
-    app.mode = Mode::Navigation;
     Ok(())
 }
 
@@ -862,11 +1142,11 @@ async fn execute_palette_item(
             .await?
         {
             DaemonResponse::WorkspaceOpened { .. } => {
-                app.snapshot = snapshot(client).await?;
+                app.selected_workspace = true;
                 app.selected_project_id = None;
                 app.selected_worktree_id = None;
                 app.selected_session_id = None;
-                app.restore_selection();
+                app.replace_snapshot(snapshot(client).await?);
                 app.flash = Some(Flash::transient(FlashKind::Success, "Workspace opened."));
             }
             response => {
@@ -1022,7 +1302,7 @@ async fn resume_session(
     let Some(session) = apply_resume_response(app, response) else {
         return Ok(());
     };
-    app.snapshot = snapshot(client).await?;
+    app.replace_snapshot(snapshot(client).await?);
     select_resumed_session(app, &session);
     app.flash = Some(Flash::transient(
         FlashKind::Success,
@@ -1467,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_selection_is_restored_and_stale_ids_fall_back() {
+    fn reconnect_snapshot_discards_stale_ids_and_non_persisted_attachment() {
         let snapshot = populated_snapshot();
         let expected = snapshot.sessions[0].id;
         let app = App::new(
@@ -1482,6 +1762,7 @@ mod tests {
         );
         assert_eq!(app.selected_session_id, Some(expected));
         assert_eq!(app.main_tab, MainTab::Details);
+        assert!(app.attached.is_none());
     }
 
     #[test]
@@ -1573,6 +1854,781 @@ mod tests {
                 .0
                 .iter()
                 .any(|region| region.target == HitTarget::Attach)
+        );
+    }
+
+    #[test]
+    fn session_removal_action_text_distinguishes_stop_from_delete() {
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let running = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(running.contains("[d] Stop Session"));
+
+        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let inactive = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(inactive.contains("[d] Delete Session"));
+    }
+
+    #[test]
+    fn hierarchy_exposes_contextual_removal_actions_for_all_entities() {
+        let snapshot = populated_snapshot();
+        let workspace_id = snapshot.workspaces[0].id;
+        let project_id = snapshot.projects[0].id;
+        let worktree_id = snapshot.worktrees[0].id;
+        let session_id = snapshot.sessions[0].id;
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(snapshot, Vec::new(), None);
+
+        for (node, expected) in [
+            (
+                ExplorerNode::Workspace(workspace_id),
+                "[d] Delete Workspace",
+            ),
+            (ExplorerNode::Project(project_id), "[d] Remove Project"),
+            (ExplorerNode::Worktree(worktree_id), "[d] Remove Worktree"),
+            (ExplorerNode::Session(session_id), "[d] Stop Session"),
+        ] {
+            app.select_node(node);
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(text.contains(expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn removal_inspection_requests_are_target_specific() {
+        let snapshot = populated_snapshot();
+        let workspace_id = snapshot.workspaces[0].id;
+        let project_id = snapshot.projects[0].id;
+        let worktree_id = snapshot.worktrees[0].id;
+        let session_id = snapshot.sessions[0].id;
+        let mut app = App::new(snapshot, Vec::new(), None);
+
+        for (node, expected) in [
+            (
+                ExplorerNode::Workspace(workspace_id),
+                ClientRequest::InspectWorkspaceDeletion { workspace_id },
+            ),
+            (
+                ExplorerNode::Project(project_id),
+                ClientRequest::InspectProjectRemoval { project_id },
+            ),
+            (
+                ExplorerNode::Worktree(worktree_id),
+                ClientRequest::GetWorktreeStatus { worktree_id },
+            ),
+            (
+                ExplorerNode::Session(session_id),
+                ClientRequest::InspectSessionDeletion { session_id },
+            ),
+        ] {
+            app.select_node(node);
+            assert_eq!(removal_inspection_request(&app), Some(expected));
+        }
+    }
+
+    #[test]
+    fn workspace_inspection_names_target_preservation_and_fallback() {
+        let snapshot = populated_snapshot();
+        let workspace_id = snapshot.workspaces[0].id;
+        let fallback_workspace_id = WorkspaceId::new();
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.select_node(ExplorerNode::Workspace(workspace_id));
+
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::WorkspaceDeletionInspected(
+                sylvops_core::protocol::WorkspaceDeletionInspection {
+                    workspace_id,
+                    is_open: true,
+                    fallback_workspace_id: Some(fallback_workspace_id),
+                    authorization_token: Some("a".repeat(64).try_into().unwrap()),
+                    refusals: Vec::new(),
+                },
+            ),
+        );
+
+        let Mode::Confirmation(confirmation) = &app.mode else {
+            panic!("authorized deletion should require confirmation");
+        };
+        assert_eq!(confirmation.title, "Delete Workspace?");
+        assert!(confirmation.detail.contains("Local"));
+        assert!(confirmation.detail.contains(&workspace_id.to_string()));
+        assert!(
+            confirmation
+                .detail
+                .contains("filesystem content is preserved")
+        );
+        assert!(
+            confirmation
+                .detail
+                .contains(&fallback_workspace_id.to_string())
+        );
+        assert!(matches!(
+            confirmation.action,
+            ConfirmAction::DeleteWorkspace { workspace_id: id, .. } if id == workspace_id
+        ));
+    }
+
+    #[test]
+    fn project_worktree_and_session_inspections_describe_exact_effects() {
+        let mut snapshot = populated_snapshot();
+        let workspace_id = snapshot.workspaces[0].id;
+        let project_id = snapshot.projects[0].id;
+        let worktree_id = snapshot.worktrees[0].id;
+        let session_id = snapshot.sessions[0].id;
+        snapshot.worktrees[0].is_root_checkout = false;
+        snapshot.worktrees[0].name = "feature".into();
+        snapshot.worktrees[0].canonical_path = "/repo/.worktrees/feature".into();
+        let mut app = App::new(snapshot, Vec::new(), None);
+
+        app.select_node(ExplorerNode::Project(project_id));
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::ProjectRemovalInspected(
+                sylvops_core::protocol::ProjectRemovalInspection {
+                    project_id,
+                    workspace_id,
+                    authorization_token: Some("b".repeat(64).try_into().unwrap()),
+                    refusals: Vec::new(),
+                },
+            ),
+        );
+        let Mode::Confirmation(project) = &app.mode else {
+            panic!("authorized Project removal should require confirmation");
+        };
+        assert_eq!(project.title, "Remove Project?");
+        assert!(project.detail.contains("repo"));
+        assert!(
+            project
+                .detail
+                .contains("filesystem and Git content are preserved")
+        );
+
+        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.select_node(ExplorerNode::Worktree(worktree_id));
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::WorktreeStatus(sylvops_core::domain::GitWorktreeState {
+                worktree_id,
+                head_commit: "abc".into(),
+                branch: Some("feature".into()),
+                tracked_changes: 0,
+                untracked_files: 0,
+                ignored_files: 0,
+                clean: true,
+                removal_confirmation_token: Some("clean-state-token".into()),
+            }),
+        );
+        let Mode::Confirmation(worktree) = &app.mode else {
+            panic!("clean managed Worktree removal should require confirmation");
+        };
+        assert_eq!(worktree.title, "Remove Worktree?");
+        assert!(worktree.detail.contains("/repo/.worktrees/feature"));
+        assert!(worktree.detail.contains("filesystem content"));
+        assert!(worktree.detail.contains("branch is preserved"));
+
+        app.select_node(ExplorerNode::Session(session_id));
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::SessionDeletionInspected(
+                sylvops_core::protocol::SessionDeletionInspection {
+                    session_id,
+                    worktree_id,
+                    state: SessionState::Running,
+                    authorization_token: None,
+                    refusal: Some(SessionDeletionRefusal::LiveState),
+                },
+            ),
+        );
+        let Mode::Confirmation(stop) = &app.mode else {
+            panic!("active Session should offer Stop Session");
+        };
+        assert_eq!(stop.title, "Stop Session?");
+        assert!(stop.detail.contains("descendant processes"));
+        assert!(stop.detail.contains("filesystem content are preserved"));
+
+        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::SessionDeletionInspected(
+                sylvops_core::protocol::SessionDeletionInspection {
+                    session_id,
+                    worktree_id,
+                    state: SessionState::FinishedSeen,
+                    authorization_token: Some("c".repeat(64).try_into().unwrap()),
+                    refusal: None,
+                },
+            ),
+        );
+        let Mode::Confirmation(delete) = &app.mode else {
+            panic!("inactive Session should offer Delete Session");
+        };
+        assert_eq!(delete.title, "Delete Session?");
+        assert!(delete.detail.contains("history and metadata are deleted"));
+        assert!(delete.detail.contains("filesystem content are preserved"));
+    }
+
+    #[test]
+    fn removal_refusals_are_bounded_and_include_every_actionable_blocker() {
+        let snapshot = populated_snapshot();
+        let workspace_id = snapshot.workspaces[0].id;
+        let project_id = snapshot.projects[0].id;
+        let session_id = snapshot.sessions[0].id;
+        let worktree_id = snapshot.worktrees[0].id;
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.select_node(ExplorerNode::Project(project_id));
+
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::ProjectRemovalInspected(
+                sylvops_core::protocol::ProjectRemovalInspection {
+                    project_id,
+                    workspace_id,
+                    authorization_token: None,
+                    refusals: vec![
+                        ProjectRemovalRefusal::SessionsRemain {
+                            count: 1,
+                            truncated: false,
+                            ids: vec![session_id],
+                        },
+                        ProjectRemovalRefusal::ManagedWorktreesRemain {
+                            count: 1,
+                            truncated: false,
+                            ids: vec![worktree_id],
+                        },
+                    ],
+                },
+            ),
+        );
+
+        let refusal = &app.flash.as_ref().expect("refusal feedback").text;
+        assert!(refusal.contains("delete inactive Sessions"));
+        assert!(refusal.contains("Remove every managed Worktree"));
+        assert!(refusal.chars().count() <= 515);
+        assert!(matches!(app.mode, Mode::Navigation));
+    }
+
+    #[test]
+    fn clean_worktree_is_still_refused_when_live_or_not_active() {
+        let mut snapshot = populated_snapshot();
+        let worktree_id = snapshot.worktrees[0].id;
+        snapshot.worktrees[0].is_root_checkout = false;
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.select_node(ExplorerNode::Worktree(worktree_id));
+        let clean_status = sylvops_core::domain::GitWorktreeState {
+            worktree_id,
+            head_commit: "abc".into(),
+            branch: Some("feature".into()),
+            tracked_changes: 0,
+            untracked_files: 0,
+            ignored_files: 0,
+            clean: true,
+            removal_confirmation_token: Some("clean-state-token".into()),
+        };
+
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::WorktreeStatus(clean_status.clone()),
+        );
+        assert!(
+            app.flash
+                .as_ref()
+                .is_some_and(|flash| flash.text.contains("active Session"))
+        );
+        assert!(matches!(app.mode, Mode::Navigation));
+
+        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.snapshot.worktrees[0].status = WorktreeStatus::Missing;
+        apply_removal_inspection(&mut app, DaemonResponse::WorktreeStatus(clean_status));
+        assert!(
+            app.flash
+                .as_ref()
+                .is_some_and(|flash| flash.text.contains("is not active"))
+        );
+        assert!(matches!(app.mode, Mode::Navigation));
+    }
+
+    #[test]
+    fn workspace_and_session_refusals_are_actionable() {
+        let mut snapshot = populated_snapshot();
+        let workspace_id = snapshot.workspaces[0].id;
+        let project_id = snapshot.projects[0].id;
+        let session_id = snapshot.sessions[0].id;
+        let worktree_id = snapshot.worktrees[0].id;
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        app.select_node(ExplorerNode::Workspace(workspace_id));
+
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::WorkspaceDeletionInspected(
+                sylvops_core::protocol::WorkspaceDeletionInspection {
+                    workspace_id,
+                    is_open: true,
+                    fallback_workspace_id: None,
+                    authorization_token: None,
+                    refusals: vec![WorkspaceDeletionRefusal::ProjectsRemain {
+                        count: 1,
+                        truncated: false,
+                        ids: vec![project_id],
+                    }],
+                },
+            ),
+        );
+        assert!(
+            app.flash
+                .as_ref()
+                .is_some_and(|flash| flash.text.contains("Remove every Project first"))
+        );
+
+        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.sessions[0].process_id = Some(42);
+        app.replace_snapshot(snapshot);
+        app.select_node(ExplorerNode::Session(session_id));
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::SessionDeletionInspected(
+                sylvops_core::protocol::SessionDeletionInspection {
+                    session_id,
+                    worktree_id,
+                    state: SessionState::FinishedSeen,
+                    authorization_token: None,
+                    refusal: Some(SessionDeletionRefusal::OwnedProcess),
+                },
+            ),
+        );
+        assert!(
+            app.flash
+                .as_ref()
+                .is_some_and(|flash| flash.text.contains("still owns a process tree"))
+        );
+    }
+
+    #[test]
+    fn removal_keyboard_and_cancellation_preserve_selection() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        app.select_node(ExplorerNode::Project(project_id));
+        let selection = app.selected_node();
+
+        assert_eq!(
+            input::navigation_action(
+                &app,
+                &Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            ),
+            Some(reducer::Action::Delete)
+        );
+        assert_eq!(
+            reduce(&mut app, reducer::Action::Delete),
+            vec![Effect::OpenDelete]
+        );
+        assert_eq!(
+            confirmation_decision(
+                &app,
+                &Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            ),
+            ConfirmationDecision::Confirm
+        );
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            assert_eq!(
+                confirmation_decision(&app, &Event::Key(KeyEvent::new(code, KeyModifiers::NONE))),
+                ConfirmationDecision::Cancel
+            );
+        }
+
+        app.mode = Mode::Confirmation(Confirmation {
+            title: "Remove Project?".into(),
+            detail: "exact target".into(),
+            action: ConfirmAction::RemoveProject {
+                project_id,
+                token: "d".repeat(64).try_into().unwrap(),
+            },
+        });
+        dismiss_confirmation(&mut app);
+
+        assert!(matches!(app.mode, Mode::Navigation));
+        assert_eq!(app.selected_node(), selection);
+        assert_eq!(app.snapshot, snapshot);
+    }
+
+    #[test]
+    fn confirmation_render_is_textual_and_names_the_target() {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        let session_id = app.snapshot.sessions[0].id;
+        app.mode = Mode::Confirmation(Confirmation {
+            title: "Delete Session?".into(),
+            detail: format!("Delete exact Session {session_id}; filesystem content is preserved."),
+            action: ConfirmAction::DeleteSession {
+                session_id,
+                token: "f".repeat(64).try_into().unwrap(),
+            },
+        });
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Delete Session?"));
+        assert!(text.contains(&session_id.to_string()));
+        assert!(text.contains("filesystem"));
+        assert!(text.contains("preserved"));
+        assert!(text.contains("Confirm · y"));
+        assert!(text.contains("Cancel · Esc"));
+    }
+
+    #[test]
+    fn narrow_header_keeps_contextual_removal_guidance_visible() {
+        let snapshot = populated_snapshot();
+        let workspace_id = snapshot.workspaces[0].id;
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.select_node(ExplorerNode::Workspace(workspace_id));
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("[d] Delete Workspace"));
+    }
+
+    #[test]
+    fn confirmation_requests_keep_authorization_bound_to_each_target() {
+        let workspace_id = WorkspaceId::new();
+        let project_id = ProjectId::new();
+        let worktree_id = WorktreeId::new();
+        let session_id = SessionId::new();
+
+        assert!(matches!(
+            confirmation_request(&ConfirmAction::DeleteWorkspace {
+                workspace_id,
+                token: "a".repeat(64).try_into().unwrap(),
+            }),
+            ClientRequest::DeleteWorkspace { workspace_id: id, .. } if id == workspace_id
+        ));
+        assert!(matches!(
+            confirmation_request(&ConfirmAction::RemoveProject {
+                project_id,
+                token: "b".repeat(64).try_into().unwrap(),
+            }),
+            ClientRequest::RemoveProject { project_id: id, .. } if id == project_id
+        ));
+        assert!(matches!(
+            confirmation_request(&ConfirmAction::RemoveWorktree {
+                worktree_id,
+                token: "clean".into(),
+            }),
+            ClientRequest::RemoveWorktree { worktree_id: id, .. } if id == worktree_id
+        ));
+        assert_eq!(
+            confirmation_request(&ConfirmAction::StopSession(session_id)),
+            ClientRequest::StopSession { session_id }
+        );
+        assert!(matches!(
+            confirmation_request(&ConfirmAction::DeleteSession {
+                session_id,
+                token: "c".repeat(64).try_into().unwrap(),
+            }),
+            ClientRequest::DeleteSession { session_id: id, .. } if id == session_id
+        ));
+    }
+
+    #[test]
+    fn confirmation_success_requires_the_matching_daemon_response() {
+        let session_id = SessionId::new();
+        let worktree_id = WorktreeId::new();
+        let action = ConfirmAction::DeleteSession {
+            session_id,
+            token: "e".repeat(64).try_into().unwrap(),
+        };
+
+        assert_eq!(
+            confirmation_success_message(
+                &action,
+                DaemonResponse::SessionDeleted {
+                    revision: 2,
+                    session_id,
+                    worktree_id,
+                }
+            ),
+            Ok("Session deleted.")
+        );
+        assert!(
+            confirmation_success_message(&action, DaemonResponse::Acknowledged)
+                .expect_err("wrong response must not be reported as success")
+                .contains("unexpected")
+        );
+        assert_eq!(
+            confirmation_success_message(
+                &action,
+                DaemonResponse::Error(sylvops_core::protocol::ProtocolFailure {
+                    code: "conflict".into(),
+                    message: "deletion authorization is stale".into(),
+                    retryable: false,
+                })
+            ),
+            Err("deletion authorization is stale".into())
+        );
+    }
+
+    #[test]
+    fn removal_snapshot_convergence_selects_survivors_and_closes_attachment() {
+        let mut snapshot = populated_snapshot();
+        let removed_session_id = snapshot.sessions[0].id;
+        let project_id = snapshot.projects[0].id;
+        let workspace_id = snapshot.workspaces[0].id;
+        let mut sibling = snapshot.sessions[0].clone();
+        sibling.id = SessionId::new();
+        sibling.display_name = "surviving session".into();
+        sibling.last_activity_at = 0;
+        let sibling_id = sibling.id;
+        snapshot.sessions.push(sibling);
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        app.select_node(ExplorerNode::Session(removed_session_id));
+        app.attached = Some(AttachedTerminal {
+            session_id: removed_session_id,
+            role: AttachmentRole::Observer,
+            parser: vt100::Parser::new(24, 80, 0),
+            last_sequence: 0,
+            columns: 80,
+            rows: 24,
+        });
+        app.mode = Mode::TerminalAttached;
+
+        snapshot
+            .sessions
+            .retain(|item| item.id != removed_session_id);
+        app.replace_snapshot(snapshot.clone());
+        assert_eq!(app.selected_session_id, Some(sibling_id));
+        assert!(app.attached.is_none());
+        assert!(matches!(app.mode, Mode::Navigation));
+
+        snapshot.sessions.clear();
+        snapshot.worktrees[0].status = WorktreeStatus::Removed;
+        app.replace_snapshot(snapshot.clone());
+        assert_eq!(app.selected_worktree_id, None);
+        assert_eq!(app.selected_project_id, Some(project_id));
+        assert_eq!(app.selected_node(), Some(ExplorerNode::Project(project_id)));
+
+        snapshot.projects.clear();
+        snapshot.worktrees.clear();
+        app.replace_snapshot(snapshot.clone());
+        assert_eq!(app.selected_project_id, None);
+        assert_eq!(
+            app.selected_node(),
+            Some(ExplorerNode::Workspace(workspace_id))
+        );
+
+        let fallback_id = WorkspaceId::new();
+        snapshot.workspaces = vec![Workspace {
+            id: fallback_id,
+            name: "Fallback".into(),
+            created_at: 2,
+            updated_at: 2,
+            last_opened_at: Some(2),
+            is_open: true,
+        }];
+        app.replace_snapshot(snapshot);
+        assert_eq!(
+            app.active_workspace().map(|item| item.id),
+            Some(fallback_id)
+        );
+        assert_eq!(
+            app.selected_node(),
+            Some(ExplorerNode::Workspace(fallback_id))
+        );
+        assert_ne!(fallback_id, workspace_id);
+    }
+
+    #[test]
+    fn removal_snapshot_selects_the_adjacent_surviving_sibling() {
+        let mut snapshot = populated_snapshot();
+        let mut middle = snapshot.sessions[0].clone();
+        middle.id = SessionId::new();
+        middle.display_name = "middle".into();
+        middle.last_activity_at = 2;
+        let middle_id = middle.id;
+        let mut oldest = snapshot.sessions[0].clone();
+        oldest.id = SessionId::new();
+        oldest.display_name = "oldest".into();
+        oldest.last_activity_at = 1;
+        let oldest_id = oldest.id;
+        snapshot.sessions[0].display_name = "newest".into();
+        snapshot.sessions[0].last_activity_at = 3;
+        let newest_id = snapshot.sessions[0].id;
+        snapshot.sessions.extend([middle, oldest]);
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        app.select_node(ExplorerNode::Session(middle_id));
+
+        snapshot.sessions.retain(|session| session.id != middle_id);
+        app.replace_snapshot(snapshot);
+
+        assert_eq!(app.selected_session_id, Some(oldest_id));
+        assert_ne!(app.selected_session_id, Some(newest_id));
+    }
+
+    #[test]
+    fn removed_worktree_closes_attachment_even_when_session_history_remains() {
+        let mut snapshot = populated_snapshot();
+        let session_id = snapshot.sessions[0].id;
+        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.sessions[0].process_id = None;
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        app.attached = Some(AttachedTerminal {
+            session_id,
+            role: AttachmentRole::Observer,
+            parser: vt100::Parser::new(24, 80, 0),
+            last_sequence: 0,
+            columns: 80,
+            rows: 24,
+        });
+        app.mode = Mode::TerminalAttached;
+
+        snapshot.worktrees[0].status = WorktreeStatus::Removed;
+        app.replace_snapshot(snapshot);
+
+        assert!(app.attached.is_none());
+        assert!(matches!(app.mode, Mode::Navigation));
+        assert!(app.selected_session_id.is_none());
+        assert_eq!(app.selected_project_id, Some(app.snapshot.projects[0].id));
+    }
+
+    #[test]
+    fn non_removed_worktree_states_remain_selected_during_snapshot_refresh() {
+        for status in [
+            WorktreeStatus::Creating,
+            WorktreeStatus::Removing,
+            WorktreeStatus::Missing,
+            WorktreeStatus::Invalid,
+        ] {
+            let mut snapshot = populated_snapshot();
+            let worktree_id = snapshot.worktrees[0].id;
+            snapshot.worktrees[0].status = status;
+            let mut app = App::new(snapshot.clone(), Vec::new(), None);
+            app.select_node(ExplorerNode::Worktree(worktree_id));
+
+            app.replace_snapshot(snapshot);
+
+            assert_eq!(
+                app.selected_node(),
+                Some(ExplorerNode::Worktree(worktree_id)),
+                "selection changed for {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_removal_event_converges_through_an_authoritative_snapshot() {
+        let mut snapshot = populated_snapshot();
+        let workspace_id = snapshot.workspaces[0].id;
+        let project_id = snapshot.projects[0].id;
+        let worktree_id = snapshot.worktrees[0].id;
+        let session_id = snapshot.sessions[0].id;
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+
+        let session_event = DaemonEvent::SessionDeleted {
+            revision: 2,
+            session_id,
+            worktree_id,
+        };
+        assert!(event_requires_snapshot_refresh(&session_event));
+        snapshot.sessions.clear();
+        app.replace_snapshot(snapshot.clone());
+        assert_eq!(
+            app.selected_node(),
+            Some(ExplorerNode::Worktree(worktree_id))
+        );
+
+        let mut removed_worktree = snapshot.worktrees[0].clone();
+        removed_worktree.status = WorktreeStatus::Removed;
+        let worktree_event = DaemonEvent::WorktreeRemoved {
+            revision: 3,
+            worktree: removed_worktree.clone(),
+        };
+        assert!(event_requires_snapshot_refresh(&worktree_event));
+        snapshot.worktrees[0] = removed_worktree;
+        app.replace_snapshot(snapshot.clone());
+        assert_eq!(app.selected_node(), Some(ExplorerNode::Project(project_id)));
+
+        let project_event = DaemonEvent::ProjectRemoved {
+            revision: 4,
+            project_id,
+            workspace_id,
+        };
+        assert!(event_requires_snapshot_refresh(&project_event));
+        snapshot.projects.clear();
+        snapshot.worktrees.clear();
+        app.replace_snapshot(snapshot.clone());
+        assert_eq!(
+            app.selected_node(),
+            Some(ExplorerNode::Workspace(workspace_id))
+        );
+
+        let fallback_id = WorkspaceId::new();
+        let workspace_event = DaemonEvent::WorkspaceDeleted {
+            revision: 5,
+            workspace_id,
+            opened_workspace_id: Some(fallback_id),
+        };
+        assert!(event_requires_snapshot_refresh(&workspace_event));
+        snapshot.workspaces = vec![Workspace {
+            id: fallback_id,
+            name: "Fallback".into(),
+            created_at: 2,
+            updated_at: 2,
+            last_opened_at: Some(2),
+            is_open: true,
+        }];
+        app.replace_snapshot(snapshot);
+        assert_eq!(
+            app.selected_node(),
+            Some(ExplorerNode::Workspace(fallback_id))
         );
     }
 

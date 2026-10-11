@@ -9,7 +9,10 @@ use sylvops_core::{
         DaemonSnapshot, Project, Session, SessionState, Workspace, Worktree, WorktreeStatus,
         attention_priority,
     },
-    ids::{ProjectId, SessionId, WorktreeId},
+    ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
+    protocol::{
+        ProjectRemovalAuthorization, SessionDeletionAuthorization, WorkspaceDeletionAuthorization,
+    },
     provider::ProviderHealth,
     ui::{MainTab, TuiState},
 };
@@ -24,11 +27,23 @@ pub(crate) enum FocusZone {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ConfirmAction {
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+        token: WorkspaceDeletionAuthorization,
+    },
+    RemoveProject {
+        project_id: ProjectId,
+        token: ProjectRemovalAuthorization,
+    },
     RemoveWorktree {
         worktree_id: WorktreeId,
         token: String,
     },
     StopSession(SessionId),
+    DeleteSession {
+        session_id: SessionId,
+        token: SessionDeletionAuthorization,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +102,7 @@ impl Flash {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExplorerNode {
+    Workspace(WorkspaceId),
     Project(ProjectId),
     Worktree(WorktreeId),
     Session(SessionId),
@@ -163,6 +179,8 @@ pub(crate) struct App {
     pub selected_worktree_id: Option<WorktreeId>,
     pub selected_session_id: Option<SessionId>,
     pub explorer_index: usize,
+    pub selected_workspace: bool,
+    pub workspace_expanded: bool,
     pub expanded_projects: HashSet<ProjectId>,
     pub expanded_worktrees: HashSet<WorktreeId>,
     pub diff: Option<String>,
@@ -180,6 +198,11 @@ impl App {
         providers: Vec<ProviderHealth>,
         persisted: Option<TuiState>,
     ) -> Self {
+        let selected_workspace = persisted.as_ref().is_some_and(|state| {
+            state.selected_project_id.is_none()
+                && state.selected_worktree_id.is_none()
+                && state.selected_session_id.is_none()
+        });
         let mut app = Self {
             mode: if snapshot.workspaces.is_empty() {
                 Mode::Modal(Form::workspace())
@@ -200,6 +223,8 @@ impl App {
                 .and_then(|state| state.selected_worktree_id),
             selected_session_id: persisted.and_then(|state| state.selected_session_id),
             explorer_index: 0,
+            selected_workspace,
+            workspace_expanded: true,
             expanded_projects: HashSet::new(),
             expanded_worktrees: HashSet::new(),
             diff: None,
@@ -212,6 +237,88 @@ impl App {
         };
         app.restore_selection();
         app
+    }
+
+    pub fn replace_snapshot(&mut self, snapshot: DaemonSnapshot) {
+        let selected_before = self.selected_node();
+        let fallback_candidates = self.selection_fallback_candidates();
+        self.snapshot = snapshot;
+
+        let attached_missing = self
+            .attached
+            .as_ref()
+            .is_some_and(|attached| !self.node_exists(ExplorerNode::Session(attached.session_id)));
+        if attached_missing {
+            self.attached = None;
+            if matches!(&self.mode, Mode::TerminalAttached) {
+                self.mode = Mode::Navigation;
+            }
+        }
+
+        if self.resume_pending.is_some_and(|session_id| {
+            !self
+                .snapshot
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id)
+        }) {
+            self.resume_pending = None;
+        }
+
+        let confirmation_target_missing = match &self.mode {
+            Mode::Confirmation(confirmation) => match &confirmation.action {
+                ConfirmAction::DeleteWorkspace { workspace_id, .. } => !self
+                    .snapshot
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == *workspace_id),
+                ConfirmAction::RemoveProject { project_id, .. } => !self
+                    .snapshot
+                    .projects
+                    .iter()
+                    .any(|project| project.id == *project_id),
+                ConfirmAction::RemoveWorktree { worktree_id, .. } => {
+                    !self.snapshot.worktrees.iter().any(|worktree| {
+                        worktree.id == *worktree_id && worktree.status != WorktreeStatus::Removed
+                    })
+                }
+                ConfirmAction::StopSession(session_id)
+                | ConfirmAction::DeleteSession { session_id, .. } => !self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == *session_id),
+            },
+            _ => false,
+        };
+        if confirmation_target_missing {
+            self.mode = Mode::Navigation;
+            self.flash = Some(Flash::error(
+                "The removal target changed; inspect it again before confirming.",
+            ));
+        }
+
+        let selected_stale = selected_before.is_some_and(|selected| !self.node_exists(selected));
+        let reconciled_selection = if selected_stale {
+            self.clear_selection();
+            fallback_candidates
+                .into_iter()
+                .find(|candidate| self.node_exists(*candidate))
+                .or_else(|| {
+                    self.active_workspace()
+                        .map(|workspace| ExplorerNode::Workspace(workspace.id))
+                })
+        } else {
+            selected_before
+        };
+
+        self.restore_selection();
+        if let Some(selection) = reconciled_selection {
+            self.reveal_and_select(selection);
+        }
+        if self.snapshot.workspaces.is_empty() && matches!(&self.mode, Mode::Navigation) {
+            self.mode = Mode::Modal(Form::workspace());
+        }
     }
 
     pub fn active_workspace(&self) -> Option<&Workspace> {
@@ -284,11 +391,24 @@ impl App {
 
     pub fn explorer_rows(&self) -> Vec<ExplorerRow> {
         let mut rows = Vec::new();
-        for project in self.visible_projects() {
+        let Some(workspace) = self.active_workspace() else {
+            return rows;
+        };
+        let projects = self.visible_projects();
+        rows.push(ExplorerRow {
+            node: ExplorerNode::Workspace(workspace.id),
+            depth: 0,
+            expanded: self.workspace_expanded,
+            expandable: !projects.is_empty(),
+        });
+        if !self.workspace_expanded {
+            return rows;
+        }
+        for project in projects {
             let project_expanded = self.expanded_projects.contains(&project.id);
             rows.push(ExplorerRow {
                 node: ExplorerNode::Project(project.id),
-                depth: 0,
+                depth: 1,
                 expanded: project_expanded,
                 expandable: !self.project_worktrees(project.id).is_empty(),
             });
@@ -299,7 +419,7 @@ impl App {
                 let worktree_expanded = self.expanded_worktrees.contains(&worktree.id);
                 rows.push(ExplorerRow {
                     node: ExplorerNode::Worktree(worktree.id),
-                    depth: 1,
+                    depth: 2,
                     expanded: worktree_expanded,
                     expandable: !self.worktree_sessions(worktree.id).is_empty(),
                 });
@@ -311,7 +431,7 @@ impl App {
                         .into_iter()
                         .map(|session| ExplorerRow {
                             node: ExplorerNode::Session(session.id),
-                            depth: 2,
+                            depth: 3,
                             expanded: false,
                             expandable: false,
                         }),
@@ -322,6 +442,21 @@ impl App {
     }
 
     pub fn restore_selection(&mut self) {
+        if self.active_workspace().is_none() {
+            self.selected_workspace = false;
+            self.selected_project_id = None;
+            self.selected_worktree_id = None;
+            self.selected_session_id = None;
+            self.explorer_index = 0;
+            return;
+        }
+        if self.selected_workspace {
+            self.selected_project_id = None;
+            self.selected_worktree_id = None;
+            self.selected_session_id = None;
+            self.sync_explorer_index();
+            return;
+        }
         let projects = self.visible_projects();
         let valid_project = self
             .selected_project_id
@@ -341,6 +476,7 @@ impl App {
                 .filter(|id| items.iter().any(|item| item.id == *id))
                 .or_else(|| items.first().map(|item| item.id))
         });
+        self.selected_workspace = valid_project.is_none();
         if let Some(id) = valid_project {
             self.expanded_projects.insert(id);
         }
@@ -356,7 +492,15 @@ impl App {
             .selected_session_id
             .map(ExplorerNode::Session)
             .or_else(|| self.selected_worktree_id.map(ExplorerNode::Worktree))
-            .or_else(|| self.selected_project_id.map(ExplorerNode::Project));
+            .or_else(|| self.selected_project_id.map(ExplorerNode::Project))
+            .or_else(|| {
+                self.selected_workspace
+                    .then(|| {
+                        self.active_workspace()
+                            .map(|item| ExplorerNode::Workspace(item.id))
+                    })
+                    .flatten()
+            });
         self.explorer_index = target
             .and_then(|target| rows.iter().position(|row| row.node == target))
             .unwrap_or(0)
@@ -370,12 +514,20 @@ impl App {
         };
         self.explorer_index = index.min(rows.len().saturating_sub(1));
         match row.node {
+            ExplorerNode::Workspace(_) => {
+                self.selected_workspace = true;
+                self.selected_project_id = None;
+                self.selected_worktree_id = None;
+                self.selected_session_id = None;
+            }
             ExplorerNode::Project(id) => {
+                self.selected_workspace = false;
                 self.selected_project_id = Some(id);
                 self.selected_worktree_id = None;
                 self.selected_session_id = None;
             }
             ExplorerNode::Worktree(id) => {
+                self.selected_workspace = false;
                 self.selected_worktree_id = Some(id);
                 self.selected_session_id = None;
                 self.selected_project_id = self
@@ -386,6 +538,7 @@ impl App {
                     .map(|item| item.project_id);
             }
             ExplorerNode::Session(id) => {
+                self.selected_workspace = false;
                 self.selected_session_id = Some(id);
                 if let Some(worktree_id) = self
                     .snapshot
@@ -426,6 +579,9 @@ impl App {
             .get(self.explorer_index)
             .map(|row| row.node)
         {
+            Some(ExplorerNode::Workspace(_)) => {
+                self.workspace_expanded = true;
+            }
             Some(ExplorerNode::Project(id)) => {
                 self.expanded_projects.insert(id);
             }
@@ -442,6 +598,9 @@ impl App {
             .get(self.explorer_index)
             .map(|row| row.node)
         {
+            Some(ExplorerNode::Workspace(_)) if self.workspace_expanded => {
+                self.workspace_expanded = false;
+            }
             Some(ExplorerNode::Project(id)) if self.expanded_projects.remove(&id) => {}
             Some(ExplorerNode::Worktree(id)) if self.expanded_worktrees.remove(&id) => {}
             Some(ExplorerNode::Worktree(id)) => {
@@ -475,6 +634,179 @@ impl App {
         if let Some(index) = self.explorer_rows().iter().position(|row| row.node == node) {
             self.select_explorer_index(index);
         }
+    }
+
+    pub fn selected_node(&self) -> Option<ExplorerNode> {
+        self.explorer_rows()
+            .get(self.explorer_index)
+            .map(|row| row.node)
+    }
+
+    fn selection_fallback_candidates(&self) -> Vec<ExplorerNode> {
+        let Some(selected) = self.selected_node() else {
+            return Vec::new();
+        };
+        let (siblings, parents) = match selected {
+            ExplorerNode::Workspace(_) => (Vec::new(), Vec::new()),
+            ExplorerNode::Project(_) => {
+                let siblings = self
+                    .visible_projects()
+                    .into_iter()
+                    .map(|project| ExplorerNode::Project(project.id))
+                    .collect();
+                let parents = self
+                    .active_workspace()
+                    .map(|workspace| vec![ExplorerNode::Workspace(workspace.id)])
+                    .unwrap_or_default();
+                (siblings, parents)
+            }
+            ExplorerNode::Worktree(worktree_id) => {
+                let Some(worktree) = self
+                    .snapshot
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.id == worktree_id)
+                else {
+                    return Vec::new();
+                };
+                let mut parents = vec![ExplorerNode::Project(worktree.project_id)];
+                if let Some(workspace_id) = self
+                    .snapshot
+                    .projects
+                    .iter()
+                    .find(|project| project.id == worktree.project_id)
+                    .map(|project| project.workspace_id)
+                {
+                    parents.push(ExplorerNode::Workspace(workspace_id));
+                }
+                (
+                    self.project_worktrees(worktree.project_id)
+                        .into_iter()
+                        .map(|item| ExplorerNode::Worktree(item.id))
+                        .collect(),
+                    parents,
+                )
+            }
+            ExplorerNode::Session(session_id) => {
+                let Some(session) = self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                else {
+                    return Vec::new();
+                };
+                let mut parents = vec![ExplorerNode::Worktree(session.worktree_id)];
+                if let Some(worktree) = self
+                    .snapshot
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.id == session.worktree_id)
+                {
+                    parents.push(ExplorerNode::Project(worktree.project_id));
+                    if let Some(workspace_id) = self
+                        .snapshot
+                        .projects
+                        .iter()
+                        .find(|project| project.id == worktree.project_id)
+                        .map(|project| project.workspace_id)
+                    {
+                        parents.push(ExplorerNode::Workspace(workspace_id));
+                    }
+                }
+                (
+                    self.worktree_sessions(session.worktree_id)
+                        .into_iter()
+                        .map(|item| ExplorerNode::Session(item.id))
+                        .collect(),
+                    parents,
+                )
+            }
+        };
+        let mut candidates = nearest_siblings(&siblings, selected);
+        candidates.extend(parents);
+        candidates
+    }
+
+    fn node_exists(&self, node: ExplorerNode) -> bool {
+        match node {
+            ExplorerNode::Workspace(workspace_id) => self
+                .active_workspace()
+                .is_some_and(|workspace| workspace.id == workspace_id),
+            ExplorerNode::Project(project_id) => self
+                .snapshot
+                .projects
+                .iter()
+                .find(|project| project.id == project_id)
+                .is_some_and(|project| {
+                    self.active_workspace()
+                        .is_some_and(|workspace| workspace.id == project.workspace_id)
+                }),
+            ExplorerNode::Worktree(worktree_id) => self
+                .snapshot
+                .worktrees
+                .iter()
+                .find(|worktree| {
+                    worktree.id == worktree_id && worktree.status != WorktreeStatus::Removed
+                })
+                .is_some_and(|worktree| {
+                    self.node_exists(ExplorerNode::Project(worktree.project_id))
+                }),
+            ExplorerNode::Session(session_id) => self
+                .snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .is_some_and(|session| {
+                    self.node_exists(ExplorerNode::Worktree(session.worktree_id))
+                }),
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected_workspace = false;
+        self.selected_project_id = None;
+        self.selected_worktree_id = None;
+        self.selected_session_id = None;
+    }
+
+    fn reveal_and_select(&mut self, node: ExplorerNode) {
+        self.workspace_expanded = true;
+        match node {
+            ExplorerNode::Worktree(worktree_id) => {
+                if let Some(project_id) = self
+                    .snapshot
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.id == worktree_id)
+                    .map(|worktree| worktree.project_id)
+                {
+                    self.expanded_projects.insert(project_id);
+                }
+            }
+            ExplorerNode::Session(session_id) => {
+                if let Some(worktree_id) = self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .map(|session| session.worktree_id)
+                {
+                    self.expanded_worktrees.insert(worktree_id);
+                    if let Some(project_id) = self
+                        .snapshot
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.id == worktree_id)
+                        .map(|worktree| worktree.project_id)
+                    {
+                        self.expanded_projects.insert(project_id);
+                    }
+                }
+            }
+            ExplorerNode::Workspace(_) | ExplorerNode::Project(_) => {}
+        }
+        self.select_node(node);
     }
 
     pub fn select_attention(&mut self) -> Option<String> {
@@ -545,6 +877,24 @@ impl App {
             self.flash = None;
         }
     }
+}
+
+fn nearest_siblings(siblings: &[ExplorerNode], selected: ExplorerNode) -> Vec<ExplorerNode> {
+    let Some(position) = siblings.iter().position(|node| *node == selected) else {
+        return Vec::new();
+    };
+    let mut nearest = Vec::with_capacity(siblings.len().saturating_sub(1));
+    for distance in 1..siblings.len() {
+        if let Some(node) = siblings.get(position.saturating_add(distance)) {
+            nearest.push(*node);
+        }
+        if let Some(index) = position.checked_sub(distance)
+            && let Some(node) = siblings.get(index)
+        {
+            nearest.push(*node);
+        }
+    }
+    nearest
 }
 
 pub(crate) fn attention_reason(state: SessionState) -> &'static str {
