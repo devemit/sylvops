@@ -865,7 +865,7 @@ mod tests {
             transport.batches.into_inner().expect("batch lock"),
             vec![expected]
         );
-        assert!(bridge.drain(1).is_empty());
+        assert_eq!(bridge.drain(1).len(), 0);
         assert!(!harness.take_wakeup());
     }
 

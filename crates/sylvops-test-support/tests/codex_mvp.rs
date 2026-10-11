@@ -370,9 +370,9 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         DaemonResponse::Snapshot(snapshot) => snapshot,
         response => panic!("unexpected removed hierarchy response: {response:?}"),
     };
-    assert!(removed.sessions.is_empty());
-    assert!(removed.projects.is_empty());
-    assert!(removed.workspaces.is_empty());
+    assert_eq!(removed.sessions.as_slice(), &[]);
+    assert_eq!(removed.projects.as_slice(), &[]);
+    assert_eq!(removed.workspaces.as_slice(), &[]);
     restarted
         .request(&ClientRequest::ShutdownDaemon)
         .await
