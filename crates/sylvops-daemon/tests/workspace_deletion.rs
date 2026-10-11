@@ -315,7 +315,7 @@ async fn exercise_final_workspace_deletion() {
         authorization_token: final_token,
     };
     client.request(&final_request).await.unwrap();
-    assert!(snapshot(&client).await.workspaces.is_empty());
+    assert_eq!(snapshot(&client).await.workspaces.as_slice(), &[]);
     assert_workspace_refused(&client.request(&final_request).await.unwrap());
     client
         .request(&ClientRequest::ShutdownDaemon)

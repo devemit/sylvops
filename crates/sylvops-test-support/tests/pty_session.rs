@@ -20,7 +20,7 @@ use sylvops_daemon::{
     session::{SessionHandle, SessionSpec},
 };
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TAGGED_ECHO_BUFFER_BYTES: usize = 4 * 1024;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

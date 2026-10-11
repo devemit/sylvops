@@ -3088,7 +3088,10 @@ mod tests {
         assert!(final_state.fallback_workspace_id.is_none());
         let (_, _, opened) = database.delete_workspace(final_state).await.unwrap();
         assert!(opened.is_none());
-        assert!(database.snapshot().await.unwrap().workspaces.is_empty());
+        assert_eq!(
+            database.snapshot().await.unwrap().workspaces.as_slice(),
+            &[]
+        );
         database.shutdown().await.unwrap();
 
         let connection = Connection::open(database_path).unwrap();

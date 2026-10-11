@@ -65,7 +65,7 @@ async fn exercise_oversized_inspection() {
     let mut daemon_task = AbortOnDropTask::spawn(async move { daemon::run(daemon_paths).await });
     let client = connect_eventually(&paths).await;
     let inspection = inspect(&client, project.id).await;
-    assert!(inspection.refusals.is_empty());
+    assert_eq!(inspection.refusals.as_slice(), &[]);
     assert!(serde_json::to_vec(&inspection).unwrap().len() < 4 * 1024);
     let authorization_token = inspection.authorization_token.unwrap();
     let response = client
