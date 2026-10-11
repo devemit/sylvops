@@ -55,6 +55,14 @@ fn run() -> io::Result<u8> {
             })?;
             heartbeat_forever(&heartbeat)
         }
+        "hangup-resistant-heartbeat" => {
+            let heartbeat = arguments.next().map(PathBuf::from).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing heartbeat path")
+            })?;
+            #[cfg(unix)]
+            block_hangup()?;
+            heartbeat_forever(&heartbeat)
+        }
         "exit" => {
             let code = arguments
                 .next()
@@ -106,7 +114,7 @@ fn leave_child(heartbeat: &Path) -> io::Result<u8> {
     let executable = env::current_exe()?;
     let mut child = Command::new(executable);
     child
-        .arg("heartbeat")
+        .arg("hangup-resistant-heartbeat")
         .arg(heartbeat)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -135,6 +143,15 @@ fn leave_child(heartbeat: &Path) -> io::Result<u8> {
         thread::sleep(Duration::from_millis(10));
     }
     Ok(0)
+}
+
+#[cfg(unix)]
+fn block_hangup() -> io::Result<()> {
+    use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+
+    let mut signals = SigSet::empty();
+    signals.add(Signal::SIGHUP);
+    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&signals), None).map_err(io::Error::other)
 }
 
 fn heartbeat_forever(path: &Path) -> io::Result<u8> {

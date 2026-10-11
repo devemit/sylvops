@@ -312,7 +312,22 @@ async fn stop_after_root_exit_reaps_the_remaining_process_group() {
         .expect("root exit timeout")
         .expect("root wait");
     wait_for_file(&heartbeat).await;
-    assert!(!session.process_tree_is_empty().await.unwrap());
+    let first_heartbeat = fs::read_to_string(&heartbeat).expect("read initial heartbeat");
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            let current = fs::read_to_string(&heartbeat).expect("read live heartbeat");
+            if current != first_heartbeat {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("descendant stopped when the PTY root exited");
+    assert!(
+        !session.process_tree_is_empty().await.unwrap(),
+        "live descendant must keep the process group non-empty after its root exits"
+    );
     session
         .stop()
         .await

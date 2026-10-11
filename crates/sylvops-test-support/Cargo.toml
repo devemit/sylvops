@@ -35,6 +35,9 @@ tokio.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal"] }
+
 [dev-dependencies]
 async-trait.workspace = true
 rusqlite.workspace = true
