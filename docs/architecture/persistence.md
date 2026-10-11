@@ -6,7 +6,7 @@ The schema contains `schema_migrations`, `workspaces`, `projects`, `worktrees`, 
 
 Migrations are embedded, checksum-validated, and applied before accepting IPC connections. Applied migrations are immutable. Migration 2 deletes legacy prompt rows and clears historical Codex argument arrays that could contain an untagged prompt while preserving session identity, lifecycle, outcome, and verified resume metadata. Migration 3 records one unique source-to-successor relationship for every successful provider resume so stale and concurrent attempts fail transactionally without mutating the historical source session. Startup refuses an unknown newer schema rather than attempting a destructive downgrade.
 
-Multi-entity state transitions use short transactions. No transaction spans a subprocess. Worktree mutation therefore follows validate → external Git command → verify → transactional record/audit, with conservative recovery if the final persistence step fails.
+Multi-entity state transitions use short transactions. No transaction spans a subprocess. Worktree mutation therefore follows validate → external Git command → verify → transactional record/audit, with conservative recovery if the final persistence step fails. Delete Session, Remove Project, and Delete Workspace revalidate leaf-first eligibility before short transactional metadata deletion, revision advancement, and event publication. Their audit rows retain only timestamp, action, entity kind, opaque identifier, and outcome; deleted content is not copied into the audit trail.
 
 Configuration is separate from the database: versioned TOML plus a machine-local override, atomically written beside the target and renamed after flush. Unknown fields are retained where possible.
 

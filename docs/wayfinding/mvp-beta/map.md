@@ -20,7 +20,7 @@ Reach a defensible `v0.1.0-beta.1`: a developer on Windows, Linux, or macOS can 
 <!-- Closed tickets are indexed here with a one-line gist and a link to their resolution. -->
 
 - [Safe Codex discovery](tickets/safe-codex-discovery.md): resolve only canonical native binaries, including official npm payloads and desktop caches, without executing package-manager or shell shims.
-- [Inactive-session history](tickets/inactive-session-history.md): retain outcome metadata indefinitely, keep terminal output memory-only, and resume eligible provider sessions into new records.
+- [Inactive-session history](tickets/inactive-session-history.md): retain outcome metadata until an explicit leaf-first Delete Session, never prune it automatically, keep terminal output memory-only, and resume eligible provider sessions into new records. The original no-deletion limitation is superseded in part by ADR-0003.
 - [First-run and provider recovery](tickets/first-run-recovery.md): guide an empty desktop through Workspace → Project/root Worktree → Session, keep Shell as the fallback, and re-probe Codex after explicit install or login repair.
 - [Beta acceptance contract](tickets/beta-acceptance-contract.md): block release on the exact cross-platform package, client, daemon, worktree, Shell, Codex, recovery, safety, and evidence clauses; permit only the named beta limitations.
 - [Fresh-machine release proof](tickets/release-proof.md): stage exactly four validated, checksummed, attested archives behind a protected publication gate, then require immutable native clean-host evidence for every contract scenario and record all missing or failed checks.

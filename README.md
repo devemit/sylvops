@@ -249,6 +249,7 @@ The repository now contains a **cross-platform application-release baseline**. I
 - controller/observer attachment, detach, resize, input, reconnect, and parser snapshots;
 - explicit process-tree termination and persisted exit state;
 - guarded managed-worktree creation, status, and removal;
+- explicit state-bound deletion of inactive Sessions, removal of cleared Projects, and deletion of empty Workspaces without cascading into user content;
 - startup reconciliation for missing and externally discovered worktrees;
 - per-project Git mutation serialization and per-worktree session/removal coordination;
 - a provider adapter registry for plain shells, Codex, and Claude Code, all selectable from the CLI, TUI, and desktop;
@@ -269,7 +270,7 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 - `Tab` switches between Explorer and Main; arrows navigate and collapse/expand.
 - `1`, `2`, and `3` open Terminal, Changes, and Details.
 - `Enter` explicitly attaches a selected session; `Ctrl+]` detaches without stopping it.
-- `n`, `r`, and `d` create, rename, and stop/remove in context. `/` searches commands and entities.
+- `n` and `r` create and rename in context. `d` names the selected target's action: Stop Session for a live Session, Delete Session for an inactive Session, Remove Worktree, Remove Project, or Delete Workspace. Each removal is inspected before an explicit `y` confirmation; a refusal explains which child, process, or Worktree condition blocks it. `/` searches commands and entities.
 - Mouse selection, tabs, actions, forms, confirmations, and wheel navigation are supported. Terminal mouse-protocol forwarding is intentionally deferred.
 
 ### Desktop essentials
@@ -282,7 +283,18 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 - Settings is one centered, scrollable modal at every window size. **Essentials** contains signature themes, density, terminal typeface, 10–22 px text sizing, and Block/Line cursor. **Updates** exposes one context-sensitive action. Collapsed **Advanced** contains Classic themes, layout reset, and protected data-removal controls.
 - The desktop interface bundles JetBrains Mono for consistent developer-focused typography across Windows, Linux, and macOS; terminal text keeps its independent font preference.
 - Details shows dates in the operating-system locale and timezone and labels repository locations **Path**. IDs, raw timestamps, process/transport terms, and exact quantities stay under expandable **Technical details** with bounded copy actions. Session-record retention and non-persisted terminal output are described separately.
-- Universal controls such as add, refresh, full screen, navigator visibility, and close use the bundled line icons. Named and risky actions retain visible text, including **Start shell**, **Start Codex**, **Open terminal**, **Leave terminal**, **Stop session**, and **Delete checkout**. The terminal TUI remains available as a keyboard-first alternative.
+- Universal controls such as add, refresh, full screen, navigator visibility, and close use the bundled line icons. Named and risky actions retain visible text, including **Start shell**, **Start Codex**, **Open terminal**, **Leave terminal**, and **Stop session**. The narrow exception is the selected entity's trash-icon removal control: its accessible name and hover/focus tooltip say **Delete workspace**, **Remove repository**, **Delete checkout**, or **Delete session**, and its confirmation remains fully textual. Blocked controls stay actionable so they can explain the required leaf-first cleanup. The terminal TUI remains available as a keyboard-first alternative.
+
+## Leaf-first removal
+
+Stop Session is separate from removal: it ends the process tree but retains the Session record and history. The four removal operations inspect current daemon state before presenting a target-specific confirmation, revalidate that state during execution, and have no undo. In the desktop, confirm in the textual dialog; in the TUI, press `d` on the selected entity and then `y`; in the CLI, pass the explicit `--confirm` flag shown below.
+
+| Operation | CLI | Eligibility and filesystem boundary |
+|---|---|---|
+| Delete Session | `sylvops session delete <session-id> --confirm` | The Session must be inactive with no owned process tree. Its retained SylvOps history is removed; its Worktree and files are preserved. |
+| Remove Project | `sylvops project remove <project-id> --confirm` | The Project must have no Sessions or active managed non-root Worktrees. It is unregistered; the repository, root checkout, Git data, and external Worktrees are preserved. |
+| Remove Worktree | `sylvops worktree remove <worktree-id> --confirm` | The Worktree must be clean, active, managed, non-root, and have no active Sessions. This is the only operation that removes a working directory, and its Git branch is preserved. |
+| Delete Workspace | `sylvops workspace delete <workspace-id> --confirm` | The Workspace must contain no Projects. Only the group is deleted; repositories, Worktrees, branches, and files are preserved. |
 
 ## Current commands
 
@@ -303,7 +315,9 @@ sylvops data remove --confirm "DELETE SYLVOPS USER DATA"
 sylvops daemon start
 sylvops daemon status
 sylvops workspace add my-workspace
+sylvops workspace delete <workspace-id> --confirm
 sylvops project add --workspace <workspace-id> <repository-path>
+sylvops project remove <project-id> --confirm
 sylvops worktree create --project <project-id> --branch feature/example --base HEAD
 sylvops worktree status <worktree-id>
 sylvops provider list
@@ -315,6 +329,7 @@ sylvops session create --worktree <worktree-id> --provider claude --model <model
 sylvops session attach <session-id>
 sylvops session resume <session-id>
 sylvops session stop <session-id>
+sylvops session delete <session-id> --confirm
 sylvops worktree remove <worktree-id> --confirm
 sylvops tui
 sylvops snapshot

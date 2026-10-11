@@ -20,6 +20,8 @@ Repository contents and paths, IPC clients, hook payloads, provider output, Git 
 
 Managed worktree creation disables Git hooks for the `git worktree add` invocation, uses an opaque destination, and resolves the requested base to a commit before mutation. Git checkout filters and the working-tree materialization itself are still repository-controlled behavior; creation therefore remains an explicit user action. Removal requires `--confirm`, a fresh clean status including ignored files, and a state-bound daemon token. It never uses `--force` or recursive filesystem deletion.
 
+Delete Session, Remove Project, Remove Worktree, and Delete Workspace are bounded authenticated inspect-then-execute operations. Each confirmation names one target and carries opaque authorization bound to the inspected runtime, descendant, or Git state; the daemon revalidates immediately before mutation and fails closed after concurrent change. Only Remove Worktree launches Git or removes a working directory. The other operations delete SylvOps-owned metadata while preserving repositories, Worktrees, branches, and files. Removal audit entries contain only timestamp, action, entity kind, opaque identifier, and outcome; names, paths, prompts, terminal content, provider or Git output, remote metadata, environment values, and credentials are excluded.
+
 ## Process and identity rules
 
 Socket permissions or pipe ACLs are necessary but not sufficient; peer identity is checked where the OS permits. Persisted PIDs are informational only and are never trusted after restart. Windows child trees are placed in Job Objects; Unix children use dedicated process groups.

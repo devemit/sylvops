@@ -11,5 +11,7 @@ These terms describe desktop interaction patterns rather than daemon domain type
 | Hover feedback | A temporary neutral tint showing that a control is interactive; it never carries information unavailable elsewhere. |
 | Inline rename | A session-name text field entered by double-click or keyboard shortcut. Enter saves; Escape or click-away cancels. |
 | Interactive session form | The desktop/TUI provider picker and optional display name. Advanced provider startup arguments are CLI-only. |
+| Removal action | A target-specific operation that deletes SylvOps metadata or, only for a managed Checkout, its working directory. It is distinct from stopping a Session. |
+| Removal control | The selected entity's compact trash-icon action. Its accessible name and hover/focus tooltip name the exact operation, while confirmation and blocker text explain the boundary. |
 | Terminal cursor | The current input cell marker, persisted as either Block or Line. |
 | Terminal typeface | The monospace family used for terminal and diff content. It is independent from the platform-native application UI font. |
