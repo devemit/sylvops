@@ -8274,7 +8274,7 @@ mod tests {
                 .iter()
                 .any(|session| session.id == first_id)
         );
-        assert!(app.open_sessions.is_empty());
+        assert_eq!(app.open_sessions.as_slice(), &[]);
     }
 
     #[test]
@@ -8322,8 +8322,8 @@ mod tests {
 
         app.cleanup_deleted_workspace(workspace_id, None);
 
-        assert!(app.snapshot.workspaces.is_empty());
-        assert!(app.open_sessions.is_empty());
+        assert_eq!(app.snapshot.workspaces.as_slice(), &[]);
+        assert_eq!(app.open_sessions.as_slice(), &[]);
         assert_eq!(app.persisted_state().selected_project_id, None);
         assert!(matches!(
             app.modal,
