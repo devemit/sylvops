@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn main() -> ExitCode {
@@ -118,7 +118,22 @@ fn leave_child(heartbeat: &Path) -> io::Result<u8> {
 
         child.creation_flags(CREATE_NO_WINDOW);
     }
-    child.spawn()?;
+    let mut child = child.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !heartbeat.exists() {
+        if child.try_wait()?.is_some() {
+            return Err(io::Error::other(
+                "heartbeat child exited before becoming ready",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "heartbeat child did not become ready",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     Ok(0)
 }
 
