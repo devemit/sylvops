@@ -4,6 +4,55 @@ SylvOps is a local application for supervising coding-agent sessions that run in
 
 ## Language
 
+### Supervision hierarchy
+
+**Workspace**:
+A saved group of Projects that a user supervises together.
+
+**Project**:
+An existing local Git repository registered in a Workspace.
+_Avoid_: Repository when naming the persisted domain type
+
+**Worktree**:
+A Git checkout belonging to a Project, either its root checkout or an isolated managed checkout.
+_Avoid_: Checkout when naming the persisted domain type
+
+**Session**:
+A supervised interactive agent or shell process that belongs to a Worktree.
+_Avoid_: Terminal
+
+**Provider**:
+The selected kind of interactive program that supplies a Session, such as a plain shell, Codex, or Claude Code.
+_Avoid_: Agent when referring to the Session's launch kind
+
+**Attachment**:
+A client's live connection to a Session's terminal.
+_Avoid_: Session, process
+
+### Supervision removal
+
+**Stop Session**:
+End a Session's process while retaining its record and history.
+_Avoid_: Delete Session
+
+**Delete Session**:
+Permanently remove an inactive Session and its retained history from SylvOps without affecting its Worktree.
+_Avoid_: Stop Session
+
+**Remove Project**:
+Unregister a Project with no Sessions or active managed Worktrees while preserving its repository, root checkout, and branches on disk.
+_Avoid_: Delete repository
+
+**Remove Worktree**:
+Remove a clean, active, managed non-root Worktree with no active Sessions from disk while preserving its branch.
+_Avoid_: Delete branch
+
+**Delete Workspace**:
+Permanently remove an empty Workspace from SylvOps without affecting repositories, Worktrees, or branches on disk.
+_Avoid_: Delete repository, delete Worktree
+
+### Application delivery
+
 **Application release**:
 A deliberately promoted, versioned SylvOps build that users can install or upgrade to.
 _Avoid_: Release-phase labels, release candidate, build artifact

@@ -8,6 +8,8 @@ blocked_by: []
 
 > **Historical release-planning record:** this ticket belongs to the retired beta-phase plan and is not an active roadmap item or release gate.
 
+> **Superseded in part by ADR-0003:** inactive Session records still have no automatic pruning or retention schedule, but a user may now explicitly delete one eligible inactive Session through the leaf-first removal flow. Terminal output remains memory-only.
+
 ## Question
 
 What must users be able to see and do with finished, failed, terminated, and disconnected sessions before and after a daemon restart, given that terminal scrollback is intentionally memory-only for the beta?

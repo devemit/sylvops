@@ -8,6 +8,8 @@ Managed worktrees use an access-controlled root and opaque project/worktree IDs.
 
 Removal always refreshes Git's worktree list, branch/HEAD identity, and porcelain status, including tracked, untracked, and ignored files. Any content or branch-identity change refuses removal. Confirmation is bound to the refreshed state. Only non-forced `git worktree remove` is allowed, and the branch is preserved. SylvOps never uses recursive deletion as a fallback.
 
+This managed Worktree operation is the only leaf-first removal that deletes a working directory. Remove Project only unregisters a cleared Project and its SylvOps-owned metadata; it never invokes Git, removes the repository root, edits Git configuration or references, or mutates external and unexpectedly discovered Worktrees. Delete Session and Delete Workspace likewise preserve all repository and Worktree content.
+
 Unix symlinks and Windows reparse points/junctions are rejected along managed paths. Windows containment comparisons account for drive and case behavior. Identity is revalidated immediately before destructive operations.
 
 Read-only status, diff, branches, commits, file finding, and grep have time and byte caps. Binary and oversized files receive markers rather than terminal rendering.

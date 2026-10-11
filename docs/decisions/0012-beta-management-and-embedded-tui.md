@@ -2,6 +2,8 @@
 
 > **Historical context:** release-phase terminology below records when this decision was made. Current delivery uses ordinary semantic `0.x` application releases.
 
+> **Superseded in part by ADR-0003:** an explicit leaf-first `Remove Project` operation is now available for a Project with no Sessions or active managed non-root Worktrees. Root-checkout and branch deletion remain unavailable.
+
 ## Status
 
 Accepted for the cross-platform beta candidate; hosted acceptance remains required.
@@ -22,6 +24,6 @@ The default `sylvops` command opens the TUI. `sylvops open [PATH]` idempotently 
 
 - The daemon remains the only owner of PTYs, persisted state, and Git mutations.
 - The command palette searches known entities and actions; it is not an arbitrary command launcher.
-- Project deletion, root-checkout deletion, and branch deletion remain unavailable.
+- At the time of this decision, Project deletion, root-checkout deletion, and branch deletion were unavailable.
 - Closing the TUI detaches the client without stopping supervised sessions.
 - Protocol 1.5 intentionally exact-matches local clients and daemons.

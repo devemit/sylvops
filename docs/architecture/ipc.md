@@ -35,7 +35,7 @@ The sole persisted TUI record is `client_scope = 'tui'`, `key = 'navigation.v1'`
 
 The desktop uses a separate `client_scope = 'desktop'`, `key = 'navigation.v1'` record. It is limited to selected IDs, the selected main tab, at most 16 open session IDs, theme, density, terminal font size, validated window size, panel ratios, and the compact navigator panel. It never stores attachment state, terminal data, form contents, searches, or credentials.
 
-`RemoveWorktree` includes a confirmation token derived from the checkout identity, branch, HEAD, and a clean porcelain-status result. The daemon refreshes all of that state and compares the token immediately before invoking non-forced removal. Tokens are authorization context for one observed state, not credentials.
+`InspectSessionDeletion`, `InspectProjectRemoval`, `InspectWorkspaceDeletion`, and Worktree status inspection return either bounded actionable refusal data or opaque authorization for the observed state. Execution revalidates Session lifecycle and runtime ownership, exact Project or Workspace membership, or Worktree identity, branch, HEAD, and clean porcelain status immediately before mutation. `RemoveWorktree` then invokes non-forced Git removal; the other operations mutate metadata only. Tokens are authorization context for one target and observed state, not credentials.
 
 Each connection has dedicated reader and writer ownership tasks. A frame read is never cancellation-interrupted by lifecycle or terminal events, and responses are correlated independently of event delivery.
 
