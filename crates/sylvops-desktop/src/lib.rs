@@ -5063,12 +5063,21 @@ impl DesktopApp {
                 .filter(|id| sessions.iter().any(|session| session.id == *id))
                 .or_else(|| sessions.first().map(|session| session.id))
         });
-        self.open_sessions.retain(|id| {
-            self.snapshot
-                .sessions
-                .iter()
-                .any(|session| session.id == *id)
-        });
+        let visible_session_ids: HashSet<_> = self
+            .snapshot
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect();
+        self.open_sessions
+            .retain(|id| visible_session_ids.contains(id));
+        let terminal_count = self.terminals.len();
+        self.terminals
+            .retain(|id, _| visible_session_ids.contains(id));
+        if self.terminals.len() != terminal_count {
+            self.terminal_focus = TerminalFocus::Unfocused;
+            self.terminal_selection_state = TerminalSelectionState::Idle;
+        }
         if self
             .active_session_id
             .is_some_and(|id| !self.open_sessions.contains(&id))
@@ -8197,6 +8206,32 @@ mod tests {
         let persisted = app.persisted_state();
         assert_ne!(persisted.selected_session_id, Some(second_id));
         assert!(!persisted.open_session_ids.contains(&second_id));
+    }
+
+    #[test]
+    fn snapshot_refresh_prunes_terminal_state_removed_by_another_client() {
+        let (mut app, _, worktree_id, first_id, second_id) = desktop_hierarchy();
+        app.open_sessions.push(second_id);
+        app.active_session_id = Some(second_id);
+        app.selected_session_id = Some(second_id);
+        app.terminals.insert(
+            second_id,
+            TerminalState::new(AttachmentRole::Controller, 24, 80, 100),
+        );
+        let mut refreshed = app.snapshot.clone();
+        refreshed.sessions.retain(|session| session.id != second_id);
+
+        app.handle_response(
+            Operation::RefreshSnapshot,
+            DaemonResponse::Snapshot(refreshed),
+        );
+
+        assert_eq!(app.selected_session_id, Some(first_id));
+        assert_eq!(app.selected_worktree_id, Some(worktree_id));
+        assert_eq!(app.active_session_id, Some(first_id));
+        assert!(!app.open_sessions.contains(&second_id));
+        assert!(!app.terminals.contains_key(&second_id));
+        assert_eq!(app.terminal_focus, TerminalFocus::Unfocused);
     }
 
     #[test]
