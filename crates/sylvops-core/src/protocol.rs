@@ -868,6 +868,7 @@ fn take_uuid(bytes: &[u8], position: &mut usize) -> Result<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::WorktreeStatus;
     use crate::ui::{MainTab, TuiState};
     use crate::{
         provider::{AuthenticationRequirement, ProviderCapabilities, ProviderRuntimeCapabilities},
@@ -1239,6 +1240,139 @@ mod tests {
         for request in requests {
             let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn complete_removal_contract_round_trips_success_and_refusal_variants() {
+        let workspace_id = WorkspaceId::new();
+        let fallback_workspace_id = WorkspaceId::new();
+        let project_id = ProjectId::new();
+        let worktree_id = WorktreeId::new();
+        let session_id = SessionId::new();
+        let removed_worktree = Worktree {
+            id: worktree_id,
+            project_id,
+            name: "removed".into(),
+            path: "/managed/removed".into(),
+            canonical_path: "/managed/removed".into(),
+            branch: Some("feature/removal".into()),
+            base_ref: "main".into(),
+            base_commit: "deadbeef".into(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Removed,
+            created_at: 1,
+            last_activity_at: 2,
+            removed_at: Some(2),
+        };
+
+        let responses = [
+            DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
+                session_id,
+                worktree_id,
+                state: SessionState::Running,
+                authorization_token: None,
+                refusal: Some(SessionDeletionRefusal::LiveState),
+            }),
+            DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
+                session_id,
+                worktree_id,
+                state: SessionState::Terminated,
+                authorization_token: None,
+                refusal: Some(SessionDeletionRefusal::OwnedProcess),
+            }),
+            DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
+                session_id,
+                worktree_id,
+                state: SessionState::Fresh,
+                authorization_token: None,
+                refusal: Some(SessionDeletionRefusal::IneligibleState),
+            }),
+            DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
+                session_id,
+                worktree_id,
+                state: SessionState::Terminated,
+                authorization_token: Some("a".repeat(64).try_into().unwrap()),
+                refusal: None,
+            }),
+            DaemonResponse::ProjectRemovalInspected(ProjectRemovalInspection {
+                project_id,
+                workspace_id,
+                authorization_token: None,
+                refusals: vec![ProjectRemovalRefusal::InconsistentDescendants],
+            }),
+            DaemonResponse::WorkspaceDeletionInspected(WorkspaceDeletionInspection {
+                workspace_id,
+                is_open: true,
+                fallback_workspace_id: Some(fallback_workspace_id),
+                authorization_token: Some("b".repeat(64).try_into().unwrap()),
+                refusals: Vec::new(),
+            }),
+            DaemonResponse::WorktreeStatus(GitWorktreeState {
+                worktree_id,
+                head_commit: "deadbeef".into(),
+                branch: Some("feature/removal".into()),
+                tracked_changes: 0,
+                untracked_files: 0,
+                ignored_files: 0,
+                clean: true,
+                removal_confirmation_token: Some("state-bound-token".into()),
+            }),
+            DaemonResponse::SessionDeleted {
+                revision: 20,
+                session_id,
+                worktree_id,
+            },
+            DaemonResponse::WorktreeRemoved {
+                revision: 21,
+                worktree: removed_worktree.clone(),
+            },
+            DaemonResponse::ProjectRemoved {
+                revision: 22,
+                project_id,
+                workspace_id,
+            },
+            DaemonResponse::WorkspaceDeleted {
+                revision: 23,
+                workspace_id,
+                opened_workspace_id: Some(fallback_workspace_id),
+            },
+            DaemonResponse::Error(ProtocolFailure {
+                code: "session_request_refused".into(),
+                message: "authorization is stale".into(),
+                retryable: false,
+            }),
+        ];
+        for response in responses {
+            let frame = Frame::message(MessageClass::Response, 50, &response).unwrap();
+            assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
+        }
+
+        let events = [
+            DaemonEvent::SessionDeleted {
+                revision: 20,
+                session_id,
+                worktree_id,
+            },
+            DaemonEvent::WorktreeRemoved {
+                revision: 21,
+                worktree: removed_worktree,
+            },
+            DaemonEvent::ProjectRemoved {
+                revision: 22,
+                project_id,
+                workspace_id,
+            },
+            DaemonEvent::WorkspaceDeleted {
+                revision: 23,
+                workspace_id,
+                opened_workspace_id: Some(fallback_workspace_id),
+            },
+        ];
+        for event in events {
+            let frame = Frame::message(MessageClass::Event, 51, &event).unwrap();
+            assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
         }
     }
 

@@ -53,12 +53,24 @@ fn run() -> io::Result<()> {
         println!("FAKE_CODEX_RESUMED={external_id}");
     } else {
         println!("FAKE_CODEX_READY={external_id}");
-        if initial_prompt(&arguments).is_some() {
+        let prompt = initial_prompt(&arguments);
+        if prompt.is_some() {
             emit_hook(
                 "UserPromptSubmit",
                 &external_id,
                 Some(json!({"turn_id": "turn-initial"})),
             )?;
+        }
+        if prompt == Some("SYLVOPS_TEST_AUTO_FINISH") {
+            emit_hook(
+                "Stop",
+                &external_id,
+                Some(json!({"turn_id": "turn-initial"})),
+            )?;
+            emit_hook("SessionEnd", &external_id, None)?;
+            println!("FAKE_CODEX_FINISHED");
+            io::stdout().flush()?;
+            return Ok(());
         }
     }
     io::stdout().flush()?;

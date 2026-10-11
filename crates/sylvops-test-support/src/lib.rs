@@ -117,6 +117,28 @@ async fn run_git(path: &Path, arguments: &[&str]) -> io::Result<()> {
     Ok(())
 }
 
+/// Reports whether a local branch exists using a bounded structured Git command.
+///
+/// # Errors
+///
+/// Returns an error when Git cannot be started or the branch check times out.
+pub async fn git_branch_exists(repository: &Path, branch: &str) -> io::Result<bool> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(repository)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    bounded(command.status())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Git branch check timed out"))?
+        .map(|status| status.success())
+}
+
 /// Apply a uniform timeout to process and IPC tests.
 ///
 /// # Errors

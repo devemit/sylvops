@@ -5,12 +5,13 @@ use std::{ffi::OsString, path::Path, process::Command, time::Duration};
 use rusqlite::OptionalExtension;
 use sylvops_core::{
     domain::{ProviderKind, Session, SessionState},
-    ids::{SessionId, WorktreeId},
+    ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonResponse},
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 
 const PROMPT_SENTINEL: &str = "SYLVOPS_PRIVATE_PROMPT_25_7f8cbfea";
+const AUTO_FINISH_PROMPT: &str = "SYLVOPS_TEST_AUTO_FINISH";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
@@ -61,7 +62,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         DaemonResponse::WorkspaceAdded { workspace, .. } => workspace.id,
         response => panic!("unexpected workspace response: {response:?}"),
     };
-    let worktree_id = match client
+    let (project_id, worktree_id) = match client
         .request(&ClientRequest::AddProject {
             workspace_id,
             repository_path: repository.to_string_lossy().into_owned(),
@@ -69,7 +70,11 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("project response")
     {
-        DaemonResponse::ProjectAdded { root_worktree, .. } => root_worktree.id,
+        DaemonResponse::ProjectAdded {
+            project,
+            root_worktree,
+            ..
+        } => (project.id, root_worktree.id),
         response => panic!("unexpected project response: {response:?}"),
     };
     let shell_session_id = create_shell_session(&client, worktree_id).await;
@@ -339,6 +344,35 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         DaemonResponse::Error(error) => assert!(error.message.contains("already been resumed")),
         response => panic!("restart stale resume unexpectedly succeeded: {response:?}"),
     }
+    exercise_session_lifecycle_stale_authorization(&restarted, worktree_id).await;
+    delete_all_sessions(&restarted).await;
+    let managed_worktree_id = match restarted
+        .request(&ClientRequest::CreateWorktree {
+            project_id,
+            name: Some("fake-provider-removal".into()),
+            branch: "feature/fake-provider-removal".into(),
+            base_ref: Some("HEAD".into()),
+        })
+        .await
+        .expect("managed Worktree response")
+    {
+        DaemonResponse::WorktreeCreated { worktree, .. } => worktree.id,
+        response => panic!("unexpected managed Worktree response: {response:?}"),
+    };
+    remove_worktree(&restarted, managed_worktree_id).await;
+    remove_project(&restarted, project_id).await;
+    delete_workspace(&restarted, workspace_id).await;
+    let removed = match restarted
+        .request(&ClientRequest::GetSnapshot)
+        .await
+        .expect("removed hierarchy snapshot")
+    {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => panic!("unexpected removed hierarchy response: {response:?}"),
+    };
+    assert!(removed.sessions.is_empty());
+    assert!(removed.projects.is_empty());
+    assert!(removed.workspaces.is_empty());
     restarted
         .request(&ClientRequest::ShutdownDaemon)
         .await
@@ -349,6 +383,174 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .expect("restart daemon task")
         .expect("restart daemon result");
     assert_no_persisted_text_contains(&paths.database, PROMPT_SENTINEL);
+}
+
+async fn exercise_session_lifecycle_stale_authorization(
+    client: &DaemonClient,
+    worktree_id: WorktreeId,
+) {
+    let session_id = match client
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Codex,
+            display_name: Some("auto-finishing fake Codex".into()),
+            model: Some("fake-model".into()),
+            effort: Some("high".into()),
+            initial_prompt: Some(AUTO_FINISH_PROMPT.into()),
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("auto-finishing Session response")
+    {
+        DaemonResponse::SessionCreated { session, .. } => session.id,
+        response => panic!("unexpected auto-finishing Session response: {response:?}"),
+    };
+    wait_for_session(client, session_id, |session| {
+        session.state == SessionState::FinishedUnseen && session.process_id.is_none()
+    })
+    .await;
+    let stale_token = session_deletion_token(client, session_id).await;
+    attach(client, session_id).await;
+    wait_for_session(client, session_id, |session| {
+        session.state == SessionState::FinishedSeen
+    })
+    .await;
+    assert!(matches!(
+        client
+            .request(&ClientRequest::DeleteSession {
+                session_id,
+                authorization_token: stale_token,
+            })
+            .await
+            .expect("stale lifecycle deletion response"),
+        DaemonResponse::Error(error) if error.code == "session_request_refused"
+    ));
+    let preserved = wait_for_session(client, session_id, |session| {
+        session.state == SessionState::FinishedSeen
+    })
+    .await;
+    assert_eq!(preserved.id, session_id);
+    let authorization_token = session_deletion_token(client, session_id).await;
+    assert!(matches!(
+        client
+            .request(&ClientRequest::DeleteSession {
+                session_id,
+                authorization_token,
+            })
+            .await
+            .expect("fresh lifecycle deletion response"),
+        DaemonResponse::SessionDeleted { session_id: deleted, .. } if deleted == session_id
+    ));
+}
+
+async fn session_deletion_token(
+    client: &DaemonClient,
+    session_id: SessionId,
+) -> sylvops_core::protocol::SessionDeletionAuthorization {
+    match client
+        .request(&ClientRequest::InspectSessionDeletion { session_id })
+        .await
+        .expect("Session deletion inspection")
+    {
+        DaemonResponse::SessionDeletionInspected(inspection) => inspection
+            .authorization_token
+            .expect("inactive fake-provider Session deletion token"),
+        response => panic!("unexpected Session deletion inspection: {response:?}"),
+    }
+}
+
+async fn delete_all_sessions(client: &DaemonClient) {
+    let sessions = match client
+        .request(&ClientRequest::GetSnapshot)
+        .await
+        .expect("Session cleanup snapshot")
+    {
+        DaemonResponse::Snapshot(snapshot) => snapshot.sessions,
+        response => panic!("unexpected Session cleanup response: {response:?}"),
+    };
+    for session in sessions {
+        let authorization_token = session_deletion_token(client, session.id).await;
+        assert!(matches!(
+            client
+                .request(&ClientRequest::DeleteSession {
+                    session_id: session.id,
+                    authorization_token,
+                })
+                .await
+                .expect("Session deletion response"),
+            DaemonResponse::SessionDeleted { .. }
+        ));
+    }
+}
+
+async fn remove_worktree(client: &DaemonClient, worktree_id: WorktreeId) {
+    let confirmation_token = match client
+        .request(&ClientRequest::GetWorktreeStatus { worktree_id })
+        .await
+        .expect("Worktree removal inspection")
+    {
+        DaemonResponse::WorktreeStatus(status) => status
+            .removal_confirmation_token
+            .expect("clean fake-provider Worktree token"),
+        response => panic!("unexpected Worktree removal inspection: {response:?}"),
+    };
+    assert!(matches!(
+        client
+            .request(&ClientRequest::RemoveWorktree {
+                worktree_id,
+                confirmation_token,
+            })
+            .await
+            .expect("Worktree removal response"),
+        DaemonResponse::WorktreeRemoved { .. }
+    ));
+}
+
+async fn remove_project(client: &DaemonClient, project_id: ProjectId) {
+    let authorization_token = match client
+        .request(&ClientRequest::InspectProjectRemoval { project_id })
+        .await
+        .expect("Project removal inspection")
+    {
+        DaemonResponse::ProjectRemovalInspected(inspection) => inspection
+            .authorization_token
+            .expect("cleared fake-provider Project token"),
+        response => panic!("unexpected Project removal inspection: {response:?}"),
+    };
+    assert!(matches!(
+        client
+            .request(&ClientRequest::RemoveProject {
+                project_id,
+                authorization_token,
+            })
+            .await
+            .expect("Project removal response"),
+        DaemonResponse::ProjectRemoved { .. }
+    ));
+}
+
+async fn delete_workspace(client: &DaemonClient, workspace_id: WorkspaceId) {
+    let authorization_token = match client
+        .request(&ClientRequest::InspectWorkspaceDeletion { workspace_id })
+        .await
+        .expect("Workspace deletion inspection")
+    {
+        DaemonResponse::WorkspaceDeletionInspected(inspection) => inspection
+            .authorization_token
+            .expect("empty fake-provider Workspace token"),
+        response => panic!("unexpected Workspace deletion inspection: {response:?}"),
+    };
+    assert!(matches!(
+        client
+            .request(&ClientRequest::DeleteWorkspace {
+                workspace_id,
+                authorization_token,
+            })
+            .await
+            .expect("Workspace deletion response"),
+        DaemonResponse::WorkspaceDeleted { .. }
+    ));
 }
 
 fn owned_hook_profile_count(codex_home: &Path) -> usize {

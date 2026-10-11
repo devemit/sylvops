@@ -104,6 +104,7 @@ async fn session_accepts_input_and_replays_after_detach() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn fake_provider_preserves_two_hundred_tagged_inputs_and_reports_echo_latency() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let repository = temporary.path().join("repository");
