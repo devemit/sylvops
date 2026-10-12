@@ -10,7 +10,10 @@ mod theme;
 
 use std::{io::stdout, time::Duration};
 
-use app::{App, ConfirmAction, Confirmation, ExplorerNode, Flash, FlashKind, HitTarget, Mode};
+use app::{
+    App, ConfirmAction, Confirmation, ExplorerNode, Flash, FlashKind, HitTarget, Mode,
+    SettingsFocus,
+};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -30,7 +33,7 @@ use sylvops_core::{
         MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal,
         SessionDeletionRefusal, WorkspaceDeletionRefusal,
     },
-    ui::{MainTab, TuiState},
+    ui::{MainTab, TuiDensity, TuiState, TuiTheme},
     upgrade::UpgradeStatus,
 };
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
@@ -59,6 +62,7 @@ fn event_requires_snapshot_refresh(event: &DaemonEvent) -> bool {
 
 #[derive(Clone, Debug)]
 pub(crate) enum PaletteItem {
+    Settings,
     CreateWorkspace,
     RegisterProject,
     Workspace(WorkspaceId, String),
@@ -70,6 +74,7 @@ pub(crate) enum PaletteItem {
 impl PaletteItem {
     pub(crate) fn label(&self) -> String {
         match self {
+            Self::Settings => "Command: open settings".into(),
             Self::CreateWorkspace => "Command: create workspace".into(),
             Self::RegisterProject => "Command: register repository".into(),
             Self::Workspace(_, name) => format!("Workspace: {name}"),
@@ -191,6 +196,10 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             }
             Mode::CommandPalette(_) => {
                 handle_palette(&client, &mut app, input).await?;
+                false
+            }
+            Mode::Settings(_) => {
+                handle_settings(&client, &mut app, &input).await?;
                 false
             }
             Mode::TerminalAttached => {
@@ -1017,6 +1026,108 @@ async fn handle_confirmation(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsDecision {
+    Continue,
+    Apply,
+    Cancel,
+}
+
+fn cycle_choice<T: Copy + PartialEq>(choices: &[T], current: T, delta: isize) -> T {
+    let current = choices
+        .iter()
+        .position(|choice| *choice == current)
+        .unwrap_or(0);
+    let len = isize::try_from(choices.len()).unwrap_or(1);
+    let next = (isize::try_from(current).unwrap_or(0) + delta).rem_euclid(len);
+    choices[usize::try_from(next).unwrap_or(0)]
+}
+
+fn adjust_setting(app: &mut App, settings: SettingsFocus, delta: isize) {
+    match settings {
+        SettingsFocus::Theme => app.theme = cycle_choice(&TuiTheme::ALL, app.theme, delta),
+        SettingsFocus::Density => {
+            app.density = cycle_choice(&TuiDensity::ALL, app.density, delta);
+        }
+        SettingsFocus::Apply | SettingsFocus::Cancel => {}
+    }
+}
+
+fn handle_settings_input(app: &mut App, input: &Event) -> SettingsDecision {
+    let clicked = if let Event::Mouse(mouse) = input
+        && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+    {
+        app.hit_map.target_at(mouse.column, mouse.row)
+    } else {
+        None
+    };
+    match clicked {
+        Some(HitTarget::SettingsTheme(choice)) => {
+            app.theme = choice;
+            if let Mode::Settings(settings) = &mut app.mode {
+                settings.focus = SettingsFocus::Theme;
+            }
+            return SettingsDecision::Continue;
+        }
+        Some(HitTarget::SettingsDensity(choice)) => {
+            app.density = choice;
+            if let Mode::Settings(settings) = &mut app.mode {
+                settings.focus = SettingsFocus::Density;
+            }
+            return SettingsDecision::Continue;
+        }
+        Some(HitTarget::SettingsApply) => {
+            app.apply_settings();
+            return SettingsDecision::Apply;
+        }
+        Some(HitTarget::SettingsCancel) => {
+            app.cancel_settings();
+            return SettingsDecision::Cancel;
+        }
+        _ => {}
+    }
+
+    let Event::Key(key) = input else {
+        return SettingsDecision::Continue;
+    };
+    if key.code == KeyCode::Esc {
+        app.cancel_settings();
+        return SettingsDecision::Cancel;
+    }
+    let Mode::Settings(mut settings) = app.mode else {
+        return SettingsDecision::Continue;
+    };
+    match key.code {
+        KeyCode::Down | KeyCode::Tab => settings.focus = settings.focus.moved(1),
+        KeyCode::Up | KeyCode::BackTab => settings.focus = settings.focus.moved(-1),
+        KeyCode::Left | KeyCode::Char('h') => adjust_setting(app, settings.focus, -1),
+        KeyCode::Right | KeyCode::Char('l') => adjust_setting(app, settings.focus, 1),
+        KeyCode::Enter if settings.focus == SettingsFocus::Apply => {
+            app.apply_settings();
+            return SettingsDecision::Apply;
+        }
+        KeyCode::Enter if settings.focus == SettingsFocus::Cancel => {
+            app.cancel_settings();
+            return SettingsDecision::Cancel;
+        }
+        _ => {}
+    }
+    app.mode = Mode::Settings(settings);
+    SettingsDecision::Continue
+}
+
+async fn handle_settings(
+    client: &DaemonClient,
+    app: &mut App,
+    input: &Event,
+) -> Result<(), DaemonError> {
+    if handle_settings_input(app, input) == SettingsDecision::Apply {
+        save_tui_state(client, app).await?;
+        app.navigation_dirty_at = None;
+    }
+    Ok(())
+}
+
 async fn handle_palette(
     client: &DaemonClient,
     app: &mut App,
@@ -1088,7 +1199,11 @@ async fn handle_palette(
 }
 
 pub(crate) fn palette_items(app: &App, query: &str) -> Vec<PaletteItem> {
-    let mut items = vec![PaletteItem::CreateWorkspace, PaletteItem::RegisterProject];
+    let mut items = vec![
+        PaletteItem::Settings,
+        PaletteItem::CreateWorkspace,
+        PaletteItem::RegisterProject,
+    ];
     items.extend(
         app.snapshot
             .workspaces
@@ -1130,6 +1245,7 @@ async fn execute_palette_item(
     item: PaletteItem,
 ) -> Result<(), DaemonError> {
     match item {
+        PaletteItem::Settings => app.open_settings(),
         PaletteItem::CreateWorkspace => app.mode = Mode::Modal(Form::workspace()),
         PaletteItem::RegisterProject => {
             app.mode = app.active_workspace().map_or_else(
@@ -1529,14 +1645,18 @@ async fn save_tui_state(client: &DaemonClient, app: &App) -> Result<(), DaemonEr
 }
 
 async fn save_debounced(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
-    if app
-        .navigation_dirty_at
-        .is_some_and(|changed| changed.elapsed() >= SAVE_DEBOUNCE)
-    {
+    if debounced_save_due(app) {
         save_tui_state(client, app).await?;
         app.navigation_dirty_at = None;
     }
     Ok(())
+}
+
+fn debounced_save_due(app: &App) -> bool {
+    !matches!(&app.mode, Mode::Settings(_))
+        && app
+            .navigation_dirty_at
+            .is_some_and(|changed| changed.elapsed() >= SAVE_DEBOUNCE)
 }
 
 fn response_message(operation: &str, response: DaemonResponse) -> String {
@@ -1758,6 +1878,7 @@ mod tests {
                 selected_worktree_id: Some(WorktreeId::new()),
                 selected_session_id: Some(SessionId::new()),
                 selected_main_tab: MainTab::Details,
+                ..TuiState::default()
             }),
         );
         assert_eq!(app.selected_session_id, Some(expected));
@@ -1775,6 +1896,346 @@ mod tests {
                 .draw(|frame| render::draw(frame, &mut app))
                 .unwrap();
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn settings_input_previews_applies_and_cancels_every_appearance_choice() {
+        use crossterm::event::{KeyEvent, MouseEvent};
+        use sylvops_core::ui::{TuiDensity, TuiTheme};
+
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+
+        let open_key = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(
+            input::navigation_action(&app, &open_key),
+            Some(reducer::Action::Settings)
+        );
+        assert!(matches!(
+            palette_items(&app, "settings").as_slice(),
+            [PaletteItem::Settings]
+        ));
+
+        let header_settings = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::Settings)
+            .cloned()
+            .expect("settings header hit target");
+        let open_click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: header_settings.area.x,
+            row: header_settings.area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            input::navigation_action(&app, &open_click),
+            Some(reducer::Action::Settings)
+        );
+        reduce(&mut app, reducer::Action::Settings);
+        assert!(matches!(app.mode, Mode::Settings(_)));
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        for expected in TuiTheme::ALL {
+            let region = app
+                .hit_map
+                .0
+                .iter()
+                .find(|region| region.target == HitTarget::SettingsTheme(expected))
+                .cloned()
+                .expect("theme hit target");
+            let decision = handle_settings_input(
+                &mut app,
+                &Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: region.area.x,
+                    row: region.area.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            );
+            assert_eq!(decision, SettingsDecision::Continue);
+            assert_eq!(app.theme, expected);
+        }
+        for expected in TuiDensity::ALL {
+            let region = app
+                .hit_map
+                .0
+                .iter()
+                .find(|region| region.target == HitTarget::SettingsDensity(expected))
+                .cloned()
+                .expect("density hit target");
+            handle_settings_input(
+                &mut app,
+                &Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: region.area.x,
+                    row: region.area.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            );
+            assert_eq!(app.density, expected);
+        }
+
+        let apply = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::SettingsApply)
+            .cloned()
+            .expect("apply hit target");
+        assert_eq!(
+            handle_settings_input(
+                &mut app,
+                &Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: apply.area.x,
+                    row: apply.area.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            ),
+            SettingsDecision::Apply
+        );
+        assert!(matches!(app.mode, Mode::Navigation));
+        assert_eq!(app.persisted_state().density, TuiDensity::Compact);
+
+        reduce(&mut app, reducer::Action::Settings);
+        handle_settings_input(
+            &mut app,
+            &Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        );
+        assert_ne!(app.theme, TuiTheme::SolarizedLight);
+        assert_eq!(
+            handle_settings_input(
+                &mut app,
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ),
+            SettingsDecision::Cancel
+        );
+        assert_eq!(app.theme, TuiTheme::SolarizedLight);
+        assert_eq!(app.density, TuiDensity::Compact);
+
+        reduce(&mut app, reducer::Action::Settings);
+        handle_settings_input(
+            &mut app,
+            &Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        );
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let cancel = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::SettingsCancel)
+            .cloned()
+            .expect("cancel hit target");
+        assert_eq!(
+            handle_settings_input(
+                &mut app,
+                &Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: cancel.area.x,
+                    row: cancel.area.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            ),
+            SettingsDecision::Cancel
+        );
+        assert_eq!(app.theme, TuiTheme::SolarizedLight);
+        assert_eq!(app.density, TuiDensity::Compact);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn density_consistently_changes_chrome_explorer_forms_and_modal_spacing() {
+        use sylvops_core::ui::TuiDensity;
+
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let comfortable_settings_row = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::Settings)
+            .unwrap()
+            .area
+            .y;
+        let comfortable_explorer_height = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| matches!(region.target, HitTarget::ExplorerRow(0)))
+            .unwrap()
+            .area
+            .height;
+        app.mode = Mode::Modal(Form::worktree(ProjectId::new()));
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let comfortable_fields: Vec<_> = app
+            .hit_map
+            .0
+            .iter()
+            .filter_map(|region| match region.target {
+                HitTarget::ModalField(index) => Some((index, region.area.y)),
+                _ => None,
+            })
+            .collect();
+        let comfortable_submit = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::ModalSubmit)
+            .unwrap()
+            .area
+            .y;
+
+        app.mode = Mode::Navigation;
+        app.density = TuiDensity::Compact;
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let compact_settings_region = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::Settings)
+            .unwrap()
+            .area;
+        let compact_settings_label = (compact_settings_region.x
+            ..compact_settings_region
+                .x
+                .saturating_add(compact_settings_region.width))
+            .map(|column| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, compact_settings_region.y))
+                    .unwrap()
+                    .symbol()
+            })
+            .collect::<String>();
+        let compact_explorer_height = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| matches!(region.target, HitTarget::ExplorerRow(0)))
+            .unwrap()
+            .area
+            .height;
+        app.mode = Mode::Modal(Form::worktree(ProjectId::new()));
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let compact_fields: Vec<_> = app
+            .hit_map
+            .0
+            .iter()
+            .filter_map(|region| match region.target {
+                HitTarget::ModalField(index) => Some((index, region.area.y)),
+                _ => None,
+            })
+            .collect();
+        let compact_submit = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::ModalSubmit)
+            .unwrap()
+            .area
+            .y;
+
+        assert!(comfortable_settings_row > compact_settings_region.y);
+        assert_eq!(compact_settings_label, " [s] Settings ");
+        assert_eq!(comfortable_explorer_height, 2);
+        assert_eq!(compact_explorer_height, 1);
+        assert!(
+            comfortable_fields[1].1 - comfortable_fields[0].1
+                > compact_fields[1].1 - compact_fields[0].1
+        );
+        assert!(comfortable_submit > compact_submit);
+    }
+
+    #[test]
+    fn settings_preview_suspends_pending_debounced_persistence_until_exit() {
+        use std::time::Instant;
+        use sylvops_core::ui::TuiTheme;
+
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.navigation_dirty_at = Some(
+            Instant::now()
+                .checked_sub(SAVE_DEBOUNCE)
+                .expect("test duration is smaller than the monotonic clock"),
+        );
+        assert!(debounced_save_due(&app));
+
+        reduce(&mut app, reducer::Action::Settings);
+        handle_settings_input(
+            &mut app,
+            &Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::NONE,
+            )),
+        );
+        assert_eq!(app.theme, TuiTheme::Nord);
+        assert!(!debounced_save_due(&app));
+
+        handle_settings_input(
+            &mut app,
+            &Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )),
+        );
+        assert_eq!(app.theme, TuiTheme::TerminalDefault);
+        assert!(debounced_save_due(&app));
+    }
+
+    #[test]
+    fn application_theme_does_not_rewrite_provider_terminal_colors() {
+        use ratatui::style::Color;
+        use sylvops_core::ui::TuiTheme;
+
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        let session_id = app.snapshot.sessions[0].id;
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[31mR\x1b[0m");
+        app.attached = Some(AttachedTerminal {
+            session_id,
+            role: AttachmentRole::Controller,
+            parser,
+            last_sequence: 1,
+            columns: 80,
+            rows: 24,
+        });
+        app.theme = TuiTheme::SolarizedLight;
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+
+        let provider_cell = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "R" && cell.fg == Color::Indexed(1))
+            .expect("provider-owned red cell");
+        assert_eq!(provider_cell.fg, Color::Indexed(1));
+        assert_eq!(provider_cell.bg, Color::Reset);
     }
 
     #[test]

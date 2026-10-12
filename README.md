@@ -257,7 +257,7 @@ The repository now contains a **cross-platform application-release baseline**. I
 - application-owned provider hook settings plus an authenticated loopback hook relay;
 - deterministic attention states, verified provider conversation-ID capture, and guarded Codex and Claude resume;
 - a native, mouse-first desktop client with workspace tabs, guided repository/worktree/session management, responsive resizable navigation, a dominant terminal workspace, session tabs, Changes/Details views, persisted appearance and layout, and daemon-backed terminal attachment;
-- a hierarchical Ratatui mission-control client with an explorer, Terminal/Changes/Details tabs, guided forms, keyboard and mouse controls, attention selection, safe embedded terminal rendering, bounded read-only diffs, and restored navigation context;
+- a hierarchical Ratatui mission-control client with an explorer, Terminal/Changes/Details tabs, guided forms, keyboard and mouse controls, attention selection, safe embedded terminal rendering, bounded read-only diffs, restored navigation context, and persisted terminal-safe appearance settings;
 - CLI workspace, project, worktree, provider, session, desktop, and TUI commands.
 
 Claude cloud Sessions, background-agent management, Remote Control, plugins, enterprise authentication, GitHub integration, commit/push/PR actions, remote execution, notifications, file finding, and Git grep remain post-MVP. SylvOps never copies or stores provider credentials.
@@ -271,6 +271,7 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 - `1`, `2`, and `3` open Terminal, Changes, and Details.
 - `Enter` explicitly attaches a selected session; `Ctrl+]` detaches without stopping it.
 - `n` and `r` create and rename in context. `d` names the selected target's action: Stop Session for a live Session, Delete Session for an inactive Session, Remove Worktree, Remove Project, or Delete Workspace. Each removal is inspected before an explicit `y` confirmation; a refusal explains which child, process, or Worktree condition blocks it. `/` searches commands and entities.
+- `s`, the header Settings target, or **Command: open settings** opens the distinct appearance mode. Theme and Comfortable/Compact density changes preview immediately; **Apply** persists them, while `Esc` or **Cancel** restores the complete pre-open appearance.
 - Mouse selection, tabs, actions, forms, confirmations, and wheel navigation are supported. Terminal mouse-protocol forwarding is intentionally deferred.
 
 ### Desktop essentials

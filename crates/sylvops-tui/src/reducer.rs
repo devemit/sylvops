@@ -21,6 +21,7 @@ pub(crate) enum Action {
     Delete,
     Diff,
     Attention,
+    Settings,
     Palette,
     ToggleHelp,
     Quit,
@@ -99,6 +100,7 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
                 None => Flash::transient(FlashKind::Info, "No sessions currently need attention."),
             });
         }
+        Action::Settings => app.open_settings(),
         Action::Palette => app.mode = Mode::CommandPalette(Palette::default()),
         Action::ToggleHelp => app.help = !app.help,
         Action::Quit => return vec![Effect::Quit],

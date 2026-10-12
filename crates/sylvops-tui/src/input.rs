@@ -25,6 +25,7 @@ pub(crate) fn navigation_action(app: &App, event: &Event) -> Option<Action> {
             KeyCode::Char('r') => Some(Action::Rename),
             KeyCode::Char('d') => Some(Action::Delete),
             KeyCode::Char('g') => Some(Action::Diff),
+            KeyCode::Char('s') => Some(Action::Settings),
             KeyCode::Char('/') => Some(Action::Palette),
             KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 Some(Action::Attention)
@@ -72,6 +73,7 @@ fn target_action(target: HitTarget) -> Option<Action> {
         HitTarget::Rename => Some(Action::Rename),
         HitTarget::Delete => Some(Action::Delete),
         HitTarget::Attention => Some(Action::Attention),
+        HitTarget::Settings => Some(Action::Settings),
         _ => None,
     }
 }

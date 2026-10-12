@@ -28,11 +28,53 @@ pub enum MainTab {
 ///
 /// Deliberately excludes form values, searches, terminal data, and credentials.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TuiState {
     pub selected_project_id: Option<ProjectId>,
     pub selected_worktree_id: Option<WorktreeId>,
     pub selected_session_id: Option<SessionId>,
     pub selected_main_tab: MainTab,
+    pub theme: TuiTheme,
+    pub density: TuiDensity,
+}
+
+/// Terminal-safe application chrome themes. Provider-owned terminal output is
+/// intentionally rendered independently from these colors.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiTheme {
+    Nord,
+    TokyoNight,
+    Catppuccin,
+    GruvboxDark,
+    SolarizedLight,
+    #[default]
+    #[serde(other)]
+    TerminalDefault,
+}
+
+impl TuiTheme {
+    pub const ALL: [Self; 6] = [
+        Self::TerminalDefault,
+        Self::Nord,
+        Self::TokyoNight,
+        Self::Catppuccin,
+        Self::GruvboxDark,
+        Self::SolarizedLight,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiDensity {
+    Compact,
+    #[default]
+    #[serde(other)]
+    Comfortable,
+}
+
+impl TuiDensity {
+    pub const ALL: [Self; 2] = [Self::Comfortable, Self::Compact];
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -155,6 +197,28 @@ impl fmt::Display for DesktopDensity {
     }
 }
 
+impl fmt::Display for TuiTheme {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TerminalDefault => "Terminal Default",
+            Self::Nord => "Nord",
+            Self::TokyoNight => "Tokyo Night",
+            Self::Catppuccin => "Catppuccin",
+            Self::GruvboxDark => "Gruvbox Dark",
+            Self::SolarizedLight => "Solarized Light",
+        })
+    }
+}
+
+impl fmt::Display for TuiDensity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Comfortable => "Comfortable",
+            Self::Compact => "Compact",
+        })
+    }
+}
+
 /// Bounded, non-sensitive state restored by the native desktop client.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -252,6 +316,51 @@ mod tests {
         assert_eq!(state.window_width, MIN_DESKTOP_WIDTH);
         assert_eq!(state.window_height, MAX_DESKTOP_HEIGHT);
         assert_eq!(state.panel_ratios, [100, 100, 350]);
+    }
+
+    #[test]
+    fn tui_appearance_preferences_are_backward_compatible_and_normalized() {
+        let legacy: TuiState = serde_json::from_str(
+            r#"{"selected_project_id":null,"selected_worktree_id":null,"selected_session_id":null,"selected_main_tab":"terminal"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.theme, TuiTheme::TerminalDefault);
+        assert_eq!(legacy.density, TuiDensity::Comfortable);
+
+        let unknown: TuiState =
+            serde_json::from_str(r#"{"theme":"ultraviolet","density":"microscopic"}"#).unwrap();
+        assert_eq!(unknown.theme, TuiTheme::TerminalDefault);
+        assert_eq!(unknown.density, TuiDensity::Comfortable);
+
+        let configured = TuiState {
+            theme: TuiTheme::TokyoNight,
+            density: TuiDensity::Compact,
+            ..TuiState::default()
+        };
+        let encoded = serde_json::to_value(configured).unwrap();
+        assert_eq!(encoded["theme"], "tokyo_night");
+        assert_eq!(encoded["density"], "compact");
+        let mut keys = encoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "density",
+                "selected_main_tab",
+                "selected_project_id",
+                "selected_session_id",
+                "selected_worktree_id",
+                "theme",
+            ]
+        );
+        assert_eq!(TuiTheme::TerminalDefault.to_string(), "Terminal Default");
+        assert_eq!(TuiTheme::TokyoNight.to_string(), "Tokyo Night");
+        assert_eq!(TuiDensity::Compact.to_string(), "Compact");
     }
 
     #[test]

@@ -14,7 +14,7 @@ use sylvops_core::{
         ProjectRemovalAuthorization, SessionDeletionAuthorization, WorkspaceDeletionAuthorization,
     },
     provider::ProviderHealth,
-    ui::{MainTab, TuiState},
+    ui::{MainTab, TuiDensity, TuiState, TuiTheme},
 };
 
 use crate::{forms::Form, terminal::AttachedTerminal};
@@ -59,12 +59,42 @@ pub(crate) struct Palette {
     pub selected: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsFocus {
+    Theme,
+    Density,
+    Apply,
+    Cancel,
+}
+
+impl SettingsFocus {
+    pub(crate) fn moved(self, delta: isize) -> Self {
+        let choices = [Self::Theme, Self::Density, Self::Apply, Self::Cancel];
+        let current = choices
+            .iter()
+            .position(|choice| *choice == self)
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(choices.len().saturating_sub(1));
+        choices[next]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Settings {
+    pub original_theme: TuiTheme,
+    pub original_density: TuiDensity,
+    pub focus: SettingsFocus,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Mode {
     Navigation,
     Modal(Form),
     Confirmation(Confirmation),
     CommandPalette(Palette),
+    Settings(Settings),
     TerminalAttached,
 }
 
@@ -129,6 +159,11 @@ pub(crate) enum HitTarget {
     Rename,
     Delete,
     Attention,
+    Settings,
+    SettingsTheme(TuiTheme),
+    SettingsDensity(TuiDensity),
+    SettingsApply,
+    SettingsCancel,
     ModalField(usize),
     ModalProvider(usize),
     ModalProviderProbe,
@@ -175,6 +210,8 @@ pub(crate) struct App {
     pub mode: Mode,
     pub focus: FocusZone,
     pub main_tab: MainTab,
+    pub theme: TuiTheme,
+    pub density: TuiDensity,
     pub selected_project_id: Option<ProjectId>,
     pub selected_worktree_id: Option<WorktreeId>,
     pub selected_session_id: Option<SessionId>,
@@ -203,6 +240,7 @@ impl App {
                 && state.selected_worktree_id.is_none()
                 && state.selected_session_id.is_none()
         });
+        let persisted = persisted.unwrap_or_default();
         let mut app = Self {
             mode: if snapshot.workspaces.is_empty() {
                 Mode::Modal(Form::workspace())
@@ -212,16 +250,12 @@ impl App {
             snapshot,
             providers,
             focus: FocusZone::Explorer,
-            main_tab: persisted
-                .as_ref()
-                .map_or(MainTab::Terminal, |state| state.selected_main_tab),
-            selected_project_id: persisted
-                .as_ref()
-                .and_then(|state| state.selected_project_id),
-            selected_worktree_id: persisted
-                .as_ref()
-                .and_then(|state| state.selected_worktree_id),
-            selected_session_id: persisted.and_then(|state| state.selected_session_id),
+            main_tab: persisted.selected_main_tab,
+            theme: persisted.theme,
+            density: persisted.density,
+            selected_project_id: persisted.selected_project_id,
+            selected_worktree_id: persisted.selected_worktree_id,
+            selected_session_id: persisted.selected_session_id,
             explorer_index: 0,
             selected_workspace,
             workspace_expanded: true,
@@ -854,7 +888,34 @@ impl App {
             selected_worktree_id: self.selected_worktree_id,
             selected_session_id: self.selected_session_id,
             selected_main_tab: self.main_tab,
+            theme: self.theme,
+            density: self.density,
         }
+    }
+
+    pub fn open_settings(&mut self) {
+        self.mode = Mode::Settings(Settings {
+            original_theme: self.theme,
+            original_density: self.density,
+            focus: SettingsFocus::Theme,
+        });
+    }
+
+    pub fn apply_settings(&mut self) {
+        self.mode = Mode::Navigation;
+        self.mark_navigation_dirty();
+        self.flash = Some(Flash::transient(
+            FlashKind::Success,
+            "Appearance settings applied.",
+        ));
+    }
+
+    pub fn cancel_settings(&mut self) {
+        if let Mode::Settings(settings) = self.mode {
+            self.theme = settings.original_theme;
+            self.density = settings.original_density;
+        }
+        self.mode = Mode::Navigation;
     }
 
     pub fn mark_navigation_dirty(&mut self) {
