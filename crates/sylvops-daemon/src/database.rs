@@ -2627,7 +2627,7 @@ mod tests {
     use super::*;
     use sylvops_core::ui::{
         DesktopDensity, DesktopState, DesktopTerminalCursor, DesktopTerminalFont, DesktopTheme,
-        MainTab,
+        MainTab, TuiDensity, TuiTheme,
     };
 
     #[tokio::test]
@@ -2792,10 +2792,51 @@ mod tests {
             selected_worktree_id: Some(WorktreeId::new()),
             selected_session_id: Some(SessionId::new()),
             selected_main_tab: MainTab::Changes,
+            theme: TuiTheme::GruvboxDark,
+            density: TuiDensity::Compact,
         };
         database.save_tui_state(state.clone()).await.unwrap();
-        assert_eq!(database.tui_state().await.unwrap(), Some(state));
+        assert_eq!(database.tui_state().await.unwrap(), Some(state.clone()));
         assert_eq!(database.snapshot().await.unwrap().revision, revision);
+        database.shutdown().await.unwrap();
+
+        let database = DatabaseHandle::open(&directory.path().join("state.db")).unwrap();
+        assert_eq!(database.tui_state().await.unwrap(), Some(state));
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tui_appearance_loads_legacy_defaults_and_stays_isolated_from_desktop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let database = DatabaseHandle::open(&path).unwrap();
+        database.shutdown().await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO ui_state(client_scope, key, value_json, updated_at) \
+                 VALUES ('tui', 'navigation.v1', \
+                 '{\"theme\":\"ultraviolet\",\"density\":\"microscopic\"}', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ui_state(client_scope, key, value_json, updated_at) \
+                 VALUES ('desktop', 'navigation.v1', \
+                 '{\"theme\":\"nord\",\"density\":\"compact\"}', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = DatabaseHandle::open(&path).unwrap();
+        let tui = database.tui_state().await.unwrap().unwrap();
+        let desktop = database.desktop_state().await.unwrap().unwrap();
+        assert_eq!(tui.theme, TuiTheme::TerminalDefault);
+        assert_eq!(tui.density, TuiDensity::Comfortable);
+        assert_eq!(desktop.theme, DesktopTheme::Nord);
+        assert_eq!(desktop.density, DesktopDensity::Compact);
         database.shutdown().await.unwrap();
     }
 

@@ -1,18 +1,18 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
+    style::Modifier,
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use sylvops_core::{
     domain::{Session, SessionState},
     provider::session_can_resume,
-    ui::MainTab,
+    ui::{MainTab, TuiDensity, TuiTheme},
 };
 
 use crate::{
-    app::{App, ExplorerNode, FocusZone, HitMap, HitTarget, Mode},
+    app::{App, ExplorerNode, FocusZone, HitMap, HitTarget, Mode, SettingsFocus},
     forms::Form,
     theme::Theme,
 };
@@ -23,18 +23,28 @@ pub(crate) struct ViewAreas {
     pub main: Option<Rect>,
 }
 
+const NEW_LABEL: &str = " [n] New ";
+const RENAME_LABEL: &str = " [r] Rename ";
+const SETTINGS_LABEL: &str = " [s] Settings ";
+const COMMANDS_LABEL: &str = " [/] Commands  ";
+
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.hit_map = HitMap::default();
-    let theme = Theme::default();
+    let theme = Theme::resolve(app.theme);
     let area = frame.area();
+    frame.render_widget(Block::default().style(theme.background), area);
     let attention_height = u16::from(app.attention_count() > 0);
+    let (header_height, footer_height) = match app.density {
+        TuiDensity::Comfortable => (2, 2),
+        TuiDensity::Compact => (1, 1),
+    };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(header_height),
             Constraint::Length(attention_height),
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(footer_height),
         ])
         .split(area);
     draw_header(frame, app, vertical[0], theme);
@@ -50,14 +60,15 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     draw_footer(frame, app, vertical[3], theme);
     if app.help {
-        draw_help(frame, area);
+        draw_help(frame, area, theme);
     }
     match app.mode.clone() {
-        Mode::Modal(form) => draw_form(frame, &form, &mut app.hit_map, theme),
+        Mode::Modal(form) => draw_form(frame, &form, &mut app.hit_map, theme, app.density),
         Mode::Confirmation(confirm) => {
-            draw_confirmation(frame, &confirm, &mut app.hit_map, theme);
+            draw_confirmation(frame, &confirm, &mut app.hit_map, theme, app.density);
         }
         Mode::CommandPalette(palette) => draw_palette(frame, app, &palette, theme),
+        Mode::Settings(settings) => draw_settings(frame, app, settings, theme),
         Mode::Navigation | Mode::TerminalAttached => {}
     }
 }
@@ -126,45 +137,66 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         }
         None => "Stop/Remove",
     };
-    let rows = vec![
-        Line::from(vec![
-            Span::styled(" SylvOps ", theme.focus),
-            Span::raw(format!("{workspace}  /  {repository}  /  {branch}")),
-        ]),
-        Line::from(vec![
-            Span::styled(format!(" [d] {removal_action} "), theme.failure),
-            Span::styled(" [n] New ", theme.success),
-            Span::raw(" [r] Rename  [/ ] Commands  "),
-            Span::styled(status, theme.muted),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(rows), area);
-    let delete_width = u16::try_from(removal_action.len().saturating_add(6))
-        .unwrap_or(u16::MAX)
-        .min(area.width);
-    app.hit_map.push(
-        Rect::new(area.x, area.y.saturating_add(1), delete_width, 1),
-        HitTarget::Delete,
-    );
-    let new_x = area.x.saturating_add(delete_width);
-    let new_width = 9.min(area.width.saturating_sub(delete_width));
-    app.hit_map.push(
-        Rect::new(new_x, area.y.saturating_add(1), new_width, 1),
-        HitTarget::New,
-    );
-    let rename_x = new_x.saturating_add(new_width);
-    app.hit_map.push(
-        Rect::new(
-            rename_x,
-            area.y.saturating_add(1),
-            12.min(
-                area.width
-                    .saturating_sub(delete_width.saturating_add(new_width)),
+    let delete_label = format!(" [d] {removal_action} ");
+    if app.density == TuiDensity::Compact {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" SylvOps ", theme.focus),
+                Span::raw(format!("{workspace} / {repository} / {branch}")),
+            ]))
+            .style(theme.text),
+            area,
+        );
+        frame.render_widget(
+            Paragraph::new(SETTINGS_LABEL)
+                .alignment(Alignment::Right)
+                .style(theme.focus),
+            area,
+        );
+        let settings_width = u16::try_from(SETTINGS_LABEL.len())
+            .unwrap_or(u16::MAX)
+            .min(area.width);
+        app.hit_map.push(
+            Rect::new(
+                area.x
+                    .saturating_add(area.width.saturating_sub(settings_width)),
+                area.y,
+                settings_width,
+                1,
             ),
-            1,
-        ),
-        HitTarget::Rename,
-    );
+            HitTarget::Settings,
+        );
+    } else {
+        let rows = vec![
+            Line::from(vec![
+                Span::styled(" SylvOps ", theme.focus),
+                Span::raw(format!("{workspace}  /  {repository}  /  {branch}")),
+            ]),
+            Line::from(vec![
+                Span::styled(delete_label.as_str(), theme.danger),
+                Span::styled(NEW_LABEL, theme.success),
+                Span::raw(RENAME_LABEL),
+                Span::styled(SETTINGS_LABEL, theme.focus),
+                Span::raw(COMMANDS_LABEL),
+                Span::styled(status, theme.muted),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(rows).style(theme.text), area);
+        let mut x = area.x;
+        for (label, target) in [
+            (delete_label.as_str(), HitTarget::Delete),
+            (NEW_LABEL, HitTarget::New),
+            (RENAME_LABEL, HitTarget::Rename),
+            (SETTINGS_LABEL, HitTarget::Settings),
+        ] {
+            let width = u16::try_from(label.len())
+                .unwrap_or(u16::MAX)
+                .min(area.x.saturating_add(area.width).saturating_sub(x));
+            app.hit_map
+                .push(Rect::new(x, area.y.saturating_add(1), width, 1), target);
+            x = x.saturating_add(width);
+        }
+    }
 }
 
 fn draw_attention(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -173,7 +205,7 @@ fn draw_attention(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
             " ! {} session(s) need attention · Shift+A or click to open next",
             app.attention_count()
         ))
-        .style(theme.warning),
+        .style(theme.attention),
         area,
     );
     app.hit_map.push(area, HitTarget::Attention);
@@ -193,14 +225,19 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
                 } else {
                     " "
                 };
-                ListItem::new(Line::from(vec![
+                let line = Line::from(vec![
                     Span::raw(format!(
                         "{}{} {label}",
                         "  ".repeat(usize::from(row.depth)),
                         disclosure
                     )),
                     Span::styled(suffix, theme.muted),
-                ]))
+                ]);
+                if app.density == TuiDensity::Comfortable {
+                    ListItem::new(vec![line, Line::from("")])
+                } else {
+                    ListItem::new(line)
+                }
             })
             .collect()
     };
@@ -212,16 +249,13 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             " Explorer "
         })
         .borders(Borders::ALL)
-        .border_style(if focused {
-            theme.focus
-        } else {
-            Style::default()
-        });
+        .border_style(if focused { theme.focus } else { theme.border });
     let mut state =
         ListState::default().with_selected((!rows.is_empty()).then_some(app.explorer_index));
     frame.render_stateful_widget(
         List::new(items)
             .block(block)
+            .style(theme.text)
             .highlight_symbol("› ")
             .highlight_style(theme.selected),
         area,
@@ -231,15 +265,26 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         horizontal: 1,
         vertical: 1,
     });
-    for (index, _) in rows.iter().take(usize::from(inner.height)).enumerate() {
+    let row_height = if app.density == TuiDensity::Comfortable {
+        2
+    } else {
+        1
+    };
+    for (index, _) in rows
+        .iter()
+        .take(usize::from(inner.height / row_height))
+        .enumerate()
+    {
         app.hit_map.push(
             Rect::new(
                 inner.x,
-                inner
-                    .y
-                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+                inner.y.saturating_add(
+                    u16::try_from(index)
+                        .unwrap_or(u16::MAX)
+                        .saturating_mul(row_height),
+                ),
                 inner.width,
-                1,
+                row_height,
             ),
             HitTarget::ExplorerRow(index),
         );
@@ -318,7 +363,13 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     frame.render_widget(
         Tabs::new(titles)
             .select(selected)
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(theme.border),
+            )
+            .style(theme.text)
             .highlight_style(theme.focus),
         chunks[0],
     );
@@ -341,12 +392,13 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     }
     match app.main_tab {
         MainTab::Terminal => draw_terminal(frame, app, chunks[1], theme),
-        MainTab::Changes => draw_changes(frame, app, chunks[1]),
+        MainTab::Changes => draw_changes(frame, app, chunks[1], theme),
         MainTab::Details => draw_details(frame, app, chunks[1], theme),
     }
 }
 
 fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let provider_owned = app.attached.is_some();
     let (title, content, action) = if let Some(attached) = app.attached.as_ref() {
         let role = if attached.role == sylvops_core::domain::AttachmentRole::Controller {
             "controller"
@@ -355,14 +407,14 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         };
         (
             format!(" Terminal · attached as {role} "),
-            attached.parser.screen().contents(),
+            terminal_text(attached.parser.screen()),
             Some(("[ Detach · Ctrl+] ]", HitTarget::Detach)),
         )
     } else if let Some(session) = app.selected_session() {
         let can_resume = session_can_resume(session, &app.snapshot.sessions, &app.providers);
         (
             " Terminal · detached ".into(),
-            format!(
+            Text::from(format!(
                 "{} is {}.\n\nSelecting a session never attaches automatically.\n{}",
                 session.display_name,
                 status_label(session.state),
@@ -371,7 +423,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
                 } else {
                     "Press Enter or click Attach to connect."
                 }
-            ),
+            )),
             Some(if can_resume {
                 ("[ Resume · u ]", HitTarget::Resume)
             } else {
@@ -381,7 +433,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     } else {
         (
             " Terminal ".into(),
-            "No session selected.\n\nPress n or click New to create a shell session.".into(),
+            Text::from("No session selected.\n\nPress n or click New to create a shell session."),
             Some(("[ New session · n ]", HitTarget::New)),
         )
     };
@@ -389,12 +441,18 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
-    frame.render_widget(
-        Paragraph::new(content)
-            .block(Block::default().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
-        inner[0],
-    );
+    let mut terminal = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(theme.border),
+        )
+        .wrap(Wrap { trim: false });
+    if !provider_owned {
+        terminal = terminal.style(theme.text);
+    }
+    frame.render_widget(terminal, inner[0]);
     if let Some((label, target)) = action {
         frame.render_widget(
             Paragraph::new(label)
@@ -406,7 +464,75 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     }
 }
 
-fn draw_changes(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn terminal_text(screen: &vt100::Screen) -> Text<'static> {
+    let (rows, columns) = screen.size();
+    let mut lines = Vec::with_capacity(usize::from(rows));
+    for row in 0..rows {
+        let mut spans = Vec::new();
+        let mut current_style = None;
+        let mut current = String::new();
+        for column in 0..columns {
+            let Some(cell) = screen.cell(row, column) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let style = terminal_cell_style(cell);
+            if current_style.is_some_and(|existing| existing != style) {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    current_style.unwrap(),
+                ));
+            }
+            current_style = Some(style);
+            if cell.has_contents() {
+                current.push_str(cell.contents());
+            } else {
+                current.push(' ');
+            }
+        }
+        if let Some(style) = current_style {
+            spans.push(Span::styled(current, style));
+        }
+        lines.push(Line::from(spans));
+    }
+    Text::from(lines)
+}
+
+fn terminal_cell_style(cell: &vt100::Cell) -> ratatui::style::Style {
+    let mut style = ratatui::style::Style::default()
+        .fg(terminal_color(cell.fgcolor()))
+        .bg(terminal_color(cell.bgcolor()));
+    let mut modifiers = Modifier::empty();
+    if cell.bold() {
+        modifiers.insert(Modifier::BOLD);
+    }
+    if cell.dim() {
+        modifiers.insert(Modifier::DIM);
+    }
+    if cell.italic() {
+        modifiers.insert(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        modifiers.insert(Modifier::UNDERLINED);
+    }
+    if cell.inverse() {
+        modifiers.insert(Modifier::REVERSED);
+    }
+    style = style.add_modifier(modifiers);
+    style
+}
+
+const fn terminal_color(color: vt100::Color) -> ratatui::style::Color {
+    match color {
+        vt100::Color::Default => ratatui::style::Color::Reset,
+        vt100::Color::Idx(index) => ratatui::style::Color::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => ratatui::style::Color::Rgb(red, green, blue),
+    }
+}
+
+fn draw_changes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let content = app
         .diff
         .as_deref()
@@ -416,8 +542,10 @@ fn draw_changes(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .block(
                 Block::default()
                     .title(" Changes · read-only ")
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(theme.border),
             )
+            .style(theme.text)
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -452,7 +580,13 @@ fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     };
     frame.render_widget(
         Paragraph::new(content)
-            .block(Block::default().title(" Details ").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(" Details ")
+                    .borders(Borders::ALL)
+                    .border_style(theme.border),
+            )
+            .style(theme.text)
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -565,16 +699,30 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     );
 }
 
-fn draw_help(frame: &mut Frame<'_>, area: Rect) {
+fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy\n← →: collapse / expand\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\n/: commands and entity search\nShift+A: next attention item\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
-        .block(Block::default().title(" Shortcuts ").borders(Borders::ALL)).wrap(Wrap { trim: false }), popup);
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy\n← →: collapse / expand\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\ns: appearance settings\n/: commands and entity search\nShift+A: next attention item\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
+        .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 
 #[allow(clippy::too_many_lines)]
-fn draw_form(frame: &mut Frame<'_>, form: &Form, hits: &mut HitMap, theme: Theme) {
-    let area = centered(frame.area(), 76, 70);
+fn draw_form(
+    frame: &mut Frame<'_>,
+    form: &Form,
+    hits: &mut HitMap,
+    theme: Theme,
+    density: TuiDensity,
+) {
+    let area = centered(
+        frame.area(),
+        76,
+        if density == TuiDensity::Comfortable {
+            76
+        } else {
+            62
+        },
+    );
     frame.render_widget(Clear, area);
     let mut lines = Vec::new();
     let mut row = area.y.saturating_add(1);
@@ -623,7 +771,7 @@ fn draw_form(frame: &mut Frame<'_>, form: &Form, hits: &mut HitMap, theme: Theme
             .provider()
             .and_then(sylvops_core::provider::ProviderHealth::session_start_error)
         {
-            lines.push(Line::from(Span::styled(error, theme.failure)));
+            lines.push(Line::from(Span::styled(error, theme.danger)));
             row = row.saturating_add(1);
             lines.push(Line::from(Span::styled(
                 "[ Check again · Ctrl+R ]",
@@ -668,15 +816,16 @@ fn draw_form(frame: &mut Frame<'_>, form: &Form, hits: &mut HitMap, theme: Theme
         );
         row = row.saturating_add(1);
         if let Some(error) = &field.error {
-            lines.push(Line::from(Span::styled(
-                format!("  {error}"),
-                theme.failure,
-            )));
+            lines.push(Line::from(Span::styled(format!("  {error}"), theme.danger)));
+            row = row.saturating_add(1);
+        }
+        if density == TuiDensity::Comfortable {
+            lines.push(Line::from(""));
             row = row.saturating_add(1);
         }
     }
     if let Some(error) = &form.submission_error {
-        lines.push(Line::from(Span::styled(error, theme.failure)));
+        lines.push(Line::from(Span::styled(error, theme.danger)));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -698,8 +847,10 @@ fn draw_form(frame: &mut Frame<'_>, form: &Form, hits: &mut HitMap, theme: Theme
             .block(
                 Block::default()
                     .title(format!(" {} · Enter next/submit · Esc cancel ", form.title))
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(theme.border),
             )
+            .style(theme.text)
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -710,23 +861,34 @@ fn draw_confirmation(
     confirm: &crate::app::Confirmation,
     hits: &mut HitMap,
     theme: Theme,
+    density: TuiDensity,
 ) {
-    let area = centered(frame.area(), 72, 35);
+    let area = centered(
+        frame.area(),
+        72,
+        if density == TuiDensity::Comfortable {
+            40
+        } else {
+            30
+        },
+    );
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(confirm.detail.as_str()),
             Line::from(""),
             Line::from(vec![
-                Span::styled("[ Confirm · y ]", theme.failure),
+                Span::styled("[ Confirm · y ]", theme.danger),
                 Span::raw("   [ Cancel · Esc ]"),
             ]),
         ])
         .block(
             Block::default()
                 .title(format!(" {} ", confirm.title))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(theme.border),
         )
+        .style(theme.text)
         .wrap(Wrap { trim: false }),
         area,
     );
@@ -738,6 +900,121 @@ fn draw_confirmation(
     hits.push(
         Rect::new(area.x.saturating_add(22), row, 18, 1),
         HitTarget::Cancel,
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+fn draw_settings(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    settings: crate::app::Settings,
+    theme: Theme,
+) {
+    let area = centered(
+        frame.area(),
+        82,
+        if app.density == TuiDensity::Comfortable {
+            82
+        } else {
+            68
+        },
+    );
+    frame.render_widget(Clear, area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let mut row = inner.y;
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        if settings.focus == SettingsFocus::Theme {
+            "› Theme"
+        } else {
+            "  Theme"
+        },
+        Modifier::BOLD,
+    )));
+    row = row.saturating_add(1);
+    for choice in TuiTheme::ALL {
+        let selected = app.theme == choice;
+        lines.push(Line::from(Span::styled(
+            format!("  {} {choice}", if selected { "●" } else { "○" }),
+            if selected { theme.selected } else { theme.text },
+        )));
+        app.hit_map.push(
+            Rect::new(inner.x, row, inner.width, 1),
+            HitTarget::SettingsTheme(choice),
+        );
+        row = row.saturating_add(1);
+    }
+    if app.density == TuiDensity::Comfortable {
+        lines.push(Line::from(""));
+        row = row.saturating_add(1);
+    }
+    lines.push(Line::from(Span::styled(
+        if settings.focus == SettingsFocus::Density {
+            "› Density"
+        } else {
+            "  Density"
+        },
+        Modifier::BOLD,
+    )));
+    row = row.saturating_add(1);
+    for choice in TuiDensity::ALL {
+        let selected = app.density == choice;
+        lines.push(Line::from(Span::styled(
+            format!("  {} {choice}", if selected { "●" } else { "○" }),
+            if selected { theme.selected } else { theme.text },
+        )));
+        app.hit_map.push(
+            Rect::new(inner.x, row, inner.width, 1),
+            HitTarget::SettingsDensity(choice),
+        );
+        row = row.saturating_add(1);
+    }
+    lines.push(Line::from(""));
+    row = row.saturating_add(1);
+    lines.push(Line::from(Span::styled(
+        "Preview is local until Apply. Escape and Cancel restore both choices.",
+        theme.muted,
+    )));
+    row = row.saturating_add(2);
+    lines.push(Line::from(vec![
+        Span::styled(
+            if settings.focus == SettingsFocus::Apply {
+                "› [ Apply ]"
+            } else {
+                "  [ Apply ]"
+            },
+            theme.success,
+        ),
+        Span::raw("    "),
+        Span::styled(
+            if settings.focus == SettingsFocus::Cancel {
+                "› [ Cancel ]"
+            } else {
+                "  [ Cancel ]"
+            },
+            theme.muted,
+        ),
+    ]));
+    app.hit_map
+        .push(Rect::new(inner.x, row, 13, 1), HitTarget::SettingsApply);
+    app.hit_map.push(
+        Rect::new(inner.x.saturating_add(17), row, 14, 1),
+        HitTarget::SettingsCancel,
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Settings · ←/→ preview · ↑/↓ navigate ")
+                    .borders(Borders::ALL)
+                    .border_style(theme.border),
+            )
+            .style(theme.text)
+            .wrap(Wrap { trim: false }),
+        area,
     );
 }
 
@@ -760,8 +1037,10 @@ fn draw_palette(frame: &mut Frame<'_>, app: &mut App, palette: &crate::app::Pale
                     " Search commands and entities · /{} ",
                     palette.query
                 ))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(theme.border),
         )
+        .style(theme.text)
         .highlight_symbol("› ")
         .highlight_style(theme.selected),
         area,
