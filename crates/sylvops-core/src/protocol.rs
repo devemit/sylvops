@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 14;
+pub const PROTOCOL_MINOR: u16 = 15;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -869,7 +869,7 @@ fn take_uuid(bytes: &[u8], position: &mut usize) -> Result<Uuid> {
 mod tests {
     use super::*;
     use crate::domain::WorktreeStatus;
-    use crate::ui::{MainTab, TuiDensity, TuiState, TuiTheme};
+    use crate::ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme};
     use crate::{
         provider::{AuthenticationRequirement, ProviderCapabilities, ProviderRuntimeCapabilities},
         status::{
@@ -892,13 +892,14 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_14_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_15_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
                 selected_worktree_id: Some(crate::ids::WorktreeId::new()),
                 selected_session_id: Some(crate::ids::SessionId::new()),
-                selected_main_tab: MainTab::Details,
+                selected_content_view: TuiContentView::Details,
+                session_presentation: TuiSessionPresentation::List,
                 theme: TuiTheme::Catppuccin,
                 density: TuiDensity::Compact,
             },
@@ -906,7 +907,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 14);
+        assert_eq!(PROTOCOL_MINOR, 15);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),

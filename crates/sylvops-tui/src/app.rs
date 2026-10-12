@@ -7,14 +7,14 @@ use ratatui::layout::Rect;
 use sylvops_core::{
     domain::{
         DaemonSnapshot, Project, Session, SessionState, Workspace, Worktree, WorktreeStatus,
-        attention_priority,
+        active_session_priority, attention_priority, state_is_active,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
         ProjectRemovalAuthorization, SessionDeletionAuthorization, WorkspaceDeletionAuthorization,
     },
     provider::ProviderHealth,
-    ui::{MainTab, TuiDensity, TuiState, TuiTheme},
+    ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
 };
 
 use crate::{forms::Form, terminal::AttachedTerminal};
@@ -62,6 +62,7 @@ pub(crate) struct Palette {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SettingsFocus {
     Theme,
+    Presentation,
     Density,
     Apply,
     Cancel,
@@ -69,7 +70,13 @@ pub(crate) enum SettingsFocus {
 
 impl SettingsFocus {
     pub(crate) fn moved(self, delta: isize) -> Self {
-        let choices = [Self::Theme, Self::Density, Self::Apply, Self::Cancel];
+        let choices = [
+            Self::Theme,
+            Self::Presentation,
+            Self::Density,
+            Self::Apply,
+            Self::Cancel,
+        ];
         let current = choices
             .iter()
             .position(|choice| *choice == self)
@@ -84,6 +91,7 @@ impl SettingsFocus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Settings {
     pub original_theme: TuiTheme,
+    pub original_presentation: TuiSessionPresentation,
     pub original_density: TuiDensity,
     pub focus: SettingsFocus,
 }
@@ -149,7 +157,10 @@ pub(crate) struct ExplorerRow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HitTarget {
     ExplorerRow(usize),
-    Tab(MainTab),
+    Tab(TuiContentView),
+    ActiveSession(SessionId),
+    ActiveSessionOpen(SessionId),
+    ActiveSessionStop(SessionId),
     FocusExplorer,
     FocusMain,
     Attach,
@@ -161,6 +172,7 @@ pub(crate) enum HitTarget {
     Attention,
     Settings,
     SettingsTheme(TuiTheme),
+    SettingsPresentation(TuiSessionPresentation),
     SettingsDensity(TuiDensity),
     SettingsApply,
     SettingsCancel,
@@ -209,8 +221,9 @@ pub(crate) struct App {
     pub providers: Vec<ProviderHealth>,
     pub mode: Mode,
     pub focus: FocusZone,
-    pub main_tab: MainTab,
+    pub main_tab: TuiContentView,
     pub theme: TuiTheme,
+    pub session_presentation: TuiSessionPresentation,
     pub density: TuiDensity,
     pub selected_project_id: Option<ProjectId>,
     pub selected_worktree_id: Option<WorktreeId>,
@@ -250,8 +263,9 @@ impl App {
             snapshot,
             providers,
             focus: FocusZone::Explorer,
-            main_tab: persisted.selected_main_tab,
+            main_tab: persisted.selected_content_view,
             theme: persisted.theme,
+            session_presentation: persisted.session_presentation,
             density: persisted.density,
             selected_project_id: persisted.selected_project_id,
             selected_worktree_id: persisted.selected_worktree_id,
@@ -270,6 +284,7 @@ impl App {
             navigation_dirty_at: None,
         };
         app.restore_selection();
+        app.reconcile_active_session_selection();
         app
     }
 
@@ -350,6 +365,7 @@ impl App {
         if let Some(selection) = reconciled_selection {
             self.reveal_and_select(selection);
         }
+        self.reconcile_active_session_selection();
         if self.snapshot.workspaces.is_empty() && matches!(&self.mode, Mode::Navigation) {
             self.mode = Mode::Modal(Form::workspace());
         }
@@ -421,6 +437,80 @@ impl App {
             .collect();
         sessions.sort_by_key(|session| std::cmp::Reverse(session.last_activity_at));
         sessions
+    }
+
+    pub fn active_sessions(&self) -> Vec<&Session> {
+        let mut sessions: Vec<_> = self
+            .snapshot
+            .sessions
+            .iter()
+            .filter(|session| {
+                state_is_active(session.state)
+                    && self.node_exists(ExplorerNode::Session(session.id))
+            })
+            .collect();
+        sessions.sort_by_key(|session| {
+            (
+                active_session_priority(session.state),
+                std::cmp::Reverse(session.last_activity_at),
+            )
+        });
+        sessions
+    }
+
+    pub fn move_active_session(&mut self, delta: isize) {
+        let ids = self
+            .active_sessions()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_session_id
+            .and_then(|selected| ids.iter().position(|id| *id == selected))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(ids.len().saturating_sub(1));
+        self.reveal_and_select(ExplorerNode::Session(ids[next]));
+    }
+
+    pub fn select_active_session(&mut self, session_id: SessionId) -> bool {
+        if self
+            .active_sessions()
+            .iter()
+            .any(|session| session.id == session_id)
+        {
+            self.reveal_and_select(ExplorerNode::Session(session_id));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reconcile_active_session_selection(&mut self) {
+        if self.main_tab != TuiContentView::Sessions {
+            return;
+        }
+        let ids = self
+            .active_sessions()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        if self
+            .selected_session_id
+            .is_some_and(|selected| ids.contains(&selected))
+        {
+            return;
+        }
+        if let Some(session_id) = ids.first().copied() {
+            self.reveal_and_select(ExplorerNode::Session(session_id));
+        } else {
+            self.selected_session_id = None;
+            self.sync_explorer_index();
+        }
     }
 
     pub fn explorer_rows(&self) -> Vec<ExplorerRow> {
@@ -887,7 +977,8 @@ impl App {
             selected_project_id: self.selected_project_id,
             selected_worktree_id: self.selected_worktree_id,
             selected_session_id: self.selected_session_id,
-            selected_main_tab: self.main_tab,
+            selected_content_view: self.main_tab,
+            session_presentation: self.session_presentation,
             theme: self.theme,
             density: self.density,
         }
@@ -896,6 +987,7 @@ impl App {
     pub fn open_settings(&mut self) {
         self.mode = Mode::Settings(Settings {
             original_theme: self.theme,
+            original_presentation: self.session_presentation,
             original_density: self.density,
             focus: SettingsFocus::Theme,
         });
@@ -906,13 +998,14 @@ impl App {
         self.mark_navigation_dirty();
         self.flash = Some(Flash::transient(
             FlashKind::Success,
-            "Appearance settings applied.",
+            "TUI settings applied.",
         ));
     }
 
     pub fn cancel_settings(&mut self) {
         if let Mode::Settings(settings) = self.mode {
             self.theme = settings.original_theme;
+            self.session_presentation = settings.original_presentation;
             self.density = settings.original_density;
         }
         self.mode = Mode::Navigation;
@@ -922,8 +1015,9 @@ impl App {
         self.navigation_dirty_at = Some(Instant::now());
     }
 
-    pub fn set_tab(&mut self, tab: MainTab) {
+    pub fn set_tab(&mut self, tab: TuiContentView) {
         self.main_tab = tab;
+        self.reconcile_active_session_selection();
         self.focus = FocusZone::Main;
         self.mark_navigation_dirty();
     }

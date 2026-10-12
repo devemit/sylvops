@@ -24,6 +24,67 @@ pub enum MainTab {
     Details,
 }
 
+/// Main content shown by the terminal UI.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiContentView {
+    Terminal,
+    Changes,
+    Details,
+    #[default]
+    #[serde(other)]
+    Sessions,
+}
+
+impl TuiContentView {
+    pub const ALL: [Self; 4] = [Self::Terminal, Self::Changes, Self::Details, Self::Sessions];
+
+    #[must_use]
+    pub const fn shortcut(self) -> char {
+        match self {
+            Self::Terminal => '1',
+            Self::Changes => '2',
+            Self::Details => '3',
+            Self::Sessions => '4',
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal",
+            Self::Changes => "Changes",
+            Self::Details => "Details",
+            Self::Sessions => "Sessions",
+        }
+    }
+
+    #[must_use]
+    pub const fn from_shortcut(shortcut: char) -> Option<Self> {
+        match shortcut {
+            '1' => Some(Self::Terminal),
+            '2' => Some(Self::Changes),
+            '3' => Some(Self::Details),
+            '4' => Some(Self::Sessions),
+            _ => None,
+        }
+    }
+}
+
+/// Presentation used by the TUI Active Sessions overview.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiSessionPresentation {
+    List,
+    #[default]
+    #[serde(other)]
+    Cards,
+}
+
+impl TuiSessionPresentation {
+    pub const ALL: [Self; 2] = [Self::Cards, Self::List];
+}
+
 /// Navigation state safe to persist between TUI runs.
 ///
 /// Deliberately excludes form values, searches, terminal data, and credentials.
@@ -33,7 +94,9 @@ pub struct TuiState {
     pub selected_project_id: Option<ProjectId>,
     pub selected_worktree_id: Option<WorktreeId>,
     pub selected_session_id: Option<SessionId>,
-    pub selected_main_tab: MainTab,
+    #[serde(alias = "selected_main_tab")]
+    pub selected_content_view: TuiContentView,
+    pub session_presentation: TuiSessionPresentation,
     pub theme: TuiTheme,
     pub density: TuiDensity,
 }
@@ -219,6 +282,15 @@ impl fmt::Display for TuiDensity {
     }
 }
 
+impl fmt::Display for TuiSessionPresentation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Cards => "Cards",
+            Self::List => "List",
+        })
+    }
+}
+
 /// Bounded, non-sensitive state restored by the native desktop client.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -324,6 +396,8 @@ mod tests {
             r#"{"selected_project_id":null,"selected_worktree_id":null,"selected_session_id":null,"selected_main_tab":"terminal"}"#,
         )
         .unwrap();
+        assert_eq!(legacy.selected_content_view, TuiContentView::Terminal);
+        assert_eq!(legacy.session_presentation, TuiSessionPresentation::Cards);
         assert_eq!(legacy.theme, TuiTheme::TerminalDefault);
         assert_eq!(legacy.density, TuiDensity::Comfortable);
 
@@ -335,6 +409,8 @@ mod tests {
         let configured = TuiState {
             theme: TuiTheme::TokyoNight,
             density: TuiDensity::Compact,
+            selected_content_view: TuiContentView::Sessions,
+            session_presentation: TuiSessionPresentation::List,
             ..TuiState::default()
         };
         let encoded = serde_json::to_value(configured).unwrap();
@@ -351,16 +427,53 @@ mod tests {
             keys,
             [
                 "density",
-                "selected_main_tab",
+                "selected_content_view",
                 "selected_project_id",
                 "selected_session_id",
                 "selected_worktree_id",
+                "session_presentation",
                 "theme",
             ]
         );
         assert_eq!(TuiTheme::TerminalDefault.to_string(), "Terminal Default");
         assert_eq!(TuiTheme::TokyoNight.to_string(), "Tokyo Night");
         assert_eq!(TuiDensity::Compact.to_string(), "Compact");
+        assert_eq!(TuiSessionPresentation::List.to_string(), "List");
+    }
+
+    #[test]
+    fn tui_session_overview_defaults_and_legacy_content_view_are_stable() {
+        let fresh = TuiState::default();
+        assert_eq!(fresh.selected_content_view, TuiContentView::Sessions);
+        assert_eq!(fresh.session_presentation, TuiSessionPresentation::Cards);
+        assert_eq!(
+            TuiContentView::ALL.map(|view| (view.shortcut(), view.label())),
+            [
+                ('1', "Terminal"),
+                ('2', "Changes"),
+                ('3', "Details"),
+                ('4', "Sessions"),
+            ]
+        );
+        assert_eq!(
+            TuiContentView::from_shortcut('4'),
+            Some(TuiContentView::Sessions)
+        );
+        assert_eq!(TuiContentView::from_shortcut('5'), None);
+
+        let legacy: TuiState = serde_json::from_str(
+            r#"{"selected_main_tab":"details","theme":"nord","density":"compact"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.selected_content_view, TuiContentView::Details);
+        assert_eq!(legacy.session_presentation, TuiSessionPresentation::Cards);
+
+        let unknown: TuiState = serde_json::from_str(
+            r#"{"selected_content_view":"unknown","session_presentation":"unknown"}"#,
+        )
+        .unwrap();
+        assert_eq!(unknown.selected_content_view, TuiContentView::Sessions);
+        assert_eq!(unknown.session_presentation, TuiSessionPresentation::Cards);
     }
 
     #[test]

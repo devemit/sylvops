@@ -1,6 +1,6 @@
 //! Pure navigation reducer. Async daemon work is represented as effects.
 
-use sylvops_core::{ids::SessionId, provider::session_can_resume, ui::MainTab};
+use sylvops_core::{ids::SessionId, provider::session_can_resume, ui::TuiContentView};
 
 use crate::app::{App, ExplorerNode, Flash, FlashKind, FocusZone, Mode, Palette};
 
@@ -13,7 +13,10 @@ pub(crate) enum Action {
     Expand,
     Collapse,
     SelectExplorer(usize),
-    SelectTab(MainTab),
+    SelectActiveSession(SessionId),
+    OpenActiveSession(SessionId),
+    StopActiveSession(SessionId),
+    SelectTab(TuiContentView),
     Primary,
     Resume,
     New,
@@ -50,16 +53,40 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
         }
         Action::Focus(focus) => app.focus = focus,
         Action::Move(delta) if app.focus == FocusZone::Explorer => app.move_explorer(delta),
+        Action::Move(delta)
+            if app.focus == FocusZone::Main && app.main_tab == TuiContentView::Sessions =>
+        {
+            app.move_active_session(delta);
+        }
         Action::Move(_) => {}
         Action::MoveExplorer(delta) => {
             app.focus = FocusZone::Explorer;
             app.move_explorer(delta);
+        }
+        Action::Expand
+            if app.focus == FocusZone::Main && app.main_tab == TuiContentView::Sessions =>
+        {
+            app.move_active_session(1);
+        }
+        Action::Collapse
+            if app.focus == FocusZone::Main && app.main_tab == TuiContentView::Sessions =>
+        {
+            app.move_active_session(-1);
         }
         Action::Expand => app.expand_selected(),
         Action::Collapse => app.collapse_selected(),
         Action::SelectExplorer(index) => {
             app.focus = FocusZone::Explorer;
             app.select_explorer_index(index);
+        }
+        Action::SelectActiveSession(session_id) => {
+            select_active_session(app, session_id, None);
+        }
+        Action::OpenActiveSession(session_id) => {
+            return select_active_session(app, session_id, Some(Effect::Attach));
+        }
+        Action::StopActiveSession(session_id) => {
+            return select_active_session(app, session_id, Some(Effect::OpenDelete));
         }
         Action::SelectTab(tab) => app.set_tab(tab),
         Action::Primary => {
@@ -73,7 +100,11 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
                     Some(_) => app.expand_selected(),
                     None => return vec![Effect::OpenCreate],
                 }
-            } else if app.main_tab == MainTab::Terminal && app.selected_session().is_some() {
+            } else if matches!(
+                app.main_tab,
+                TuiContentView::Terminal | TuiContentView::Sessions
+            ) && app.selected_session().is_some()
+            {
                 return vec![Effect::Attach];
             }
         }
@@ -91,7 +122,7 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
         Action::Rename => return vec![Effect::OpenRename],
         Action::Delete => return vec![Effect::OpenDelete],
         Action::Diff => {
-            app.set_tab(MainTab::Changes);
+            app.set_tab(TuiContentView::Changes);
             return vec![Effect::LoadDiff];
         }
         Action::Attention => {
@@ -106,6 +137,23 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
         Action::Quit => return vec![Effect::Quit],
     }
     Vec::new()
+}
+
+fn select_active_session(
+    app: &mut App,
+    session_id: SessionId,
+    effect: Option<Effect>,
+) -> Vec<Effect> {
+    app.focus = FocusZone::Main;
+    if app.select_active_session(session_id) {
+        effect.into_iter().collect()
+    } else {
+        app.flash = Some(Flash::transient(
+            FlashKind::Info,
+            "That Active Session is no longer available.",
+        ));
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -161,8 +209,8 @@ mod tests {
     #[test]
     fn tabs_and_focus_are_synchronous_state_changes() {
         let mut app = App::new(DaemonSnapshot::default(), vec![ready_claude()], None);
-        reduce(&mut app, Action::SelectTab(MainTab::Details));
-        assert_eq!(app.main_tab, MainTab::Details);
+        reduce(&mut app, Action::SelectTab(TuiContentView::Details));
+        assert_eq!(app.main_tab, TuiContentView::Details);
         assert_eq!(app.focus, FocusZone::Main);
         assert!(reduce(&mut app, Action::Quit).contains(&Effect::Quit));
     }
