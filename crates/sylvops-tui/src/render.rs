@@ -1,12 +1,12 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use sylvops_core::{
-    domain::{Session, SessionState},
+    domain::{Session, SessionState, WorktreeStatus},
     provider::session_can_resume,
     ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiTheme},
 };
@@ -23,10 +23,13 @@ pub(crate) struct ViewAreas {
     pub main: Option<Rect>,
 }
 
-const NEW_LABEL: &str = " [n] New ";
-const RENAME_LABEL: &str = " [r] Rename ";
 const SETTINGS_LABEL: &str = " [s] Settings ";
-const COMMANDS_LABEL: &str = " [/] Commands  ";
+
+struct ActionItem {
+    label: String,
+    target: HitTarget,
+    style: Style,
+}
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.hit_map = HitMap::default();
@@ -34,17 +37,13 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(theme.background), area);
     let attention_height = u16::from(app.attention_count() > 0);
-    let (header_height, footer_height) = match app.density {
-        TuiDensity::Comfortable => (2, 2),
-        TuiDensity::Compact => (1, 1),
-    };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(header_height),
+            Constraint::Length(1),
             Constraint::Length(attention_height),
             Constraint::Min(3),
-            Constraint::Length(footer_height),
+            Constraint::Length(1),
         ])
         .split(area);
     draw_header(frame, app, vertical[0], theme);
@@ -103,100 +102,62 @@ pub(crate) fn view_areas(area: Rect, focus: FocusZone) -> ViewAreas {
 fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let workspace = app
         .active_workspace()
-        .map_or("No workspace", |item| item.name.as_str());
-    let repository = app
-        .selected_project()
-        .map_or("No repository", |item| item.name.as_str());
-    let branch = app
-        .selected_worktree()
-        .and_then(|item| item.branch.as_deref())
-        .unwrap_or("detached");
-    let status = format!(
-        "● Connected  {} active Sessions  {} attention",
-        app.active_sessions().len(),
-        app.attention_count()
-    );
-    let removal_action = match app.selected_node() {
-        Some(ExplorerNode::Workspace(_)) => "Delete Workspace",
-        Some(ExplorerNode::Project(_)) => "Remove Project",
-        Some(ExplorerNode::Worktree(_)) => "Remove Worktree",
-        Some(ExplorerNode::Session(_)) => {
-            app.selected_session().map_or("Delete Session", |session| {
-                if matches!(
-                    session.state,
-                    SessionState::Fresh
-                        | SessionState::Starting
-                        | SessionState::Running
-                        | SessionState::NeedsFeedback
-                ) {
-                    "Stop Session"
-                } else {
-                    "Delete Session"
-                }
-            })
-        }
-        None => "Stop/Remove",
-    };
-    let delete_label = format!(" [d] {removal_action} ");
-    if app.density == TuiDensity::Compact {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" SylvOps ", theme.focus),
-                Span::raw(format!("{workspace} / {repository} / {branch}")),
-            ]))
-            .style(theme.text),
-            area,
-        );
-        frame.render_widget(
-            Paragraph::new(SETTINGS_LABEL)
-                .alignment(Alignment::Right)
-                .style(theme.focus),
-            area,
-        );
-        let settings_width = u16::try_from(SETTINGS_LABEL.len())
-            .unwrap_or(u16::MAX)
-            .min(area.width);
-        app.hit_map.push(
-            Rect::new(
-                area.x
-                    .saturating_add(area.width.saturating_sub(settings_width)),
-                area.y,
-                settings_width,
-                1,
-            ),
-            HitTarget::Settings,
-        );
+        .map_or_else(|| "No Workspace".to_owned(), |item| item.name.clone());
+    let attention = app.attention_count();
+    let active = app.active_sessions().len();
+    let full = app.density == TuiDensity::Comfortable && area.width >= 72;
+    let context = if full {
+        format!(" SylvOps · Workspace: {workspace}")
     } else {
-        let rows = vec![
-            Line::from(vec![
-                Span::styled(" SylvOps ", theme.focus),
-                Span::raw(format!("{workspace}  /  {repository}  /  {branch}")),
-            ]),
-            Line::from(vec![
-                Span::styled(delete_label.as_str(), theme.danger),
-                Span::styled(NEW_LABEL, theme.success),
-                Span::raw(RENAME_LABEL),
-                Span::styled(SETTINGS_LABEL, theme.focus),
-                Span::raw(COMMANDS_LABEL),
-                Span::styled(status, theme.muted),
-            ]),
-        ];
-        frame.render_widget(Paragraph::new(rows).style(theme.text), area);
-        let mut x = area.x;
-        for (label, target) in [
-            (delete_label.as_str(), HitTarget::Delete),
-            (NEW_LABEL, HitTarget::New),
-            (RENAME_LABEL, HitTarget::Rename),
-            (SETTINGS_LABEL, HitTarget::Settings),
-        ] {
-            let width = u16::try_from(label.len())
-                .unwrap_or(u16::MAX)
-                .min(area.x.saturating_add(area.width).saturating_sub(x));
-            app.hit_map
-                .push(Rect::new(x, area.y.saturating_add(1), width, 1), target);
-            x = x.saturating_add(width);
+        format!(" W:{workspace}")
+    };
+    let summary = if attention > 0 {
+        if full {
+            format!("{attention} attention")
+        } else {
+            format!("!{attention}")
         }
-    }
+    } else if full {
+        format!("{active} active Sessions")
+    } else {
+        format!("{active} active")
+    };
+    let connectivity = if full { "● Connected" } else { "●" };
+    let status = format!(" {connectivity} · {summary} ");
+    let settings_width = text_width(SETTINGS_LABEL).min(area.width);
+    let status_width = text_width(&status).min(area.width.saturating_sub(settings_width));
+    let reserved = status_width.saturating_add(settings_width);
+    let context_area = Rect::new(area.x, area.y, area.width.saturating_sub(reserved), 1);
+    let status_area = Rect::new(
+        area.x.saturating_add(context_area.width),
+        area.y,
+        status_width,
+        1,
+    );
+    let settings_area = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(settings_width)),
+        area.y,
+        settings_width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(truncate_text(&context, context_area.width)).style(theme.text),
+        context_area,
+    );
+    frame.render_widget(
+        Paragraph::new(status)
+            .alignment(Alignment::Right)
+            .style(theme.muted),
+        status_area,
+    );
+    frame.render_widget(
+        Paragraph::new(SETTINGS_LABEL)
+            .alignment(Alignment::Right)
+            .style(theme.focus),
+        settings_area,
+    );
+    app.hit_map.push(settings_area, HitTarget::Settings);
 }
 
 fn draw_attention(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -250,21 +211,23 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         })
         .borders(Borders::ALL)
         .border_style(if focused { theme.focus } else { theme.border });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let action_height = u16::from(inner.height > 0);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(action_height)])
+        .split(inner);
     let mut state =
         ListState::default().with_selected((!rows.is_empty()).then_some(app.explorer_index));
     frame.render_stateful_widget(
         List::new(items)
-            .block(block)
             .style(theme.text)
             .highlight_symbol("› ")
             .highlight_style(theme.selected),
-        area,
+        chunks[0],
         &mut state,
     );
-    let inner = area.inner(ratatui::layout::Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
     let row_height = if app.density == TuiDensity::Comfortable {
         2
     } else {
@@ -272,23 +235,25 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     };
     for (index, _) in rows
         .iter()
-        .take(usize::from(inner.height / row_height))
+        .take(usize::from(chunks[0].height / row_height))
         .enumerate()
     {
         app.hit_map.push(
             Rect::new(
-                inner.x,
-                inner.y.saturating_add(
+                chunks[0].x,
+                chunks[0].y.saturating_add(
                     u16::try_from(index)
                         .unwrap_or(u16::MAX)
                         .saturating_mul(row_height),
                 ),
-                inner.width,
+                chunks[0].width,
                 row_height,
             ),
             HitTarget::ExplorerRow(index),
         );
     }
+    let actions = contextual_actions(app, chunks[1].width, theme);
+    draw_action_line(frame, &mut app.hit_map, chunks[1], &actions, theme);
 }
 
 fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
@@ -350,15 +315,22 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         .iter()
         .position(|view| *view == app.main_tab)
         .unwrap_or(0);
-    let selected_session = app.selected_session();
-    let title = selected_session.map_or(" Session workspace".into(), |session| {
-        format!(
-            " {} · {} · {}",
-            session.display_name,
-            session.provider_kind.display_name(),
-            status_label(session.state)
-        )
-    });
+    let focus_label = if app.focus == FocusZone::Main {
+        " Main [active]"
+    } else {
+        " Main"
+    };
+    let title = app.selected_session().map_or_else(
+        || format!("{focus_label} · Session workspace "),
+        |session| {
+            format!(
+                "{focus_label} · {} · {} · {} ",
+                session.display_name,
+                session.provider_kind.display_name(),
+                status_label(session.state)
+            )
+        },
+    );
     frame.render_widget(
         Tabs::new(titles)
             .select(selected)
@@ -387,12 +359,22 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
             HitTarget::Tab(tab),
         );
     }
-    match app.main_tab {
-        TuiContentView::Terminal => draw_terminal(frame, app, chunks[1], theme),
-        TuiContentView::Changes => draw_changes(frame, app, chunks[1], theme),
-        TuiContentView::Details => draw_details(frame, app, chunks[1], theme),
-        TuiContentView::Sessions => draw_sessions(frame, app, chunks[1], theme),
+    if app.main_tab == TuiContentView::Sessions {
+        draw_sessions(frame, app, chunks[1], theme);
+        return;
     }
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(chunks[1]);
+    match app.main_tab {
+        TuiContentView::Terminal => draw_terminal(frame, app, content[0], theme),
+        TuiContentView::Changes => draw_changes(frame, app, content[0], theme),
+        TuiContentView::Details => draw_details(frame, app, content[0], theme),
+        TuiContentView::Sessions => unreachable!("Sessions is rendered above"),
+    }
+    let actions = contextual_actions(app, content[1].width, theme);
+    draw_action_line(frame, &mut app.hit_map, content[1], &actions, theme);
 }
 
 struct ActiveSessionItem {
@@ -620,7 +602,7 @@ fn relative_activity(captured_at: i64, activity_at: i64) -> String {
 
 fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let provider_owned = app.attached.is_some();
-    let (title, content, action) = if let Some(attached) = app.attached.as_ref() {
+    let (title, content) = if let Some(attached) = app.attached.as_ref() {
         let role = if attached.role == sylvops_core::domain::AttachmentRole::Controller {
             "controller"
         } else {
@@ -629,7 +611,6 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         (
             format!(" Terminal · attached as {role} "),
             terminal_text(attached.parser.screen()),
-            Some(("[ Detach · Ctrl+] ]", HitTarget::Detach)),
         )
     } else if let Some(session) = app.selected_session() {
         let can_resume = session_can_resume(session, &app.snapshot.sessions, &app.providers);
@@ -645,23 +626,13 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
                     "Press Enter or click Attach to connect."
                 }
             )),
-            Some(if can_resume {
-                ("[ Resume · u ]", HitTarget::Resume)
-            } else {
-                ("[ Attach ]", HitTarget::Attach)
-            }),
         )
     } else {
         (
             " Terminal ".into(),
             Text::from("No session selected.\n\nPress n or click New to create a shell session."),
-            Some(("[ New session · n ]", HitTarget::New)),
         )
     };
-    let inner = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
     let mut terminal = Paragraph::new(content)
         .block(
             Block::default()
@@ -673,16 +644,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     if !provider_owned {
         terminal = terminal.style(theme.text);
     }
-    frame.render_widget(terminal, inner[0]);
-    if let Some((label, target)) = action {
-        frame.render_widget(
-            Paragraph::new(label)
-                .alignment(Alignment::Right)
-                .style(theme.focus),
-            inner[1],
-        );
-        app.hit_map.push(inner[1], target);
-    }
+    frame.render_widget(terminal, area);
 }
 
 fn terminal_text(screen: &vt100::Screen) -> Text<'static> {
@@ -901,23 +863,376 @@ fn optional_number<T: ToString>(value: Option<T>, fallback: &str) -> String {
     value.map_or_else(|| fallback.to_owned(), |value| value.to_string())
 }
 
-fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let message = app.flash.as_ref().map_or_else(
-        || "Tab switch area · arrows navigate · Enter primary action · ? help · q close UI".into(),
-        |flash| flash.text.clone(),
+fn action_label(label: impl Into<String>, target: HitTarget, style: Style) -> ActionItem {
+    ActionItem {
+        label: format!("{} ", label.into()),
+        target,
+        style,
+    }
+}
+
+fn draw_action_line(
+    frame: &mut Frame<'_>,
+    hits: &mut HitMap,
+    area: Rect,
+    actions: &[ActionItem],
+    theme: Theme,
+) {
+    frame.render_widget(Block::default().style(theme.muted), area);
+    let mut x = area.x;
+    let right = area.x.saturating_add(area.width);
+    for action in actions {
+        let width = text_width(&action.label);
+        if width == 0 || x.saturating_add(width) > right {
+            break;
+        }
+        let action_area = Rect::new(x, area.y, width, 1.min(area.height));
+        frame.render_widget(
+            Paragraph::new(action.label.as_str()).style(action.style),
+            action_area,
+        );
+        hits.push(action_area, action.target);
+        x = x.saturating_add(width);
+    }
+}
+
+fn removal_action(app: &App) -> Option<&'static str> {
+    match app.selected_node() {
+        Some(ExplorerNode::Workspace(_)) => Some("Delete Workspace"),
+        Some(ExplorerNode::Project(_)) => Some("Remove Project"),
+        Some(ExplorerNode::Worktree(_)) if worktree_removal_available(app) => {
+            Some("Remove Worktree")
+        }
+        Some(ExplorerNode::Worktree(_)) | None => None,
+        Some(ExplorerNode::Session(_)) if session_is_active(app.selected_session()) => {
+            Some("Stop Session")
+        }
+        Some(ExplorerNode::Session(_)) => Some("Delete Session"),
+    }
+}
+
+fn worktree_removal_available(app: &App) -> bool {
+    app.selected_worktree().is_some_and(|worktree| {
+        worktree.status == WorktreeStatus::Active
+            && !worktree.is_root_checkout
+            && !app.snapshot.sessions.iter().any(|session| {
+                session.worktree_id == worktree.id && session_is_active(Some(session))
+            })
+    })
+}
+
+fn session_is_active(session: Option<&Session>) -> bool {
+    session.is_some_and(|session| {
+        matches!(
+            session.state,
+            SessionState::Fresh
+                | SessionState::Starting
+                | SessionState::Running
+                | SessionState::NeedsFeedback
+        )
+    })
+}
+
+fn contextual_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
+    let terse = width < 60 || app.density == TuiDensity::Compact;
+    match app.selected_node() {
+        Some(ExplorerNode::Workspace(_)) => workspace_actions(terse, theme),
+        Some(ExplorerNode::Project(_)) => entity_actions(
+            terse,
+            "[n] New Worktree",
+            "[n]Tree",
+            "[d] Remove Project",
+            theme,
+        ),
+        Some(ExplorerNode::Worktree(_)) => worktree_actions(app, terse, theme),
+        Some(ExplorerNode::Session(_)) => session_actions(app, terse, theme),
+        None => Vec::new(),
+    }
+}
+
+fn workspace_actions(terse: bool, theme: Theme) -> Vec<ActionItem> {
+    if terse {
+        vec![
+            action_label("[d] Delete Workspace", HitTarget::Delete, theme.danger),
+            action_label("[n]Proj", HitTarget::New, theme.success),
+        ]
+    } else {
+        vec![
+            action_label("[n] Add Project", HitTarget::New, theme.success),
+            action_label("[d] Delete Workspace", HitTarget::Delete, theme.danger),
+        ]
+    }
+}
+
+fn worktree_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
+    let active = app
+        .selected_worktree()
+        .is_some_and(|worktree| worktree.status == WorktreeStatus::Active);
+    let mut actions = Vec::new();
+    if terse && worktree_removal_available(app) {
+        actions.push(action_label(
+            "[d] Remove Worktree",
+            HitTarget::Delete,
+            theme.danger,
+        ));
+    }
+    if active {
+        actions.push(action_label(
+            if terse { "[n]Sess" } else { "[n] New Session" },
+            HitTarget::New,
+            theme.success,
+        ));
+    }
+    actions.push(action_label(
+        if terse { "[r]Name" } else { "[r] Rename" },
+        HitTarget::Rename,
+        theme.text,
+    ));
+    if !terse && worktree_removal_available(app) {
+        actions.push(action_label(
+            "[d] Remove Worktree",
+            HitTarget::Delete,
+            theme.danger,
+        ));
+    }
+    actions
+}
+
+fn entity_actions(
+    terse: bool,
+    create: &'static str,
+    terse_create: &'static str,
+    removal: &'static str,
+    theme: Theme,
+) -> Vec<ActionItem> {
+    if terse {
+        vec![
+            action_label(removal, HitTarget::Delete, theme.danger),
+            action_label(terse_create, HitTarget::New, theme.success),
+            action_label("[r]Name", HitTarget::Rename, theme.text),
+        ]
+    } else {
+        vec![
+            action_label(create, HitTarget::New, theme.success),
+            action_label("[r] Rename", HitTarget::Rename, theme.text),
+            action_label(removal, HitTarget::Delete, theme.danger),
+        ]
+    }
+}
+
+fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
+    let removal = if session_is_active(app.selected_session()) {
+        "[d] Stop Session"
+    } else {
+        "[d] Delete Session"
+    };
+    let primary = primary_session_action(app, terse, theme);
+    let rename = action_label(
+        if terse { "[r]Name" } else { "[r] Rename" },
+        HitTarget::Rename,
+        theme.text,
     );
-    let style = app
-        .flash
-        .as_ref()
-        .map_or(theme.muted, |flash| theme.flash(flash.kind));
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(message),
-            Line::from("Sessions keep running after the UI closes."),
-        ])
-        .style(style),
-        area,
-    );
+    let remove = action_label(removal, HitTarget::Delete, theme.danger);
+    if terse {
+        let mut actions = vec![remove];
+        if let Some(primary) = primary {
+            actions.push(primary);
+        }
+        actions.push(rename);
+        actions
+    } else {
+        let mut actions = Vec::new();
+        if let Some(primary) = primary {
+            actions.push(primary);
+        }
+        actions.push(rename);
+        actions.push(remove);
+        actions
+    }
+}
+
+fn primary_session_action(app: &App, terse: bool, theme: Theme) -> Option<ActionItem> {
+    if app.attached.is_some() {
+        return Some(action_label(
+            if terse {
+                "[C-]]Detach"
+            } else {
+                "[Ctrl+]] Detach"
+            },
+            HitTarget::Detach,
+            theme.focus,
+        ));
+    }
+    let session = app.selected_session()?;
+    Some(
+        if session_can_resume(session, &app.snapshot.sessions, &app.providers) {
+            action_label("[u] Resume", HitTarget::Resume, theme.focus)
+        } else {
+            action_label(
+                if terse { "[E]Attach" } else { "[Enter] Attach" },
+                HitTarget::Attach,
+                theme.focus,
+            )
+        },
+    )
+}
+
+fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
+    let terse = app.density == TuiDensity::Compact;
+    let mut items = vec![action_label(
+        "Explorer",
+        HitTarget::FocusExplorer,
+        theme.focus,
+    )];
+    items.push(action_label(
+        if terse {
+            "[Tab] Main"
+        } else {
+            "[Tab] Focus Main"
+        },
+        HitTarget::FocusMain,
+        theme.text,
+    ));
+    items.extend(contextual_actions(app, width, theme));
+    items
+}
+
+fn main_footer_actions(app: &App, theme: Theme) -> Vec<ActionItem> {
+    let terse = app.density == TuiDensity::Compact;
+    let mut items = vec![action_label(
+        app.main_tab.label(),
+        HitTarget::FocusMain,
+        theme.focus,
+    )];
+    match app.main_tab {
+        TuiContentView::Sessions => {
+            if let Some(session) = app
+                .selected_session_id
+                .and_then(|id| app.active_sessions().into_iter().find(|item| item.id == id))
+            {
+                items.push(action_label(
+                    "[Enter] Open",
+                    HitTarget::ActiveSessionOpen(session.id),
+                    theme.focus,
+                ));
+                items.push(action_label(
+                    "[d] Stop",
+                    HitTarget::ActiveSessionStop(session.id),
+                    theme.danger,
+                ));
+            } else if app.selected_worktree().is_some_and(|worktree| {
+                worktree.status == sylvops_core::domain::WorktreeStatus::Active
+            }) {
+                items.push(action_label("[n] New", HitTarget::New, theme.success));
+            }
+        }
+        TuiContentView::Terminal => add_terminal_footer_action(app, &mut items, theme),
+        TuiContentView::Changes if app.selected_worktree_id.is_some() => {
+            items.push(action_label("[g] Refresh", HitTarget::Diff, theme.focus));
+        }
+        TuiContentView::Details if app.selected_node().is_some() => {
+            if matches!(
+                app.selected_node(),
+                Some(
+                    ExplorerNode::Project(_) | ExplorerNode::Worktree(_) | ExplorerNode::Session(_)
+                )
+            ) {
+                items.push(action_label("[r] Rename", HitTarget::Rename, theme.text));
+            }
+            if let Some(removal) = removal_action(app) {
+                items.push(action_label(
+                    format!("[d] {removal}"),
+                    HitTarget::Delete,
+                    theme.danger,
+                ));
+            }
+        }
+        TuiContentView::Changes | TuiContentView::Details => {}
+    }
+    items.push(action_label(
+        if terse {
+            "[Tab] Explorer"
+        } else {
+            "[Tab] Focus Explorer"
+        },
+        HitTarget::FocusExplorer,
+        theme.text,
+    ));
+    items
+}
+
+fn add_terminal_footer_action(app: &App, items: &mut Vec<ActionItem>, theme: Theme) {
+    if let Some(action) = primary_session_action(app, false, theme) {
+        items.push(action);
+    } else {
+        items.push(action_label("[n] New", HitTarget::New, theme.success));
+    }
+}
+
+fn footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
+    let mut actions = match app.focus {
+        FocusZone::Explorer => explorer_footer_actions(app, width, theme),
+        FocusZone::Main => main_footer_actions(app, theme),
+    };
+    actions.push(action_label(
+        "[/] Commands",
+        HitTarget::Commands,
+        theme.text,
+    ));
+    actions.push(action_label(
+        "[s] Settings",
+        HitTarget::Settings,
+        theme.text,
+    ));
+    actions.push(action_label("[?] Help", HitTarget::Help, theme.text));
+    actions
+}
+
+fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    if let Some(flash) = &app.flash {
+        frame.render_widget(
+            Paragraph::new(truncate_text(&flash.text, area.width)).style(theme.flash(flash.kind)),
+            area,
+        );
+        return;
+    }
+    if app.help {
+        let actions = vec![action_label(
+            "[Esc] Close Help",
+            HitTarget::Help,
+            theme.focus,
+        )];
+        draw_action_line(frame, &mut app.hit_map, area, &actions, theme);
+        return;
+    }
+    if matches!(app.mode, Mode::TerminalAttached) {
+        let actions = vec![action_label(
+            "[Ctrl+]] Detach",
+            HitTarget::Detach,
+            theme.focus,
+        )];
+        draw_action_line(frame, &mut app.hit_map, area, &actions, theme);
+        return;
+    }
+    if !matches!(app.mode, Mode::Navigation) {
+        let message = match &app.mode {
+            Mode::Modal(_) => "Form · ↑↓ fields · Enter continue · Esc cancel",
+            Mode::Confirmation(_) => "Confirmation · y confirm · Esc cancel",
+            Mode::CommandPalette(_) => {
+                "Commands · type to filter · ↑↓ select · Enter run · Esc close"
+            }
+            Mode::Settings(_) => "Settings · ↑↓ field · ←→ change · Enter apply · Esc cancel",
+            Mode::TerminalAttached => unreachable!("Terminal attachment handled above"),
+            Mode::Navigation => unreachable!("Navigation handled below"),
+        };
+        frame.render_widget(
+            Paragraph::new(truncate_text(message, area.width)).style(theme.muted),
+            area,
+        );
+        return;
+    }
+    let actions = footer_actions(app, area.width, theme);
+    draw_action_line(frame, &mut app.hit_map, area, &actions, theme);
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
@@ -1335,6 +1650,32 @@ pub(crate) fn status_label(state: SessionState) -> &'static str {
         SessionState::Terminated => "Stopped",
         SessionState::Disconnected => "Disconnected",
     }
+}
+
+fn text_width(text: &str) -> u16 {
+    u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX)
+}
+
+fn truncate_text(text: &str, width: u16) -> String {
+    if text_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let budget = width.saturating_sub(text_width("…"));
+    let mut truncated = String::new();
+    let mut used = 0_u16;
+    for character in text.chars() {
+        let character_width = text_width(&character.to_string());
+        if used.saturating_add(character_width) > budget {
+            break;
+        }
+        truncated.push(character);
+        used = used.saturating_add(character_width);
+    }
+    truncated.push('…');
+    truncated
 }
 
 fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {

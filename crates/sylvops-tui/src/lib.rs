@@ -1595,9 +1595,9 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
 fn terminal_content_area(area: Rect, focus: app::FocusZone) -> Rect {
     let body = Rect::new(
         area.x,
-        area.y.saturating_add(2),
+        area.y.saturating_add(1),
         area.width,
-        area.height.saturating_sub(4),
+        area.height.saturating_sub(2),
     );
     let main = render::view_areas(body, focus).main.unwrap_or(body);
     Rect::new(
@@ -1923,7 +1923,7 @@ mod tests {
                 .iter()
                 .filter(|region| matches!(region.target, HitTarget::ActiveSessionOpen(_)))
                 .count(),
-            3
+            4
         );
         assert_eq!(
             card_hits
@@ -1931,8 +1931,11 @@ mod tests {
                 .iter()
                 .filter(|region| matches!(region.target, HitTarget::ActiveSessionStop(_)))
                 .count(),
-            3
+            4
         );
+        assert!(card_hits.0.iter().any(|region| {
+            matches!(region.target, HitTarget::ActiveSessionOpen(_)) && region.area.y == 31
+        }));
 
         let (list, list_hits) = render(140, TuiSessionPresentation::List);
         let list_x = list_hits
@@ -2195,7 +2198,226 @@ mod tests {
             terminal
                 .draw(|frame| render::draw(frame, &mut app))
                 .unwrap();
+
+            let row_text = |row| {
+                (0..width)
+                    .map(|column| {
+                        terminal
+                            .backend()
+                            .buffer()
+                            .cell((column, row))
+                            .unwrap()
+                            .symbol()
+                    })
+                    .collect::<String>()
+            };
+            let header = row_text(0);
+            let footer = row_text(height - 1);
+            assert!(
+                header.contains("Local"),
+                "missing Workspace at {width}x{height}"
+            );
+            assert!(
+                header.contains("Settings"),
+                "missing Settings at {width}x{height}"
+            );
+            assert!(
+                header.contains("Connected") || header.contains('●'),
+                "missing connectivity at {width}x{height}"
+            );
+            assert!(
+                footer.contains("Explorer"),
+                "wrong footer at {width}x{height}"
+            );
+            assert_eq!(
+                app.hit_map
+                    .0
+                    .iter()
+                    .find(|region| region.target == HitTarget::Settings)
+                    .expect("Settings hit target")
+                    .area
+                    .y,
+                0
+            );
+            assert!(app.hit_map.0.iter().any(|region| {
+                region.target == HitTarget::FocusMain && region.area.y == height - 1
+            }));
+            assert!(app.hit_map.0.iter().all(|region| {
+                region.area.x.saturating_add(region.area.width) <= width
+                    && region.area.y.saturating_add(region.area.height) <= height
+            }));
+
+            app.snapshot.sessions[0].display_name = "a very long selected Session name".repeat(6);
+            app.focus = app::FocusZone::Main;
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(
+                rendered.contains("Main [active]"),
+                "missing explicit Main focus at {width}x{height}"
+            );
+            assert!(app.hit_map.0.iter().all(|region| {
+                region.area.x.saturating_add(region.area.width) <= width
+                    && region.area.y.saturating_add(region.area.height) <= height
+            }));
         }
+    }
+
+    #[test]
+    fn chrome_actions_and_shortcuts_follow_focus_and_attention_context() {
+        let backend = ratatui::backend::TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Explorer [active]"));
+        assert!(
+            !app.hit_map
+                .0
+                .iter()
+                .any(|region| region.target == HitTarget::Attention)
+        );
+        let explorer = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::FocusExplorer)
+            .expect("Explorer region")
+            .area;
+        let delete = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::Delete)
+            .expect("contextual delete action")
+            .area;
+        assert!(delete.y >= explorer.y && delete.y < explorer.y + explorer.height);
+        assert_eq!(
+            app.hit_map.target_at(delete.x, delete.y),
+            Some(HitTarget::Delete)
+        );
+
+        app.snapshot.sessions[0].state = SessionState::Running;
+        app.focus = app::FocusZone::Main;
+        app.set_tab(TuiContentView::Sessions);
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let footer = (0..120)
+            .map(|column| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, 23))
+                    .unwrap()
+                    .symbol()
+            })
+            .collect::<String>();
+        assert!(footer.contains("Sessions"));
+        assert!(footer.contains("Open"));
+        assert!(!footer.contains("Rename"));
+        let footer_open = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| {
+                matches!(region.target, HitTarget::ActiveSessionOpen(_)) && region.area.y == 23
+            })
+            .expect("footer open action");
+        assert_eq!(
+            app.hit_map
+                .target_at(footer_open.area.x, footer_open.area.y),
+            Some(footer_open.target)
+        );
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("[active]"));
+
+        app.snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let attention = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::Attention)
+            .expect("conditional attention banner");
+        assert_eq!(attention.area.height, 1);
+        assert_eq!(attention.area.y, 1);
+    }
+
+    #[test]
+    fn footer_shortcuts_follow_the_active_mode() {
+        let backend = ratatui::backend::TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+
+        reduce(&mut app, reducer::Action::Settings);
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let footer = (0..120)
+            .map(|column| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, 23))
+                    .unwrap()
+                    .symbol()
+            })
+            .collect::<String>();
+        assert!(footer.contains("Settings"));
+        assert!(footer.contains("apply"));
+        assert!(footer.contains("cancel"));
+        assert!(!footer.contains("Open"));
+
+        let session_id = app.snapshot.sessions[0].id;
+        app.cancel_settings();
+        app.attached = Some(AttachedTerminal {
+            session_id,
+            role: AttachmentRole::Controller,
+            parser: vt100::Parser::new(24, 80, 0),
+            last_sequence: 0,
+            columns: 80,
+            rows: 24,
+        });
+        app.mode = Mode::TerminalAttached;
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let detach = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::Detach && region.area.y == 23)
+            .expect("footer detach action");
+        assert_eq!(
+            app.hit_map.target_at(detach.area.x, detach.area.y),
+            Some(HitTarget::Detach)
+        );
     }
 
     #[test]
@@ -2390,22 +2612,48 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn density_consistently_changes_chrome_explorer_forms_and_modal_spacing() {
-        use sylvops_core::ui::TuiDensity;
+        use ratatui::style::Color;
+        use sylvops_core::ui::{TuiDensity, TuiTheme};
 
         let backend = ratatui::backend::TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.theme = TuiTheme::Nord;
         terminal
             .draw(|frame| render::draw(frame, &mut app))
             .unwrap();
-        let comfortable_settings_row = app
+        let comfortable_settings_region = app
             .hit_map
             .0
             .iter()
             .find(|region| region.target == HitTarget::Settings)
             .unwrap()
-            .area
-            .y;
+            .area;
+        let header_settings = terminal
+            .backend()
+            .buffer()
+            .cell((
+                comfortable_settings_region.x.saturating_add(1),
+                comfortable_settings_region.y,
+            ))
+            .unwrap();
+        assert_eq!(header_settings.fg, Color::Rgb(136, 192, 208));
+        assert_eq!(header_settings.bg, Color::Rgb(46, 52, 64));
+        let footer_focus = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::FocusExplorer && region.area.y == 31)
+            .expect("focused footer label");
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((footer_focus.area.x, footer_focus.area.y))
+                .unwrap()
+                .fg,
+            Color::Rgb(136, 192, 208)
+        );
         let comfortable_explorer_height = app
             .hit_map
             .0
@@ -2491,7 +2739,8 @@ mod tests {
             .area
             .y;
 
-        assert!(comfortable_settings_row > compact_settings_region.y);
+        assert_eq!(comfortable_settings_region.y, 0);
+        assert_eq!(compact_settings_region.y, 0);
         assert_eq!(compact_settings_label, " [s] Settings ");
         assert_eq!(comfortable_explorer_height, 2);
         assert_eq!(compact_explorer_height, 1);
@@ -2688,7 +2937,7 @@ mod tests {
     }
 
     #[test]
-    fn hierarchy_exposes_contextual_removal_actions_for_all_entities() {
+    fn hierarchy_exposes_only_valid_contextual_actions() {
         let snapshot = populated_snapshot();
         let workspace_id = snapshot.workspaces[0].id;
         let project_id = snapshot.projects[0].id;
@@ -2698,14 +2947,31 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new(snapshot, Vec::new(), None);
 
-        for (node, expected) in [
+        for (node, expected_removal, expected_creation, can_rename) in [
             (
                 ExplorerNode::Workspace(workspace_id),
-                "[d] Delete Workspace",
+                Some("[d] Delete Workspace"),
+                Some("[n] Add Project"),
+                false,
             ),
-            (ExplorerNode::Project(project_id), "[d] Remove Project"),
-            (ExplorerNode::Worktree(worktree_id), "[d] Remove Worktree"),
-            (ExplorerNode::Session(session_id), "[d] Stop Session"),
+            (
+                ExplorerNode::Project(project_id),
+                Some("[d] Remove Project"),
+                Some("[n] New Worktree"),
+                true,
+            ),
+            (
+                ExplorerNode::Worktree(worktree_id),
+                None,
+                Some("[n] New Session"),
+                true,
+            ),
+            (
+                ExplorerNode::Session(session_id),
+                Some("[d] Stop Session"),
+                Some("[Enter] Attach"),
+                true,
+            ),
         ] {
             app.select_node(node);
             terminal
@@ -2718,8 +2984,46 @@ mod tests {
                 .iter()
                 .map(ratatui::buffer::Cell::symbol)
                 .collect::<String>();
-            assert!(text.contains(expected), "missing {expected:?}");
+            if let Some(expected) = expected_removal {
+                assert!(text.contains(expected), "missing {expected:?}");
+            } else {
+                assert!(!text.contains("[d] Remove Worktree"));
+            }
+            if let Some(expected) = expected_creation {
+                assert!(text.contains(expected), "missing {expected:?}");
+            }
+            assert_eq!(text.contains("[r] Rename"), can_rename);
         }
+
+        app.snapshot.worktrees[0].is_root_checkout = false;
+        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.select_node(ExplorerNode::Worktree(worktree_id));
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let removable = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(removable.contains("[d] Remove Worktree"));
+
+        app.snapshot.worktrees[0].status = WorktreeStatus::Missing;
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let missing = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(!missing.contains("[n] New Session"));
+        assert!(!missing.contains("[d] Remove Worktree"));
+        assert!(missing.contains("[r] Rename"));
     }
 
     #[test]
