@@ -18,7 +18,7 @@ use subtle::ConstantTimeEq;
 use sylvops_core::{
     domain::{
         DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, WorktreeStatus,
-        state_allows_deletion, state_allows_resume,
+        state_allows_deletion, state_allows_resume, state_is_active,
     },
     ids::{ProjectId, ProviderProfileId, SessionId, WorktreeId},
     protocol::{
@@ -2058,10 +2058,7 @@ async fn handle_request(
             let mut active_handles = Vec::new();
             for managed in managed_sessions {
                 let record = managed.record.read().await.clone();
-                if matches!(
-                    record.state,
-                    SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
-                ) {
+                if state_is_active(record.state) {
                     if active.len() >= MAX_UPGRADE_ACTIVE_SESSIONS {
                         return Err(DaemonError::Lifecycle(
                             "too many active sessions to coordinate an upgrade".into(),
@@ -2187,10 +2184,7 @@ async fn handle_request(
             }
             let managed_sessions: Vec<_> = state.sessions.read().await.values().cloned().collect();
             for managed in managed_sessions {
-                if matches!(
-                    managed.record.read().await.state,
-                    SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
-                ) {
+                if state_is_active(managed.record.read().await.state) {
                     state
                         .database
                         .audit(
@@ -3090,10 +3084,7 @@ async fn inspect_session_deletion(
     } else {
         false
     };
-    let refusal = if matches!(
-        session.state,
-        SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
-    ) {
+    let refusal = if state_is_active(session.state) {
         Some(SessionDeletionRefusal::LiveState)
     } else if session.process_id.is_some() || runtime_owned {
         Some(SessionDeletionRefusal::OwnedProcess)

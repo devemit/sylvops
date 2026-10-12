@@ -10,6 +10,8 @@ Multi-entity state transitions use short transactions. No transaction spans a su
 
 Configuration is separate from the database: versioned TOML plus a machine-local override, atomically written beside the target and renamed after flush. Unknown fields are retained where possible.
 
+The bounded `tui/navigation.v1` record persists only navigation identifiers, the selected TUI content view, Cards/List Session presentation, theme, and density. Fresh state defaults to Active Sessions with Cards; legacy `selected_main_tab` values still restore Terminal, Changes, or Details, and missing or unknown new values normalize safely. The TUI scope remains independent from `desktop/navigation.v1`, and these preference-only writes do not advance the entity revision or emit lifecycle events.
+
 ## Phase 1 implementation
 
 One bounded actor channel feeds a dedicated operating-system thread that exclusively owns the SQLite connection. Startup enables foreign keys, WAL, a five-second busy timeout, and `NORMAL` synchronous mode before applying migrations. The daemon does not accept authenticated requests until migration and restart reconciliation finish.

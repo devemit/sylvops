@@ -214,6 +214,26 @@ pub const fn attention_priority(state: SessionState) -> u8 {
     }
 }
 
+/// Whether a Session belongs in cross-client active-session supervision.
+#[must_use]
+pub const fn state_is_active(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
+    )
+}
+
+/// Stable ordering for the Active Sessions overview.
+#[must_use]
+pub const fn active_session_priority(state: SessionState) -> u8 {
+    match state {
+        SessionState::NeedsFeedback => 0,
+        SessionState::Running => 1,
+        SessionState::Starting => 2,
+        _ => 3,
+    }
+}
+
 /// Whether a terminal session state is eligible for provider-level resume.
 ///
 /// A verified external session identifier is still required by the daemon.
@@ -264,7 +284,10 @@ pub fn session_record_can_resume(session: &Session, sessions: &[Session]) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderKind, SessionState, state_allows_deletion, state_allows_resume};
+    use super::{
+        ProviderKind, SessionState, active_session_priority, state_allows_deletion,
+        state_allows_resume, state_is_active,
+    };
 
     #[test]
     fn provider_display_names_are_distinct_from_protocol_values() {
@@ -321,5 +344,22 @@ mod tests {
                 "{state} should not allow deletion"
             );
         }
+    }
+
+    #[test]
+    fn active_session_states_have_a_stable_supervision_order() {
+        let active = [
+            SessionState::NeedsFeedback,
+            SessionState::Running,
+            SessionState::Starting,
+        ];
+        for state in active {
+            assert!(state_is_active(state));
+        }
+        assert_eq!(active_session_priority(SessionState::NeedsFeedback), 0);
+        assert_eq!(active_session_priority(SessionState::Running), 1);
+        assert_eq!(active_session_priority(SessionState::Starting), 2);
+        assert!(!state_is_active(SessionState::FinishedSeen));
+        assert_eq!(active_session_priority(SessionState::FinishedSeen), 3);
     }
 }

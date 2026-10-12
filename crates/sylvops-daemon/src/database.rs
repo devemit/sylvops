@@ -2627,7 +2627,7 @@ mod tests {
     use super::*;
     use sylvops_core::ui::{
         DesktopDensity, DesktopState, DesktopTerminalCursor, DesktopTerminalFont, DesktopTheme,
-        MainTab, TuiDensity, TuiTheme,
+        MainTab, TuiContentView, TuiDensity, TuiSessionPresentation, TuiTheme,
     };
 
     #[tokio::test]
@@ -2791,7 +2791,8 @@ mod tests {
             selected_project_id: Some(ProjectId::new()),
             selected_worktree_id: Some(WorktreeId::new()),
             selected_session_id: Some(SessionId::new()),
-            selected_main_tab: MainTab::Changes,
+            selected_content_view: TuiContentView::Changes,
+            session_presentation: TuiSessionPresentation::List,
             theme: TuiTheme::GruvboxDark,
             density: TuiDensity::Compact,
         };
@@ -2835,6 +2836,8 @@ mod tests {
         let desktop = database.desktop_state().await.unwrap().unwrap();
         assert_eq!(tui.theme, TuiTheme::TerminalDefault);
         assert_eq!(tui.density, TuiDensity::Comfortable);
+        assert_eq!(tui.selected_content_view, TuiContentView::Sessions);
+        assert_eq!(tui.session_presentation, TuiSessionPresentation::Cards);
         assert_eq!(desktop.theme, DesktopTheme::Nord);
         assert_eq!(desktop.density, DesktopDensity::Compact);
         database.shutdown().await.unwrap();

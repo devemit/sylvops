@@ -8,7 +8,7 @@ use ratatui::{
 use sylvops_core::{
     domain::{Session, SessionState},
     provider::session_can_resume,
-    ui::{MainTab, TuiDensity, TuiTheme},
+    ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiTheme},
 };
 
 use crate::{
@@ -112,8 +112,8 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         .and_then(|item| item.branch.as_deref())
         .unwrap_or("detached");
     let status = format!(
-        "● Connected  {} sessions  {} attention",
-        app.snapshot.sessions.len(),
+        "● Connected  {} active Sessions  {} attention",
+        app.active_sessions().len(),
         app.attention_count()
     );
     let removal_action = match app.selected_node() {
@@ -342,15 +342,14 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(2)])
         .split(area);
-    let titles: Vec<_> = ["1 Terminal", "2 Changes", "3 Details"]
+    let titles: Vec<_> = TuiContentView::ALL
         .into_iter()
-        .map(Line::from)
+        .map(|view| Line::from(format!("{} {}", view.shortcut(), view.label())))
         .collect();
-    let selected = match app.main_tab {
-        MainTab::Terminal => 0,
-        MainTab::Changes => 1,
-        MainTab::Details => 2,
-    };
+    let selected = TuiContentView::ALL
+        .iter()
+        .position(|view| *view == app.main_tab)
+        .unwrap_or(0);
     let selected_session = app.selected_session();
     let title = selected_session.map_or(" Session workspace".into(), |session| {
         format!(
@@ -373,11 +372,9 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
             .highlight_style(theme.focus),
         chunks[0],
     );
-    let tab_width = chunks[0].width.saturating_sub(2) / 3;
-    for (index, tab) in [MainTab::Terminal, MainTab::Changes, MainTab::Details]
-        .into_iter()
-        .enumerate()
-    {
+    let tab_count = u16::try_from(TuiContentView::ALL.len()).unwrap_or(1);
+    let tab_width = chunks[0].width.saturating_sub(2) / tab_count;
+    for (index, tab) in TuiContentView::ALL.into_iter().enumerate() {
         app.hit_map.push(
             Rect::new(
                 chunks[0].x.saturating_add(
@@ -391,9 +388,233 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         );
     }
     match app.main_tab {
-        MainTab::Terminal => draw_terminal(frame, app, chunks[1], theme),
-        MainTab::Changes => draw_changes(frame, app, chunks[1], theme),
-        MainTab::Details => draw_details(frame, app, chunks[1], theme),
+        TuiContentView::Terminal => draw_terminal(frame, app, chunks[1], theme),
+        TuiContentView::Changes => draw_changes(frame, app, chunks[1], theme),
+        TuiContentView::Details => draw_details(frame, app, chunks[1], theme),
+        TuiContentView::Sessions => draw_sessions(frame, app, chunks[1], theme),
+    }
+}
+
+struct ActiveSessionItem {
+    id: sylvops_core::ids::SessionId,
+    name: String,
+    state: SessionState,
+    provider: &'static str,
+    project: String,
+    worktree: String,
+    last_activity_at: i64,
+}
+
+fn draw_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let sessions = app
+        .active_sessions()
+        .into_iter()
+        .map(|session| {
+            let worktree = app
+                .snapshot
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.id == session.worktree_id);
+            let project = worktree.and_then(|worktree| {
+                app.snapshot
+                    .projects
+                    .iter()
+                    .find(|project| project.id == worktree.project_id)
+            });
+            ActiveSessionItem {
+                id: session.id,
+                name: session.display_name.clone(),
+                state: session.state,
+                provider: session.provider_kind.display_name(),
+                project: project
+                    .map_or("Unknown Project", |project| project.name.as_str())
+                    .to_owned(),
+                worktree: worktree
+                    .map_or("Unknown Worktree", |worktree| worktree.name.as_str())
+                    .to_owned(),
+                last_activity_at: session.last_activity_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    let title = format!(
+        " Active Sessions · {} · {} ",
+        sessions.len(),
+        app.session_presentation
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(theme.border);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if sessions.is_empty() {
+        draw_sessions_empty(frame, app, inner, theme);
+        return;
+    }
+
+    let columns = session_columns(inner.width, app.session_presentation);
+    let gap = u16::from(columns == 2);
+    let card_width = inner
+        .width
+        .saturating_sub(gap)
+        .checked_div(columns)
+        .unwrap_or(inner.width);
+    let card_height = 7;
+    let selected_index = app
+        .selected_session_id
+        .and_then(|selected| sessions.iter().position(|session| session.id == selected))
+        .unwrap_or(0);
+    let selected_row = selected_index / usize::from(columns);
+    let visible_rows = usize::from(inner.height / card_height).max(1);
+    let first_row = selected_row.saturating_sub(visible_rows.saturating_sub(1));
+    let first_index = first_row.saturating_mul(usize::from(columns));
+    let visible_count = visible_rows.saturating_mul(usize::from(columns));
+
+    for (visible_index, session) in sessions
+        .iter()
+        .enumerate()
+        .skip(first_index)
+        .take(visible_count)
+    {
+        let visible_row = (visible_index - first_index) / usize::from(columns);
+        let column = (visible_index - first_index) % usize::from(columns);
+        let x = inner.x.saturating_add(
+            u16::try_from(column)
+                .unwrap_or(0)
+                .saturating_mul(card_width.saturating_add(gap)),
+        );
+        let y = inner.y.saturating_add(
+            u16::try_from(visible_row)
+                .unwrap_or(u16::MAX)
+                .saturating_mul(card_height),
+        );
+        let card = Rect::new(
+            x,
+            y,
+            card_width.min(inner.x.saturating_add(inner.width).saturating_sub(x)),
+            card_height.min(inner.y.saturating_add(inner.height).saturating_sub(y)),
+        );
+        draw_active_session(
+            frame,
+            app,
+            card,
+            session,
+            app.selected_session_id == Some(session.id),
+            theme,
+        );
+    }
+}
+
+const fn session_columns(width: u16, presentation: TuiSessionPresentation) -> u16 {
+    if matches!(presentation, TuiSessionPresentation::Cards) && width.saturating_sub(1) / 2 >= 36 {
+        2
+    } else {
+        1
+    }
+}
+
+fn draw_active_session(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    session: &ActiveSessionItem,
+    selected: bool,
+    theme: Theme,
+) {
+    let border = if selected { theme.focus } else { theme.border };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} {}", status_symbol(session.state), session.name),
+                Modifier::BOLD,
+            ),
+            Span::raw(format!(" · {}", status_label(session.state))),
+        ]),
+        Line::from(format!(
+            "Provider: {} · Project: {}",
+            session.provider, session.project
+        )),
+        Line::from(format!("Worktree: {}", session.worktree)),
+        Line::from(format!(
+            "Activity: {}",
+            relative_activity(app.snapshot.captured_at, session.last_activity_at)
+        )),
+        Line::from("[ Open terminal · Enter ]  [ Stop · d ]"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).border_style(border))
+            .style(if selected { theme.selected } else { theme.text })
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+    app.hit_map.push(area, HitTarget::ActiveSession(session.id));
+    if area.height >= 2 {
+        let actions_y = area.y.saturating_add(area.height.saturating_sub(2));
+        let open_width = 25.min(area.width.saturating_sub(2));
+        app.hit_map.push(
+            Rect::new(area.x.saturating_add(1), actions_y, open_width, 1),
+            HitTarget::ActiveSessionOpen(session.id),
+        );
+        let stop_x = area
+            .x
+            .saturating_add(28)
+            .min(area.x.saturating_add(area.width));
+        app.hit_map.push(
+            Rect::new(
+                stop_x,
+                actions_y,
+                12.min(area.x.saturating_add(area.width).saturating_sub(stop_x)),
+                1,
+            ),
+            HitTarget::ActiveSessionStop(session.id),
+        );
+    }
+}
+
+fn draw_sessions_empty(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let project = app
+        .selected_project()
+        .map_or("No Project selected", |project| project.name.as_str());
+    let worktree = app
+        .selected_worktree()
+        .map_or("No Worktree selected", |worktree| worktree.name.as_str());
+    let can_create = app
+        .selected_worktree()
+        .is_some_and(|worktree| worktree.status == sylvops_core::domain::WorktreeStatus::Active);
+    let guidance = if can_create {
+        "[ New Session · n ]"
+    } else {
+        "Select an active Worktree in the Explorer to start a Session."
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("No Active Sessions in this Workspace."),
+            Line::from(format!("Project: {project}")),
+            Line::from(format!("Worktree: {worktree}")),
+            Line::from(""),
+            Line::from(guidance),
+        ])
+        .style(theme.text)
+        .wrap(Wrap { trim: true }),
+        area,
+    );
+    if can_create {
+        app.hit_map.push(
+            Rect::new(area.x, area.y.saturating_add(4), 19.min(area.width), 1),
+            HitTarget::New,
+        );
+    }
+}
+
+fn relative_activity(captured_at: i64, activity_at: i64) -> String {
+    let elapsed = captured_at.saturating_sub(activity_at).max(0);
+    match elapsed {
+        0..60_000 => "just now".into(),
+        60_000..3_600_000 => format!("{}m ago", elapsed / 60_000),
+        3_600_000..86_400_000 => format!("{}h ago", elapsed / 3_600_000),
+        _ => format!("{}d ago", elapsed / 86_400_000),
     }
 }
 
@@ -702,7 +923,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy\n← →: collapse / expand\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\ns: appearance settings\n/: commands and entity search\nShift+A: next attention item\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Terminal / Changes / Details / Sessions\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 
@@ -952,6 +1173,31 @@ fn draw_settings(
         row = row.saturating_add(1);
     }
     lines.push(Line::from(Span::styled(
+        if settings.focus == SettingsFocus::Presentation {
+            "› Sessions presentation"
+        } else {
+            "  Sessions presentation"
+        },
+        Modifier::BOLD,
+    )));
+    row = row.saturating_add(1);
+    for choice in TuiSessionPresentation::ALL {
+        let selected = app.session_presentation == choice;
+        lines.push(Line::from(Span::styled(
+            format!("  {} {choice}", if selected { "●" } else { "○" }),
+            if selected { theme.selected } else { theme.text },
+        )));
+        app.hit_map.push(
+            Rect::new(inner.x, row, inner.width, 1),
+            HitTarget::SettingsPresentation(choice),
+        );
+        row = row.saturating_add(1);
+    }
+    if app.density == TuiDensity::Comfortable {
+        lines.push(Line::from(""));
+        row = row.saturating_add(1);
+    }
+    lines.push(Line::from(Span::styled(
         if settings.focus == SettingsFocus::Density {
             "› Density"
         } else {
@@ -975,7 +1221,7 @@ fn draw_settings(
     lines.push(Line::from(""));
     row = row.saturating_add(1);
     lines.push(Line::from(Span::styled(
-        "Preview is local until Apply. Escape and Cancel restore both choices.",
+        "Preview is local until Apply. Escape and Cancel restore all choices.",
         theme.muted,
     )));
     row = row.saturating_add(2);

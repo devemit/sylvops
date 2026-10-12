@@ -33,7 +33,7 @@ use sylvops_core::{
         MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal,
         SessionDeletionRefusal, WorkspaceDeletionRefusal,
     },
-    ui::{MainTab, TuiDensity, TuiState, TuiTheme},
+    ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
     upgrade::UpgradeStatus,
 };
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
@@ -1046,6 +1046,13 @@ fn cycle_choice<T: Copy + PartialEq>(choices: &[T], current: T, delta: isize) ->
 fn adjust_setting(app: &mut App, settings: SettingsFocus, delta: isize) {
     match settings {
         SettingsFocus::Theme => app.theme = cycle_choice(&TuiTheme::ALL, app.theme, delta),
+        SettingsFocus::Presentation => {
+            app.session_presentation = cycle_choice(
+                &TuiSessionPresentation::ALL,
+                app.session_presentation,
+                delta,
+            );
+        }
         SettingsFocus::Density => {
             app.density = cycle_choice(&TuiDensity::ALL, app.density, delta);
         }
@@ -1073,6 +1080,13 @@ fn handle_settings_input(app: &mut App, input: &Event) -> SettingsDecision {
             app.density = choice;
             if let Mode::Settings(settings) = &mut app.mode {
                 settings.focus = SettingsFocus::Density;
+            }
+            return SettingsDecision::Continue;
+        }
+        Some(HitTarget::SettingsPresentation(choice)) => {
+            app.session_presentation = choice;
+            if let Mode::Settings(settings) = &mut app.mode {
+                settings.focus = SettingsFocus::Presentation;
             }
             return SettingsDecision::Continue;
         }
@@ -1337,7 +1351,7 @@ async fn show_diff(client: &DaemonClient, app: &mut App) -> Result<(), DaemonErr
         }
         response => app.diff = Some(response_message("Git diff", response)),
     }
-    app.set_tab(MainTab::Changes);
+    app.set_tab(TuiContentView::Changes);
     Ok(())
 }
 
@@ -1375,7 +1389,7 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
                 columns,
                 rows,
             });
-            app.main_tab = MainTab::Terminal;
+            app.main_tab = TuiContentView::Terminal;
             app.mode = Mode::TerminalAttached;
             app.flash = Some(Flash::transient(
                 FlashKind::Info,
@@ -1452,7 +1466,7 @@ fn select_resumed_session(app: &mut App, session: &sylvops_core::domain::Session
         app.expanded_worktrees.insert(worktree.id);
     }
     app.select_node(ExplorerNode::Session(session.id));
-    app.set_tab(MainTab::Terminal);
+    app.set_tab(TuiContentView::Terminal);
 }
 
 async fn handle_terminal(
@@ -1797,6 +1811,292 @@ mod tests {
     }
 
     #[test]
+    fn active_session_selection_orders_filters_and_reconciles_from_snapshots() {
+        let mut snapshot = populated_snapshot();
+        let running_id = snapshot.sessions[0].id;
+        snapshot.sessions[0].display_name = "running".into();
+        snapshot.sessions[0].last_activity_at = 80;
+
+        let mut starting = snapshot.sessions[0].clone();
+        starting.id = SessionId::new();
+        starting.display_name = "starting".into();
+        starting.state = SessionState::Starting;
+        starting.last_activity_at = 100;
+        let starting_id = starting.id;
+
+        let mut needs_feedback = snapshot.sessions[0].clone();
+        needs_feedback.id = SessionId::new();
+        needs_feedback.display_name = "needs feedback".into();
+        needs_feedback.state = SessionState::NeedsFeedback;
+        needs_feedback.last_activity_at = 20;
+        let needs_feedback_id = needs_feedback.id;
+
+        let mut inactive = snapshot.sessions[0].clone();
+        inactive.id = SessionId::new();
+        inactive.display_name = "finished history".into();
+        inactive.state = SessionState::FinishedSeen;
+        inactive.last_activity_at = 200;
+        snapshot
+            .sessions
+            .extend([starting, needs_feedback, inactive]);
+
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        assert_eq!(
+            app.active_sessions()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![needs_feedback_id, running_id, starting_id]
+        );
+        assert_eq!(app.selected_session_id, Some(needs_feedback_id));
+
+        app.move_active_session(2);
+        assert_eq!(app.selected_session_id, Some(starting_id));
+
+        snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == starting_id)
+            .unwrap()
+            .state = SessionState::FinishedSeen;
+        app.replace_snapshot(snapshot);
+        assert_eq!(app.selected_session_id, Some(needs_feedback_id));
+        assert_eq!(
+            app.snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == starting_id)
+                .unwrap()
+                .display_name,
+            "starting"
+        );
+    }
+
+    #[test]
+    fn sessions_cards_and_list_render_identical_content_with_responsive_hit_targets() {
+        let mut snapshot = populated_snapshot();
+        snapshot.captured_at = 120_000;
+        snapshot.sessions[0].display_name = "running shell".into();
+        snapshot.sessions[0].last_activity_at = 60_000;
+        for (name, state, activity) in [
+            ("feedback codex", SessionState::NeedsFeedback, 119_000),
+            ("starting claude", SessionState::Starting, 118_000),
+        ] {
+            let mut session = snapshot.sessions[0].clone();
+            session.id = SessionId::new();
+            session.display_name = name.into();
+            session.state = state;
+            session.last_activity_at = activity;
+            snapshot.sessions.push(session);
+        }
+
+        let render = |width, presentation| {
+            let backend = ratatui::backend::TestBackend::new(width, 32);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut app = App::new(snapshot.clone(), Vec::new(), None);
+            app.focus = app::FocusZone::Main;
+            app.session_presentation = presentation;
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            (text, app.hit_map)
+        };
+
+        let (cards, card_hits) = render(140, TuiSessionPresentation::Cards);
+        let card_items = card_hits
+            .0
+            .iter()
+            .filter(|region| matches!(region.target, HitTarget::ActiveSession(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(card_items.len(), 3);
+        assert_ne!(card_items[0].area.x, card_items[1].area.x);
+        assert_eq!(
+            card_hits
+                .0
+                .iter()
+                .filter(|region| matches!(region.target, HitTarget::ActiveSessionOpen(_)))
+                .count(),
+            3
+        );
+        assert_eq!(
+            card_hits
+                .0
+                .iter()
+                .filter(|region| matches!(region.target, HitTarget::ActiveSessionStop(_)))
+                .count(),
+            3
+        );
+
+        let (list, list_hits) = render(140, TuiSessionPresentation::List);
+        let list_x = list_hits
+            .0
+            .iter()
+            .filter_map(|region| match region.target {
+                HitTarget::ActiveSession(_) => Some(region.area.x),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(list_x.len(), 3);
+        assert!(list_x.windows(2).all(|pair| pair[0] == pair[1]));
+
+        let (_, narrow_hits) = render(84, TuiSessionPresentation::Cards);
+        let narrow_x = narrow_hits
+            .0
+            .iter()
+            .filter_map(|region| match region.target {
+                HitTarget::ActiveSession(_) => Some(region.area.x),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(narrow_x.windows(2).all(|pair| pair[0] == pair[1]));
+
+        for text in [&cards, &list] {
+            assert!(text.contains("feedback codex"));
+            assert!(text.contains("Needs feedback"));
+            assert!(text.contains("Provider: Shell"));
+            assert!(text.contains("Project: repo"));
+            assert!(text.contains("Worktree: root"));
+            assert!(text.contains("Activity: 1m ago"));
+            assert!(text.contains("Open terminal"));
+            assert!(text.contains("Stop"));
+        }
+    }
+
+    #[test]
+    fn sessions_navigation_scrolls_selects_and_exposes_explicit_actions() {
+        use crossterm::event::{KeyEvent, MouseEvent};
+
+        let mut snapshot = populated_snapshot();
+        for index in 1..8 {
+            let mut session = snapshot.sessions[0].clone();
+            session.id = SessionId::new();
+            session.display_name = format!("session {index}");
+            session.last_activity_at = i64::from(index);
+            snapshot.sessions.push(session);
+        }
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.focus = app::FocusZone::Main;
+
+        let key_four = Event::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert_eq!(
+            input::navigation_action(&app, &key_four),
+            Some(reducer::Action::SelectTab(TuiContentView::Sessions))
+        );
+        let first = app.selected_session_id;
+        reduce(&mut app, reducer::Action::Move(1));
+        assert_ne!(app.selected_session_id, first);
+        assert_eq!(
+            reduce(&mut app, reducer::Action::Primary),
+            vec![reducer::Effect::Attach]
+        );
+
+        for presentation in [TuiSessionPresentation::Cards, TuiSessionPresentation::List] {
+            app.session_presentation = presentation;
+            app.move_active_session(1_000);
+            let selected = app.selected_session_id.unwrap();
+            let backend = ratatui::backend::TestBackend::new(100, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            assert!(
+                app.hit_map
+                    .0
+                    .iter()
+                    .any(|region| { region.target == HitTarget::ActiveSession(selected) })
+            );
+        }
+
+        let selected = app.selected_session_id.unwrap();
+        let open = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::ActiveSessionOpen(selected))
+            .unwrap();
+        let open_click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: open.area.x,
+            row: open.area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            input::navigation_action(&app, &open_click),
+            Some(reducer::Action::OpenActiveSession(selected))
+        );
+        assert_eq!(
+            reduce(&mut app, reducer::Action::OpenActiveSession(selected)),
+            vec![reducer::Effect::Attach]
+        );
+        assert_eq!(
+            reduce(&mut app, reducer::Action::StopActiveSession(selected)),
+            vec![reducer::Effect::OpenDelete]
+        );
+
+        let stale = SessionId::new();
+        assert!(reduce(&mut app, reducer::Action::OpenActiveSession(stale)).is_empty());
+        assert!(reduce(&mut app, reducer::Action::StopActiveSession(stale)).is_empty());
+        assert_eq!(app.selected_session_id, Some(selected));
+    }
+
+    #[test]
+    fn sessions_empty_state_keeps_context_and_guides_creation_or_selection() {
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.focus = app::FocusZone::Main;
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("No Active Sessions"));
+        assert!(text.contains("Project: repo"));
+        assert!(text.contains("Worktree: root"));
+        assert!(text.contains("New Session"));
+        assert!(
+            app.hit_map
+                .0
+                .iter()
+                .any(|region| region.target == HitTarget::New)
+        );
+        assert!(
+            app.explorer_rows()
+                .iter()
+                .any(|row| { matches!(row.node, ExplorerNode::Session(_)) })
+        );
+
+        let project_id = app.snapshot.projects[0].id;
+        app.select_node(ExplorerNode::Project(project_id));
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("No Worktree selected"));
+        assert!(text.contains("Select an active Worktree"));
+    }
+
+    #[test]
     fn successful_resume_selects_successor_and_preserves_source_history() {
         let mut snapshot = populated_snapshot();
         snapshot.sessions[0].provider_kind = ProviderKind::Codex;
@@ -1817,7 +2117,7 @@ mod tests {
         select_resumed_session(&mut app, &successor);
 
         assert_eq!(app.selected_session_id, Some(successor.id));
-        assert_eq!(app.main_tab, MainTab::Terminal);
+        assert_eq!(app.main_tab, TuiContentView::Terminal);
         assert!(
             app.snapshot
                 .sessions
@@ -1877,12 +2177,12 @@ mod tests {
                 selected_project_id: Some(ProjectId::new()),
                 selected_worktree_id: Some(WorktreeId::new()),
                 selected_session_id: Some(SessionId::new()),
-                selected_main_tab: MainTab::Details,
+                selected_content_view: TuiContentView::Details,
                 ..TuiState::default()
             }),
         );
         assert_eq!(app.selected_session_id, Some(expected));
-        assert_eq!(app.main_tab, MainTab::Details);
+        assert_eq!(app.main_tab, TuiContentView::Details);
         assert!(app.attached.is_none());
     }
 
@@ -1900,7 +2200,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn settings_input_previews_applies_and_cancels_every_appearance_choice() {
+    fn settings_input_previews_applies_and_cancels_every_tui_choice() {
         use crossterm::event::{KeyEvent, MouseEvent};
         use sylvops_core::ui::{TuiDensity, TuiTheme};
 
@@ -1964,6 +2264,25 @@ mod tests {
             assert_eq!(decision, SettingsDecision::Continue);
             assert_eq!(app.theme, expected);
         }
+        for expected in TuiSessionPresentation::ALL {
+            let region = app
+                .hit_map
+                .0
+                .iter()
+                .find(|region| region.target == HitTarget::SettingsPresentation(expected))
+                .cloned()
+                .expect("presentation hit target");
+            handle_settings_input(
+                &mut app,
+                &Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: region.area.x,
+                    row: region.area.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            );
+            assert_eq!(app.session_presentation, expected);
+        }
         for expected in TuiDensity::ALL {
             let region = app
                 .hit_map
@@ -2005,6 +2324,10 @@ mod tests {
         );
         assert!(matches!(app.mode, Mode::Navigation));
         assert_eq!(app.persisted_state().density, TuiDensity::Compact);
+        assert_eq!(
+            app.persisted_state().session_presentation,
+            TuiSessionPresentation::List
+        );
 
         reduce(&mut app, reducer::Action::Settings);
         handle_settings_input(
@@ -2012,6 +2335,15 @@ mod tests {
             &Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
         );
         assert_ne!(app.theme, TuiTheme::SolarizedLight);
+        handle_settings_input(
+            &mut app,
+            &Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        );
+        handle_settings_input(
+            &mut app,
+            &Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        );
+        assert_eq!(app.session_presentation, TuiSessionPresentation::Cards);
         assert_eq!(
             handle_settings_input(
                 &mut app,
@@ -2021,6 +2353,7 @@ mod tests {
         );
         assert_eq!(app.theme, TuiTheme::SolarizedLight);
         assert_eq!(app.density, TuiDensity::Compact);
+        assert_eq!(app.session_presentation, TuiSessionPresentation::List);
 
         reduce(&mut app, reducer::Action::Settings);
         handle_settings_input(
@@ -2051,6 +2384,7 @@ mod tests {
         );
         assert_eq!(app.theme, TuiTheme::SolarizedLight);
         assert_eq!(app.density, TuiDensity::Compact);
+        assert_eq!(app.session_presentation, TuiSessionPresentation::List);
     }
 
     #[test]
@@ -2211,6 +2545,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.set_tab(TuiContentView::Terminal);
         let session_id = app.snapshot.sessions[0].id;
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(b"\x1b[31mR\x1b[0m");
@@ -2282,6 +2617,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.set_tab(TuiContentView::Terminal);
         terminal
             .draw(|frame| render::draw(frame, &mut app))
             .unwrap();
@@ -2297,6 +2633,7 @@ mod tests {
             "1 Terminal",
             "2 Changes",
             "3 Details",
+            "4 Sessions",
             "Running",
         ] {
             assert!(
@@ -3012,6 +3349,7 @@ mod tests {
             let worktree_id = snapshot.worktrees[0].id;
             snapshot.worktrees[0].status = status;
             let mut app = App::new(snapshot.clone(), Vec::new(), None);
+            app.set_tab(TuiContentView::Details);
             app.select_node(ExplorerNode::Worktree(worktree_id));
 
             app.replace_snapshot(snapshot);
