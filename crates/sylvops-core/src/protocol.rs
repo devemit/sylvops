@@ -12,7 +12,8 @@ use crate::{
     },
     github::{
         GitHubAssociation, GitHubBrowseFailure, GitHubFailure, GitHubIntegrationStatus,
-        GitHubItemDetail, GitHubListPage, GitHubListQuery, GitHubViewQuery, GitRemoteName,
+        GitHubItemDetail, GitHubItemIdentity, GitHubListPage, GitHubListQuery, GitHubViewQuery,
+        GitRemoteName,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     provider::ProviderHealth,
@@ -21,7 +22,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 17;
+pub const PROTOCOL_MINOR: u16 = 18;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -508,6 +509,10 @@ pub enum ClientRequest {
         project_id: ProjectId,
         query: GitHubViewQuery,
     },
+    OpenGitHubItem {
+        project_id: ProjectId,
+        identity: GitHubItemIdentity,
+    },
     AddWorkspace {
         name: String,
     },
@@ -929,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_17_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_18_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -944,7 +949,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 17);
+        assert_eq!(PROTOCOL_MINOR, 18);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -962,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_17_github_contracts_round_trip() {
+    fn protocol_1_18_github_contracts_round_trip() {
         use crate::github::{
             GitHubAssociation, GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubHost,
             GitHubIntegrationStatus, GitHubItemKind, GitHubItemNumber, GitHubListFilters,
@@ -1058,7 +1063,30 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 17);
+        assert_eq!(PROTOCOL_MINOR, 18);
+    }
+
+    #[test]
+    fn protocol_1_18_typed_github_browser_request_round_trips() {
+        use crate::github::{
+            GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, GitHubOwner,
+            GitHubRepositoryIdentity, GitHubRepositoryName,
+        };
+        let request = ClientRequest::OpenGitHubItem {
+            project_id: ProjectId::new(),
+            identity: GitHubItemIdentity::new(
+                GitHubRepositoryIdentity::new(
+                    GitHubHost::new("github.example.com").unwrap(),
+                    GitHubOwner::new("acme").unwrap(),
+                    GitHubRepositoryName::new("widgets").unwrap(),
+                ),
+                GitHubItemKind::Issue,
+                GitHubItemNumber::new(125).unwrap(),
+            ),
+        };
+        let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
+        assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        assert_eq!(PROTOCOL_MINOR, 18);
     }
 
     #[test]

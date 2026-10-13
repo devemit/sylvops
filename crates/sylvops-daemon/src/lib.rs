@@ -2,6 +2,7 @@
 
 mod atomic_file;
 mod background_process;
+mod browser;
 mod claude_discovery;
 pub mod client;
 mod codex_discovery;
@@ -71,6 +72,7 @@ mod tests {
     #[test]
     fn background_commands_use_the_hidden_process_factory() {
         for (name, source) in [
+            ("browser", include_str!("browser.rs")),
             ("git", include_str!("git.rs")),
             ("github", include_str!("github.rs")),
             ("provider", include_str!("provider.rs")),

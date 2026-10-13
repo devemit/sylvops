@@ -2,6 +2,7 @@
 
 mod bridge;
 mod forms;
+mod github_surface;
 mod icons;
 mod presentation;
 mod state;
@@ -15,10 +16,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bridge::{Bridge, BridgeEvent, Operation, TerminalInputError};
+use bridge::{Bridge, BridgeEvent, GitHubDetailRequest, Operation, TerminalInputError};
 use chrono::{DateTime, Local, Locale};
 use forms::{
     Confirmation, DataRemovalConfirmation, FirstRunStepState, FormModal, Modal, first_run_steps,
+};
+use github_surface::{
+    GitHubLoad, GitHubRequestTarget, GitHubSurfaceKind, GitHubSurfaceState, failure_copy,
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Font, Length, Point, Subscription, Task,
@@ -50,7 +54,10 @@ use sylvops_core::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
         Worktree, WorktreeStatus,
     },
-    github::{GitHubIntegrationStatus, GitRemoteName},
+    github::{
+        GitHubCheckFilter, GitHubCheckState, GitHubIntegrationStatus, GitHubItemIdentity,
+        GitHubItemState, GitHubListState, GitHubReviewFilter, GitHubReviewState, GitRemoteName,
+    },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, ProjectRemovalRefusal, SessionDeletionRefusal,
@@ -221,6 +228,9 @@ struct DesktopApp {
     providers: Vec<ProviderHealth>,
     github_status: Option<GitHubIntegrationStatus>,
     github_request: RequestState,
+    deferred_github_status_project: Option<ProjectId>,
+    github_surface: GitHubSurfaceState,
+    content_surface: ContentSurface,
     connection: ConnectionState,
     selected_project_id: Option<ProjectId>,
     selected_worktree_id: Option<WorktreeId>,
@@ -275,6 +285,140 @@ enum RequestState {
     #[default]
     Idle,
     Pending,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ContentSurface {
+    #[default]
+    Session,
+    GitHub,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum GitHubDraftChoice {
+    #[default]
+    Any,
+    Ready,
+    Draft,
+}
+
+impl GitHubDraftChoice {
+    const ALL: [Self; 3] = [Self::Any, Self::Ready, Self::Draft];
+
+    const fn filter(self) -> Option<bool> {
+        match self {
+            Self::Any => None,
+            Self::Ready => Some(false),
+            Self::Draft => Some(true),
+        }
+    }
+
+    const fn from_filter(filter: Option<bool>) -> Self {
+        match filter {
+            None => Self::Any,
+            Some(false) => Self::Ready,
+            Some(true) => Self::Draft,
+        }
+    }
+}
+
+impl fmt::Display for GitHubDraftChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Any => "Any draft state",
+            Self::Ready => "Ready for review",
+            Self::Draft => "Draft",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum GitHubReviewChoice {
+    #[default]
+    Any,
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
+impl GitHubReviewChoice {
+    const ALL: [Self; 4] = [
+        Self::Any,
+        Self::Approved,
+        Self::ChangesRequested,
+        Self::ReviewRequired,
+    ];
+
+    const fn filter(self) -> Option<GitHubReviewFilter> {
+        match self {
+            Self::Any => None,
+            Self::Approved => Some(GitHubReviewFilter::Approved),
+            Self::ChangesRequested => Some(GitHubReviewFilter::ChangesRequested),
+            Self::ReviewRequired => Some(GitHubReviewFilter::ReviewRequired),
+        }
+    }
+
+    const fn from_filter(filter: Option<GitHubReviewFilter>) -> Self {
+        match filter {
+            None => Self::Any,
+            Some(GitHubReviewFilter::Approved) => Self::Approved,
+            Some(GitHubReviewFilter::ChangesRequested) => Self::ChangesRequested,
+            Some(GitHubReviewFilter::ReviewRequired) => Self::ReviewRequired,
+        }
+    }
+}
+
+impl fmt::Display for GitHubReviewChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Any => "Any review state",
+            Self::Approved => "Approved",
+            Self::ChangesRequested => "Changes requested",
+            Self::ReviewRequired => "Review required",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum GitHubCheckChoice {
+    #[default]
+    Any,
+    Success,
+    Failure,
+    Pending,
+}
+
+impl GitHubCheckChoice {
+    const ALL: [Self; 4] = [Self::Any, Self::Success, Self::Failure, Self::Pending];
+
+    const fn filter(self) -> Option<GitHubCheckFilter> {
+        match self {
+            Self::Any => None,
+            Self::Success => Some(GitHubCheckFilter::Success),
+            Self::Failure => Some(GitHubCheckFilter::Failure),
+            Self::Pending => Some(GitHubCheckFilter::Pending),
+        }
+    }
+
+    const fn from_filter(filter: Option<GitHubCheckFilter>) -> Self {
+        match filter {
+            None => Self::Any,
+            Some(GitHubCheckFilter::Success) => Self::Success,
+            Some(GitHubCheckFilter::Failure) => Self::Failure,
+            Some(GitHubCheckFilter::Pending) => Self::Pending,
+        }
+    }
+}
+
+impl fmt::Display for GitHubCheckChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Any => "Any check state",
+            Self::Success => "Checks passing",
+            Self::Failure => "Checks failing",
+            Self::Pending => "Checks pending",
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -449,6 +593,26 @@ enum Message {
     RefreshGitHub,
     AssociateGitHub(GitRemoteName),
     ClearGitHubAssociation,
+    SelectGitHubKind(GitHubSurfaceKind),
+    GitHubFilterText(String),
+    GitHubFilterAuthor(String),
+    GitHubFilterAssignee(String),
+    GitHubFilterLabels(String),
+    GitHubFilterState(GitHubListState),
+    GitHubFilterDraft(GitHubDraftChoice),
+    GitHubFilterReview(GitHubReviewChoice),
+    GitHubFilterCheck(GitHubCheckChoice),
+    ApplyGitHubFilters,
+    EditGitHubFilters,
+    RefreshGitHubItems,
+    PreviousGitHubPage,
+    NextGitHubPage,
+    SelectGitHubItem(GitHubItemIdentity),
+    BackToGitHubList,
+    RefreshGitHubDetail,
+    LoadMoreGitHubComments,
+    OpenGitHubItemInBrowser,
+    RetryGitHub,
     ToggleClassicThemes,
     ToggleTechnicalDetails,
     CopyTechnicalValue(String),
@@ -504,6 +668,9 @@ impl DesktopApp {
             providers: Vec::new(),
             github_status: None,
             github_request: RequestState::Idle,
+            deferred_github_status_project: None,
+            github_surface: GitHubSurfaceState::default(),
+            content_surface: ContentSurface::Session,
             connection: ConnectionState::Connecting,
             selected_project_id: None,
             selected_worktree_id: None,
@@ -593,6 +760,17 @@ impl DesktopApp {
                         _ => {}
                     }
                     return Task::none();
+                }
+                if self.modal.is_none()
+                    && self.content_surface == ContentSurface::GitHub
+                    && let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
+                    && let Some(direction) = github_tab_focus_direction(key, *modifiers)
+                {
+                    return if direction < 0 {
+                        widget::operation::focus_previous()
+                    } else {
+                        widget::operation::focus_next()
+                    };
                 }
                 if self.modal.is_none()
                     && !self.terminal_focus.is_focused()
@@ -754,6 +932,34 @@ impl DesktopApp {
                     );
                 }
             }
+            Message::SelectGitHubKind(kind) => self.open_github_surface(kind),
+            Message::GitHubFilterText(value) => self.github_surface.filter_input.text = value,
+            Message::GitHubFilterAuthor(value) => self.github_surface.filter_input.author = value,
+            Message::GitHubFilterAssignee(value) => {
+                self.github_surface.filter_input.assignee = value;
+            }
+            Message::GitHubFilterLabels(value) => self.github_surface.filter_input.labels = value,
+            Message::GitHubFilterState(value) => self.github_surface.filters.state = value,
+            Message::GitHubFilterDraft(value) => {
+                self.github_surface.filters.draft = value.filter();
+            }
+            Message::GitHubFilterReview(value) => {
+                self.github_surface.filters.review = value.filter();
+            }
+            Message::GitHubFilterCheck(value) => {
+                self.github_surface.filters.check = value.filter();
+            }
+            Message::ApplyGitHubFilters => self.apply_github_filters(),
+            Message::EditGitHubFilters => self.github_surface.edit_filters_after_failure(),
+            Message::RefreshGitHubItems => self.refresh_github_items(),
+            Message::PreviousGitHubPage => self.previous_github_page(),
+            Message::NextGitHubPage => self.next_github_page(),
+            Message::SelectGitHubItem(identity) => self.select_github_item(identity),
+            Message::BackToGitHubList => self.github_surface.back_to_list(),
+            Message::RefreshGitHubDetail => self.refresh_github_detail(),
+            Message::LoadMoreGitHubComments => self.load_more_github_comments(),
+            Message::OpenGitHubItemInBrowser => self.open_github_item_in_browser(),
+            Message::RetryGitHub => self.retry_github_request(),
             Message::ToggleClassicThemes => {
                 self.disclosures.classic_themes = !self.disclosures.classic_themes;
                 self.disclosures.settings_theme_focus = self
@@ -1505,24 +1711,85 @@ impl DesktopApp {
         let presentation = self.presentation();
         let density = presentation.density;
         let main_tab = presentation.selection.main_tab;
-        let tabs = self.session_tabs();
-        let views = container(
-            row![
-                tab_button("Terminal", MainTab::Terminal, main_tab, density),
-                tab_button("Changes", MainTab::Changes, main_tab, density),
-                tab_button("Details", MainTab::Details, main_tab, density),
-            ]
-            .spacing(density.region_spacing)
-            .align_y(Center),
-        )
-        .height(density.tab_height)
-        .padding([4, 8])
-        .width(Fill)
-        .style(tab_strip_surface);
-        let content = match main_tab {
-            MainTab::Terminal => self.terminal_view(),
-            MainTab::Changes => self.changes_view(),
-            MainTab::Details => self.details_view(),
+        let github_surface_open = self.content_surface == ContentSurface::GitHub;
+        let tabs = if github_surface_open {
+            self.github_context_header()
+        } else {
+            self.session_tabs()
+        };
+        let session_view_tabs = row![
+            tab_button(
+                "Terminal",
+                MainTab::Terminal,
+                main_tab,
+                !github_surface_open,
+                density
+            ),
+            tab_button(
+                "Changes",
+                MainTab::Changes,
+                main_tab,
+                !github_surface_open,
+                density
+            ),
+            tab_button(
+                "Details",
+                MainTab::Details,
+                main_tab,
+                !github_surface_open,
+                density
+            ),
+        ]
+        .spacing(density.region_spacing)
+        .align_y(Center);
+        let github_available = github_surface_open
+            || self.github_status.as_ref().is_some_and(|status| {
+                status.association.as_ref().is_some_and(|association| {
+                    Some(association.project_id) == self.selected_project_id
+                })
+            });
+        let views: Element<'_, Message> = if github_available {
+            let view_tabs = session_view_tabs
+                .push(github_tab_button(
+                    GitHubSurfaceKind::Issues,
+                    github_surface_open,
+                    self.github_surface.kind(),
+                    density,
+                ))
+                .push(github_tab_button(
+                    GitHubSurfaceKind::PullRequests,
+                    github_surface_open,
+                    self.github_surface.kind(),
+                    density,
+                ));
+            container(
+                scrollable(view_tabs)
+                    .direction(scrollable::Direction::Horizontal(
+                        scrollable::Scrollbar::hidden(),
+                    ))
+                    .height(density.control_height),
+            )
+            .height(density.tab_height)
+            .padding([4, 8])
+            .width(Fill)
+            .style(tab_strip_surface)
+            .into()
+        } else {
+            container(session_view_tabs)
+                .height(density.tab_height)
+                .padding([4, 8])
+                .width(Fill)
+                .style(tab_strip_surface)
+                .into()
+        };
+        let content = if github_surface_open {
+            self.github_view()
+        } else {
+            match main_tab {
+                MainTab::Terminal => self.terminal_view(),
+                MainTab::Changes => self.changes_view(),
+                MainTab::Details => self.details_view(),
+            }
         };
         container(column![
             tabs,
@@ -1533,6 +1800,47 @@ impl DesktopApp {
         ])
         .width(Fill)
         .height(Fill)
+        .into()
+    }
+
+    fn github_context_header(&self) -> Element<'_, Message> {
+        let density = self.presentation().density;
+        let project = self
+            .selected_project_id
+            .and_then(|project_id| {
+                self.snapshot
+                    .projects
+                    .iter()
+                    .find(|project| project.id == project_id)
+            })
+            .map_or("No Repository selected", |project| project.name.as_str());
+        let repository = self
+            .github_status
+            .as_ref()
+            .and_then(|status| status.association.as_ref())
+            .map_or_else(
+                || "GitHub Repository not connected".to_owned(),
+                |association| association.repository.to_string(),
+            );
+        container(
+            row![
+                column![
+                    text(project).font(UI_MEDIUM).size(UI_TEXT_SIZE),
+                    text(repository).size(UI_META_SIZE).style(text::secondary),
+                ]
+                .spacing(2),
+                space::horizontal(),
+                text("Repository-level GitHub")
+                    .font(UI_MEDIUM)
+                    .size(UI_META_SIZE)
+                    .style(text::secondary),
+            ]
+            .align_y(Center),
+        )
+        .height(density.control_height + 14)
+        .padding([5, 10])
+        .width(Fill)
+        .style(tab_strip_surface)
         .into()
     }
 
@@ -1832,6 +2140,484 @@ impl DesktopApp {
         .width(Fill)
         .height(Fill)
         .style(workspace_surface)
+        .into()
+    }
+
+    fn github_view(&self) -> Element<'_, Message> {
+        if self.selected_project_id.is_none() {
+            return centered_message("Select a Repository to browse its GitHub work.");
+        }
+        let Some(status) = &self.github_status else {
+            return centered_message("Checking this Repository's GitHub connection…");
+        };
+        if status.association.is_none() {
+            return centered_action(
+                "Connect this Repository to a validated GitHub Repository in Settings.",
+                "Open settings",
+                Message::ToggleSettings,
+            );
+        }
+        responsive(move |size| self.github_browse_layout(size.width >= 760.0))
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }
+
+    fn github_browse_layout(&self, wide: bool) -> Element<'_, Message> {
+        let filters =
+            responsive(move |size| self.github_filter_controls(size.width < 720.0)).width(Fill);
+        let content = if wide {
+            row![
+                container(self.github_list_view()).width(Length::FillPortion(5)),
+                rule::vertical(1),
+                container(self.github_detail_view()).width(Length::FillPortion(6)),
+            ]
+            .height(Fill)
+            .into()
+        } else if self.github_surface.selected.is_some() {
+            self.github_detail_view()
+        } else {
+            self.github_list_view()
+        };
+        container(column![filters, rule::horizontal(1), content])
+            .width(Fill)
+            .height(Fill)
+            .style(workspace_surface)
+            .into()
+    }
+
+    fn github_filter_controls(&self, compact: bool) -> Element<'_, Message> {
+        let common = self.github_common_filter_controls(compact);
+        let mut controls = column![common].spacing(6);
+        if self.github_surface.kind() == GitHubSurfaceKind::PullRequests {
+            controls = controls.push(self.github_pull_request_filter_controls(compact));
+        }
+        let pending = self.github_request == RequestState::Pending;
+        let actions = row![
+            button("Apply filters")
+                .on_press_maybe((!pending).then_some(Message::ApplyGitHubFilters))
+                .style(primary_action_style),
+            button("Refresh")
+                .on_press_maybe((!pending).then_some(Message::RefreshGitHubItems))
+                .style(chrome_action_style),
+            text(if self.github_surface.list.is_loading() {
+                "Loading GitHub data…"
+            } else {
+                "Filters are temporary and stay on this screen only."
+            })
+            .size(UI_META_SIZE)
+            .style(text::secondary),
+        ]
+        .spacing(8)
+        .align_y(Center);
+        controls = controls.push(actions);
+        if let Some(error) = &self.github_surface.filter_error {
+            controls = controls.push(text(error).size(UI_META_SIZE).style(text::danger));
+        }
+        container(
+            scrollable(controls).direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::default(),
+            )),
+        )
+        .padding([8, 10])
+        .width(Fill)
+        .into()
+    }
+
+    fn github_common_filter_controls(&self, compact: bool) -> Element<'_, Message> {
+        let state = column![
+            text("State").font(UI_MEDIUM).size(UI_META_SIZE),
+            pick_list(
+                [
+                    GitHubListState::Open,
+                    GitHubListState::Closed,
+                    GitHubListState::All,
+                ],
+                Some(self.github_surface.filters.state),
+                Message::GitHubFilterState,
+            )
+            .width(Fill),
+        ]
+        .spacing(3);
+        let search = github_filter_input(
+            "Search",
+            "Title or body text",
+            &self.github_surface.filter_input.text,
+            Message::GitHubFilterText,
+        );
+        let author = github_filter_input(
+            "Author",
+            "GitHub login",
+            &self.github_surface.filter_input.author,
+            Message::GitHubFilterAuthor,
+        );
+        let assignee = github_filter_input(
+            "Assignee",
+            "GitHub login",
+            &self.github_surface.filter_input.assignee,
+            Message::GitHubFilterAssignee,
+        );
+        let labels = github_filter_input(
+            "Labels",
+            "Comma-separated labels",
+            &self.github_surface.filter_input.labels,
+            Message::GitHubFilterLabels,
+        );
+        if compact {
+            column![state, search, author, assignee, labels]
+                .spacing(6)
+                .into()
+        } else {
+            row![state, search, author, assignee, labels]
+                .spacing(8)
+                .align_y(Vertical::Bottom)
+                .into()
+        }
+    }
+
+    fn github_pull_request_filter_controls(&self, compact: bool) -> Element<'_, Message> {
+        let draft = column![
+            text("Draft").font(UI_MEDIUM).size(UI_META_SIZE),
+            pick_list(
+                GitHubDraftChoice::ALL,
+                Some(GitHubDraftChoice::from_filter(
+                    self.github_surface.filters.draft,
+                )),
+                Message::GitHubFilterDraft,
+            )
+            .width(Fill),
+        ]
+        .spacing(3);
+        let review = column![
+            text("Review").font(UI_MEDIUM).size(UI_META_SIZE),
+            pick_list(
+                GitHubReviewChoice::ALL,
+                Some(GitHubReviewChoice::from_filter(
+                    self.github_surface.filters.review,
+                )),
+                Message::GitHubFilterReview,
+            )
+            .width(Fill),
+        ]
+        .spacing(3);
+        let checks = column![
+            text("Checks").font(UI_MEDIUM).size(UI_META_SIZE),
+            pick_list(
+                GitHubCheckChoice::ALL,
+                Some(GitHubCheckChoice::from_filter(
+                    self.github_surface.filters.check,
+                )),
+                Message::GitHubFilterCheck,
+            )
+            .width(Fill),
+        ]
+        .spacing(3);
+        if compact {
+            column![draft, review, checks].spacing(6).into()
+        } else {
+            row![draft, review, checks].spacing(8).into()
+        }
+    }
+
+    fn github_list_view(&self) -> Element<'_, Message> {
+        match &self.github_surface.list {
+            GitHubLoad::Idle => centered_message("Choose a GitHub view to load items."),
+            GitHubLoad::Loading(None) => centered_message("Loading GitHub items…"),
+            GitHubLoad::Failed(failure) => Self::github_failure_view(failure, false),
+            GitHubLoad::Ready(page) | GitHubLoad::Loading(Some(page)) => {
+                let mut items = column![].spacing(6);
+                if page.items.is_empty() {
+                    items = items.push(
+                        text(format!(
+                            "No {} match these filters.",
+                            self.github_surface.kind().label().to_lowercase()
+                        ))
+                        .style(text::secondary),
+                    );
+                } else {
+                    for summary in &page.items {
+                        items = items.push(self.github_summary_row(summary));
+                    }
+                }
+                let pending = self.github_request == RequestState::Pending;
+                let pagination = row![
+                    button("Previous page")
+                        .on_press_maybe(
+                            (self.github_surface.can_go_back() && !pending)
+                                .then_some(Message::PreviousGitHubPage)
+                        )
+                        .style(chrome_action_style),
+                    button("Next page")
+                        .on_press_maybe(
+                            (page.next_cursor.is_some() && !pending)
+                                .then_some(Message::NextGitHubPage)
+                        )
+                        .style(chrome_action_style),
+                    space::horizontal(),
+                    text(if self.github_surface.list.is_loading() {
+                        "Refreshing…"
+                    } else {
+                        "Most recently updated first"
+                    })
+                    .size(UI_META_SIZE)
+                    .style(text::secondary),
+                ]
+                .spacing(6)
+                .align_y(Center);
+                column![
+                    container(
+                        text(self.github_surface.kind().label())
+                            .font(UI_SEMIBOLD)
+                            .size(18),
+                    )
+                    .padding([8, 10]),
+                    scrollable(container(items).padding([0, 10])).height(Fill),
+                    container(pagination).padding([8, 10]),
+                ]
+                .height(Fill)
+                .into()
+            }
+        }
+    }
+
+    fn github_summary_row(
+        &self,
+        summary: &sylvops_core::github::GitHubItemSummary,
+    ) -> Element<'_, Message> {
+        let identity = summary.identity.clone();
+        let selected = self.github_surface.selected.as_ref() == Some(&summary.identity);
+        let mut metadata = vec![
+            format!("#{}", summary.identity.number),
+            github_item_state_label(summary.state).to_owned(),
+            format!(
+                "by {}",
+                summary
+                    .author
+                    .as_ref()
+                    .map_or("unknown", |author| author.as_str())
+            ),
+            format!(
+                "updated {}",
+                github_timestamp_label(summary.updated_at.as_str())
+            ),
+        ];
+        if !summary.labels.is_empty() {
+            metadata.push(format!(
+                "labels: {}",
+                summary
+                    .labels
+                    .iter()
+                    .map(sylvops_core::github::GitHubLabelName::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !summary.assignees.is_empty() {
+            metadata.push(format!(
+                "assigned: {}",
+                summary
+                    .assignees
+                    .iter()
+                    .map(sylvops_core::github::GitHubLogin::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(pull_request) = &summary.pull_request {
+            metadata.push(format!(
+                "{} → {} · {} · {} · {} checks · {} files",
+                pull_request.head_branch,
+                pull_request.base_branch,
+                if pull_request.draft { "Draft" } else { "Ready" },
+                github_review_state_label(pull_request.review),
+                github_check_state_label(pull_request.checks.state),
+                pull_request.changed_files.total,
+            ));
+        }
+        button(
+            column![
+                text(summary.title.to_string())
+                    .font(if selected { UI_SEMIBOLD } else { UI_MEDIUM })
+                    .size(UI_TEXT_SIZE),
+                text(metadata.join(" · "))
+                    .size(UI_META_SIZE)
+                    .style(text::secondary),
+            ]
+            .spacing(4),
+        )
+        .on_press(Message::SelectGitHubItem(identity))
+        .padding([8, 10])
+        .width(Fill)
+        .style(move |theme, status| content_tab_style(theme, status, selected))
+        .into()
+    }
+
+    fn github_detail_view(&self) -> Element<'_, Message> {
+        match &self.github_surface.detail {
+            GitHubLoad::Idle => centered_message("Select an item to view bounded details."),
+            GitHubLoad::Loading(None) => centered_message("Loading GitHub item…"),
+            GitHubLoad::Failed(failure) => Self::github_failure_view(failure, true),
+            GitHubLoad::Ready(detail) | GitHubLoad::Loading(Some(detail)) => {
+                self.github_loaded_detail_view(detail)
+            }
+        }
+    }
+
+    fn github_loaded_detail_view<'a>(
+        &'a self,
+        detail: &'a sylvops_core::github::GitHubItemDetail,
+    ) -> Element<'a, Message> {
+        let mut content = column![self.github_detail_header(&detail.summary)].spacing(10);
+        if let Some(pull_request) = &detail.summary.pull_request {
+            content = content.push(github_pull_request_detail(pull_request));
+        }
+        content = content
+            .push(rule::horizontal(1))
+            .push(text("Description").font(UI_SEMIBOLD).size(16))
+            .push(text(detail.body.as_str()).size(UI_TEXT_SIZE))
+            .push(self.github_comments_view(detail));
+        if let Some(error) = &self.github_surface.browser_error {
+            content = content.push(text(error).size(UI_META_SIZE).style(text::danger));
+        }
+        scrollable(container(content).padding(14))
+            .height(Fill)
+            .width(Fill)
+            .into()
+    }
+
+    fn github_detail_header(
+        &self,
+        summary: &sylvops_core::github::GitHubItemSummary,
+    ) -> Element<'_, Message> {
+        let pending = self.github_request == RequestState::Pending;
+        let mut actions = row![
+            button("Back to list")
+                .on_press(Message::BackToGitHubList)
+                .style(chrome_action_style),
+            button("Refresh detail")
+                .on_press_maybe((!pending).then_some(Message::RefreshGitHubDetail))
+                .style(chrome_action_style),
+            button(if self.github_surface.browser_pending {
+                "Opening browser…"
+            } else {
+                "Open in browser"
+            })
+            .on_press_maybe(
+                (!pending && !self.github_surface.browser_pending)
+                    .then_some(Message::OpenGitHubItemInBrowser)
+            )
+            .style(primary_action_style),
+        ]
+        .spacing(6)
+        .align_y(Center);
+        if self.github_surface.detail.is_loading() {
+            actions = actions.push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
+        }
+        let mut heading = column![
+            actions,
+            text(format!(
+                "#{} · {}",
+                summary.identity.number,
+                github_item_state_label(summary.state)
+            ))
+            .font(UI_MEDIUM)
+            .size(UI_META_SIZE)
+            .style(text::secondary),
+            text(summary.title.to_string()).font(UI_SEMIBOLD).size(22),
+            text(format!(
+                "Author: {}  ·  Created {}  ·  Updated {}",
+                summary
+                    .author
+                    .as_ref()
+                    .map_or("unknown", |author| author.as_str()),
+                github_timestamp_label(summary.created_at.as_str()),
+                github_timestamp_label(summary.updated_at.as_str()),
+            ))
+            .size(UI_META_SIZE)
+            .style(text::secondary),
+        ]
+        .spacing(10);
+        if !summary.labels.is_empty() || !summary.assignees.is_empty() {
+            heading = heading.push(
+                text(format!(
+                    "Labels: {}  ·  Assignees: {}",
+                    github_join_labels(&summary.labels),
+                    github_join_logins(&summary.assignees),
+                ))
+                .size(UI_META_SIZE)
+                .style(text::secondary),
+            );
+        }
+        heading.into()
+    }
+
+    fn github_comments_view<'a>(
+        &'a self,
+        detail: &'a sylvops_core::github::GitHubItemDetail,
+    ) -> Element<'a, Message> {
+        let mut comments = column![
+            rule::horizontal(1),
+            text(format!("Comments ({})", detail.comments.comments.len()))
+                .font(UI_SEMIBOLD)
+                .size(16),
+        ]
+        .spacing(8);
+        if detail.comments.comments.is_empty() {
+            comments = comments.push(text("No comments on this page.").style(text::secondary));
+        }
+        for comment in &detail.comments.comments {
+            comments = comments.push(github_comment_card(comment));
+        }
+        if detail.comments.next_cursor.is_some() {
+            comments = comments.push(
+                button("Load more comments")
+                    .on_press_maybe(
+                        (self.github_request == RequestState::Idle)
+                            .then_some(Message::LoadMoreGitHubComments),
+                    )
+                    .style(chrome_action_style),
+            );
+        }
+        comments.into()
+    }
+
+    fn github_failure_view(
+        failure: &sylvops_core::github::GitHubBrowseFailure,
+        detail: bool,
+    ) -> Element<'_, Message> {
+        let copy = failure_copy(failure);
+        let action = match failure.kind {
+            sylvops_core::github::GitHubBrowseFailureKind::CliUnavailable
+            | sylvops_core::github::GitHubBrowseFailureKind::Authentication
+            | sylvops_core::github::GitHubBrowseFailureKind::Permission => Message::ToggleSettings,
+            sylvops_core::github::GitHubBrowseFailureKind::UnavailableItem if detail => {
+                Message::BackToGitHubList
+            }
+            sylvops_core::github::GitHubBrowseFailureKind::OversizedResponse if !detail => {
+                Message::EditGitHubFilters
+            }
+            sylvops_core::github::GitHubBrowseFailureKind::OversizedResponse => {
+                Message::BackToGitHubList
+            }
+            _ => Message::RetryGitHub,
+        };
+        container(
+            column![
+                text(copy.title).font(UI_SEMIBOLD).size(18),
+                text(bounded_redacted_diagnostic(&failure.diagnostic))
+                    .size(UI_TEXT_SIZE)
+                    .style(text::secondary),
+                button(copy.action)
+                    .on_press(action)
+                    .style(primary_action_style),
+            ]
+            .spacing(10),
+        )
+        .padding(18)
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
         .into()
     }
 
@@ -2201,10 +2987,10 @@ impl DesktopApp {
                 );
             }
             if self.selected_project_id.is_some() {
-                content = content.push(text("Project association").font(UI_SEMIBOLD));
+                content = content.push(text("Repository association").font(UI_SEMIBOLD));
                 if status.remotes.is_empty() {
                     content = content.push(
-                        text("No validated GitHub remotes are configured in this Project.")
+                        text("No validated GitHub remotes are configured in this Repository.")
                             .style(text::secondary),
                     );
                 }
@@ -2232,7 +3018,7 @@ impl DesktopApp {
                 }
                 if status.association.is_some() {
                     content = content.push(
-                        button("Clear Project association")
+                        button("Clear Repository association")
                             .on_press_maybe(
                                 (self.github_request == RequestState::Idle)
                                     .then_some(Message::ClearGitHubAssociation),
@@ -2791,12 +3577,14 @@ impl DesktopApp {
                 .push(footer_separator())
                 .push(footer_context("Session", &session));
         }
-        let mut trailing = row![footer_context(
-            "View",
-            main_tab_label(presentation.selection.main_tab),
-        )]
-        .spacing(density.region_spacing)
-        .align_y(Center);
+        let view_label = if self.content_surface == ContentSurface::GitHub {
+            self.github_surface.kind().label()
+        } else {
+            main_tab_label(presentation.selection.main_tab)
+        };
+        let mut trailing = row![footer_context("View", view_label)]
+            .spacing(density.region_spacing)
+            .align_y(Center);
         if width >= 1_180 {
             trailing = trailing
                 .push(footer_separator())
@@ -2861,6 +3649,9 @@ impl DesktopApp {
                 }
                 self.send_request(Operation::GetUpdateStatus, ClientRequest::GetUpdateStatus);
                 self.restore_selection();
+                if self.selected_project_id.is_some() {
+                    self.refresh_github_status();
+                }
                 if self.snapshot.workspaces.is_empty() {
                     self.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
                     self.modal_focus = ModalFocus::Pending;
@@ -2886,15 +3677,27 @@ impl DesktopApp {
                 if matches!(operation, Some(Operation::RefreshSnapshot)) {
                     self.snapshot_pending = false;
                 }
-                if matches!(
-                    operation,
-                    Some(
-                        Operation::GetGitHubStatus
+                let github_operation = operation.filter(|operation| {
+                    matches!(
+                        operation,
+                        Operation::GetGitHubStatus(_)
                             | Operation::SetGitHubAssociation(_)
                             | Operation::ClearGitHubAssociation(_)
+                            | Operation::ListGitHubItems(..)
+                            | Operation::ViewGitHubItem(..)
+                            | Operation::OpenGitHubItem(..)
                     )
-                ) {
-                    self.github_request = RequestState::Idle;
+                });
+                if let Some(github_operation) = github_operation {
+                    let matches_surface = self.github_operation_matches_surface(github_operation);
+                    self.finish_github_request();
+                    if !matches_surface {
+                        return;
+                    }
+                }
+                if matches!(github_operation, Some(Operation::OpenGitHubItem(..))) {
+                    self.github_surface.browser_pending = false;
+                    self.github_surface.browser_error = Some(message.clone());
                 }
                 if matches!(operation, Some(Operation::SaveDesktopState)) {
                     self.state_save_pending = false;
@@ -3049,9 +3852,25 @@ impl DesktopApp {
             }))
         );
         match (operation, response) {
-            (Operation::GetGitHubStatus, DaemonResponse::GitHubStatus(status)) => {
-                self.github_request = RequestState::Idle;
+            (Operation::GetGitHubStatus(expected), DaemonResponse::GitHubStatus(status))
+                if expected == self.selected_project_id =>
+            {
+                self.finish_github_request();
+                let associated_project = status
+                    .association
+                    .as_ref()
+                    .map(|association| association.project_id);
                 self.github_status = Some(status);
+                if self.content_surface == ContentSurface::GitHub
+                    && associated_project == self.github_surface.project_id()
+                    && self.github_surface.list.ready().is_none()
+                    && let Some(project_id) = associated_project
+                {
+                    let query = self
+                        .github_surface
+                        .open(project_id, self.github_surface.kind());
+                    self.send_github_list_query(project_id, query);
+                }
             }
             (
                 Operation::SetGitHubAssociation(expected)
@@ -3061,12 +3880,60 @@ impl DesktopApp {
                     association,
                     ..
                 },
-            ) if expected == project_id => {
-                self.github_request = RequestState::Idle;
+            ) if expected == project_id && self.selected_project_id == Some(project_id) => {
+                self.finish_github_request();
+                let association_ready = association.is_some();
                 if let Some(status) = &mut self.github_status {
                     status.association = association;
+                } else {
+                    self.refresh_github_status();
                 }
-                self.show_success("GitHub Project association updated.");
+                self.show_success("GitHub Repository association updated.");
+                if association_ready && self.content_surface == ContentSurface::GitHub {
+                    let query = self
+                        .github_surface
+                        .open(project_id, self.github_surface.kind());
+                    self.send_github_list_query(project_id, query);
+                }
+            }
+            (Operation::ListGitHubItems(project_id, kind), DaemonResponse::GitHubItems(page))
+                if self.selected_project_id == Some(project_id)
+                    && self.github_surface.project_id() == Some(project_id)
+                    && self.github_surface.kind().item_kind() == kind =>
+            {
+                self.finish_github_request();
+                self.github_surface.receive_list(page);
+            }
+            (
+                Operation::ViewGitHubItem(project_id, kind, number, request_kind),
+                DaemonResponse::GitHubItem(detail),
+            ) if self.github_surface.project_id() == Some(project_id)
+                && self.selected_project_id == Some(project_id)
+                && detail.summary.identity.kind == kind
+                && detail.summary.identity.number == number =>
+            {
+                self.finish_github_request();
+                match request_kind {
+                    GitHubDetailRequest::Initial => self.github_surface.receive_detail(detail),
+                    GitHubDetailRequest::AppendComments => {
+                        self.github_surface.append_comments(detail);
+                    }
+                }
+            }
+            (Operation::OpenGitHubItem(project_id, kind, number), DaemonResponse::Acknowledged)
+                if self.selected_project_id == Some(project_id)
+                    && self.github_surface.project_id() == Some(project_id)
+                    && self
+                        .github_surface
+                        .selected
+                        .as_ref()
+                        .is_some_and(|identity| {
+                            identity.kind == kind && identity.number == number
+                        }) =>
+            {
+                self.finish_github_request();
+                self.github_surface.browser_opened();
+                self.show_success("Opened GitHub item in the browser.");
             }
             (Operation::RefreshSnapshot, DaemonResponse::Snapshot(snapshot)) => {
                 self.snapshot_pending = false;
@@ -3486,23 +4353,67 @@ impl DesktopApp {
                 );
             }
             (
-                operation @ (Operation::GetGitHubStatus
+                operation @ (Operation::ListGitHubItems(..)
+                | Operation::ViewGitHubItem(..)
+                | Operation::OpenGitHubItem(..)),
+                DaemonResponse::GitHubBrowseFailure(failure),
+            ) => {
+                let matches_surface = self.github_operation_matches_surface(operation);
+                self.finish_github_request();
+                if !matches_surface {
+                    return;
+                }
+                let target = match operation {
+                    Operation::ListGitHubItems(..) => GitHubRequestTarget::List,
+                    Operation::ViewGitHubItem(..) => GitHubRequestTarget::Detail,
+                    Operation::OpenGitHubItem(..) => GitHubRequestTarget::Browser,
+                    _ => unreachable!(),
+                };
+                let safe_diagnostic = bounded_redacted_diagnostic(&failure.diagnostic);
+                self.github_surface.fail(target, failure, safe_diagnostic);
+            }
+            (
+                operation @ (Operation::GetGitHubStatus(_)
                 | Operation::SetGitHubAssociation(_)
-                | Operation::ClearGitHubAssociation(_)),
+                | Operation::ClearGitHubAssociation(_)
+                | Operation::ListGitHubItems(..)
+                | Operation::ViewGitHubItem(..)
+                | Operation::OpenGitHubItem(..)),
                 DaemonResponse::GitHubFailure(failure),
             ) => {
-                self.github_request = RequestState::Idle;
+                let matches_surface = self.github_operation_matches_surface(operation);
+                self.finish_github_request();
+                if !matches_surface {
+                    return;
+                }
+                if matches!(operation, Operation::OpenGitHubItem(..)) {
+                    self.github_surface.browser_pending = false;
+                    self.github_surface.browser_error =
+                        Some(bounded_redacted_diagnostic(failure.message()));
+                }
                 self.error = Some(contextual_error(Some(operation), failure.message()));
             }
             (operation, DaemonResponse::Error(failure)) => {
                 let message = bounded_redacted_diagnostic(&failure.message);
-                if matches!(
+                let github_operation = matches!(
                     operation,
-                    Operation::GetGitHubStatus
+                    Operation::GetGitHubStatus(_)
                         | Operation::SetGitHubAssociation(_)
                         | Operation::ClearGitHubAssociation(_)
-                ) {
-                    self.github_request = RequestState::Idle;
+                        | Operation::ListGitHubItems(..)
+                        | Operation::ViewGitHubItem(..)
+                        | Operation::OpenGitHubItem(..)
+                );
+                if github_operation {
+                    let matches_surface = self.github_operation_matches_surface(operation);
+                    self.finish_github_request();
+                    if !matches_surface {
+                        return;
+                    }
+                }
+                if matches!(operation, Operation::OpenGitHubItem(..)) {
+                    self.github_surface.browser_pending = false;
+                    self.github_surface.browser_error = Some(message.clone());
                 }
                 if let Operation::Resume(session_id) = operation {
                     self.resume_pending.remove(&session_id);
@@ -3538,6 +4449,24 @@ impl DesktopApp {
                     modal.form.submission_error = Some(message);
                 } else {
                     self.error = Some(contextual_error(Some(operation), &message));
+                }
+            }
+            (
+                operation @ (Operation::GetGitHubStatus(_)
+                | Operation::SetGitHubAssociation(_)
+                | Operation::ClearGitHubAssociation(_)
+                | Operation::ListGitHubItems(..)
+                | Operation::ViewGitHubItem(..)
+                | Operation::OpenGitHubItem(..)),
+                _response,
+            ) => {
+                let matches_surface = self.github_operation_matches_surface(operation);
+                self.finish_github_request();
+                if matches_surface {
+                    self.error = Some(
+                        "The background service returned an unexpected GitHub response. Refresh and try again."
+                            .into(),
+                    );
                 }
             }
             (_operation, _response) => {
@@ -3946,14 +4875,242 @@ impl DesktopApp {
 
     fn select_main_tab(&mut self, tab: MainTab) {
         self.unfocus_terminal();
-        if self.main_tab == tab {
+        if self.main_tab == tab && self.content_surface == ContentSurface::Session {
             return;
         }
+        self.content_surface = ContentSurface::Session;
         self.main_tab = tab;
         if tab == MainTab::Changes {
             self.load_diff();
         }
         self.mark_state_dirty();
+    }
+
+    fn open_github_surface(&mut self, kind: GitHubSurfaceKind) {
+        self.unfocus_terminal();
+        self.content_surface = ContentSurface::GitHub;
+        let Some(project_id) = self.selected_project_id else {
+            return;
+        };
+        let query = self.github_surface.open(project_id, kind);
+        let association_ready = self.github_status.as_ref().is_some_and(|status| {
+            status
+                .association
+                .as_ref()
+                .is_some_and(|association| association.project_id == project_id)
+        });
+        if association_ready {
+            self.send_github_list_query(project_id, query);
+        } else {
+            self.github_status = None;
+            self.refresh_github_status();
+        }
+    }
+
+    fn apply_github_filters(&mut self) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        match self.github_surface.apply_filters() {
+            Ok(query) => {
+                if let Some(project_id) = self.github_surface.project_id() {
+                    self.send_github_list_query(project_id, query);
+                }
+            }
+            Err(error) => self.github_surface.set_filter_error(error),
+        }
+    }
+
+    fn refresh_github_items(&mut self) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        if let (Some(project_id), Some(query)) = (
+            self.github_surface.project_id(),
+            self.github_surface.refresh_list(),
+        ) {
+            self.send_github_list_query(project_id, query);
+        }
+    }
+
+    fn previous_github_page(&mut self) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        if let (Some(project_id), Some(query)) = (
+            self.github_surface.project_id(),
+            self.github_surface.previous_page(),
+        ) {
+            self.send_github_list_query(project_id, query);
+        }
+    }
+
+    fn next_github_page(&mut self) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        if let (Some(project_id), Some(query)) = (
+            self.github_surface.project_id(),
+            self.github_surface.next_page(),
+        ) {
+            self.send_github_list_query(project_id, query);
+        }
+    }
+
+    fn select_github_item(&mut self, identity: GitHubItemIdentity) {
+        if self.github_request == RequestState::Pending
+            || !self.github_identity_matches_association(&identity)
+        {
+            return;
+        }
+        let Some(project_id) = self.github_surface.project_id() else {
+            return;
+        };
+        if let Some(query) = self.github_surface.select(identity, false) {
+            self.send_github_browse_request(
+                Operation::ViewGitHubItem(
+                    project_id,
+                    query.kind,
+                    query.number,
+                    GitHubDetailRequest::Initial,
+                ),
+                ClientRequest::ViewGitHubItem { project_id, query },
+            );
+        }
+    }
+
+    fn refresh_github_detail(&mut self) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        let Some(project_id) = self.github_surface.project_id() else {
+            return;
+        };
+        if let Some(query) = self.github_surface.refresh_detail() {
+            self.send_github_browse_request(
+                Operation::ViewGitHubItem(
+                    project_id,
+                    query.kind,
+                    query.number,
+                    GitHubDetailRequest::Initial,
+                ),
+                ClientRequest::ViewGitHubItem { project_id, query },
+            );
+        }
+    }
+
+    fn load_more_github_comments(&mut self) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        let Some(project_id) = self.github_surface.project_id() else {
+            return;
+        };
+        if let Some(query) = self.github_surface.load_more_comments() {
+            self.send_github_browse_request(
+                Operation::ViewGitHubItem(
+                    project_id,
+                    query.kind,
+                    query.number,
+                    GitHubDetailRequest::AppendComments,
+                ),
+                ClientRequest::ViewGitHubItem { project_id, query },
+            );
+        }
+    }
+
+    fn open_github_item_in_browser(&mut self) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        let Some(project_id) = self.github_surface.project_id() else {
+            return;
+        };
+        let Some(identity) = self.github_surface.begin_browser_open() else {
+            return;
+        };
+        if !self.github_identity_matches_association(&identity) {
+            self.github_surface.browser_opened();
+            self.error = Some(
+                "Open in browser: the selected item no longer matches this Repository's GitHub association. Refresh and try again."
+                    .into(),
+            );
+            return;
+        }
+        self.send_github_browse_request(
+            Operation::OpenGitHubItem(project_id, identity.kind, identity.number),
+            ClientRequest::OpenGitHubItem {
+                project_id,
+                identity,
+            },
+        );
+    }
+
+    fn retry_github_request(&mut self) {
+        if self.github_surface.selected.is_some() {
+            self.refresh_github_detail();
+        } else {
+            self.refresh_github_items();
+        }
+    }
+
+    fn send_github_list_query(
+        &mut self,
+        project_id: ProjectId,
+        query: sylvops_core::github::GitHubListQuery,
+    ) {
+        let kind = query.kind;
+        self.send_github_browse_request(
+            Operation::ListGitHubItems(project_id, kind),
+            ClientRequest::ListGitHubItems { project_id, query },
+        );
+    }
+
+    fn send_github_browse_request(&mut self, operation: Operation, request: ClientRequest) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        self.github_request = if self.bridge.request(operation, request) {
+            RequestState::Pending
+        } else {
+            self.error = Some("GitHub browsing: the background service is busy. Try again.".into());
+            RequestState::Idle
+        };
+    }
+
+    fn github_identity_matches_association(&self, identity: &GitHubItemIdentity) -> bool {
+        self.github_status.as_ref().is_some_and(|status| {
+            status.association.as_ref().is_some_and(|association| {
+                Some(association.project_id) == self.github_surface.project_id()
+                    && association.repository == identity.repository
+            })
+        })
+    }
+
+    fn github_operation_matches_surface(&self, operation: Operation) -> bool {
+        match operation {
+            Operation::GetGitHubStatus(project_id) => project_id == self.selected_project_id,
+            Operation::SetGitHubAssociation(project_id)
+            | Operation::ClearGitHubAssociation(project_id) => {
+                self.selected_project_id == Some(project_id)
+            }
+            Operation::ListGitHubItems(project_id, kind) => {
+                self.selected_project_id == Some(project_id)
+                    && self.github_surface.project_id() == Some(project_id)
+                    && self.github_surface.kind().item_kind() == kind
+            }
+            Operation::ViewGitHubItem(project_id, kind, number, _)
+            | Operation::OpenGitHubItem(project_id, kind, number) => {
+                self.selected_project_id == Some(project_id)
+                    && self.github_surface.project_id() == Some(project_id)
+                    && self
+                        .github_surface
+                        .selected
+                        .as_ref()
+                        .is_some_and(|identity| identity.kind == kind && identity.number == number)
+            }
+            _ => false,
+        }
     }
 
     fn open_settings(&mut self) {
@@ -4169,12 +5326,27 @@ impl DesktopApp {
     }
 
     fn refresh_github_status(&mut self) {
+        if self.github_request == RequestState::Pending {
+            self.deferred_github_status_project = self.selected_project_id;
+            return;
+        }
+        let project_id = self.selected_project_id;
+        self.deferred_github_status_project = None;
         self.send_github_request(
-            Operation::GetGitHubStatus,
-            ClientRequest::GetGitHubStatus {
-                project_id: self.selected_project_id,
-            },
+            Operation::GetGitHubStatus(project_id),
+            ClientRequest::GetGitHubStatus { project_id },
         );
+    }
+
+    fn finish_github_request(&mut self) {
+        self.github_request = RequestState::Idle;
+        if self
+            .deferred_github_status_project
+            .take()
+            .is_some_and(|project_id| self.selected_project_id == Some(project_id))
+        {
+            self.refresh_github_status();
+        }
     }
 
     fn open_project_form(&mut self) {
@@ -5317,6 +6489,12 @@ impl DesktopApp {
             .selected_worktree_id
             .and_then(|id| self.sessions_for(id).first().map(|item| item.id));
         self.diff = None;
+        self.github_status = None;
+        if self.content_surface == ContentSurface::GitHub {
+            let kind = self.github_surface.kind();
+            let _ = self.github_surface.open(project_id, kind);
+        }
+        self.refresh_github_status();
         self.mark_state_dirty();
     }
 
@@ -5664,10 +6842,13 @@ const fn operation_error_context(operation: Operation) -> &'static str {
     match operation {
         Operation::RefreshSnapshot => "Refresh",
         Operation::ProbeProvider(_) => "Provider check",
-        Operation::GetGitHubStatus => "GitHub status",
+        Operation::GetGitHubStatus(_) => "GitHub status",
         Operation::SetGitHubAssociation(_) | Operation::ClearGitHubAssociation(_) => {
             "GitHub association"
         }
+        Operation::ListGitHubItems(..) => "Browse GitHub",
+        Operation::ViewGitHubItem(..) => "Load GitHub item",
+        Operation::OpenGitHubItem(..) => "Open GitHub item in browser",
         Operation::CreateWorkspace => "Create workspace",
         Operation::OpenWorkspace(_) => "Open workspace",
         Operation::InspectWorkspaceDeletion(_) | Operation::DeleteWorkspace => "Delete workspace",
@@ -5941,9 +7122,10 @@ fn tab_button(
     label: &str,
     tab: MainTab,
     active: MainTab,
+    session_surface_open: bool,
     density: DensityMetrics,
 ) -> Element<'_, Message> {
-    let selected = tab == active;
+    let selected = session_surface_open && tab == active;
     button(
         centered_button_label(
             label.to_owned(),
@@ -5957,6 +7139,172 @@ fn tab_button(
     .padding([6, 14])
     .style(move |theme, status| content_tab_style(theme, status, selected))
     .into()
+}
+
+fn github_tab_button(
+    kind: GitHubSurfaceKind,
+    github_surface_open: bool,
+    active: GitHubSurfaceKind,
+    density: DensityMetrics,
+) -> Element<'static, Message> {
+    let selected = github_surface_open && kind == active;
+    button(
+        centered_button_label(
+            kind.label(),
+            UI_TEXT_SIZE,
+            if selected { UI_SEMIBOLD } else { UI_FONT },
+        )
+        .wrapping(text::Wrapping::None),
+    )
+    .on_press(Message::SelectGitHubKind(kind))
+    .height(density.control_height)
+    .padding([6, 14])
+    .style(move |theme, status| content_tab_style(theme, status, selected))
+    .into()
+}
+
+fn github_filter_input<'a>(
+    label: &'static str,
+    placeholder: &'static str,
+    value: &'a str,
+    on_input: fn(String) -> Message,
+) -> Element<'a, Message> {
+    column![
+        text(label).font(UI_MEDIUM).size(UI_META_SIZE),
+        text_input(placeholder, value)
+            .on_input(on_input)
+            .padding([6, 8])
+            .size(UI_TEXT_SIZE),
+    ]
+    .spacing(3)
+    .into()
+}
+
+const fn github_item_state_label(state: GitHubItemState) -> &'static str {
+    match state {
+        GitHubItemState::Open => "Open",
+        GitHubItemState::Closed => "Closed",
+        GitHubItemState::Merged => "Merged",
+    }
+}
+
+const fn github_review_state_label(state: GitHubReviewState) -> &'static str {
+    match state {
+        GitHubReviewState::Approved => "Approved",
+        GitHubReviewState::ChangesRequested => "Changes requested",
+        GitHubReviewState::ReviewRequired => "Review required",
+        GitHubReviewState::None => "No review state",
+    }
+}
+
+const fn github_check_state_label(state: GitHubCheckState) -> &'static str {
+    match state {
+        GitHubCheckState::Success => "Passing",
+        GitHubCheckState::Failure => "Failing",
+        GitHubCheckState::Pending => "Pending",
+        GitHubCheckState::Neutral => "Neutral",
+        GitHubCheckState::Skipped => "Skipped",
+        GitHubCheckState::None => "No checks",
+    }
+}
+
+fn github_timestamp_label(value: &str) -> String {
+    let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".into());
+    github_timestamp_label_for_locale(value, &locale)
+}
+
+fn github_timestamp_label_for_locale(value: &str, locale: &str) -> String {
+    DateTime::parse_from_rfc3339(value).map_or_else(
+        |_| value.to_owned(),
+        |timestamp| {
+            human_readable_timestamp_for_locale(timestamp.timestamp_millis(), locale)
+                .unwrap_or_else(|| value.to_owned())
+        },
+    )
+}
+
+fn github_pull_request_detail(
+    pull_request: &sylvops_core::github::GitHubPullRequestSummary,
+) -> Element<'_, Message> {
+    container(
+        column![
+            text(format!(
+                "{} → {}  ·  {}",
+                pull_request.head_branch,
+                pull_request.base_branch,
+                if pull_request.draft {
+                    "Draft"
+                } else {
+                    "Ready for review"
+                },
+            )),
+            text(format!(
+                "Review: {}  ·  Checks: {} ({} total)",
+                github_review_state_label(pull_request.review),
+                github_check_state_label(pull_request.checks.state),
+                pull_request.checks.total,
+            )),
+            text(format!(
+                "Changed files: {}  ·  +{}  −{}",
+                pull_request.changed_files.total,
+                pull_request.changed_files.additions,
+                pull_request.changed_files.deletions,
+            )),
+        ]
+        .spacing(4),
+    )
+    .padding(10)
+    .width(Fill)
+    .style(card_surface)
+    .into()
+}
+
+fn github_comment_card(comment: &sylvops_core::github::GitHubComment) -> Element<'_, Message> {
+    container(
+        column![
+            text(format!(
+                "{} · {}",
+                comment
+                    .author
+                    .as_ref()
+                    .map_or("unknown", |author| author.as_str()),
+                github_timestamp_label(comment.updated_at.as_str()),
+            ))
+            .font(UI_MEDIUM)
+            .size(UI_META_SIZE)
+            .style(text::secondary),
+            text(comment.body.as_str()).size(UI_TEXT_SIZE),
+        ]
+        .spacing(5),
+    )
+    .padding(10)
+    .width(Fill)
+    .style(card_surface)
+    .into()
+}
+
+fn github_join_labels(labels: &[sylvops_core::github::GitHubLabelName]) -> String {
+    if labels.is_empty() {
+        "None".into()
+    } else {
+        labels
+            .iter()
+            .map(sylvops_core::github::GitHubLabelName::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn github_join_logins(logins: &[sylvops_core::github::GitHubLogin]) -> String {
+    if logins.is_empty() {
+        "None".into()
+    } else {
+        logins
+            .iter()
+            .map(sylvops_core::github::GitHubLogin::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn trimmed_option(value: &str) -> Option<String> {
@@ -6208,6 +7556,25 @@ fn centered_message(message: &str) -> Element<'_, Message> {
         .into()
 }
 
+fn centered_action(
+    message: &'static str,
+    label: &'static str,
+    action: Message,
+) -> Element<'static, Message> {
+    container(
+        column![
+            text(message).style(text::secondary),
+            button(label).on_press(action).style(primary_action_style),
+        ]
+        .spacing(12)
+        .align_x(Center),
+    )
+    .width(Fill)
+    .height(Fill)
+    .center(Fill)
+    .into()
+}
+
 fn open_terminal_action(density: DensityMetrics) -> Element<'static, Message> {
     container(
         column![
@@ -6362,6 +7729,19 @@ fn workspace_surface(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
         background: Some(Background::Color(palette.background.base.color)),
+        ..container::Style::default()
+    }
+}
+
+fn card_surface(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.weakest.color)),
+        border: Border {
+            width: 1.0,
+            radius: 5.0.into(),
+            color: palette.background.weak.color,
+        },
         ..container::Style::default()
     }
 }
@@ -6908,6 +8288,10 @@ fn is_open_settings_shortcut(key: &Key, modifiers: keyboard::Modifiers) -> bool 
     modifiers.control() && matches!(key.as_ref(), Key::Character(value) if value == ",")
 }
 
+fn github_tab_focus_direction(key: &Key, modifiers: keyboard::Modifiers) -> Option<i8> {
+    matches!(key, Key::Named(Named::Tab)).then_some(if modifiers.shift() { -1 } else { 1 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6918,7 +8302,10 @@ mod tests {
         widget::{Operation as WidgetOperation, Tree},
     };
     use std::time::Duration;
-    use sylvops_core::provider::{AuthenticationRequirement, ProviderCapabilities};
+    use sylvops_core::{
+        github::GitHubItemKind,
+        provider::{AuthenticationRequirement, ProviderCapabilities},
+    };
 
     fn session(state: SessionState, external_session_id: Option<&str>) -> Session {
         Session {
@@ -7028,6 +8415,116 @@ mod tests {
         app.connection = ConnectionState::Connected;
         app.desktop_state.theme = DesktopTheme::Canopy;
         (app, project_id, worktree_id, first_id, second_id)
+    }
+
+    fn desktop_project_with_bridge(bridge: Bridge) -> (DesktopApp, ProjectId) {
+        let mut app = DesktopApp::with_bridge(bridge);
+        let workspace_id = WorkspaceId::new();
+        let project_id = ProjectId::new();
+        app.snapshot.workspaces.push(Workspace {
+            id: workspace_id,
+            name: "Local".into(),
+            created_at: 1,
+            updated_at: 1,
+            last_opened_at: Some(1),
+            is_open: true,
+        });
+        app.snapshot.projects.push(Project {
+            id: project_id,
+            workspace_id,
+            name: "SylvOps".into(),
+            repository_path: "C:/repo".into(),
+            canonical_repository_path: "C:/repo".into(),
+            default_branch: Some("main".into()),
+            remote_url: None,
+            created_at: 1,
+            last_activity_at: 1,
+        });
+        app.selected_project_id = Some(project_id);
+        app.connection = ConnectionState::Connected;
+        (app, project_id)
+    }
+
+    fn github_repository() -> sylvops_core::github::GitHubRepositoryIdentity {
+        use sylvops_core::github::{
+            GitHubHost, GitHubOwner, GitHubRepositoryIdentity, GitHubRepositoryName,
+        };
+        GitHubRepositoryIdentity::new(
+            GitHubHost::new("github.example.com").unwrap(),
+            GitHubOwner::new("acme").unwrap(),
+            GitHubRepositoryName::new("widgets").unwrap(),
+        )
+    }
+
+    fn github_status_for(project_id: ProjectId) -> GitHubIntegrationStatus {
+        use sylvops_core::github::{GitHubAssociation, GitRemoteName};
+        GitHubIntegrationStatus {
+            executable_path: Some("gh".into()),
+            connections: Vec::new(),
+            remotes: Vec::new(),
+            association: Some(GitHubAssociation {
+                project_id,
+                remote_name: GitRemoteName::new("upstream").unwrap(),
+                repository: github_repository(),
+                created_at: 1,
+                updated_at: 1,
+            }),
+        }
+    }
+
+    fn github_summary(
+        kind: GitHubItemKind,
+        number: u64,
+    ) -> sylvops_core::github::GitHubItemSummary {
+        use sylvops_core::github::{
+            GitHubBranchName, GitHubChangedFileSummary, GitHubCheckSummary, GitHubItemNumber,
+            GitHubLogin, GitHubPullRequestSummary, GitHubTimestamp, GitHubTitle,
+        };
+        sylvops_core::github::GitHubItemSummary {
+            identity: GitHubItemIdentity::new(
+                github_repository(),
+                kind,
+                GitHubItemNumber::new(number).unwrap(),
+            ),
+            state: GitHubItemState::Open,
+            title: GitHubTitle::new("Bounded remote title").unwrap(),
+            author: Some(GitHubLogin::new("octocat").unwrap()),
+            labels: vec![sylvops_core::github::GitHubLabelName::new("ready").unwrap()],
+            assignees: vec![GitHubLogin::new("maintainer").unwrap()],
+            created_at: GitHubTimestamp::new("2026-10-12T12:00:00Z").unwrap(),
+            updated_at: GitHubTimestamp::new("2026-10-13T12:00:00Z").unwrap(),
+            pull_request: (kind == GitHubItemKind::PullRequest).then(|| GitHubPullRequestSummary {
+                head_branch: GitHubBranchName::new("feature").unwrap(),
+                base_branch: GitHubBranchName::new("main").unwrap(),
+                draft: false,
+                review: GitHubReviewState::ReviewRequired,
+                checks: GitHubCheckSummary {
+                    state: GitHubCheckState::Pending,
+                    total: 4,
+                },
+                changed_files: GitHubChangedFileSummary {
+                    total: 3,
+                    additions: 24,
+                    deletions: 7,
+                },
+            }),
+        }
+    }
+
+    fn github_detail(
+        summary: sylvops_core::github::GitHubItemSummary,
+    ) -> sylvops_core::github::GitHubItemDetail {
+        use sylvops_core::github::{GitHubBody, GitHubCommentPage};
+        let browser_target = summary.identity.browser_target();
+        sylvops_core::github::GitHubItemDetail {
+            summary,
+            body: GitHubBody::new("Bounded detail body").unwrap(),
+            comments: GitHubCommentPage {
+                comments: Vec::new(),
+                next_cursor: None,
+            },
+            browser_target,
+        }
     }
 
     #[derive(Default)]
@@ -9367,6 +10864,317 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn github_surface_renders_list_and_detail_without_a_worktree_or_session_at_every_layout()
+    {
+        use sylvops_core::github::{
+            GitHubBody, GitHubComment, GitHubCommentBody, GitHubCommentPage, GitHubListPage,
+            GitHubTimestamp,
+        };
+
+        let (bridge, _harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        app.content_surface = ContentSurface::GitHub;
+        let _ = app
+            .github_surface
+            .open(project_id, GitHubSurfaceKind::Issues);
+        let summary = github_summary(GitHubItemKind::Issue, 125);
+        app.github_surface.receive_list(GitHubListPage {
+            items: vec![summary.clone()],
+            next_cursor: None,
+        });
+        let _ = app
+            .github_surface
+            .select(summary.identity.clone(), false)
+            .unwrap();
+        let browser_target = summary.identity.browser_target();
+        app.github_surface
+            .receive_detail(sylvops_core::github::GitHubItemDetail {
+                summary,
+                body: GitHubBody::new("Untrusted body text, shown without links or controls.")
+                    .unwrap(),
+                comments: GitHubCommentPage {
+                    comments: vec![GitHubComment {
+                        author: None,
+                        body: GitHubCommentBody::new("Bounded comment text.").unwrap(),
+                        created_at: GitHubTimestamp::new("2026-10-13T12:00:00Z").unwrap(),
+                        updated_at: GitHubTimestamp::new("2026-10-13T12:00:00Z").unwrap(),
+                    }],
+                    next_cursor: None,
+                },
+                browser_target,
+            });
+
+        for size in [
+            iced::Size::new(1440.0, 900.0),
+            iced::Size::new(900.0, 700.0),
+            iced::Size::new(680.0, 480.0),
+        ] {
+            let rendered = rendered_text(app.workspace_view(), size).await;
+            assert!(rendered.iter().any(|line| line.contains("Issues")));
+            assert!(
+                rendered
+                    .iter()
+                    .any(|line| line.contains("Bounded remote title"))
+            );
+            assert!(rendered.iter().any(|line| line.contains("Open in browser")));
+            assert!(
+                rendered
+                    .iter()
+                    .any(|line| line.contains("Untrusted body text"))
+            );
+            assert!(
+                rendered
+                    .iter()
+                    .any(|line| line.contains("Bounded comment text"))
+            );
+            for label in [
+                "Issues",
+                "Pull requests",
+                "Apply filters",
+                "Back to list",
+                "Open in browser",
+            ] {
+                let bounds = button_bounds_by_label(app.workspace_view(), label, size).await;
+                assert!(bounds.width > 0.0 && bounds.height > 0.0, "{label}");
+            }
+        }
+        assert!(app.snapshot.worktrees.is_empty());
+        assert!(app.snapshot.sessions.is_empty());
+    }
+
+    #[test]
+    fn browser_action_sends_only_the_selected_typed_identity_after_visible_action() {
+        let (bridge, mut harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        app.content_surface = ContentSurface::GitHub;
+        let _ = app
+            .github_surface
+            .open(project_id, GitHubSurfaceKind::Issues);
+        let summary = github_summary(GitHubItemKind::Issue, 125);
+        let identity = summary.identity.clone();
+        let _ = app.github_surface.select(identity.clone(), false);
+        app.github_surface
+            .receive_detail(sylvops_core::github::GitHubItemDetail {
+                summary,
+                body: sylvops_core::github::GitHubBody::new("https://evil.example/redirect")
+                    .unwrap(),
+                comments: sylvops_core::github::GitHubCommentPage {
+                    comments: Vec::new(),
+                    next_cursor: None,
+                },
+                browser_target: identity.browser_target(),
+            });
+        assert!(!harness.has_request());
+
+        let _ = app.update(Message::OpenGitHubItemInBrowser);
+
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::OpenGitHubItem(project_id, GitHubItemKind::Issue, identity.number,),
+                ClientRequest::OpenGitHubItem {
+                    project_id,
+                    identity: identity.clone(),
+                },
+            )
+        );
+        assert!(app.github_surface.browser_pending);
+        app.handle_response(
+            Operation::OpenGitHubItem(project_id, GitHubItemKind::Issue, identity.number),
+            DaemonResponse::Acknowledged,
+        );
+        assert!(!app.github_surface.browser_pending);
+    }
+
+    #[tokio::test]
+    async fn github_presentation_actions_cover_navigation_filters_pagination_refresh_and_recovery()
+    {
+        use sylvops_core::github::{
+            GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubCursor, GitHubListPage,
+        };
+
+        let (bridge, mut harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        app.open_github_surface(GitHubSurfaceKind::Issues);
+        let initial_operation = harness.take_request().0;
+        assert_eq!(
+            initial_operation,
+            Operation::ListGitHubItems(project_id, GitHubItemKind::Issue)
+        );
+
+        let summary = github_summary(GitHubItemKind::Issue, 125);
+        app.handle_response(
+            initial_operation,
+            DaemonResponse::GitHubItems(GitHubListPage {
+                items: vec![summary.clone()],
+                next_cursor: None,
+            }),
+        );
+        let _ = app.update(Message::RefreshGitHubItems);
+        let (refresh_operation, refresh_request) = harness.take_request();
+        let ClientRequest::ListGitHubItems { query, .. } = refresh_request else {
+            panic!("expected explicit GitHub refresh request");
+        };
+        assert!(query.refresh);
+        app.handle_response(
+            refresh_operation,
+            DaemonResponse::GitHubItems(GitHubListPage {
+                items: vec![summary.clone()],
+                next_cursor: None,
+            }),
+        );
+        let _ = app.update(Message::SelectGitHubItem(summary.identity.clone()));
+        let detail_operation = harness.take_request().0;
+        assert_eq!(
+            detail_operation,
+            Operation::ViewGitHubItem(
+                project_id,
+                GitHubItemKind::Issue,
+                summary.identity.number,
+                GitHubDetailRequest::Initial,
+            )
+        );
+        app.handle_response(
+            detail_operation,
+            DaemonResponse::GitHubItem(github_detail(summary.clone())),
+        );
+        let _ = app.update(Message::BackToGitHubList);
+        assert!(app.github_surface.selected.is_none());
+
+        let _ = app.update(Message::GitHubFilterText("scheduler".into()));
+        let _ = app.update(Message::GitHubFilterAuthor("octocat".into()));
+        let _ = app.update(Message::ApplyGitHubFilters);
+        let (filter_operation, filter_request) = harness.take_request();
+        let ClientRequest::ListGitHubItems { query, .. } = filter_request else {
+            panic!("expected filtered GitHub list request");
+        };
+        assert_eq!(query.filters.text.unwrap().as_str(), "scheduler");
+        assert_eq!(query.filters.author.unwrap().as_str(), "octocat");
+        assert!(!query.refresh);
+
+        let next_cursor = GitHubCursor::new("next-page").unwrap();
+        app.handle_response(
+            filter_operation,
+            DaemonResponse::GitHubItems(GitHubListPage {
+                items: vec![summary],
+                next_cursor: Some(next_cursor.clone()),
+            }),
+        );
+        let _ = app.update(Message::NextGitHubPage);
+        let (next_operation, next_request) = harness.take_request();
+        let ClientRequest::ListGitHubItems { query, .. } = next_request else {
+            panic!("expected paginated GitHub list request");
+        };
+        assert_eq!(query.cursor, Some(next_cursor));
+
+        app.handle_response(
+            next_operation,
+            DaemonResponse::GitHubBrowseFailure(GitHubBrowseFailure::new(
+                GitHubBrowseFailureKind::Network,
+            )),
+        );
+        let rendered = rendered_text(app.github_list_view(), iced::Size::new(680.0, 360.0)).await;
+        assert!(rendered.iter().any(|line| line == "GitHub is offline"));
+        assert!(rendered.iter().any(|line| line == "Try again"));
+
+        let _ = app.update(Message::RetryGitHub);
+        let (_, retry_request) = harness.take_request();
+        let ClientRequest::ListGitHubItems { query, .. } = retry_request else {
+            panic!("expected GitHub refresh request");
+        };
+        assert!(query.refresh);
+    }
+
+    #[test]
+    fn project_switch_ignores_stale_github_failure_and_refreshes_the_new_association() {
+        use sylvops_core::github::{GitHubBrowseFailure, GitHubBrowseFailureKind};
+
+        let (bridge, mut harness) = Bridge::harness();
+        let (mut app, first_project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(first_project_id));
+        app.open_github_surface(GitHubSurfaceKind::Issues);
+        let stale_operation = harness.take_request().0;
+
+        let second_project_id = ProjectId::new();
+        let workspace_id = app.snapshot.workspaces[0].id;
+        app.snapshot.projects.push(Project {
+            id: second_project_id,
+            workspace_id,
+            name: "Second".into(),
+            repository_path: "C:/second".into(),
+            canonical_repository_path: "C:/second".into(),
+            default_branch: Some("main".into()),
+            remote_url: None,
+            created_at: 2,
+            last_activity_at: 2,
+        });
+        app.select_main_tab(MainTab::Terminal);
+        app.select_project(second_project_id);
+        assert!(!harness.has_request());
+
+        app.handle_response(
+            stale_operation,
+            DaemonResponse::GitHubBrowseFailure(GitHubBrowseFailure::new(
+                GitHubBrowseFailureKind::Network,
+            )),
+        );
+        assert!(app.error.is_none());
+        let (status_operation, status_request) = harness.take_request();
+        assert_eq!(
+            status_operation,
+            Operation::GetGitHubStatus(Some(second_project_id))
+        );
+        assert_eq!(
+            status_request,
+            ClientRequest::GetGitHubStatus {
+                project_id: Some(second_project_id),
+            }
+        );
+
+        app.handle_response(
+            status_operation,
+            DaemonResponse::GitHubStatus(github_status_for(second_project_id)),
+        );
+        assert_eq!(
+            app.github_status
+                .as_ref()
+                .and_then(|status| status.association.as_ref())
+                .map(|association| association.project_id),
+            Some(second_project_id)
+        );
+    }
+
+    #[test]
+    fn github_tab_focus_uses_native_widget_order_in_both_directions() {
+        assert_eq!(
+            github_tab_focus_direction(&Key::Named(Named::Tab), keyboard::Modifiers::default()),
+            Some(1)
+        );
+        assert_eq!(
+            github_tab_focus_direction(&Key::Named(Named::Tab), keyboard::Modifiers::SHIFT),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn github_filters_and_selection_are_not_written_to_desktop_preferences() {
+        let (bridge, _harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        let persisted_before = app.desktop_state.clone();
+        let _ = app
+            .github_surface
+            .open(project_id, GitHubSurfaceKind::PullRequests);
+        app.github_surface.filter_input.text = "release".into();
+        app.github_surface.filters.review = Some(GitHubReviewFilter::ReviewRequired);
+        app.github_surface.selected = Some(github_summary(GitHubItemKind::PullRequest, 7).identity);
+
+        assert_eq!(app.desktop_state, persisted_before);
+    }
+
     #[test]
     fn details_format_dates_for_people_and_bound_technical_copy_payloads() {
         let formatted =
@@ -9379,6 +11187,10 @@ mod tests {
         );
         assert_eq!(chrono_locale("mk-MK"), Locale::mk_MK);
         assert_eq!(chrono_locale("en_US.UTF-8"), Locale::en_US);
+        assert_ne!(
+            github_timestamp_label_for_locale("2026-10-13T12:00:00Z", "en-US"),
+            github_timestamp_label_for_locale("2026-10-13T12:00:00Z", "de-DE")
+        );
 
         let oversized = "x".repeat(MAX_TECHNICAL_COPY_CHARS + 10);
         let bounded = bounded_technical_copy(&oversized);
@@ -9406,6 +11218,31 @@ mod tests {
             bounded_redacted_diagnostic(&oversized).chars().count(),
             MAX_USER_DIAGNOSTIC_CHARS
         );
+    }
+
+    #[test]
+    fn github_failure_diagnostics_are_redacted_before_entering_presentation_state() {
+        let (bridge, _harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        let _ = app
+            .github_surface
+            .open(project_id, GitHubSurfaceKind::Issues);
+        let mut failure = sylvops_core::github::GitHubBrowseFailure::new(
+            sylvops_core::github::GitHubBrowseFailureKind::Network,
+        );
+        failure.diagnostic = "request failed\ntoken=super-secret".into();
+
+        app.handle_response(
+            Operation::ListGitHubItems(project_id, GitHubItemKind::Issue),
+            DaemonResponse::GitHubBrowseFailure(failure),
+        );
+
+        let GitHubLoad::Failed(failure) = &app.github_surface.list else {
+            panic!("expected GitHub presentation failure");
+        };
+        assert!(!failure.diagnostic.contains("super-secret"));
+        assert!(!failure.diagnostic.contains('\n'));
+        assert!(failure.diagnostic.contains("[redacted]"));
     }
 
     #[test]

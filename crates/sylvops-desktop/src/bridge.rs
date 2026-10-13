@@ -17,6 +17,7 @@ use iced::{
 };
 use sylvops_core::{
     domain::{DaemonSnapshot, ProviderKind},
+    github::{GitHubItemKind, GitHubItemNumber},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse, MAX_PTY_CHUNK_SIZE},
     provider::ProviderHealth,
@@ -33,13 +34,27 @@ const TERMINAL_EVENT_CAPACITY: usize = 4_096;
 const WAKE_CAPACITY: usize = 1;
 const CRITICAL_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitHubDetailRequest {
+    Initial,
+    AppendComments,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Operation {
     RefreshSnapshot,
     ProbeProvider(ProviderKind),
-    GetGitHubStatus,
+    GetGitHubStatus(Option<ProjectId>),
     SetGitHubAssociation(ProjectId),
     ClearGitHubAssociation(ProjectId),
+    ListGitHubItems(ProjectId, GitHubItemKind),
+    ViewGitHubItem(
+        ProjectId,
+        GitHubItemKind,
+        GitHubItemNumber,
+        GitHubDetailRequest,
+    ),
+    OpenGitHubItem(ProjectId, GitHubItemKind, GitHubItemNumber),
     CreateWorkspace,
     OpenWorkspace(WorkspaceId),
     InspectWorkspaceDeletion(WorkspaceId),
@@ -307,6 +322,18 @@ impl Bridge {
 
 #[cfg(test)]
 impl BridgeHarness {
+    pub(crate) fn take_request(&mut self) -> (Operation, ClientRequest) {
+        match self.commands.try_recv() {
+            Ok(BridgeCommand::Request { operation, request }) => (operation, request),
+            Ok(command) => panic!("unexpected harness command: {command:?}"),
+            Err(error) => panic!("expected a bridge request: {error}"),
+        }
+    }
+
+    pub(crate) fn has_request(&self) -> bool {
+        !self.commands.is_empty()
+    }
+
     pub(crate) fn send_critical(&self, event: BridgeEvent) {
         assert!(self.events.send_critical(event));
     }
