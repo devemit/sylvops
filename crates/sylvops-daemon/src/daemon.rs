@@ -1486,6 +1486,7 @@ async fn handle_request(
             confirmation,
             branch,
             provider,
+            display_name,
             additional_instructions,
             start_another_worktree,
             columns,
@@ -1829,7 +1830,7 @@ async fn handle_request(
                 state,
                 worktree.clone(),
                 provider,
-                Some(format!("Issue #{}", issue.identity.number)),
+                display_name.or_else(|| Some(format!("Issue #{}", issue.identity.number))),
                 None,
                 None,
                 Some(prompt),
@@ -1871,6 +1872,7 @@ async fn handle_request(
         ClientRequest::RetryStartWorkSession {
             worktree_id,
             provider,
+            display_name,
             columns,
             rows,
         } => {
@@ -2059,7 +2061,7 @@ async fn handle_request(
                 state,
                 worktree.clone(),
                 provider,
-                Some(format!("Issue #{}", source.item.number)),
+                display_name.or_else(|| Some(format!("Issue #{}", source.item.number))),
                 None,
                 None,
                 Some(prompt),

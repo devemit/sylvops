@@ -30,12 +30,18 @@ use crossterm::{
 };
 use directory_browser::{DirectoryBrowser, DirectoryBrowserEntry};
 use forms::{Form, FormKind};
-use github_modal::{GitHubDepth, GitHubEscape, GitHubModal, GitHubQuery, GitHubRequestTarget};
+use github_modal::{
+    GitHubDepth, GitHubEscape, GitHubModal, GitHubQuery, GitHubRequestTarget, StartWorkFocus,
+    StartWorkRecovery,
+};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use reducer::{Effect, reduce};
 use sylvops_core::{
-    domain::{AttachmentRole, DaemonSnapshot, SessionState},
-    github::{GitHubItemIdentity, GitHubItemKind},
+    domain::{AttachmentRole, DaemonSnapshot, SessionState, state_is_active},
+    github::{
+        GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, StartWorkFailure,
+        StartWorkFailureKind, StartWorkOutcome,
+    },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, MAX_PTY_CHUNK_SIZE, MAX_TERMINAL_COLUMNS,
@@ -123,7 +129,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         app.expire_flash();
         for _ in 0..16 {
             match github_results.try_recv() {
-                Ok(result) => apply_github_result(&mut app, result)?,
+                Ok(result) => apply_github_result_async(&client, &mut app, result).await?,
                 Err(
                     tokio::sync::mpsc::error::TryRecvError::Empty
                     | tokio::sync::mpsc::error::TryRecvError::Disconnected,
@@ -312,7 +318,10 @@ async fn execute_effects(
             Effect::OpenDelete => open_destructive_confirmation(client, app).await?,
             Effect::LoadDiff => show_diff(client, app).await?,
             Effect::LoadGitHubStatus => refresh_github_status(client, app).await?,
-            Effect::OpenGitHub => open_github(client, github_results, github_tasks, app),
+            Effect::OpenGitHub => {
+                refresh_github_status(client, app).await?;
+                open_github(client, github_results, github_tasks, app);
+            }
             Effect::Quit => return Ok(true),
         }
     }
@@ -328,6 +337,17 @@ enum GitHubDecision {
         append_comments: bool,
     },
     Browser(GitHubItemIdentity),
+    PrepareStartWork {
+        issue_number: GitHubItemNumber,
+        start_another_worktree: bool,
+    },
+    StartWork(ClientRequest),
+    OpenWorktree(WorktreeId),
+    RetrySession {
+        worktree_id: WorktreeId,
+        provider: sylvops_core::domain::ProviderKind,
+    },
+    RemoveWorktree(WorktreeId),
     Settings,
     Close,
 }
@@ -345,6 +365,12 @@ enum GitHubAction {
     PreviousPage,
     NextPage,
     MoreComments,
+    StartWork,
+    StartAnother,
+    SubmitStartWork,
+    RetrySession,
+    OpenWorktree,
+    RemoveWorktree,
     Settings,
     Back,
 }
@@ -378,12 +404,122 @@ fn github_input_decision(
         return GitHubDecision::None;
     }
 
+    if modal.depth == GitHubDepth::StartWork {
+        return start_work_input_decision(modal, input, clicked);
+    }
+
+    if modal.depth == GitHubDepth::Recovery {
+        return recovery_input_decision(modal, input, clicked);
+    }
+
     let action = clicked
         .and_then(github_mouse_action)
         .or_else(|| github_keyboard_action(input));
     action.map_or(GitHubDecision::None, |action| {
         apply_github_action(modal, action)
     })
+}
+
+fn start_work_input_decision(
+    modal: &mut GitHubModal,
+    input: &Event,
+    clicked: Option<HitTarget>,
+) -> GitHubDecision {
+    let escape_requested = clicked == Some(HitTarget::GitHubBack)
+        || matches!(input, Event::Key(key) if key.code == KeyCode::Esc);
+    if escape_requested && modal.start_work.as_ref().is_some_and(|form| form.pending) {
+        return GitHubDecision::None;
+    }
+    if escape_requested {
+        modal.escape();
+        return GitHubDecision::None;
+    }
+    let activate = clicked == Some(HitTarget::GitHubStartSubmit);
+    let key = match input {
+        Event::Key(key) => Some(key),
+        _ => None,
+    };
+    let project_id = modal.project_id;
+    let Some(form) = &mut modal.start_work else {
+        return GitHubDecision::None;
+    };
+    if let Some(HitTarget::GitHubScroll(delta)) = clicked {
+        form.scroll_context(delta);
+        return GitHubDecision::None;
+    }
+    if activate || key.is_some_and(|key| key.code == KeyCode::Enter) {
+        if form.focus != StartWorkFocus::Confirm {
+            form.focus = form.focus.moved(1);
+            return GitHubDecision::None;
+        }
+        return match form.request(project_id) {
+            Ok(request) => {
+                form.pending = true;
+                GitHubDecision::StartWork(request)
+            }
+            Err(error) => {
+                form.error = Some(StartWorkFailure::new(
+                    StartWorkFailureKind::InvalidRequest,
+                    error,
+                ));
+                GitHubDecision::None
+            }
+        };
+    }
+    let Some(key) = key else {
+        return GitHubDecision::None;
+    };
+    match key.code {
+        KeyCode::Tab => form.focus = form.focus.moved(1),
+        KeyCode::BackTab => form.focus = form.focus.moved(-1),
+        KeyCode::Down | KeyCode::Char('j') if form.focus == StartWorkFocus::Provider => {
+            form.move_provider(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') if form.focus == StartWorkFocus::Provider => {
+            form.move_provider(-1);
+        }
+        KeyCode::Backspace => form.pop_character(),
+        KeyCode::PageDown => form.scroll_context(5),
+        KeyCode::PageUp => form.scroll_context(-5),
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            form.push_character(character);
+        }
+        _ => {}
+    }
+    GitHubDecision::None
+}
+
+fn recovery_input_decision(
+    modal: &mut GitHubModal,
+    input: &Event,
+    clicked: Option<HitTarget>,
+) -> GitHubDecision {
+    if modal
+        .recovery
+        .as_ref()
+        .is_some_and(|recovery| recovery.pending)
+    {
+        return GitHubDecision::None;
+    }
+    if let Some(action) = clicked.and_then(github_mouse_action) {
+        return apply_github_action(modal, action);
+    }
+    let Event::Key(key) = input else {
+        return GitHubDecision::None;
+    };
+    let Some(recovery) = &modal.recovery else {
+        return GitHubDecision::None;
+    };
+    match key.code {
+        KeyCode::Char('s') => GitHubDecision::RetrySession {
+            worktree_id: recovery.worktree_id,
+            provider: recovery.provider,
+        },
+        KeyCode::Char('o') => GitHubDecision::OpenWorktree(recovery.worktree_id),
+        KeyCode::Char('d') => GitHubDecision::RemoveWorktree(recovery.worktree_id),
+        KeyCode::Esc => github_escape_decision(modal),
+        _ => GitHubDecision::None,
+    }
 }
 
 fn github_mouse_action(target: HitTarget) -> Option<GitHubAction> {
@@ -397,6 +533,12 @@ fn github_mouse_action(target: HitTarget) -> Option<GitHubAction> {
         HitTarget::GitHubPrevious => Some(GitHubAction::PreviousPage),
         HitTarget::GitHubNext => Some(GitHubAction::NextPage),
         HitTarget::GitHubMoreComments => Some(GitHubAction::MoreComments),
+        HitTarget::GitHubStartWork => Some(GitHubAction::StartWork),
+        HitTarget::GitHubStartAnother => Some(GitHubAction::StartAnother),
+        HitTarget::GitHubStartSubmit => Some(GitHubAction::SubmitStartWork),
+        HitTarget::GitHubRetrySession => Some(GitHubAction::RetrySession),
+        HitTarget::GitHubOpenWorktree => Some(GitHubAction::OpenWorktree),
+        HitTarget::GitHubRemoveWorktree => Some(GitHubAction::RemoveWorktree),
         HitTarget::GitHubScroll(delta) => Some(GitHubAction::Move(delta)),
         HitTarget::GitHubBack => Some(GitHubAction::Back),
         HitTarget::Settings => Some(GitHubAction::Settings),
@@ -420,12 +562,15 @@ fn github_keyboard_action(input: &Event) -> Option<GitHubAction> {
         KeyCode::Char('n') => Some(GitHubAction::NextPage),
         KeyCode::Char('b') => Some(GitHubAction::PreviousPage),
         KeyCode::Char('c') => Some(GitHubAction::MoreComments),
-        KeyCode::Char('s') => Some(GitHubAction::Settings),
+        KeyCode::Char('s') => Some(GitHubAction::StartWork),
+        KeyCode::Char('a') => Some(GitHubAction::StartAnother),
+        KeyCode::Char('t') => Some(GitHubAction::Settings),
         KeyCode::Esc => Some(GitHubAction::Back),
         _ => None,
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_github_action(modal: &mut GitHubModal, action: GitHubAction) -> GitHubDecision {
     match action {
         GitHubAction::Issues => modal
@@ -474,6 +619,48 @@ fn apply_github_action(modal: &mut GitHubModal, action: GitHubAction) -> GitHubD
                 query,
                 append_comments: true,
             }),
+        GitHubAction::StartWork => {
+            if let Some(worktree_id) = modal.existing_worktree() {
+                GitHubDecision::OpenWorktree(worktree_id)
+            } else {
+                modal.begin_start_work(false).map_or(
+                    GitHubDecision::None,
+                    |(issue_number, start_another_worktree)| GitHubDecision::PrepareStartWork {
+                        issue_number,
+                        start_another_worktree,
+                    },
+                )
+            }
+        }
+        GitHubAction::StartAnother => modal.begin_start_work(true).map_or(
+            GitHubDecision::None,
+            |(issue_number, start_another_worktree)| GitHubDecision::PrepareStartWork {
+                issue_number,
+                start_another_worktree,
+            },
+        ),
+        GitHubAction::RetrySession if modal.depth == GitHubDepth::Recovery => modal
+            .recovery
+            .as_ref()
+            .filter(|recovery| !recovery.pending)
+            .map_or(GitHubDecision::None, |recovery| {
+                GitHubDecision::RetrySession {
+                    worktree_id: recovery.worktree_id,
+                    provider: recovery.provider,
+                }
+            }),
+        GitHubAction::OpenWorktree if modal.depth == GitHubDepth::Recovery => modal
+            .recovery
+            .as_ref()
+            .map_or(GitHubDecision::None, |recovery| {
+                GitHubDecision::OpenWorktree(recovery.worktree_id)
+            }),
+        GitHubAction::RemoveWorktree if modal.depth == GitHubDepth::Recovery => modal
+            .recovery
+            .as_ref()
+            .map_or(GitHubDecision::None, |recovery| {
+                GitHubDecision::RemoveWorktree(recovery.worktree_id)
+            }),
         GitHubAction::Settings => GitHubDecision::Settings,
         GitHubAction::Back => github_escape_decision(modal),
         GitHubAction::OpenDetail
@@ -481,7 +668,11 @@ fn apply_github_action(modal: &mut GitHubModal, action: GitHubAction) -> GitHubD
         | GitHubAction::Filter
         | GitHubAction::PreviousPage
         | GitHubAction::NextPage
-        | GitHubAction::MoreComments => GitHubDecision::None,
+        | GitHubAction::MoreComments
+        | GitHubAction::SubmitStartWork
+        | GitHubAction::RetrySession
+        | GitHubAction::OpenWorktree
+        | GitHubAction::RemoveWorktree => GitHubDecision::None,
     }
 }
 
@@ -521,6 +712,23 @@ enum GitHubAsyncResult {
         project_id: ProjectId,
         response: Result<DaemonResponse, String>,
     },
+    PrepareStartWork {
+        request_id: u64,
+        project_id: ProjectId,
+        start_another_worktree: bool,
+        response: Result<DaemonResponse, String>,
+    },
+    StartWork {
+        request_id: u64,
+        project_id: ProjectId,
+        provider: sylvops_core::domain::ProviderKind,
+        response: Result<DaemonResponse, String>,
+    },
+    RetrySession {
+        request_id: u64,
+        project_id: ProjectId,
+        response: Result<DaemonResponse, String>,
+    },
 }
 
 #[derive(Default)]
@@ -529,6 +737,7 @@ struct GitHubTasks {
     list: Option<tokio::task::AbortHandle>,
     detail: Option<tokio::task::AbortHandle>,
     browser: Option<tokio::task::AbortHandle>,
+    start_work: Option<tokio::task::AbortHandle>,
 }
 
 impl GitHubTasks {
@@ -553,10 +762,16 @@ impl GitHubTasks {
         self.browser = Some(handle);
     }
 
+    fn replace_start_work(&mut self, handle: tokio::task::AbortHandle) {
+        abort_task(&mut self.start_work);
+        self.start_work = Some(handle);
+    }
+
     fn cancel_all(&mut self) {
         abort_task(&mut self.list);
         abort_task(&mut self.detail);
         abort_task(&mut self.browser);
+        abort_task(&mut self.start_work);
     }
 }
 
@@ -584,8 +799,36 @@ fn open_github(
     };
     tasks.cancel_all();
     let (modal, query) = GitHubModal::open(project_id);
-    app.mode = Mode::GitHub(Box::new(modal));
-    queue_github_list(client, results, tasks, app, project_id, query);
+    let mut modal = modal;
+    modal.sync_local_work(&app.snapshot);
+    let source_identity = app
+        .selected_worktree_id
+        .and_then(|worktree_id| {
+            app.snapshot
+                .work_sources
+                .iter()
+                .find(|source| source.worktree_id == worktree_id)
+        })
+        .map(|source| source.item.clone());
+    if let Some(identity) = source_identity {
+        let repository_changed = app.github_status.as_ref().is_some_and(|status| {
+            status
+                .association
+                .as_ref()
+                .is_none_or(|association| association.repository != identity.repository)
+        });
+        let detail = modal.open_identity(&identity);
+        if repository_changed {
+            modal.mark_repository_changed(identity);
+            app.mode = Mode::GitHub(Box::new(modal));
+            return;
+        }
+        app.mode = Mode::GitHub(Box::new(modal));
+        queue_github_detail(client, results, tasks, app, project_id, detail, false);
+    } else {
+        app.mode = Mode::GitHub(Box::new(modal));
+        queue_github_list(client, results, tasks, app, project_id, query);
+    }
 }
 
 async fn handle_github(
@@ -632,6 +875,43 @@ async fn handle_github(
         GitHubDecision::Browser(identity) => {
             queue_github_browser(client, results, tasks, app, project_id, identity);
         }
+        GitHubDecision::PrepareStartWork {
+            issue_number,
+            start_another_worktree,
+        } => queue_prepare_start_work(
+            client,
+            results,
+            tasks,
+            app,
+            project_id,
+            issue_number,
+            start_another_worktree,
+        ),
+        GitHubDecision::StartWork(request) => {
+            queue_start_work(client, results, tasks, app, project_id, request);
+        }
+        GitHubDecision::OpenWorktree(worktree_id) => {
+            if open_github_worktree(app, worktree_id) {
+                attach_selected(client, app).await?;
+            }
+        }
+        GitHubDecision::RetrySession {
+            worktree_id,
+            provider,
+        } => queue_retry_start_work_session(
+            client,
+            results,
+            tasks,
+            app,
+            project_id,
+            worktree_id,
+            provider,
+        ),
+        GitHubDecision::RemoveWorktree(worktree_id) => {
+            app.reveal_and_select(ExplorerNode::Worktree(worktree_id));
+            open_destructive_confirmation(client, app).await?;
+            apply_checkout_recovery_confirmation_copy(app, worktree_id);
+        }
         GitHubDecision::Settings => {
             tasks.cancel_all();
             app.open_settings();
@@ -640,6 +920,34 @@ async fn handle_github(
         GitHubDecision::None | GitHubDecision::Close => {}
     }
     Ok(())
+}
+
+fn apply_checkout_recovery_confirmation_copy(app: &mut App, worktree_id: WorktreeId) {
+    let worktree = app
+        .snapshot
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.id == worktree_id);
+    let Some(worktree) = worktree else {
+        return;
+    };
+    let Mode::Confirmation(confirmation) = &mut app.mode else {
+        return;
+    };
+    if !matches!(
+        confirmation.action,
+        ConfirmAction::RemoveWorktree {
+            worktree_id: candidate,
+            ..
+        } if candidate == worktree_id
+    ) {
+        return;
+    }
+    confirmation.title = "Delete checkout?".into();
+    confirmation.detail = format!(
+        "Delete checkout '{}' ({}) exactly? The checkout directory at {} is removed without force only after this clean-state confirmation; the Git branch is preserved.",
+        worktree.name, worktree.id, worktree.canonical_path
+    );
 }
 
 fn queue_github_list(
@@ -713,6 +1021,100 @@ fn queue_github_browser(
     tasks.replace_browser(handle);
 }
 
+fn queue_prepare_start_work(
+    client: &DaemonClient,
+    results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    tasks: &mut GitHubTasks,
+    app: &mut App,
+    project_id: ProjectId,
+    issue_number: GitHubItemNumber,
+    start_another_worktree: bool,
+) {
+    let request_id = tasks.next_request_id();
+    if let Mode::GitHub(modal) = &mut app.mode {
+        modal.register_start_work_request(request_id);
+    }
+    let request = ClientRequest::PrepareStartWork {
+        project_id,
+        issue_number,
+    };
+    let handle = dispatch_github_request(client, results, request, move |response| {
+        GitHubAsyncResult::PrepareStartWork {
+            request_id,
+            project_id,
+            start_another_worktree,
+            response,
+        }
+    });
+    tasks.replace_start_work(handle);
+}
+
+fn queue_start_work(
+    client: &DaemonClient,
+    results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    tasks: &mut GitHubTasks,
+    app: &mut App,
+    project_id: ProjectId,
+    request: ClientRequest,
+) {
+    let provider = match &request {
+        ClientRequest::StartWork { provider, .. } => *provider,
+        _ => return,
+    };
+    let request_id = tasks.next_request_id();
+    if let Mode::GitHub(modal) = &mut app.mode {
+        modal.register_start_work_request(request_id);
+    }
+    let handle = dispatch_github_request(client, results, request, move |response| {
+        GitHubAsyncResult::StartWork {
+            request_id,
+            project_id,
+            provider,
+            response,
+        }
+    });
+    tasks.replace_start_work(handle);
+}
+
+fn queue_retry_start_work_session(
+    client: &DaemonClient,
+    results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    tasks: &mut GitHubTasks,
+    app: &mut App,
+    project_id: ProjectId,
+    worktree_id: WorktreeId,
+    provider: sylvops_core::domain::ProviderKind,
+) {
+    let session_name = if let Mode::GitHub(modal) = &mut app.mode {
+        let Some(recovery) = &mut modal.recovery else {
+            return;
+        };
+        recovery.pending = true;
+        recovery.session_name.clone()
+    } else {
+        return;
+    };
+    let request_id = tasks.next_request_id();
+    if let Mode::GitHub(modal) = &mut app.mode {
+        modal.register_start_work_request(request_id);
+    }
+    let request = ClientRequest::RetryStartWorkSession {
+        worktree_id,
+        provider,
+        display_name: (!session_name.is_empty()).then_some(session_name.clone()),
+        columns: 80,
+        rows: 24,
+    };
+    let handle = dispatch_github_request(client, results, request, move |response| {
+        GitHubAsyncResult::RetrySession {
+            request_id,
+            project_id,
+            response,
+        }
+    });
+    tasks.replace_start_work(handle);
+}
+
 fn dispatch_github_request(
     client: &DaemonClient,
     results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
@@ -752,41 +1154,334 @@ fn github_browser_request(project_id: ProjectId, identity: GitHubItemIdentity) -
     }
 }
 
-fn apply_github_result(app: &mut App, result: GitHubAsyncResult) -> Result<(), DaemonError> {
-    let Mode::GitHub(modal) = &mut app.mode else {
-        return Ok(());
+#[derive(Debug, Eq, PartialEq)]
+enum GitHubResultEffect {
+    None,
+    Attach { session_id: SessionId },
+    OpenWorktree(WorktreeId),
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_github_result(
+    app: &mut App,
+    result: GitHubAsyncResult,
+) -> Result<GitHubResultEffect, DaemonError> {
+    let accepted = match (&app.mode, &result) {
+        (
+            Mode::GitHub(modal),
+            GitHubAsyncResult::List {
+                request_id,
+                project_id,
+                ..
+            },
+        ) => modal.project_id == *project_id && modal.accepts_list(*request_id),
+        (
+            Mode::GitHub(modal),
+            GitHubAsyncResult::Detail {
+                request_id,
+                project_id,
+                ..
+            },
+        ) => modal.project_id == *project_id && modal.accepts_detail(*request_id),
+        (
+            Mode::GitHub(modal),
+            GitHubAsyncResult::Browser {
+                request_id,
+                project_id,
+                ..
+            },
+        ) => modal.project_id == *project_id && modal.accepts_browser(*request_id),
+        (
+            Mode::GitHub(modal),
+            GitHubAsyncResult::PrepareStartWork {
+                request_id,
+                project_id,
+                ..
+            }
+            | GitHubAsyncResult::StartWork {
+                request_id,
+                project_id,
+                ..
+            }
+            | GitHubAsyncResult::RetrySession {
+                request_id,
+                project_id,
+                ..
+            },
+        ) => modal.project_id == *project_id && modal.accepts_start_work(*request_id),
+        _ => false,
     };
+    if !accepted {
+        return Ok(GitHubResultEffect::None);
+    }
     match result {
-        GitHubAsyncResult::List {
-            request_id,
-            project_id,
-            response,
-            ..
-        } if modal.project_id == project_id && modal.accepts_list(request_id) => {
+        GitHubAsyncResult::List { response, .. } => {
+            let Mode::GitHub(modal) = &mut app.mode else {
+                unreachable!("accepted GitHub list result without a modal")
+            };
             apply_github_list_response(modal, response)?;
         }
         GitHubAsyncResult::Detail {
-            request_id,
-            project_id,
             append_comments,
             response,
             ..
-        } if modal.project_id == project_id && modal.accepts_detail(request_id) => {
+        } => {
+            let Mode::GitHub(modal) = &mut app.mode else {
+                unreachable!("accepted GitHub detail result without a modal")
+            };
             apply_github_detail_response(modal, append_comments, response)?;
         }
-        GitHubAsyncResult::Browser {
-            request_id,
-            project_id,
-            response,
-            ..
-        } if modal.project_id == project_id && modal.accepts_browser(request_id) => {
+        GitHubAsyncResult::Browser { response, .. } => {
+            let Mode::GitHub(modal) = &mut app.mode else {
+                unreachable!("accepted GitHub browser result without a modal")
+            };
             apply_github_browser_response(modal, response)?;
         }
-        GitHubAsyncResult::List { .. }
-        | GitHubAsyncResult::Detail { .. }
-        | GitHubAsyncResult::Browser { .. } => {}
+        GitHubAsyncResult::PrepareStartWork {
+            start_another_worktree,
+            response,
+            ..
+        } => {
+            let Mode::GitHub(modal) = &mut app.mode else {
+                unreachable!("accepted Start Work preparation without a modal")
+            };
+            match response {
+                Ok(DaemonResponse::StartWorkPrepared(preparation)) => {
+                    if !start_another_worktree
+                        && let Some(source) = preparation
+                            .existing_work
+                            .iter()
+                            .max_by_key(|source| source.created_at)
+                    {
+                        return Ok(GitHubResultEffect::OpenWorktree(source.worktree_id));
+                    }
+                    modal.receive_start_work_preparation(preparation, start_another_worktree);
+                }
+                Ok(DaemonResponse::StartWorkFailure(failure)) => {
+                    modal.fail_start_work(failure);
+                }
+                Ok(DaemonResponse::Error(error)) => modal.fail_start_work(StartWorkFailure::new(
+                    StartWorkFailureKind::InvalidRequest,
+                    bounded_feedback(error.message),
+                )),
+                Err(error) => modal.fail_start_work(StartWorkFailure::new(
+                    StartWorkFailureKind::InvalidRequest,
+                    bounded_feedback(error),
+                )),
+                Ok(response) => {
+                    return Err(DaemonError::Lifecycle(format!(
+                        "unexpected Start Work preparation response: {response:?}"
+                    )));
+                }
+            }
+        }
+        GitHubAsyncResult::StartWork {
+            provider, response, ..
+        } => match response {
+            Ok(DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
+                worktree,
+                source,
+                session,
+                ..
+            })) => return Ok(apply_started_work(app, worktree, source, *session)),
+            Ok(DaemonResponse::StartWorkCompleted(StartWorkOutcome::WorktreeCreated {
+                worktree,
+                source,
+                failure,
+                ..
+            })) => {
+                let worktree_id = worktree.id;
+                let branch = worktree.branch.clone().unwrap_or_else(|| "detached".into());
+                let session_name = match &app.mode {
+                    Mode::GitHub(modal) => modal
+                        .start_work
+                        .as_ref()
+                        .map_or_else(String::new, |form| form.session_name.trim().to_owned()),
+                    _ => String::new(),
+                };
+                upsert_start_work_state(app, worktree, source, None);
+                let Mode::GitHub(modal) = &mut app.mode else {
+                    unreachable!("partial Start Work result lost its modal")
+                };
+                modal.begin_recovery(StartWorkRecovery {
+                    worktree_id,
+                    branch,
+                    provider,
+                    session_name,
+                    failure,
+                    pending: false,
+                });
+            }
+            Ok(DaemonResponse::StartWorkFailure(failure)) => {
+                let Mode::GitHub(modal) = &mut app.mode else {
+                    unreachable!("Start Work failure lost its modal")
+                };
+                if failure.kind == StartWorkFailureKind::BranchConflict
+                    && let Some(form) = &mut modal.start_work
+                {
+                    form.branch_conflict = Some(form.branch.clone());
+                }
+                modal.fail_start_work(failure);
+            }
+            Ok(response) => {
+                return Err(DaemonError::Lifecycle(format!(
+                    "unexpected Start Work response: {response:?}"
+                )));
+            }
+            Err(error) => {
+                let Mode::GitHub(modal) = &mut app.mode else {
+                    unreachable!("Start Work transport failure lost its modal")
+                };
+                modal.fail_start_work(StartWorkFailure::new(
+                    StartWorkFailureKind::InvalidRequest,
+                    bounded_feedback(error),
+                ));
+            }
+        },
+        GitHubAsyncResult::RetrySession { response, .. } => match response {
+            Ok(DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
+                worktree,
+                source,
+                session,
+                ..
+            })) => return Ok(apply_started_work(app, worktree, source, *session)),
+            Ok(DaemonResponse::StartWorkFailure(failure)) => {
+                let Mode::GitHub(modal) = &mut app.mode else {
+                    unreachable!("Retry Session failure lost its modal")
+                };
+                if let Some(recovery) = &mut modal.recovery {
+                    recovery.pending = false;
+                    recovery.failure = failure;
+                }
+            }
+            Ok(DaemonResponse::StartWorkCompleted(StartWorkOutcome::WorktreeCreated {
+                ..
+            })) => {
+                unreachable!("Retry Session cannot create another Worktree")
+            }
+            Ok(response) => {
+                return Err(DaemonError::Lifecycle(format!(
+                    "unexpected Retry Session response: {response:?}"
+                )));
+            }
+            Err(error) => {
+                let Mode::GitHub(modal) = &mut app.mode else {
+                    unreachable!("Retry Session transport failure lost its modal")
+                };
+                if let Some(recovery) = &mut modal.recovery {
+                    recovery.pending = false;
+                    recovery.failure = StartWorkFailure::new(
+                        StartWorkFailureKind::ProviderLaunchFailed,
+                        bounded_feedback(error),
+                    );
+                }
+            }
+        },
+    }
+    Ok(GitHubResultEffect::None)
+}
+
+fn apply_started_work(
+    app: &mut App,
+    worktree: sylvops_core::domain::Worktree,
+    source: sylvops_core::github::WorkSource,
+    session: sylvops_core::domain::Session,
+) -> GitHubResultEffect {
+    let session_id = session.id;
+    upsert_start_work_state(app, worktree, source, Some(session));
+    app.mode = Mode::Navigation;
+    app.reveal_and_select(ExplorerNode::Session(session_id));
+    app.main_tab = TuiContentView::Terminal;
+    GitHubResultEffect::Attach { session_id }
+}
+
+fn upsert_start_work_state(
+    app: &mut App,
+    worktree: sylvops_core::domain::Worktree,
+    source: sylvops_core::github::WorkSource,
+    session: Option<sylvops_core::domain::Session>,
+) {
+    if let Some(index) = app
+        .snapshot
+        .worktrees
+        .iter()
+        .position(|existing| existing.id == worktree.id)
+    {
+        app.snapshot.worktrees[index] = worktree;
+    } else {
+        app.snapshot.worktrees.push(worktree);
+    }
+    if let Some(existing) = app
+        .snapshot
+        .work_sources
+        .iter_mut()
+        .find(|existing| existing.worktree_id == source.worktree_id)
+    {
+        *existing = source;
+    } else {
+        app.snapshot.work_sources.push(source);
+    }
+    if let Some(session) = session {
+        if let Some(existing) = app
+            .snapshot
+            .sessions
+            .iter_mut()
+            .find(|existing| existing.id == session.id)
+        {
+            *existing = session;
+        } else {
+            app.snapshot.sessions.push(session);
+        }
+    }
+    if let Mode::GitHub(modal) = &mut app.mode {
+        modal.sync_local_work(&app.snapshot);
+    }
+}
+
+async fn apply_github_result_async(
+    client: &DaemonClient,
+    app: &mut App,
+    result: GitHubAsyncResult,
+) -> Result<(), DaemonError> {
+    match apply_github_result(app, result)? {
+        GitHubResultEffect::None => {}
+        GitHubResultEffect::OpenWorktree(worktree_id) => {
+            if open_github_worktree(app, worktree_id) {
+                attach_selected(client, app).await?;
+            }
+        }
+        GitHubResultEffect::Attach { session_id } => {
+            app.mode = Mode::Navigation;
+            app.reveal_and_select(ExplorerNode::Session(session_id));
+            attach_selected(client, app).await?;
+        }
     }
     Ok(())
+}
+
+fn open_github_worktree(app: &mut App, worktree_id: WorktreeId) -> bool {
+    let session = app
+        .snapshot
+        .sessions
+        .iter()
+        .filter(|session| session.worktree_id == worktree_id)
+        .max_by_key(|session| (state_is_active(session.state), session.last_activity_at))
+        .map(|session| (session.id, state_is_active(session.state)));
+    app.mode = Mode::Navigation;
+    if let Some((session_id, active)) = session {
+        app.reveal_and_select(ExplorerNode::Session(session_id));
+        if active {
+            app.main_tab = TuiContentView::Terminal;
+            true
+        } else {
+            app.main_tab = TuiContentView::Details;
+            false
+        }
+    } else {
+        app.reveal_and_select(ExplorerNode::Worktree(worktree_id));
+        app.set_tab(sylvops_core::ui::TuiContentView::Details);
+        false
+    }
 }
 
 fn apply_github_list_response(
@@ -2646,7 +3341,8 @@ mod tests {
         GitHubItemDetail, GitHubItemNumber, GitHubItemState, GitHubItemSummary, GitHubLabelName,
         GitHubListPage, GitHubLogin, GitHubOwner, GitHubPullRequestSummary,
         GitHubRepositoryIdentity, GitHubRepositoryName, GitHubReviewState, GitHubTimestamp,
-        GitHubTitle,
+        GitHubTitle, StartWorkBase, StartWorkBranch, StartWorkIssueContext, StartWorkPreparation,
+        WorkSource,
     };
     use sylvops_core::provider::{AuthenticationRequirement, ProviderCapabilities, ProviderHealth};
 
@@ -2791,6 +3487,51 @@ mod tests {
                 next_cursor: Some(GitHubCursor::new("comments-page-2").unwrap()),
             },
         }
+    }
+
+    fn start_work_preparation(snapshot: &DaemonSnapshot, number: u64) -> StartWorkPreparation {
+        StartWorkPreparation {
+            issue: StartWorkIssueContext::try_from(github_detail(GitHubItemKind::Issue, number))
+                .unwrap(),
+            base: StartWorkBase::new(
+                snapshot.worktrees[0].id,
+                "main",
+                "0123456789abcdef0123456789abcdef01234567",
+            )
+            .unwrap(),
+            suggested_branch: StartWorkBranch::new(format!("issue/{number}-bounded-item")).unwrap(),
+            suggested_branch_conflict: false,
+            eligible_providers: vec![ProviderKind::Codex],
+            existing_work: Vec::new(),
+        }
+    }
+
+    fn sourced_worktree(snapshot: &DaemonSnapshot, number: u64) -> (Worktree, WorkSource) {
+        let project_id = snapshot.projects[0].id;
+        let identity = github_identity(GitHubItemKind::Issue, number);
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id,
+            name: format!("Issue #{number}"),
+            path: format!("/repo/.sylvops/{number}"),
+            canonical_path: format!("/repo/.sylvops/{number}"),
+            branch: Some(format!("issue/{number}-bounded-item")),
+            base_ref: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Active,
+            created_at: 2,
+            last_activity_at: 2,
+            removed_at: None,
+        };
+        let source = WorkSource {
+            worktree_id: worktree.id,
+            project_id,
+            canonical_url: identity.browser_target(),
+            item: identity,
+            created_at: 2,
+        };
+        (worktree, source)
     }
 
     #[test]
@@ -5348,6 +6089,484 @@ mod tests {
             assert!(text.contains(expected), "missing {expected} for {kind:?}");
             assert!(text.contains("[r] Refresh"));
         }
+    }
+
+    #[test]
+    fn github_issue_start_work_preview_is_keyboard_native_and_pull_requests_exclude_it() {
+        use crossterm::event::KeyEvent;
+
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.receive_list(GitHubListPage {
+            items: vec![github_summary(GitHubItemKind::Issue, 129)],
+            next_cursor: None,
+        });
+        assert_eq!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('s')), None),
+            GitHubDecision::PrepareStartWork {
+                issue_number: GitHubItemNumber::new(129).unwrap(),
+                start_another_worktree: false,
+            }
+        );
+
+        let mut preparation = start_work_preparation(&snapshot, 129);
+        preparation.issue.body = GitHubBody::new("bounded untrusted line\n".repeat(200)).unwrap();
+        modal.receive_start_work_preparation(preparation, false);
+        let form = modal.start_work.as_mut().unwrap();
+        form.session_name = "Issue 129 TUI".into();
+        form.instructions = "Keep the public IPC seam.".into();
+        form.error = Some(StartWorkFailure::new(
+            StartWorkFailureKind::InvalidRequest,
+            "Visible validation feedback.",
+        ));
+        form.focus = StartWorkFocus::Confirm;
+        form.scroll_context(5);
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.mode = Mode::GitHub(Box::new(modal));
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        for expected in [
+            "untrusted reference material",
+            "Exact local base: main @ 0123456789abcdef",
+            "Session name (optional): Issue 129 TUI",
+            "Additional instructions: Keep the public IPC seam.",
+            "Visible validation feedback.",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        let Mode::GitHub(modal) = &mut app.mode else {
+            panic!("GitHub modal expected")
+        };
+        let decision = github_input_decision(modal, &key(KeyCode::Enter), None);
+        let GitHubDecision::StartWork(ClientRequest::StartWork {
+            provider,
+            display_name,
+            additional_instructions,
+            start_another_worktree,
+            ..
+        }) = decision
+        else {
+            panic!("confirmation must use the shared Start Work request")
+        };
+        assert_eq!(provider, ProviderKind::Codex);
+        assert_eq!(display_name.as_deref(), Some("Issue 129 TUI"));
+        assert_eq!(
+            additional_instructions.unwrap().as_str(),
+            "Keep the public IPC seam."
+        );
+        assert!(!start_another_worktree);
+        assert_eq!(
+            github_input_decision(modal, &key(KeyCode::Esc), None),
+            GitHubDecision::None
+        );
+        assert_eq!(modal.depth, GitHubDepth::StartWork);
+
+        let (mut pull_request, _) = GitHubModal::open(project_id);
+        pull_request.switch_kind(GitHubItemKind::PullRequest);
+        pull_request.receive_list(GitHubListPage {
+            items: vec![github_summary(GitHubItemKind::PullRequest, 129)],
+            next_cursor: None,
+        });
+        assert_eq!(
+            github_input_decision(&mut pull_request, &key(KeyCode::Char('s')), None),
+            GitHubDecision::None
+        );
+        assert_eq!(pull_request.depth, GitHubDepth::List);
+    }
+
+    #[test]
+    fn github_issue_local_status_drives_duplicate_and_explicit_parallel_actions() {
+        use crossterm::event::KeyEvent;
+
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let mut snapshot = populated_snapshot();
+        let (worktree, source) = sourced_worktree(&snapshot, 129);
+        let mut session = snapshot.sessions[0].clone();
+        session.id = SessionId::new();
+        session.worktree_id = worktree.id;
+        session.provider_kind = ProviderKind::Codex;
+        session.display_name = "Issue #129".into();
+        snapshot.worktrees.push(worktree.clone());
+        snapshot.work_sources.push(source);
+        snapshot.sessions.push(session);
+        let (mut modal, _) = GitHubModal::open(snapshot.projects[0].id);
+        modal.sync_local_work(&snapshot);
+        let mut summary = github_summary(GitHubItemKind::Issue, 129);
+        summary.state = GitHubItemState::Closed;
+        modal.receive_list(GitHubListPage {
+            items: vec![summary],
+            next_cursor: None,
+        });
+        assert_eq!(
+            modal
+                .status_for(&github_identity(GitHubItemKind::Issue, 129))
+                .display_name(),
+            "Session active"
+        );
+        assert_eq!(
+            modal
+                .remote_status_for(&github_identity(GitHubItemKind::Issue, 129))
+                .unwrap()
+                .display_name(),
+            "Closed"
+        );
+        modal.open_selected().unwrap();
+        let unavailable = GitHubBrowseFailure::new(GitHubBrowseFailureKind::UnavailableItem);
+        modal.fail(
+            GitHubRequestTarget::Detail,
+            unavailable.clone(),
+            unavailable.diagnostic,
+        );
+        assert_eq!(
+            modal
+                .remote_status_for(&github_identity(GitHubItemKind::Issue, 129))
+                .unwrap()
+                .display_name(),
+            "Unavailable"
+        );
+        modal.escape();
+        let sourced_session = snapshot.sessions.len() - 1;
+        snapshot.sessions[sourced_session].state = SessionState::FinishedSeen;
+        snapshot.sessions[sourced_session].ended_at = Some(3);
+        modal.sync_local_work(&snapshot);
+        assert_eq!(
+            modal
+                .status_for(&github_identity(GitHubItemKind::Issue, 129))
+                .display_name(),
+            "Session stopped"
+        );
+        snapshot.sessions.remove(sourced_session);
+        modal.sync_local_work(&snapshot);
+        assert_eq!(
+            modal
+                .status_for(&github_identity(GitHubItemKind::Issue, 129))
+                .display_name(),
+            "Worktree ready"
+        );
+        let (mut newest_worktree, mut newest_source) = sourced_worktree(&snapshot, 129);
+        newest_worktree.created_at = 9;
+        newest_source.created_at = 9;
+        snapshot.worktrees.push(newest_worktree.clone());
+        snapshot.work_sources.push(newest_source);
+        modal.sync_local_work(&snapshot);
+        assert_eq!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('s')), None),
+            GitHubDecision::OpenWorktree(newest_worktree.id)
+        );
+        assert_eq!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('a')), None),
+            GitHubDecision::PrepareStartWork {
+                issue_number: GitHubItemNumber::new(129).unwrap(),
+                start_another_worktree: true,
+            }
+        );
+    }
+
+    #[test]
+    fn github_repository_changed_and_recovery_confirmation_use_explicit_copy() {
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let identity = github_identity(GitHubItemKind::Issue, 129);
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.open_identity(&identity);
+        modal.mark_repository_changed(identity);
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        app.mode = Mode::GitHub(Box::new(modal));
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Repository changed"));
+        assert!(text.contains("historical Work Source is preserved"));
+
+        let (worktree, _) = sourced_worktree(&snapshot, 129);
+        app.snapshot.worktrees.push(worktree.clone());
+        app.mode = Mode::Confirmation(Confirmation {
+            title: "Remove Worktree?".into(),
+            detail: "generic copy".into(),
+            action: ConfirmAction::RemoveWorktree {
+                worktree_id: worktree.id,
+                token: "bounded-token".into(),
+            },
+        });
+        apply_checkout_recovery_confirmation_copy(&mut app, worktree.id);
+        let Mode::Confirmation(confirmation) = &app.mode else {
+            panic!("checkout confirmation expected")
+        };
+        assert_eq!(confirmation.title, "Delete checkout?");
+        assert!(confirmation.detail.contains("removed without force"));
+        assert!(confirmation.detail.contains("Git branch is preserved"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn github_start_work_failures_and_partial_success_remain_actionable() {
+        use crossterm::event::KeyEvent;
+
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.receive_list(GitHubListPage {
+            items: vec![github_summary(GitHubItemKind::Issue, 129)],
+            next_cursor: None,
+        });
+        modal.open_selected().unwrap();
+        modal.receive_detail(github_detail(GitHubItemKind::Issue, 129));
+        modal.begin_start_work(false).unwrap();
+        modal.receive_start_work_preparation(start_work_preparation(&snapshot, 129), false);
+        modal.register_start_work_request(10);
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        app.mode = Mode::GitHub(Box::new(modal));
+
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::StartWork {
+                request_id: 10,
+                project_id,
+                provider: ProviderKind::Codex,
+                response: Ok(DaemonResponse::StartWorkFailure(StartWorkFailure::new(
+                    StartWorkFailureKind::BaseMoved,
+                    "The confirmed base moved.",
+                ))),
+            },
+        )
+        .unwrap();
+        let Mode::GitHub(modal) = &mut app.mode else {
+            panic!("GitHub modal expected")
+        };
+        assert_eq!(
+            modal
+                .start_work
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .kind,
+            StartWorkFailureKind::BaseMoved
+        );
+
+        modal.register_start_work_request(11);
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::StartWork {
+                request_id: 11,
+                project_id,
+                provider: ProviderKind::Codex,
+                response: Ok(DaemonResponse::StartWorkFailure(StartWorkFailure::new(
+                    StartWorkFailureKind::BranchConflict,
+                    "The selected branch already exists.",
+                ))),
+            },
+        )
+        .unwrap();
+        let Mode::GitHub(modal) = &mut app.mode else {
+            panic!("GitHub modal expected")
+        };
+        assert!(modal.start_work.as_ref().unwrap().branch_conflict.is_some());
+        let form = modal.start_work.as_mut().unwrap();
+        form.branch = "issue/129-custom-conflict".into();
+        modal.register_start_work_request(111);
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::StartWork {
+                request_id: 111,
+                project_id,
+                provider: ProviderKind::Codex,
+                response: Ok(DaemonResponse::StartWorkFailure(StartWorkFailure::new(
+                    StartWorkFailureKind::BranchConflict,
+                    "The selected branch already exists.",
+                ))),
+            },
+        )
+        .unwrap();
+        let Mode::GitHub(modal) = &mut app.mode else {
+            panic!("GitHub modal expected")
+        };
+        let form = modal.start_work.as_mut().unwrap();
+        assert_eq!(
+            form.branch_conflict.as_deref(),
+            Some("issue/129-custom-conflict")
+        );
+        assert!(form.request(project_id).is_err());
+        form.focus = StartWorkFocus::Branch;
+        form.push_character('x');
+        assert!(form.branch_conflict.is_none());
+
+        modal.register_start_work_request(12);
+        let (worktree, source) = sourced_worktree(&snapshot, 129);
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::StartWork {
+                request_id: 12,
+                project_id,
+                provider: ProviderKind::Codex,
+                response: Ok(DaemonResponse::StartWorkCompleted(
+                    StartWorkOutcome::WorktreeCreated {
+                        revision: 2,
+                        worktree: worktree.clone(),
+                        source,
+                        failure: StartWorkFailure::new(
+                            StartWorkFailureKind::ProviderLaunchFailed,
+                            "Provider launch failed.",
+                        ),
+                    },
+                )),
+            },
+        )
+        .unwrap();
+        let Mode::GitHub(modal) = &mut app.mode else {
+            panic!("recovery modal expected")
+        };
+        assert_eq!(modal.depth, GitHubDepth::Recovery);
+        modal.recovery.as_mut().unwrap().pending = true;
+        assert_eq!(
+            github_input_decision(modal, &key(KeyCode::Esc), None),
+            GitHubDecision::None
+        );
+        assert_eq!(modal.depth, GitHubDepth::Recovery);
+        modal.recovery.as_mut().unwrap().pending = false;
+        assert_eq!(
+            github_input_decision(modal, &key(KeyCode::Char('s')), None),
+            GitHubDecision::RetrySession {
+                worktree_id: worktree.id,
+                provider: ProviderKind::Codex,
+            }
+        );
+        assert_eq!(
+            github_input_decision(modal, &key(KeyCode::Char('o')), None),
+            GitHubDecision::OpenWorktree(worktree.id)
+        );
+        assert_eq!(
+            github_input_decision(modal, &key(KeyCode::Char('d')), None),
+            GitHubDecision::RemoveWorktree(worktree.id)
+        );
+        modal.register_start_work_request(13);
+        let mut session = snapshot.sessions[0].clone();
+        session.id = SessionId::new();
+        session.worktree_id = worktree.id;
+        session.provider_kind = ProviderKind::Codex;
+        let source = app.snapshot.work_sources[0].clone();
+        let effect = apply_github_result(
+            &mut app,
+            GitHubAsyncResult::RetrySession {
+                request_id: 13,
+                project_id,
+                response: Ok(DaemonResponse::StartWorkCompleted(
+                    StartWorkOutcome::Started {
+                        revision: 3,
+                        worktree,
+                        source,
+                        session: Box::new(session.clone()),
+                    },
+                )),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            effect,
+            GitHubResultEffect::Attach {
+                session_id: session.id
+            }
+        );
+    }
+
+    #[test]
+    fn successful_start_work_selects_the_session_and_requests_terminal_attachment() {
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let (worktree, source) = sourced_worktree(&snapshot, 129);
+        let mut session = snapshot.sessions[0].clone();
+        session.id = SessionId::new();
+        session.worktree_id = worktree.id;
+        session.provider_kind = ProviderKind::Codex;
+        session.display_name = "Issue #129".into();
+
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.receive_list(GitHubListPage {
+            items: vec![github_summary(GitHubItemKind::Issue, 129)],
+            next_cursor: None,
+        });
+        modal.open_selected().unwrap();
+        modal.receive_detail(github_detail(GitHubItemKind::Issue, 129));
+        modal.begin_start_work(false).unwrap();
+        modal.receive_start_work_preparation(start_work_preparation(&snapshot, 129), false);
+        modal.start_work.as_mut().unwrap().session_name = "TUI Start Work".into();
+        modal.register_start_work_request(20);
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.mode = Mode::GitHub(Box::new(modal));
+
+        let effect = apply_github_result(
+            &mut app,
+            GitHubAsyncResult::StartWork {
+                request_id: 20,
+                project_id,
+                provider: ProviderKind::Codex,
+                response: Ok(DaemonResponse::StartWorkCompleted(
+                    StartWorkOutcome::Started {
+                        revision: 3,
+                        worktree: worktree.clone(),
+                        source,
+                        session: Box::new(session.clone()),
+                    },
+                )),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            effect,
+            GitHubResultEffect::Attach {
+                session_id: session.id
+            }
+        );
+        assert!(matches!(app.mode, Mode::Navigation));
+        assert_eq!(app.selected_worktree_id, Some(worktree.id));
+        assert_eq!(app.selected_session_id, Some(session.id));
+        assert_eq!(app.main_tab, TuiContentView::Terminal);
+        assert!(
+            app.snapshot
+                .work_sources
+                .iter()
+                .any(|item| item.worktree_id == worktree.id)
+        );
+        app.main_tab = TuiContentView::Details;
+        let backend = ratatui::backend::TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Work Source"));
+        assert!(text.contains("#129"));
+        assert!(text.contains("press G to return to Issue detail"));
     }
 
     #[test]

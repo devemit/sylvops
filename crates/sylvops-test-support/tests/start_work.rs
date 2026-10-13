@@ -111,6 +111,7 @@ async fn scenario() {
         .request(&ClientRequest::RetryStartWorkSession {
             worktree_id: sylvops_core::ids::WorktreeId::new(),
             provider: ProviderKind::Codex,
+            display_name: None,
             columns: 100,
             rows: 30,
         })
@@ -131,6 +132,7 @@ async fn scenario() {
             confirmation: preparation.confirmation(project_id),
             branch: preparation.suggested_branch,
             provider: ProviderKind::Codex,
+            display_name: None,
             additional_instructions: None,
             start_another_worktree: false,
             columns: 100,
@@ -153,6 +155,7 @@ async fn scenario() {
             confirmation: preparation.confirmation(project_id),
             branch: branch.clone(),
             provider: ProviderKind::Codex,
+            display_name: None,
             additional_instructions: None,
             start_another_worktree: false,
             columns: 100,
@@ -173,6 +176,7 @@ async fn scenario() {
             confirmation: preparation.confirmation(project_id),
             branch: branch.clone(),
             provider: ProviderKind::Codex,
+            display_name: None,
             additional_instructions: None,
             start_another_worktree: false,
             columns: 100,
@@ -192,6 +196,7 @@ async fn scenario() {
             confirmation: preparation.confirmation(project_id),
             branch: branch.clone(),
             provider: ProviderKind::Shell,
+            display_name: None,
             additional_instructions: None,
             start_another_worktree: false,
             columns: 100,
@@ -210,6 +215,7 @@ async fn scenario() {
             confirmation: preparation.confirmation(project_id),
             branch: branch.clone(),
             provider: ProviderKind::Codex,
+            display_name: Some("Issue 42 custom".into()),
             additional_instructions: Some(StartWorkInstructions::new(ADDITIONAL_SENTINEL).unwrap()),
             start_another_worktree: false,
             columns: 100,
@@ -217,16 +223,17 @@ async fn scenario() {
         })
         .await
         .unwrap();
-    let (expected_worktree, session_id, expected_source) = match outcome {
+    let (expected_worktree, session_id, session_name, expected_source) = match outcome {
         DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
             worktree,
             source,
             session,
             ..
-        }) => (worktree, session.id, source),
+        }) => (worktree, session.id, session.display_name.clone(), source),
         response => panic!("unexpected Start Work response: {response:?}"),
     };
     let worktree_id = expected_worktree.id;
+    assert_eq!(session_name, "Issue 42 custom");
     assert!(
         git_branch_exists(repository.path(), branch.as_str())
             .await
@@ -255,6 +262,7 @@ async fn scenario() {
             confirmation: parallel_preparation.confirmation(project_id),
             branch: parallel_branch.clone(),
             provider: ProviderKind::Codex,
+            display_name: None,
             additional_instructions: None,
             start_another_worktree: false,
             columns: 100,
@@ -272,6 +280,7 @@ async fn scenario() {
             confirmation: parallel_preparation.confirmation(project_id),
             branch: parallel_branch,
             provider: ProviderKind::Codex,
+            display_name: None,
             additional_instructions: None,
             start_another_worktree: true,
             columns: 100,
@@ -310,6 +319,7 @@ async fn scenario() {
             confirmation: partial_preparation.confirmation(project_id),
             branch: partial_branch.clone(),
             provider: ProviderKind::Codex,
+            display_name: None,
             additional_instructions: None,
             start_another_worktree: true,
             columns: 100,
@@ -501,6 +511,7 @@ async fn scenario() {
         .request(&ClientRequest::RetryStartWorkSession {
             worktree_id: partial_worktree.id,
             provider: ProviderKind::Codex,
+            display_name: None,
             columns: 100,
             rows: 30,
         })
@@ -519,6 +530,7 @@ async fn scenario() {
         .request(&ClientRequest::RetryStartWorkSession {
             worktree_id: partial_worktree.id,
             provider: ProviderKind::Codex,
+            display_name: Some("Issue 42 recovered".into()),
             columns: 100,
             rows: 30,
         })
@@ -539,6 +551,7 @@ async fn scenario() {
             assert_eq!(worktree.base_commit, partial_worktree.base_commit);
             assert_eq!(source, partial_source);
             assert_ne!(session.id, session_id);
+            assert_eq!(session.display_name, "Issue 42 recovered");
             session.id
         }
         response => panic!("unexpected Retry Session response: {response:?}"),

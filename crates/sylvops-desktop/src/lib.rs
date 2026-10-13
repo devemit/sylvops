@@ -5685,6 +5685,7 @@ impl DesktopApp {
             ClientRequest::RetryStartWorkSession {
                 worktree_id,
                 provider,
+                display_name: None,
                 columns,
                 rows,
             },
@@ -12267,6 +12268,7 @@ mod tests {
                 ClientRequest::RetryStartWorkSession {
                     worktree_id: worktree.id,
                     provider: ProviderKind::Codex,
+                    display_name: None,
                     columns,
                     rows,
                 },
