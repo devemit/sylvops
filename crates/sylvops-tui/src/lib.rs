@@ -62,7 +62,9 @@ pub enum TuiExit {
 fn event_requires_snapshot_refresh(event: &DaemonEvent) -> bool {
     !matches!(
         event,
-        DaemonEvent::SessionOutput { .. } | DaemonEvent::ResynchronizationRequired { .. }
+        DaemonEvent::SessionOutput { .. }
+            | DaemonEvent::ResynchronizationRequired { .. }
+            | DaemonEvent::GitHubAssociationUpdated { .. }
     )
 }
 
@@ -151,6 +153,17 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 Ok(DaemonEvent::UpgradeProgress {
                     status: UpgradeStatus::Installing { .. },
                 }) => return Ok(TuiExit::Quit),
+                Ok(DaemonEvent::GitHubAssociationUpdated {
+                    project_id,
+                    association,
+                    ..
+                }) => {
+                    if app.selected_project_id == Some(project_id)
+                        && let Some(status) = &mut app.github_status
+                    {
+                        status.association = association;
+                    }
+                }
                 Ok(event) => refresh |= event_requires_snapshot_refresh(&event),
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
                     refresh = true;
@@ -260,10 +273,36 @@ async fn execute_effects(
             Effect::OpenRename => open_rename_form(app),
             Effect::OpenDelete => open_destructive_confirmation(client, app).await?,
             Effect::LoadDiff => show_diff(client, app).await?,
+            Effect::LoadGitHubStatus => refresh_github_status(client, app).await?,
             Effect::Quit => return Ok(true),
         }
     }
     Ok(false)
+}
+
+async fn refresh_github_status(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
+    match client
+        .request(&ClientRequest::GetGitHubStatus {
+            project_id: app.selected_project_id,
+        })
+        .await?
+    {
+        DaemonResponse::GitHubStatus(status) => {
+            app.github_status = Some(status);
+            Ok(())
+        }
+        DaemonResponse::Error(error) => {
+            app.flash = Some(Flash::error(bounded_feedback(error.message)));
+            Ok(())
+        }
+        DaemonResponse::GitHubFailure(failure) => {
+            app.flash = Some(Flash::error(failure.message()));
+            Ok(())
+        }
+        response => Err(DaemonError::Lifecycle(format!(
+            "unexpected GitHub status response: {response:?}"
+        ))),
+    }
 }
 
 fn selected_node(app: &App) -> Option<ExplorerNode> {
@@ -799,9 +838,8 @@ async fn open_directory_browser(app: &mut App) {
         Mode::Modal(form) if matches!(form.kind, FormKind::RegisterProject(_)) => form.clone(),
         _ => return,
     };
-    app.mode = Mode::DirectoryBrowser(
-        DirectoryBrowser::new(form, app.invocation_directory.clone()).await,
-    );
+    app.mode =
+        Mode::DirectoryBrowser(DirectoryBrowser::new(form, app.invocation_directory.clone()).await);
 }
 
 async fn handle_directory_browser(app: &mut App, input: Event) {
@@ -888,9 +926,8 @@ fn restore_directory_browser_form(app: &mut App, selected: Option<PathBuf>) {
         if let Some(path) = selected.to_str() {
             form.set_repository_path(path.into());
         } else {
-            form.submission_error = Some(
-                "The selected directory cannot be represented by the IPC path format.".into(),
-            );
+            form.submission_error =
+                Some("The selected directory cannot be represented by the IPC path format.".into());
         }
     }
     app.mode = Mode::Modal(form);
@@ -1036,10 +1073,8 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
         _ => message,
     };
     let selection = match &response {
-        DaemonResponse::ProjectAdded { root_worktree, .. } => {
-            Some(ExplorerNode::Worktree(root_worktree.id))
-        }
-        DaemonResponse::ProjectReady { root_worktree, .. } => {
+        DaemonResponse::ProjectAdded { root_worktree, .. }
+        | DaemonResponse::ProjectReady { root_worktree, .. } => {
             Some(ExplorerNode::Worktree(root_worktree.id))
         }
         DaemonResponse::WorktreeCreated { worktree, .. } => {
@@ -1191,6 +1226,9 @@ enum SettingsDecision {
     Continue,
     Apply,
     Cancel,
+    AssociateGitHub(usize),
+    ClearGitHub,
+    RefreshGitHub,
 }
 
 fn cycle_choice<T: Copy + PartialEq>(choices: &[T], current: T, delta: isize) -> T {
@@ -1216,10 +1254,11 @@ fn adjust_setting(app: &mut App, settings: SettingsFocus, delta: isize) {
         SettingsFocus::Density => {
             app.density = cycle_choice(&TuiDensity::ALL, app.density, delta);
         }
-        SettingsFocus::Apply | SettingsFocus::Cancel => {}
+        SettingsFocus::GitHub | SettingsFocus::Apply | SettingsFocus::Cancel => {}
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_settings_input(app: &mut App, input: &Event) -> SettingsDecision {
     let clicked = if let Event::Mouse(mouse) = input
         && mouse.kind == MouseEventKind::Down(MouseButton::Left)
@@ -1229,6 +1268,15 @@ fn handle_settings_input(app: &mut App, input: &Event) -> SettingsDecision {
         None
     };
     match clicked {
+        Some(HitTarget::SettingsGithubRemote(index)) => {
+            if let Mode::Settings(settings) = &mut app.mode {
+                settings.focus = SettingsFocus::GitHub;
+                settings.github_remote_index = index;
+            }
+            return SettingsDecision::AssociateGitHub(index);
+        }
+        Some(HitTarget::SettingsGithubClear) => return SettingsDecision::ClearGitHub,
+        Some(HitTarget::SettingsGithubRefresh) => return SettingsDecision::RefreshGitHub,
         Some(HitTarget::SettingsTheme(choice)) => {
             app.theme = choice;
             if let Mode::Settings(settings) = &mut app.mode {
@@ -1274,8 +1322,41 @@ fn handle_settings_input(app: &mut App, input: &Event) -> SettingsDecision {
     match key.code {
         KeyCode::Down | KeyCode::Tab => settings.focus = settings.focus.moved(1),
         KeyCode::Up | KeyCode::BackTab => settings.focus = settings.focus.moved(-1),
+        KeyCode::Left | KeyCode::Char('h') if settings.focus == SettingsFocus::GitHub => {
+            let count = app
+                .github_status
+                .as_ref()
+                .map_or(0, |status| status.remotes.len());
+            if count > 0 {
+                settings.github_remote_index = settings
+                    .github_remote_index
+                    .saturating_add_signed(-1)
+                    .min(count - 1);
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') if settings.focus == SettingsFocus::GitHub => {
+            let count = app
+                .github_status
+                .as_ref()
+                .map_or(0, |status| status.remotes.len());
+            if count > 0 {
+                settings.github_remote_index = settings
+                    .github_remote_index
+                    .saturating_add(1)
+                    .min(count - 1);
+            }
+        }
         KeyCode::Left | KeyCode::Char('h') => adjust_setting(app, settings.focus, -1),
         KeyCode::Right | KeyCode::Char('l') => adjust_setting(app, settings.focus, 1),
+        KeyCode::Enter if settings.focus == SettingsFocus::GitHub => {
+            return SettingsDecision::AssociateGitHub(settings.github_remote_index);
+        }
+        KeyCode::Char('c') if settings.focus == SettingsFocus::GitHub => {
+            return SettingsDecision::ClearGitHub;
+        }
+        KeyCode::Char('r') if settings.focus == SettingsFocus::GitHub => {
+            return SettingsDecision::RefreshGitHub;
+        }
         KeyCode::Enter if settings.focus == SettingsFocus::Apply => {
             app.apply_settings();
             return SettingsDecision::Apply;
@@ -1295,9 +1376,83 @@ async fn handle_settings(
     app: &mut App,
     input: &Event,
 ) -> Result<(), DaemonError> {
-    if handle_settings_input(app, input) == SettingsDecision::Apply {
-        save_tui_state(client, app).await?;
-        app.navigation_dirty_at = None;
+    match handle_settings_input(app, input) {
+        SettingsDecision::Apply => {
+            save_tui_state(client, app).await?;
+            app.navigation_dirty_at = None;
+        }
+        SettingsDecision::AssociateGitHub(index) => {
+            let Some(project_id) = app.selected_project_id else {
+                app.flash = Some(Flash::error(
+                    "Select a Project before choosing a GitHub remote.",
+                ));
+                return Ok(());
+            };
+            let Some(remote_name) = app
+                .github_status
+                .as_ref()
+                .and_then(|status| status.remotes.get(index))
+                .map(|remote| remote.name.clone())
+            else {
+                app.flash = Some(Flash::error("No validated GitHub remote is selected."));
+                return Ok(());
+            };
+            apply_github_association(
+                client,
+                app,
+                ClientRequest::SetGitHubAssociation {
+                    project_id,
+                    remote_name,
+                },
+            )
+            .await?;
+        }
+        SettingsDecision::ClearGitHub => {
+            let Some(project_id) = app.selected_project_id else {
+                app.flash = Some(Flash::error(
+                    "Select a Project before clearing its GitHub association.",
+                ));
+                return Ok(());
+            };
+            apply_github_association(
+                client,
+                app,
+                ClientRequest::ClearGitHubAssociation { project_id },
+            )
+            .await?;
+        }
+        SettingsDecision::RefreshGitHub => refresh_github_status(client, app).await?,
+        SettingsDecision::Continue | SettingsDecision::Cancel => {}
+    }
+    Ok(())
+}
+
+async fn apply_github_association(
+    client: &DaemonClient,
+    app: &mut App,
+    request: ClientRequest,
+) -> Result<(), DaemonError> {
+    match client.request(&request).await? {
+        DaemonResponse::GitHubAssociationUpdated { association, .. } => {
+            if let Some(status) = &mut app.github_status {
+                status.association = association;
+            }
+            app.flash = Some(Flash::transient(
+                FlashKind::Success,
+                "GitHub Project association updated.",
+            ));
+        }
+        DaemonResponse::Error(error) => {
+            app.flash = Some(Flash::error(bounded_feedback(error.message)));
+        }
+        DaemonResponse::GitHubFailure(failure) => {
+            app.flash = Some(Flash::error(failure.message()));
+        }
+        response => {
+            return Err(DaemonError::Lifecycle(format!(
+                "unexpected GitHub association response: {response:?}"
+            )));
+        }
     }
     Ok(())
 }
@@ -1419,7 +1574,10 @@ async fn execute_palette_item(
     item: PaletteItem,
 ) -> Result<(), DaemonError> {
     match item {
-        PaletteItem::Settings => app.open_settings(),
+        PaletteItem::Settings => {
+            app.open_settings();
+            refresh_github_status(client, app).await?;
+        }
         PaletteItem::CreateWorkspace => app.mode = Mode::Modal(Form::workspace()),
         PaletteItem::RegisterProject => {
             app.mode = app.active_workspace().map_or_else(
@@ -2944,6 +3102,61 @@ mod tests {
         );
         assert_eq!(app.theme, TuiTheme::TerminalDefault);
         assert!(debounced_save_due(&app));
+    }
+
+    #[test]
+    fn settings_expose_github_health_and_project_remote_controls_without_a_session() {
+        use sylvops_core::github::{
+            GitHubConnection, GitHubConnectionState, GitHubHost, GitHubIntegrationStatus,
+            GitHubOwner, GitHubRemote, GitHubRepositoryIdentity, GitHubRepositoryName,
+            GitRemoteName,
+        };
+
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions.clear();
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.github_status = Some(GitHubIntegrationStatus {
+            executable_path: Some("gh".into()),
+            connections: vec![GitHubConnection {
+                host: GitHubHost::new("github.example.com").unwrap(),
+                state: GitHubConnectionState::Ready,
+                diagnostic: "GitHub CLI is ready.".into(),
+                checked_at: 1,
+            }],
+            remotes: vec![GitHubRemote {
+                name: GitRemoteName::new("upstream").unwrap(),
+                repository: GitHubRepositoryIdentity::new(
+                    GitHubHost::new("github.example.com").unwrap(),
+                    GitHubOwner::new("acme").unwrap(),
+                    GitHubRepositoryName::new("widgets").unwrap(),
+                ),
+            }],
+            association: None,
+        });
+        app.open_settings();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+
+        let remote = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::SettingsGithubRemote(0))
+            .cloned()
+            .expect("GitHub remote control");
+        let decision = handle_settings_input(
+            &mut app,
+            &Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: remote.area.x,
+                row: remote.area.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert_eq!(decision, SettingsDecision::AssociateGitHub(0));
     }
 
     #[test]

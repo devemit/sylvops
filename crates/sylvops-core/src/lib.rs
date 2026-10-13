@@ -11,6 +11,7 @@ pub const APPLICATION_PUBLISHER: &str = "devemit";
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod github;
 pub mod ids;
 pub mod protocol;
 pub mod provider;

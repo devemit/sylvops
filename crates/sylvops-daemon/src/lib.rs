@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod data_removal;
 pub mod database;
 pub mod git;
+pub mod github;
 pub mod hook;
 pub mod ipc;
 pub mod native_upgrade;
@@ -51,6 +52,8 @@ pub enum DaemonError {
     Configuration(String),
     #[error("Git operation failed: {0}")]
     Git(String),
+    #[error("GitHub operation failed: {0}")]
+    GitHub(sylvops_core::github::GitHubFailure),
     #[error("provider operation failed: {0}")]
     Provider(String),
     #[error("daemon lifecycle failed: {0}")]
@@ -69,6 +72,7 @@ mod tests {
     fn background_commands_use_the_hidden_process_factory() {
         for (name, source) in [
             ("git", include_str!("git.rs")),
+            ("github", include_str!("github.rs")),
             ("provider", include_str!("provider.rs")),
         ] {
             let production = source

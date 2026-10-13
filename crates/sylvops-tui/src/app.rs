@@ -10,6 +10,7 @@ use sylvops_core::{
         DaemonSnapshot, Project, Session, SessionState, Workspace, Worktree, WorktreeStatus,
         active_session_priority, attention_priority, state_is_active,
     },
+    github::GitHubIntegrationStatus,
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
         ProjectRemovalAuthorization, SessionDeletionAuthorization, WorkspaceDeletionAuthorization,
@@ -18,9 +19,7 @@ use sylvops_core::{
     ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
 };
 
-use crate::{
-    directory_browser::DirectoryBrowser, forms::Form, terminal::AttachedTerminal,
-};
+use crate::{directory_browser::DirectoryBrowser, forms::Form, terminal::AttachedTerminal};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FocusZone {
@@ -64,6 +63,7 @@ pub(crate) struct Palette {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SettingsFocus {
+    GitHub,
     Theme,
     Presentation,
     Density,
@@ -74,6 +74,7 @@ pub(crate) enum SettingsFocus {
 impl SettingsFocus {
     pub(crate) fn moved(self, delta: isize) -> Self {
         let choices = [
+            Self::GitHub,
             Self::Theme,
             Self::Presentation,
             Self::Density,
@@ -97,6 +98,7 @@ pub(crate) struct Settings {
     pub original_presentation: TuiSessionPresentation,
     pub original_density: TuiDensity,
     pub focus: SettingsFocus,
+    pub github_remote_index: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +183,9 @@ pub(crate) enum HitTarget {
     SettingsTheme(TuiTheme),
     SettingsPresentation(TuiSessionPresentation),
     SettingsDensity(TuiDensity),
+    SettingsGithubRemote(usize),
+    SettingsGithubClear,
+    SettingsGithubRefresh,
     SettingsApply,
     SettingsCancel,
     ModalField(usize),
@@ -230,6 +235,7 @@ impl HitMap {
 pub(crate) struct App {
     pub snapshot: DaemonSnapshot,
     pub providers: Vec<ProviderHealth>,
+    pub github_status: Option<GitHubIntegrationStatus>,
     pub mode: Mode,
     pub focus: FocusZone,
     pub main_tab: TuiContentView,
@@ -255,6 +261,7 @@ pub(crate) struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(
         snapshot: DaemonSnapshot,
         providers: Vec<ProviderHealth>,
@@ -284,6 +291,7 @@ impl App {
             },
             snapshot,
             providers,
+            github_status: None,
             focus: FocusZone::Explorer,
             main_tab: persisted.selected_content_view,
             theme: persisted.theme,
@@ -1013,6 +1021,7 @@ impl App {
             original_presentation: self.session_presentation,
             original_density: self.density,
             focus: SettingsFocus::Theme,
+            github_remote_index: 0,
         });
     }
 

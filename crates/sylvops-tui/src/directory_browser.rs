@@ -90,8 +90,7 @@ impl DirectoryBrowser {
             self.directories
                 .iter()
                 .filter(|path| {
-                    filter.is_empty()
-                        || file_name(path).to_lowercase().contains(filter.as_str())
+                    filter.is_empty() || file_name(path).to_lowercase().contains(filter.as_str())
                 })
                 .map(|path| DirectoryBrowserEntry::Navigate {
                     label: format!("{}/", file_name(path)),
@@ -158,33 +157,33 @@ impl DirectoryBrowser {
             }
             Ok(Err(error)) => self.error = Some(crate::bounded_feedback(error)),
             Err(_) => {
-                self.error = Some(format!(
-                    "Timed out while reading {}.",
-                    display_path(&path)
-                ));
+                self.error = Some(format!("Timed out while reading {}.", display_path(&path)));
             }
         }
     }
 }
 
 async fn scan_directory(path: PathBuf) -> Result<(PathBuf, Vec<PathBuf>), String> {
-    let current = fs::canonicalize(&path).await.map_err(|error| {
-        format!("Cannot open {}: {error}", display_path(&path))
-    })?;
-    let metadata = fs::metadata(&current).await.map_err(|error| {
-        format!("Cannot inspect {}: {error}", display_path(&current))
-    })?;
+    let current = fs::canonicalize(&path)
+        .await
+        .map_err(|error| format!("Cannot open {}: {error}", display_path(&path)))?;
+    let metadata = fs::metadata(&current)
+        .await
+        .map_err(|error| format!("Cannot inspect {}: {error}", display_path(&current)))?;
     if !metadata.is_dir() {
         return Err("The selected path is not a directory.".into());
     }
-    let mut entries = fs::read_dir(&current).await.map_err(|error| {
-        format!("Cannot read {}: {error}", display_path(&current))
-    })?;
+    let mut entries = fs::read_dir(&current)
+        .await
+        .map_err(|error| format!("Cannot read {}: {error}", display_path(&current)))?;
     let mut directories = Vec::new();
     let mut scanned = 0_usize;
     loop {
         let entry = entries.next_entry().await.map_err(|error| {
-            format!("Cannot continue reading {}: {error}", display_path(&current))
+            format!(
+                "Cannot continue reading {}: {error}",
+                display_path(&current)
+            )
         })?;
         let Some(entry) = entry else {
             break;
@@ -226,7 +225,7 @@ fn file_name(path: &Path) -> String {
 }
 
 fn file_name_os(path: &Path) -> &OsStr {
-    path.file_name().unwrap_or_else(|| path.as_os_str())
+    path.file_name().unwrap_or(path.as_os_str())
 }
 
 pub(crate) fn display_path(path: &Path) -> String {

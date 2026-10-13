@@ -20,6 +20,7 @@ use sylvops_core::{
         DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, WorktreeStatus,
         state_allows_deletion, state_allows_resume, state_is_active,
     },
+    github::{GitHubFailure, GitHubIntegrationStatus},
     ids::{ProjectId, ProviderProfileId, SessionId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, Frame, HelloRequest, MessageClass,
@@ -342,6 +343,7 @@ struct DaemonState {
     session_locks: Arc<RwLock<HashMap<SessionId, Arc<Mutex<()>>>>>,
     project_locks: Arc<RwLock<HashMap<ProjectId, Arc<Mutex<()>>>>>,
     worktree_locks: Arc<RwLock<HashMap<WorktreeId, Arc<Mutex<()>>>>>,
+    github: Arc<crate::github::GitHubGateway>,
     lifecycle: Arc<LifecycleCoordinator>,
     application_mutations: Arc<ApplicationMutationCoordinator>,
     scrollback_bytes: usize,
@@ -595,6 +597,7 @@ pub async fn run_with_handoff_launchers(
         session_locks: Arc::new(RwLock::new(HashMap::new())),
         project_locks: Arc::new(RwLock::new(HashMap::new())),
         worktree_locks: Arc::new(RwLock::new(HashMap::new())),
+        github: Arc::new(crate::github::GitHubGateway::discover()),
         lifecycle: LifecycleCoordinator::new(),
         application_mutations: ApplicationMutationCoordinator::new(upgrade_handoff_pending),
         scrollback_bytes: config.scrollback_capacity_bytes,
@@ -929,13 +932,25 @@ async fn serve_client(mut stream: BoxStream, state: DaemonState) -> Result<()> {
                 let request_id = frame.message_id;
                 if let Err(error) = handle_request(request, request_id, client_id, client_process_id, &state,
                     &outgoing, &connection_failed, &mut attachments).await {
-                    send_failure_queue(
-                        &outgoing,
-                        request_id,
-                        failure_code(&error),
-                        &error.to_string(),
-                        false,
-                    ).await?;
+                    match error {
+                        DaemonError::GitHub(failure) => {
+                            send_response_queue(
+                                &outgoing,
+                                request_id,
+                                &DaemonResponse::GitHubFailure(failure),
+                            )
+                            .await?;
+                        }
+                        other => {
+                            send_failure_queue(
+                                &outgoing,
+                                request_id,
+                                failure_code(&other),
+                                &other.to_string(),
+                                false,
+                            ).await?;
+                        }
+                    }
                 }
             }
             event = lifecycle.recv() => match event {
@@ -1138,6 +1153,126 @@ async fn handle_request(
             let _ = state
                 .events
                 .send(DaemonEvent::ProviderHealthChanged { health });
+            Ok(())
+        }
+        ClientRequest::GetGitHubStatus { project_id } => {
+            let (remotes, association, mut repositories) = if let Some(project_id) = project_id {
+                let project = state
+                    .database
+                    .project(project_id)
+                    .await
+                    .map_err(|_| DaemonError::GitHub(GitHubFailure::ProjectUnavailable))?;
+                let association = state
+                    .database
+                    .github_association(project_id)
+                    .await
+                    .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?;
+                let remotes = git::github_remotes(&project)
+                    .await
+                    .map_err(|_| DaemonError::GitHub(GitHubFailure::RepositoryUnavailable))?;
+                let mut repositories = association
+                    .iter()
+                    .map(|association| association.repository.clone())
+                    .collect::<Vec<_>>();
+                for remote in &remotes {
+                    if !repositories.contains(&remote.repository) {
+                        repositories.push(remote.repository.clone());
+                    }
+                }
+                (remotes, association, repositories)
+            } else {
+                let associations = state
+                    .database
+                    .github_associations()
+                    .await
+                    .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?;
+                let repositories = associations
+                    .iter()
+                    .map(|association| association.repository.clone())
+                    .collect();
+                (Vec::new(), None, repositories)
+            };
+            repositories.truncate(sylvops_core::github::MAX_GITHUB_CONNECTIONS);
+            let connections = state.github.probe(&repositories).await;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::GitHubStatus(GitHubIntegrationStatus {
+                    executable_path: state.github.executable_path(),
+                    connections,
+                    remotes,
+                    association,
+                }),
+            )
+            .await
+        }
+        ClientRequest::SetGitHubAssociation {
+            project_id,
+            remote_name,
+        } => {
+            let operation_lock = project_operation_lock(state, project_id).await;
+            let _operation_guard = operation_lock.lock().await;
+            let project = state
+                .database
+                .project(project_id)
+                .await
+                .map_err(|_| DaemonError::GitHub(GitHubFailure::ProjectUnavailable))?;
+            let remote = git::github_remotes(&project)
+                .await
+                .map_err(|_| DaemonError::GitHub(GitHubFailure::RepositoryUnavailable))?
+                .into_iter()
+                .find(|remote| remote.name == remote_name)
+                .ok_or(DaemonError::GitHub(GitHubFailure::InvalidRemote))?;
+            let (revision, association) = state
+                .database
+                .set_github_association(project_id, remote)
+                .await
+                .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?;
+            let response = DaemonResponse::GitHubAssociationUpdated {
+                revision,
+                project_id,
+                association: Some(association.clone()),
+            };
+            send_response_queue(outgoing, request_id, &response).await?;
+            let _ = state.events.send(DaemonEvent::GitHubAssociationUpdated {
+                revision,
+                project_id,
+                association: Some(association),
+            });
+            Ok(())
+        }
+        ClientRequest::ClearGitHubAssociation { project_id } => {
+            let operation_lock = project_operation_lock(state, project_id).await;
+            let _operation_guard = operation_lock.lock().await;
+            state
+                .database
+                .project(project_id)
+                .await
+                .map_err(|_| DaemonError::GitHub(GitHubFailure::ProjectUnavailable))?;
+            let existed = state
+                .database
+                .github_association(project_id)
+                .await
+                .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?
+                .is_some();
+            let (revision, association) = state
+                .database
+                .clear_github_association(project_id)
+                .await
+                .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?;
+            let response = DaemonResponse::GitHubAssociationUpdated {
+                revision,
+                project_id,
+                association: association.clone(),
+            };
+            send_response_queue(outgoing, request_id, &response).await?;
+            if existed {
+                let _ = state.events.send(DaemonEvent::GitHubAssociationUpdated {
+                    revision,
+                    project_id,
+                    association,
+                });
+            }
             Ok(())
         }
         ClientRequest::AddWorkspace { name } => {
@@ -3249,6 +3384,7 @@ fn failure_code(error: &DaemonError) -> &'static str {
         DaemonError::InvalidWorkspace(_) => "workspace_request_refused",
         DaemonError::Attachment(_) => "attachment_refused",
         DaemonError::Git(_) => "git_validation_failed",
+        DaemonError::GitHub(_) => "github_operation_failed",
         DaemonError::Provider(_) => "provider_operation_failed",
         DaemonError::Database(_) => "state_operation_failed",
         DaemonError::Upgrade(_) => "upgrade_operation_failed",

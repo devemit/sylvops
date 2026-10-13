@@ -82,6 +82,11 @@ enum Command {
         #[command(subcommand)]
         command: ProviderCommand,
     },
+    /// Inspect GitHub CLI connection health and Project association.
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
+    },
     /// Open the hierarchical mission-control interface.
     Tui,
     /// Register or select a repository and open mission control.
@@ -252,6 +257,16 @@ enum ProviderCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum GithubCommand {
+    /// Report bounded, redacted GitHub CLI connection diagnostics.
+    Status {
+        /// Include validated remotes and association for this Project.
+        #[arg(long)]
+        project: Option<ProjectId>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum UpdateCommand {
     /// Check signed release metadata without downloading anything.
     Check,
@@ -408,6 +423,9 @@ async fn run_command(
         Command::Provider { command } => match command {
             ProviderCommand::List => list_providers(&paths).await?,
             ProviderCommand::Probe { provider } => probe_provider(&paths, provider).await?,
+        },
+        Command::Github { command } => match command {
+            GithubCommand::Status { project } => show_github_status(&paths, project).await?,
         },
         Command::Tui => run_tui(&paths, state_dir.as_deref()).await?,
         Command::Open {
@@ -1033,6 +1051,54 @@ async fn probe_provider(
             Ok(())
         }
         response => unexpected("provider probe", response),
+    }
+}
+
+async fn show_github_status(
+    paths: &RuntimePaths,
+    project_id: Option<ProjectId>,
+) -> sylvops_daemon::Result<()> {
+    let client = DaemonClient::connect(paths, "sylvops-cli").await?;
+    match client
+        .request(&ClientRequest::GetGitHubStatus { project_id })
+        .await?
+    {
+        DaemonResponse::GitHubStatus(status) => {
+            println!(
+                "GitHub CLI: {}",
+                status
+                    .executable_path
+                    .as_deref()
+                    .unwrap_or("not found")
+                    .chars()
+                    .take(4_096)
+                    .collect::<String>()
+            );
+            for connection in status.connections {
+                println!("{}: {}", connection.host, connection.state.display_name());
+                println!("  diagnostic: {}", connection.diagnostic);
+            }
+            if project_id.is_some() {
+                println!("Validated remotes:");
+                if status.remotes.is_empty() {
+                    println!("  none");
+                } else {
+                    for remote in status.remotes {
+                        println!("  {remote}");
+                    }
+                }
+                match status.association {
+                    Some(association) => println!(
+                        "Association: {} ({})",
+                        association.remote_name, association.repository
+                    ),
+                    None => println!("Association: none"),
+                }
+            }
+            Ok(())
+        }
+        DaemonResponse::GitHubFailure(failure) => Err(DaemonError::GitHub(failure)),
+        response => unexpected("GitHub status", response),
     }
 }
 
@@ -1799,6 +1865,28 @@ mod tests {
                 command: ProjectCommand::Remove {
                     project_id: parsed,
                     confirm: true,
+                }
+            }) if parsed == project_id
+        ));
+    }
+
+    #[test]
+    fn cli_accepts_github_status_for_an_optional_project() {
+        let project_id = ProjectId::new();
+        let arguments = Arguments::try_parse_from([
+            "sylvops",
+            "github",
+            "status",
+            "--project",
+            &project_id.to_string(),
+        ])
+        .expect("GitHub status command");
+
+        assert!(matches!(
+            arguments.command,
+            Some(Command::Github {
+                command: GithubCommand::Status {
+                    project: Some(parsed),
                 }
             }) if parsed == project_id
         ));

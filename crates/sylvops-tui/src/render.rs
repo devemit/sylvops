@@ -1433,8 +1433,7 @@ fn draw_directory_browser(
         .margin(1)
         .split(area);
     frame.render_widget(
-        Paragraph::new(format!("Current\n{}", display_path(&browser.current)))
-            .style(theme.text),
+        Paragraph::new(format!("Current\n{}", display_path(&browser.current))).style(theme.text),
         inner[0],
     );
     let filter = if browser.filter.is_empty() {
@@ -1459,7 +1458,9 @@ fn draw_directory_browser(
             hits.push(
                 Rect::new(
                     inner[2].x,
-                    inner[2].y.saturating_add((index - offset) as u16),
+                    inner[2]
+                        .y
+                        .saturating_add(u16::try_from(index - offset).unwrap_or(u16::MAX)),
                     inner[2].width,
                     1,
                 ),
@@ -1468,7 +1469,11 @@ fn draw_directory_browser(
             Line::from(Span::styled(
                 format!(
                     "{} {}",
-                    if index == browser.selected { "›" } else { " " },
+                    if index == browser.selected {
+                        "›"
+                    } else {
+                        " "
+                    },
                     entry.label()
                 ),
                 if index == browser.selected {
@@ -1571,15 +1576,7 @@ fn draw_settings(
     settings: crate::app::Settings,
     theme: Theme,
 ) {
-    let area = centered(
-        frame.area(),
-        82,
-        if app.density == TuiDensity::Comfortable {
-            82
-        } else {
-            68
-        },
-    );
+    let area = centered(frame.area(), 92, 94);
     frame.render_widget(Clear, area);
     let inner = area.inner(ratatui::layout::Margin {
         horizontal: 2,
@@ -1587,6 +1584,84 @@ fn draw_settings(
     });
     let mut row = inner.y;
     let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        if settings.focus == SettingsFocus::GitHub {
+            "› GitHub integration"
+        } else {
+            "  GitHub integration"
+        },
+        Modifier::BOLD,
+    )));
+    row = row.saturating_add(1);
+    if let Some(status) = &app.github_status {
+        for connection in &status.connections {
+            lines.push(Line::from(format!(
+                "  {} · {}",
+                connection.host,
+                connection.state.display_name()
+            )));
+            row = row.saturating_add(1);
+        }
+        if app.selected_project_id.is_some() {
+            if status.remotes.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  No validated GitHub remotes in this Project.",
+                    theme.muted,
+                )));
+                row = row.saturating_add(1);
+            }
+            for (index, remote) in status.remotes.iter().enumerate() {
+                let associated = status.association.as_ref().is_some_and(|association| {
+                    association.remote_name == remote.name
+                        && association.repository == remote.repository
+                });
+                let selected = settings.github_remote_index == index;
+                let label = format!(
+                    "  {} {} {}",
+                    if selected { "›" } else { " " },
+                    if associated { "●" } else { "○" },
+                    remote
+                );
+                lines.push(Line::from(Span::styled(
+                    label.chars().take(76).collect::<String>(),
+                    if associated {
+                        theme.selected
+                    } else {
+                        theme.text
+                    },
+                )));
+                app.hit_map.push(
+                    Rect::new(inner.x, row, inner.width, 1),
+                    HitTarget::SettingsGithubRemote(index),
+                );
+                row = row.saturating_add(1);
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  Select a Project to choose its GitHub remote.",
+                theme.muted,
+            )));
+            row = row.saturating_add(1);
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  GitHub status has not been checked.",
+            theme.muted,
+        )));
+        row = row.saturating_add(1);
+    }
+    lines.push(Line::from("  [r Refresh]  [c Clear association]"));
+    app.hit_map.push(
+        Rect::new(inner.x.saturating_add(2), row, 11, 1),
+        HitTarget::SettingsGithubRefresh,
+    );
+    app.hit_map.push(
+        Rect::new(inner.x.saturating_add(15), row, 21, 1),
+        HitTarget::SettingsGithubClear,
+    );
+    row = row.saturating_add(1);
+    lines.push(Line::from(""));
+    row = row.saturating_add(1);
     lines.push(Line::from(Span::styled(
         if settings.focus == SettingsFocus::Theme {
             "› Theme"
@@ -1694,7 +1769,7 @@ fn draw_settings(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(" Settings · ←/→ preview · ↑/↓ navigate ")
+                    .title(" Settings · ↑/↓ section · ←/→ choice · Enter connect/apply ")
                     .borders(Borders::ALL)
                     .border_style(theme.border),
             )
