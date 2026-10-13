@@ -5,7 +5,7 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{ProviderKind, Session, Worktree},
+    domain::{ProviderKind, Session, Worktree, WorktreeStatus, state_is_active},
     ids::{ProjectId, WorktreeId},
 };
 
@@ -1033,6 +1033,67 @@ pub struct WorkSource {
     pub created_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueWorkStatus {
+    NotStarted,
+    WorktreeReady,
+    SessionActive,
+    SessionStopped,
+}
+
+impl IssueWorkStatus {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::NotStarted => "Not started",
+            Self::WorktreeReady => "Worktree ready",
+            Self::SessionActive => "Session active",
+            Self::SessionStopped => "Session stopped",
+        }
+    }
+}
+
+#[must_use]
+pub fn issue_work_status(
+    item: &GitHubItemIdentity,
+    sources: &[WorkSource],
+    worktrees: &[Worktree],
+    sessions: &[Session],
+) -> IssueWorkStatus {
+    let mut has_ready_worktree = false;
+    let mut has_stopped_session = false;
+    for source in sources.iter().filter(|source| &source.item == item) {
+        let Some(worktree) = worktrees.iter().find(|worktree| {
+            worktree.id == source.worktree_id && worktree.status == WorktreeStatus::Active
+        }) else {
+            continue;
+        };
+        let mut has_started_session = false;
+        for session in sessions
+            .iter()
+            .filter(|session| session.worktree_id == worktree.id)
+        {
+            if state_is_active(session.state) {
+                return IssueWorkStatus::SessionActive;
+            }
+            has_started_session |= session.started_at.is_some();
+        }
+        if has_started_session {
+            has_stopped_session = true;
+        } else {
+            has_ready_worktree = true;
+        }
+    }
+    if has_ready_worktree {
+        IssueWorkStatus::WorktreeReady
+    } else if has_stopped_session {
+        IssueWorkStatus::SessionStopped
+    } else {
+        IssueWorkStatus::NotStarted
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StartWorkPreparation {
     pub issue: StartWorkIssueContext,
@@ -1061,12 +1122,14 @@ impl StartWorkPreparation {
 #[serde(rename_all = "snake_case")]
 pub enum StartWorkFailureKind {
     ProjectUnavailable,
+    WorktreeUnavailable,
     AssociationChanged,
     IssueChanged,
     IssueUnavailable,
     BaseMoved,
     BranchConflict,
     ExistingWork,
+    CapacityReached,
     UnsupportedProvider,
     InvalidRequest,
     ProviderLaunchFailed,
@@ -1668,6 +1731,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        domain::{SessionState, WorktreeStatus},
+        ids::SessionId,
+    };
 
     #[test]
     fn parses_https_and_ssh_github_remotes_into_the_same_identity() {
@@ -1877,5 +1944,104 @@ mod tests {
         assert_eq!(prompt.matches("</additional_instructions>").count(), 1);
         assert!(prompt.contains("\\u003c/additional_instructions\\u003e"));
         assert!(!prompt.to_ascii_lowercase().contains("comment"));
+    }
+
+    #[test]
+    fn issue_work_status_is_derived_from_authoritative_local_state() {
+        let project_id = ProjectId::new();
+        let worktree_id = WorktreeId::new();
+        let repository = GitHubRepositoryIdentity::new(
+            GitHubHost::new("github.example.com").unwrap(),
+            GitHubOwner::new("acme").unwrap(),
+            GitHubRepositoryName::new("widgets").unwrap(),
+        );
+        let item = GitHubItemIdentity::new(
+            repository,
+            GitHubItemKind::Issue,
+            GitHubItemNumber::new(128).unwrap(),
+        );
+        let source = WorkSource {
+            worktree_id,
+            project_id,
+            canonical_url: item.browser_target(),
+            item: item.clone(),
+            created_at: 1,
+        };
+        let worktree = Worktree {
+            id: worktree_id,
+            project_id,
+            name: "Issue #128".into(),
+            path: "/managed/128".into(),
+            canonical_path: "/managed/128".into(),
+            branch: Some("issue/128-recover-work".into()),
+            base_ref: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Active,
+            created_at: 1,
+            last_activity_at: 1,
+            removed_at: None,
+        };
+        let session = Session {
+            id: SessionId::new(),
+            worktree_id,
+            provider_profile_id: None,
+            provider_kind: ProviderKind::Codex,
+            display_name: "Issue #128".into(),
+            state: SessionState::Running,
+            process_id: None,
+            external_session_id: None,
+            command: "codex".into(),
+            arguments_json: "[]".into(),
+            cwd: "/managed/128".into(),
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+            last_activity_at: 1,
+            last_seen_output_sequence: 0,
+            exit_code: None,
+            failure_reason: None,
+        };
+
+        assert_eq!(
+            issue_work_status(&item, &[], &[], &[]),
+            IssueWorkStatus::NotStarted
+        );
+        assert_eq!(
+            issue_work_status(
+                &item,
+                std::slice::from_ref(&source),
+                std::slice::from_ref(&worktree),
+                &[]
+            ),
+            IssueWorkStatus::WorktreeReady
+        );
+        assert_eq!(
+            issue_work_status(
+                &item,
+                std::slice::from_ref(&source),
+                std::slice::from_ref(&worktree),
+                std::slice::from_ref(&session),
+            ),
+            IssueWorkStatus::SessionActive
+        );
+        let mut never_started = session.clone();
+        never_started.state = SessionState::Failed;
+        never_started.started_at = None;
+        assert_eq!(
+            issue_work_status(
+                &item,
+                std::slice::from_ref(&source),
+                std::slice::from_ref(&worktree),
+                &[never_started],
+            ),
+            IssueWorkStatus::WorktreeReady
+        );
+        let mut stopped = session;
+        stopped.state = SessionState::FinishedSeen;
+        assert_eq!(
+            issue_work_status(&item, &[source], &[worktree], &[stopped]),
+            IssueWorkStatus::SessionStopped
+        );
     }
 }

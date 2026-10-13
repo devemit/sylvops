@@ -5,8 +5,8 @@ use std::{ffi::OsString, path::Path, process::Command, time::Duration};
 use sylvops_core::{
     domain::ProviderKind,
     github::{
-        GitHubItemNumber, GitRemoteName, StartWorkFailureKind, StartWorkInstructions,
-        StartWorkOutcome,
+        GitHubItemNumber, GitRemoteName, StartWorkBranch, StartWorkFailureKind,
+        StartWorkInstructions, StartWorkOutcome,
     },
     protocol::{ClientRequest, DaemonResponse},
 };
@@ -34,6 +34,15 @@ async fn scenario() {
             "git@enterprise.example.com:allowed/repository.git",
         ],
     );
+    git(
+        repository.path(),
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@enterprise.example.com:different/repository.git",
+        ],
+    );
     let _gh = EnvironmentGuard::set(
         "SYLVOPS_GH_CLI_PATH",
         OsString::from(env!("CARGO_BIN_EXE_fake-gh")),
@@ -45,7 +54,8 @@ async fn scenario() {
     });
     std::fs::copy(env!("CARGO_BIN_EXE_fake-codex"), &codex_path).unwrap();
     let _codex = EnvironmentGuard::set("CODEX_CLI_PATH", codex_path.clone().into_os_string());
-    let _codex_home = EnvironmentGuard::set("CODEX_HOME", repository.root().join("codex-home"));
+    let codex_home = repository.root().join("codex-home");
+    let _codex_home = EnvironmentGuard::set("CODEX_HOME", codex_home.clone());
     let paths = RuntimePaths::discover(Some(&repository.root().join("state"))).unwrap();
     let mut daemon_task = AbortOnDropTask::spawn(daemon::run(paths.clone()));
     let client = connect_eventually(&paths).await;
@@ -76,6 +86,7 @@ async fn scenario() {
             .request(&ClientRequest::SetGitHubAssociation {
                 project_id,
                 remote_name: GitRemoteName::new("origin").unwrap(),
+                authorization_token: None,
             })
             .await
             .unwrap(),
@@ -95,6 +106,21 @@ async fn scenario() {
     );
     assert!(!preparation.suggested_branch_conflict);
     assert!(preparation.existing_work.is_empty());
+
+    let missing_retry = client
+        .request(&ClientRequest::RetryStartWorkSession {
+            worktree_id: sylvops_core::ids::WorktreeId::new(),
+            provider: ProviderKind::Codex,
+            columns: 100,
+            rows: 30,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        missing_retry,
+        DaemonResponse::StartWorkFailure(ref failure)
+            if failure.kind == StartWorkFailureKind::WorktreeUnavailable
+    ));
 
     git(
         repository.path(),
@@ -191,20 +217,237 @@ async fn scenario() {
         })
         .await
         .unwrap();
-    let (worktree_id, session_id, expected_source) = match outcome {
+    let (expected_worktree, session_id, expected_source) = match outcome {
         DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
             worktree,
             source,
             session,
             ..
-        }) => (worktree.id, session.id, source),
+        }) => (worktree, session.id, source),
         response => panic!("unexpected Start Work response: {response:?}"),
     };
+    let worktree_id = expected_worktree.id;
     assert!(
         git_branch_exists(repository.path(), branch.as_str())
             .await
             .unwrap()
     );
+    assert_eq!(
+        client
+            .request(&ClientRequest::GetWorkSource { worktree_id })
+            .await
+            .unwrap(),
+        DaemonResponse::WorkSource(Some(expected_source.clone()))
+    );
+    let snapshot = match client.request(&ClientRequest::GetSnapshot).await.unwrap() {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => panic!("unexpected snapshot response: {response:?}"),
+    };
+    assert_eq!(snapshot.work_sources, vec![expected_source.clone()]);
+    let parallel_preparation = prepare(&client, project_id).await;
+    assert_eq!(
+        parallel_preparation.existing_work,
+        vec![expected_source.clone()]
+    );
+    let parallel_branch = StartWorkBranch::new("issue/42-explicit-parallel").unwrap();
+    let duplicate = client
+        .request(&ClientRequest::StartWork {
+            confirmation: parallel_preparation.confirmation(project_id),
+            branch: parallel_branch.clone(),
+            provider: ProviderKind::Codex,
+            additional_instructions: None,
+            start_another_worktree: false,
+            columns: 100,
+            rows: 30,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        duplicate,
+        DaemonResponse::StartWorkFailure(ref failure)
+            if failure.kind == StartWorkFailureKind::ExistingWork
+    ));
+    let parallel = client
+        .request(&ClientRequest::StartWork {
+            confirmation: parallel_preparation.confirmation(project_id),
+            branch: parallel_branch,
+            provider: ProviderKind::Codex,
+            additional_instructions: None,
+            start_another_worktree: true,
+            columns: 100,
+            rows: 30,
+        })
+        .await
+        .unwrap();
+    let (parallel_worktree_id, parallel_session_id) = match parallel {
+        DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
+            worktree,
+            source,
+            session,
+            ..
+        }) => {
+            assert_ne!(worktree.id, worktree_id);
+            assert_eq!(source.item, expected_source.item);
+            (worktree.id, session.id)
+        }
+        response => panic!("unexpected parallel Start Work response: {response:?}"),
+    };
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: parallel_session_id,
+        })
+        .await
+        .unwrap();
+    let partial_preparation = prepare(&client, project_id).await;
+    let partial_branch = StartWorkBranch::new("issue/42-partial-recovery").unwrap();
+    std::fs::write(
+        codex_home.join(".fake-codex-invalidate-home"),
+        b"invalidate",
+    )
+    .unwrap();
+    let partial = client
+        .request(&ClientRequest::StartWork {
+            confirmation: partial_preparation.confirmation(project_id),
+            branch: partial_branch.clone(),
+            provider: ProviderKind::Codex,
+            additional_instructions: None,
+            start_another_worktree: true,
+            columns: 100,
+            rows: 30,
+        })
+        .await
+        .unwrap();
+    let (partial_worktree, partial_source) = match partial {
+        DaemonResponse::StartWorkCompleted(StartWorkOutcome::WorktreeCreated {
+            worktree,
+            source,
+            failure,
+            ..
+        }) => {
+            assert_eq!(failure.kind, StartWorkFailureKind::ProviderLaunchFailed);
+            assert_eq!(worktree.branch.as_deref(), Some(partial_branch.as_str()));
+            (worktree, source)
+        }
+        response => panic!("unexpected partial Start Work response: {response:?}"),
+    };
+    assert!(
+        git_branch_exists(repository.path(), partial_branch.as_str())
+            .await
+            .unwrap()
+    );
+    std::fs::write(
+        Path::new(&partial_worktree.canonical_path).join("dirty.txt"),
+        b"preserve me",
+    )
+    .unwrap();
+    let dirty = client
+        .request(&ClientRequest::GetWorktreeStatus {
+            worktree_id: partial_worktree.id,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        dirty,
+        DaemonResponse::WorktreeStatus(ref checkout)
+            if !checkout.clean && checkout.removal_confirmation_token.is_none()
+    ));
+    let snapshot = match client.request(&ClientRequest::GetSnapshot).await.unwrap() {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => panic!("unexpected snapshot response: {response:?}"),
+    };
+    assert!(
+        snapshot
+            .work_sources
+            .iter()
+            .any(|source| source.worktree_id == worktree_id)
+    );
+    assert!(
+        snapshot
+            .work_sources
+            .iter()
+            .any(|source| source.worktree_id == parallel_worktree_id)
+    );
+    assert!(
+        snapshot
+            .work_sources
+            .iter()
+            .any(|source| source.worktree_id == partial_worktree.id)
+    );
+    let changed_remote = GitRemoteName::new("upstream").unwrap();
+    let association_change = match client
+        .request(&ClientRequest::SetGitHubAssociation {
+            project_id,
+            remote_name: changed_remote.clone(),
+            authorization_token: None,
+        })
+        .await
+        .unwrap()
+    {
+        DaemonResponse::GitHubAssociationChangeRequiresConfirmation(inspection) => inspection,
+        response => panic!("unexpected association confirmation response: {response:?}"),
+    };
+    assert_eq!(
+        association_change.remote_name.as_ref(),
+        Some(&changed_remote)
+    );
+    assert_eq!(association_change.work_source_count, 3);
+    let association_change = match client
+        .request(&ClientRequest::SetGitHubAssociation {
+            project_id,
+            remote_name: changed_remote.clone(),
+            authorization_token: Some(
+                sylvops_core::protocol::GitHubAssociationChangeAuthorization::try_from(
+                    "b".repeat(64),
+                )
+                .unwrap(),
+            ),
+        })
+        .await
+        .unwrap()
+    {
+        DaemonResponse::GitHubAssociationChangeRequiresConfirmation(inspection) => inspection,
+        response => panic!("unexpected forged authorization response: {response:?}"),
+    };
+    assert!(matches!(
+        client
+            .request(&ClientRequest::SetGitHubAssociation {
+                project_id,
+                remote_name: changed_remote,
+                authorization_token: Some(association_change.authorization_token),
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::GitHubAssociationUpdated {
+            association: Some(_),
+            ..
+        }
+    ));
+    let association_clear = match client
+        .request(&ClientRequest::ClearGitHubAssociation {
+            project_id,
+            authorization_token: None,
+        })
+        .await
+        .unwrap()
+    {
+        DaemonResponse::GitHubAssociationChangeRequiresConfirmation(inspection) => inspection,
+        response => panic!("unexpected association confirmation response: {response:?}"),
+    };
+    assert_eq!(association_clear.project_id, project_id);
+    assert_eq!(association_clear.work_source_count, 3);
+    assert!(matches!(
+        client
+            .request(&ClientRequest::ClearGitHubAssociation {
+                project_id,
+                authorization_token: Some(association_clear.authorization_token),
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::GitHubAssociationUpdated {
+            association: None,
+            ..
+        }
+    ));
     assert_eq!(
         client
             .request(&ClientRequest::GetWorkSource { worktree_id })
@@ -243,11 +486,69 @@ async fn scenario() {
     let client = connect_eventually(&paths).await;
     assert_eq!(
         client
-            .request(&ClientRequest::GetWorkSource { worktree_id })
+            .request(&ClientRequest::GetWorkSource {
+                worktree_id: partial_worktree.id,
+            })
             .await
             .unwrap(),
-        DaemonResponse::WorkSource(Some(expected_source))
+        DaemonResponse::WorkSource(Some(partial_source.clone()))
     );
+    git(
+        Path::new(&partial_worktree.canonical_path),
+        &["switch", "--detach"],
+    );
+    let changed_identity = client
+        .request(&ClientRequest::RetryStartWorkSession {
+            worktree_id: partial_worktree.id,
+            provider: ProviderKind::Codex,
+            columns: 100,
+            rows: 30,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        changed_identity,
+        DaemonResponse::StartWorkFailure(ref failure)
+            if failure.kind == StartWorkFailureKind::WorktreeUnavailable
+    ));
+    git(
+        Path::new(&partial_worktree.canonical_path),
+        &["switch", partial_branch.as_str()],
+    );
+    let retried = client
+        .request(&ClientRequest::RetryStartWorkSession {
+            worktree_id: partial_worktree.id,
+            provider: ProviderKind::Codex,
+            columns: 100,
+            rows: 30,
+        })
+        .await
+        .unwrap();
+    let retried_session_id = match retried {
+        DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
+            worktree,
+            source,
+            session,
+            ..
+        }) => {
+            assert_eq!(worktree.id, partial_worktree.id);
+            assert_eq!(worktree.project_id, partial_worktree.project_id);
+            assert_eq!(worktree.canonical_path, partial_worktree.canonical_path);
+            assert_eq!(worktree.branch, partial_worktree.branch);
+            assert_eq!(worktree.base_ref, partial_worktree.base_ref);
+            assert_eq!(worktree.base_commit, partial_worktree.base_commit);
+            assert_eq!(source, partial_source);
+            assert_ne!(session.id, session_id);
+            session.id
+        }
+        response => panic!("unexpected Retry Session response: {response:?}"),
+    };
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: retried_session_id,
+        })
+        .await
+        .unwrap();
     client
         .request(&ClientRequest::ShutdownDaemon)
         .await

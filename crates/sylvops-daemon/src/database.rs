@@ -14,8 +14,8 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sylvops_core::domain::{
-    DaemonSnapshot, Project, ProviderProfile, Session, SessionState, Workspace, Worktree,
-    WorktreeStatus, state_allows_deletion,
+    DaemonSnapshot, MAX_SNAPSHOT_WORK_SOURCES, Project, ProviderProfile, Session, SessionState,
+    Workspace, Worktree, WorktreeStatus, state_allows_deletion,
 };
 use sylvops_core::github::{
     GitHubAssociation, GitHubBrowserTarget, GitHubHost, GitHubItemIdentity, GitHubItemKind,
@@ -160,6 +160,13 @@ enum DatabaseCommand {
     GetWorkSource {
         id: WorktreeId,
         reply: oneshot::Sender<Result<Option<WorkSource>>>,
+    },
+    GetProjectWorkSourceCount {
+        id: ProjectId,
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    GetActiveWorkSourceCount {
+        reply: oneshot::Sender<Result<u64>>,
     },
     GetIssueWorkSources {
         project_id: ProjectId,
@@ -696,6 +703,30 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Counts every historical Work Source for one Project without loading its unbounded rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, cancellation, query, or persisted-value validation error.
+    pub async fn project_work_source_count(&self, id: ProjectId) -> Result<u64> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::GetProjectWorkSourceCount { id, reply }
+        })
+        .await
+    }
+
+    /// Counts every active Work Source without loading its row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, cancellation, query, or persisted-value validation error.
+    pub async fn active_work_source_count(&self) -> Result<u64> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::GetActiveWorkSourceCount { reply }
+        })
+        .await
+    }
+
     /// Loads the bounded local Worktrees sourced from one Issue identity.
     ///
     /// # Errors
@@ -1161,6 +1192,12 @@ fn database_thread(
             }
             DatabaseCommand::GetWorkSource { id, reply } => {
                 let _ = reply.send(load_work_source(&connection, id));
+            }
+            DatabaseCommand::GetProjectWorkSourceCount { id, reply } => {
+                let _ = reply.send(load_project_work_source_count(&connection, id));
+            }
+            DatabaseCommand::GetActiveWorkSourceCount { reply } => {
+                let _ = reply.send(load_active_work_source_count(&connection));
             }
             DatabaseCommand::GetIssueWorkSources {
                 project_id,
@@ -1732,6 +1769,58 @@ fn load_work_source(connection: &Connection, id: WorktreeId) -> Result<Option<Wo
         )
         .optional()
         .map_err(database_error)
+}
+
+fn load_project_work_source_count(connection: &Connection, id: ProjectId) -> Result<u64> {
+    let count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM work_sources WHERE project_id = ?1",
+            [id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(database_error)?;
+    u64::try_from(count).map_err(|_| DaemonError::Database("Work Source count is invalid".into()))
+}
+
+fn load_active_work_source_count(connection: &Connection) -> Result<u64> {
+    let count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM work_sources \
+             JOIN worktrees ON worktrees.id = work_sources.worktree_id \
+             WHERE worktrees.status <> 'removed'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(database_error)?;
+    u64::try_from(count)
+        .map_err(|_| DaemonError::Database("active Work Source count is invalid".into()))
+}
+
+fn load_snapshot_work_sources(connection: &Connection) -> Result<Vec<WorkSource>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT work_sources.worktree_id, work_sources.project_id, host, owner, repository, \
+                    item_kind, item_number, canonical_url, work_sources.created_at \
+             FROM work_sources JOIN worktrees ON worktrees.id = work_sources.worktree_id \
+             WHERE worktrees.status <> 'removed' \
+             ORDER BY work_sources.created_at DESC, work_sources.worktree_id LIMIT ?1",
+        )
+        .map_err(database_error)?;
+    let mut sources = statement
+        .query_map(
+            [i64::try_from(MAX_SNAPSHOT_WORK_SOURCES.saturating_add(1)).unwrap_or(i64::MAX)],
+            work_source_from_row,
+        )
+        .map_err(database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(database_error)?;
+    if sources.len() > MAX_SNAPSHOT_WORK_SOURCES {
+        return Err(DaemonError::Database(
+            "active Work Sources exceed snapshot capacity".into(),
+        ));
+    }
+    sources.shrink_to_fit();
+    Ok(sources)
 }
 
 fn load_issue_work_sources(
@@ -2846,6 +2935,7 @@ fn load_snapshot(connection: &Connection, revision: u64) -> Result<DaemonSnapsho
                     failure_reason FROM sessions ORDER BY last_activity_at DESC",
             session_from_row,
         )?,
+        work_sources: load_snapshot_work_sources(connection)?,
         provider_profiles: query_all(
             connection,
             "SELECT id, kind, display_name, executable_path, default_model, default_effort, \

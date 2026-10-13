@@ -426,6 +426,40 @@ pub async fn inspect_worktree(worktree: &Worktree) -> Result<GitWorktreeState> {
     })
 }
 
+/// Revalidates that a managed Worktree still belongs to its Project and remains on its recorded
+/// branch without changing either checkout.
+///
+/// # Errors
+///
+/// Returns an error if either checkout identity changed, the Worktree is no longer registered,
+/// or its current branch differs from the persisted branch.
+pub async fn verify_managed_worktree_identity(
+    project: &Project,
+    worktree: &Worktree,
+) -> Result<()> {
+    if worktree.project_id != project.id
+        || worktree.is_root_checkout
+        || worktree.status != WorktreeStatus::Active
+    {
+        return Err(DaemonError::Git(
+            "managed worktree identity is invalid".into(),
+        ));
+    }
+    let repository = canonical_registered_path(&project.canonical_repository_path).await?;
+    let checkout = canonical_registered_path(&worktree.canonical_path).await?;
+    verify_repository_root(&repository).await?;
+    verify_repository_root(&checkout).await?;
+    verify_common_repository(&repository, &checkout).await?;
+    ensure_worktree_registered(&repository, &checkout).await?;
+    let branch = optional_git(&checkout, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
+    if branch != worktree.branch {
+        return Err(DaemonError::Git(
+            "managed worktree branch identity changed".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Returns a bounded, no-color unified diff for an active verified worktree.
 ///
 /// # Errors

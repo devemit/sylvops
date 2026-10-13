@@ -7,7 +7,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,19 +17,22 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use sylvops_core::{
     domain::{
-        DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, Worktree,
-        WorktreeStatus, state_allows_deletion, state_allows_resume, state_is_active,
+        DaemonHealth, MAX_SNAPSHOT_WORK_SOURCES, ProviderKind, ProviderProfile, Session,
+        SessionState, Worktree, WorktreeStatus, state_allows_deletion, state_allows_resume,
+        state_is_active,
     },
     github::{
-        GitHubFailure, GitHubIntegrationStatus, GitHubItemKind, GitHubItemNumber, GitHubPageSize,
-        GitHubRepositoryIdentity, GitHubViewQuery, StartWorkBase, StartWorkFailure,
-        StartWorkFailureKind, StartWorkIssueContext, StartWorkOutcome, StartWorkPreparation,
-        build_task_bootstrap_prompt, issue_branch_suggestion,
+        GitHubAssociation, GitHubFailure, GitHubIntegrationStatus, GitHubItemKind,
+        GitHubItemNumber, GitHubPageSize, GitHubRemote, GitHubRepositoryIdentity, GitHubViewQuery,
+        StartWorkBase, StartWorkFailure, StartWorkFailureKind, StartWorkIssueContext,
+        StartWorkOutcome, StartWorkPreparation, build_task_bootstrap_prompt,
+        issue_branch_suggestion,
     },
     ids::{ProjectId, ProviderProfileId, SessionId, WorktreeId},
     protocol::{
-        ClientRequest, DaemonEvent, DaemonResponse, Frame, HelloRequest, MessageClass,
-        PROTOCOL_MAJOR, PROTOCOL_MINOR, ProjectRemovalAuthorization, ProjectRemovalInspection,
+        ClientRequest, DaemonEvent, DaemonResponse, Frame, GitHubAssociationChangeAuthorization,
+        GitHubAssociationChangeInspection, HelloRequest, MessageClass, PROTOCOL_MAJOR,
+        PROTOCOL_MINOR, ProjectRemovalAuthorization, ProjectRemovalInspection,
         ProjectRemovalRefusal, ProtocolFailure, SessionDeletionAuthorization,
         SessionDeletionInspection, SessionDeletionRefusal, WelcomeResponse,
         WorkspaceDeletionAuthorization, WorkspaceDeletionInspection, WorkspaceDeletionRefusal,
@@ -348,6 +351,8 @@ struct DaemonState {
     session_locks: Arc<RwLock<HashMap<SessionId, Arc<Mutex<()>>>>>,
     project_locks: Arc<RwLock<HashMap<ProjectId, Arc<Mutex<()>>>>>,
     worktree_locks: Arc<RwLock<HashMap<WorktreeId, Arc<Mutex<()>>>>>,
+    work_source_capacity: Arc<Semaphore>,
+    work_source_capacity_excess: Arc<AtomicUsize>,
     github: Arc<crate::github::GitHubGateway>,
     lifecycle: Arc<LifecycleCoordinator>,
     application_mutations: Arc<ApplicationMutationCoordinator>,
@@ -575,6 +580,12 @@ pub async fn run_with_handoff_launchers(
     let database = DatabaseHandle::open(&paths.database)?;
     let reconciled = database.reconcile_after_restart().await?;
     let worktree_reconciliation = reconcile_worktrees(&database).await?;
+    let active_work_source_count = database.active_work_source_count().await?;
+    let available_work_source_capacity = MAX_SNAPSHOT_WORK_SOURCES
+        .saturating_sub(usize::try_from(active_work_source_count).unwrap_or(usize::MAX));
+    let work_source_capacity_excess = usize::try_from(active_work_source_count)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(MAX_SNAPSHOT_WORK_SOURCES);
     database
         .audit(
             "daemon_started",
@@ -602,6 +613,8 @@ pub async fn run_with_handoff_launchers(
         session_locks: Arc::new(RwLock::new(HashMap::new())),
         project_locks: Arc::new(RwLock::new(HashMap::new())),
         worktree_locks: Arc::new(RwLock::new(HashMap::new())),
+        work_source_capacity: Arc::new(Semaphore::new(available_work_source_capacity)),
+        work_source_capacity_excess: Arc::new(AtomicUsize::new(work_source_capacity_excess)),
         github: Arc::new(crate::github::GitHubGateway::discover()),
         lifecycle: LifecycleCoordinator::new(),
         application_mutations: ApplicationMutationCoordinator::new(upgrade_handoff_pending),
@@ -1214,6 +1227,7 @@ async fn handle_request(
         ClientRequest::SetGitHubAssociation {
             project_id,
             remote_name,
+            authorization_token,
         } => {
             let operation_lock = project_operation_lock(state, project_id).await;
             let _operation_guard = operation_lock.lock().await;
@@ -1228,6 +1242,34 @@ async fn handle_request(
                 .into_iter()
                 .find(|remote| remote.name == remote_name)
                 .ok_or(DaemonError::GitHub(GitHubFailure::InvalidRemote))?;
+            let current = state
+                .database
+                .github_association(project_id)
+                .await
+                .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?;
+            let association_changes = current.as_ref().is_none_or(|association| {
+                association.remote_name != remote.name
+                    || association.repository != remote.repository
+            });
+            let work_source_count = state.database.project_work_source_count(project_id).await?;
+            if association_changes
+                && work_source_count > 0
+                && let Err(inspection) = authorize_github_association_change(
+                    &state.authentication_token,
+                    project_id,
+                    current.as_ref(),
+                    Some(&remote),
+                    work_source_count,
+                    authorization_token.as_ref(),
+                )
+            {
+                return send_response_queue(
+                    outgoing,
+                    request_id,
+                    &DaemonResponse::GitHubAssociationChangeRequiresConfirmation(inspection),
+                )
+                .await;
+            }
             let (revision, association) = state
                 .database
                 .set_github_association(project_id, remote)
@@ -1246,7 +1288,10 @@ async fn handle_request(
             });
             Ok(())
         }
-        ClientRequest::ClearGitHubAssociation { project_id } => {
+        ClientRequest::ClearGitHubAssociation {
+            project_id,
+            authorization_token,
+        } => {
             let operation_lock = project_operation_lock(state, project_id).await;
             let _operation_guard = operation_lock.lock().await;
             state
@@ -1254,12 +1299,31 @@ async fn handle_request(
                 .project(project_id)
                 .await
                 .map_err(|_| DaemonError::GitHub(GitHubFailure::ProjectUnavailable))?;
-            let existed = state
+            let current = state
                 .database
                 .github_association(project_id)
                 .await
-                .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?
-                .is_some();
+                .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?;
+            let existed = current.is_some();
+            let work_source_count = state.database.project_work_source_count(project_id).await?;
+            if existed
+                && work_source_count > 0
+                && let Err(inspection) = authorize_github_association_change(
+                    &state.authentication_token,
+                    project_id,
+                    current.as_ref(),
+                    None,
+                    work_source_count,
+                    authorization_token.as_ref(),
+                )
+            {
+                return send_response_queue(
+                    outgoing,
+                    request_id,
+                    &DaemonResponse::GitHubAssociationChangeRequiresConfirmation(inspection),
+                )
+                .await;
+            }
             let (revision, association) = state
                 .database
                 .clear_github_association(project_id)
@@ -1698,6 +1762,16 @@ async fn handle_request(
                 )
                 .await;
             }
+            let Ok(work_source_capacity) = state.work_source_capacity.clone().try_acquire_owned()
+            else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::CapacityReached,
+                    "SylvOps reached the active Work Source capacity. Remove a clean inactive checkout before starting another.",
+                )
+                .await;
+            };
             let mut record = match git::create_managed_worktree(
                 &project,
                 &state.managed_worktree_root,
@@ -1749,6 +1823,7 @@ async fn handle_request(
                 revision: worktree_revision,
                 worktree: worktree.clone(),
             });
+            work_source_capacity.forget();
             let prompt = build_task_bootstrap_prompt(&issue, additional_instructions.as_ref());
             let launch = launch_new_session(
                 state,
@@ -1792,6 +1867,235 @@ async fn handle_request(
                 &DaemonResponse::StartWorkCompleted(outcome),
             )
             .await
+        }
+        ClientRequest::RetryStartWorkSession {
+            worktree_id,
+            provider,
+            columns,
+            rows,
+        } => {
+            validate_terminal_size(columns, rows).map_err(DaemonError::InvalidSession)?;
+            let _lifecycle_activity = state.lifecycle.begin()?;
+            if *state.shutdown.borrow() {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::InvalidRequest,
+                    "The daemon is quiescing for application replacement.",
+                )
+                .await;
+            }
+            let Ok(recorded_worktree) = state.database.worktree(worktree_id).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::WorktreeUnavailable,
+                    "The preserved Worktree is no longer available.",
+                )
+                .await;
+            };
+            if recorded_worktree.is_root_checkout {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::WorktreeUnavailable,
+                    "Retry Session requires a preserved managed Worktree.",
+                )
+                .await;
+            }
+            let operation_lock = project_operation_lock(state, recorded_worktree.project_id).await;
+            let _operation_guard = operation_lock.lock().await;
+            let Ok(project) = state.database.project(recorded_worktree.project_id).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::ProjectUnavailable,
+                    "The preserved Worktree's Project is no longer available.",
+                )
+                .await;
+            };
+            let worktree = match verified_worktree(state, worktree_id).await {
+                Ok(worktree) if worktree == recorded_worktree => worktree,
+                _ => {
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::WorktreeUnavailable,
+                        "The preserved Worktree identity could not be revalidated.",
+                    )
+                    .await;
+                }
+            };
+            if git::verify_managed_worktree_identity(&project, &worktree)
+                .await
+                .is_err()
+            {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::WorktreeUnavailable,
+                    "The preserved Worktree no longer matches its registered Project and branch.",
+                )
+                .await;
+            }
+            let source = match state.database.work_source(worktree_id).await? {
+                Some(source) if source.project_id == worktree.project_id => source,
+                _ => {
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::WorktreeUnavailable,
+                        "The preserved Worktree no longer has a valid Work Source.",
+                    )
+                    .await;
+                }
+            };
+            if state
+                .database
+                .worktree_has_live_sessions(worktree_id)
+                .await?
+            {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::InvalidRequest,
+                    "The preserved Worktree already has an active Session.",
+                )
+                .await;
+            }
+            let issue =
+                match load_start_work_issue(state, &source.item.repository, source.item.number)
+                    .await
+                {
+                    Ok(issue) if issue.identity == source.item => issue,
+                    Ok(_) => {
+                        return send_start_work_failure(
+                            outgoing,
+                            request_id,
+                            StartWorkFailureKind::IssueChanged,
+                            "The Work Source Issue identity changed and cannot bootstrap a retry.",
+                        )
+                        .await;
+                    }
+                    Err(failure) => {
+                        return send_response_queue(
+                            outgoing,
+                            request_id,
+                            &DaemonResponse::StartWorkFailure(failure),
+                        )
+                        .await;
+                    }
+                };
+            let Ok(health) = state.providers.probe(provider).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::UnsupportedProvider,
+                    "The selected Provider could not be revalidated for Retry Session.",
+                )
+                .await;
+            };
+            persist_provider_health(state, &health).await?;
+            if !health.can_start_task_bootstrap() {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::UnsupportedProvider,
+                    "The selected Provider does not support task bootstrap for Retry Session.",
+                )
+                .await;
+            }
+            let worktree = match verified_worktree(state, worktree_id).await {
+                Ok(current) if current == worktree => current,
+                _ => {
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::WorktreeUnavailable,
+                        "The preserved Worktree identity changed before Retry Session launch.",
+                    )
+                    .await;
+                }
+            };
+            let current_project = match state.database.project(worktree.project_id).await {
+                Ok(current) if same_project_identity(&project, &current) => current,
+                _ => {
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::ProjectUnavailable,
+                        "The preserved Worktree's Project identity changed before Retry Session launch.",
+                    )
+                    .await;
+                }
+            };
+            if git::verify_managed_worktree_identity(&current_project, &worktree)
+                .await
+                .is_err()
+            {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::WorktreeUnavailable,
+                    "The preserved Worktree identity changed before Retry Session launch.",
+                )
+                .await;
+            }
+            if state
+                .database
+                .worktree_has_live_sessions(worktree_id)
+                .await?
+            {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::InvalidRequest,
+                    "The preserved Worktree gained an active Session before retry.",
+                )
+                .await;
+            }
+            let prompt = build_task_bootstrap_prompt(&issue, None);
+            match launch_new_session(
+                state,
+                worktree.clone(),
+                provider,
+                Some(format!("Issue #{}", source.item.number)),
+                None,
+                None,
+                Some(prompt),
+                true,
+                columns,
+                rows,
+            )
+            .await
+            {
+                Ok((revision, session)) => {
+                    let _ = state.events.send(DaemonEvent::SessionCreated {
+                        revision,
+                        session: session.clone(),
+                    });
+                    send_response_queue(
+                        outgoing,
+                        request_id,
+                        &DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
+                            revision,
+                            worktree,
+                            source,
+                            session: Box::new(session),
+                        }),
+                    )
+                    .await
+                }
+                Err(_) => {
+                    send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::ProviderLaunchFailed,
+                        "The preserved Worktree remains available, but the Provider Session did not start.",
+                    )
+                    .await
+                }
+            }
         }
         ClientRequest::GetWorkSource { worktree_id } => {
             let source = state.database.work_source(worktree_id).await?;
@@ -2144,6 +2448,8 @@ async fn handle_request(
             let operation_lock = worktree_operation_lock(state, worktree_id).await;
             let _operation_guard = operation_lock.lock().await;
             let worktree = state.database.worktree(worktree_id).await?;
+            let releases_work_source_capacity =
+                state.database.work_source(worktree_id).await?.is_some();
             if state
                 .database
                 .worktree_has_live_sessions(worktree_id)
@@ -2177,6 +2483,12 @@ async fn handle_request(
                     return Err(error);
                 }
             };
+            if releases_work_source_capacity {
+                release_work_source_capacity(
+                    &state.work_source_capacity,
+                    &state.work_source_capacity_excess,
+                );
+            }
             send_response_queue(
                 outgoing,
                 request_id,
@@ -3759,6 +4071,88 @@ fn project_removal_token(
         .expect("SHA-256 is a valid project removal authorization")
 }
 
+fn github_association_change_inspection(
+    secret: &AuthenticationToken,
+    project_id: ProjectId,
+    current: Option<&GitHubAssociation>,
+    target: Option<&GitHubRemote>,
+    work_source_count: u64,
+) -> GitHubAssociationChangeInspection {
+    let mut digest = Sha256::new();
+    digest.update(b"sylvops-github-association-change-v1\0");
+    digest.update(secret.expose().as_bytes());
+    digest.update(project_id.to_string().as_bytes());
+    digest.update([0]);
+    if let Some(current) = current {
+        digest.update(current.remote_name.as_str().as_bytes());
+        digest.update([0]);
+        digest.update(current.repository.to_string().as_bytes());
+        digest.update([0]);
+        digest.update(current.updated_at.to_be_bytes());
+    } else {
+        digest.update(b"no-current-association");
+    }
+    digest.update([0]);
+    if let Some(target) = target {
+        digest.update(target.name.as_str().as_bytes());
+        digest.update([0]);
+        digest.update(target.repository.to_string().as_bytes());
+    } else {
+        digest.update(b"clear-association");
+    }
+    digest.update([0]);
+    digest.update(work_source_count.to_be_bytes());
+    let authorization_token = format!("{:x}", digest.finalize())
+        .try_into()
+        .expect("SHA-256 is a valid GitHub association change authorization");
+    GitHubAssociationChangeInspection {
+        project_id,
+        remote_name: target.map(|target| target.name.clone()),
+        work_source_count,
+        authorization_token,
+    }
+}
+
+fn release_work_source_capacity(capacity: &Semaphore, excess: &AtomicUsize) {
+    let absorbed_excess = excess
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            (value > 0).then(|| value - 1)
+        })
+        .is_ok();
+    if !absorbed_excess {
+        capacity.add_permits(1);
+    }
+}
+
+fn authorize_github_association_change(
+    secret: &AuthenticationToken,
+    project_id: ProjectId,
+    current: Option<&GitHubAssociation>,
+    target: Option<&GitHubRemote>,
+    work_source_count: u64,
+    supplied: Option<&GitHubAssociationChangeAuthorization>,
+) -> std::result::Result<(), GitHubAssociationChangeInspection> {
+    let inspection = github_association_change_inspection(
+        secret,
+        project_id,
+        current,
+        target,
+        work_source_count,
+    );
+    if supplied.is_some_and(|authorization| {
+        bool::from(
+            inspection
+                .authorization_token
+                .as_bytes()
+                .ct_eq(authorization.as_bytes()),
+        )
+    }) {
+        Ok(())
+    } else {
+        Err(inspection)
+    }
+}
+
 async fn inspect_session_deletion(
     state: &DaemonState,
     session: &Session,
@@ -4241,14 +4635,30 @@ impl Drop for ClientGuard {
 mod tests {
     use super::{
         ApplicationMutationCoordinator, CONTROL_OPCODE, HookTracking, LifecycleCoordinator,
-        decode_request, provider_external_id_update, same_project_identity,
+        decode_request, provider_external_id_update, release_work_source_capacity,
+        same_project_identity,
     };
+    use std::sync::atomic::AtomicUsize;
     use sylvops_core::{
         domain::{Project, SessionState},
         ids::{ProjectId, WorkspaceId},
         protocol::{ClientRequest, Frame, MessageClass},
         status::{ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId},
     };
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn persisted_capacity_excess_is_paid_down_before_a_slot_is_released() {
+        let capacity = Semaphore::new(0);
+        let excess = AtomicUsize::new(2);
+
+        release_work_source_capacity(&capacity, &excess);
+        assert_eq!(capacity.available_permits(), 0);
+        release_work_source_capacity(&capacity, &excess);
+        assert_eq!(capacity.available_permits(), 0);
+        release_work_source_capacity(&capacity, &excess);
+        assert_eq!(capacity.available_permits(), 1);
+    }
 
     #[test]
     fn malformed_authenticated_control_request_fails_closed_with_bounded_diagnostics() {

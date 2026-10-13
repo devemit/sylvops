@@ -6,8 +6,8 @@ use sylvops_core::{
     },
     ids::ProjectId,
     protocol::{
-        ClientRequest, ProjectRemovalInspection, SessionDeletionInspection,
-        WorkspaceDeletionInspection,
+        ClientRequest, GitHubAssociationChangeInspection, ProjectRemovalInspection,
+        SessionDeletionInspection, WorkspaceDeletionInspection,
     },
     ui_forms::{Form, FormKind},
     upgrade::ActiveUpgradeSession,
@@ -119,6 +119,9 @@ pub(crate) enum Confirmation {
     InstallUpdate {
         version: String,
         active_sessions: Vec<ActiveUpgradeSession>,
+    },
+    ChangeGitHubAssociation {
+        inspection: GitHubAssociationChangeInspection,
     },
 }
 

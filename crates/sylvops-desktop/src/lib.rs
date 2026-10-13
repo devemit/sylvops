@@ -53,17 +53,17 @@ use presentation::{
 use sylvops_core::{
     domain::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
-        Worktree, WorktreeStatus,
+        Worktree, WorktreeStatus, state_is_active,
     },
     github::{
         GitHubCheckFilter, GitHubCheckState, GitHubIntegrationStatus, GitHubItemIdentity,
         GitHubItemState, GitHubListState, GitHubReviewFilter, GitHubReviewState, GitRemoteName,
-        StartWorkFailureKind, StartWorkOutcome,
+        StartWorkFailureKind, StartWorkOutcome, issue_work_status,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
-        ClientRequest, DaemonEvent, DaemonResponse, ProjectRemovalRefusal, SessionDeletionRefusal,
-        WorkspaceDeletionRefusal,
+        ClientRequest, DaemonEvent, DaemonResponse, GitHubAssociationChangeAuthorization,
+        ProjectRemovalRefusal, SessionDeletionRefusal, WorkspaceDeletionRefusal,
     },
     provider::{ProviderHealth, session_can_resume},
     ui::{
@@ -230,8 +230,10 @@ struct DesktopApp {
     providers: Vec<ProviderHealth>,
     github_status: Option<GitHubIntegrationStatus>,
     github_request: RequestState,
+    start_work_preparation_intent: StartWorkPreparationIntent,
     deferred_github_status_project: Option<ProjectId>,
     github_surface: GitHubSurfaceState,
+    work_source_remote_states: HashMap<GitHubItemIdentity, WorkSourceRemoteState>,
     content_surface: ContentSurface,
     connection: ConnectionState,
     selected_project_id: Option<ProjectId>,
@@ -290,10 +292,24 @@ enum RequestState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StartWorkPreparationIntent {
+    #[default]
+    OpenExistingOrStart,
+    StartAnotherWorktree,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ContentSurface {
     #[default]
     Session,
     GitHub,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkSourceRemoteState {
+    Open,
+    Closed,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -615,12 +631,16 @@ enum Message {
     LoadMoreGitHubComments,
     OpenGitHubItemInBrowser,
     PrepareStartWork,
+    PrepareAnotherWorktree,
     StartWorkBranchInput(String),
     StartWorkInstructionsInput(String),
     SelectStartWorkProvider(ProviderKind),
     StartAnotherWorktree,
     SubmitStartWork,
     OpenExistingIssueWork(WorktreeId),
+    RetryStartWorkSession(WorktreeId),
+    DeleteIssueWork(WorktreeId),
+    OpenWorkSourceIssue(WorktreeId),
     RetryGitHub,
     ToggleClassicThemes,
     ToggleTechnicalDetails,
@@ -677,8 +697,10 @@ impl DesktopApp {
             providers: Vec::new(),
             github_status: None,
             github_request: RequestState::Idle,
+            start_work_preparation_intent: StartWorkPreparationIntent::default(),
             deferred_github_status_project: None,
             github_surface: GitHubSurfaceState::default(),
+            work_source_remote_states: HashMap::new(),
             content_surface: ContentSurface::Session,
             connection: ConnectionState::Connecting,
             selected_project_id: None,
@@ -924,21 +946,12 @@ impl DesktopApp {
             Message::RefreshGitHub => self.refresh_github_status(),
             Message::AssociateGitHub(remote_name) => {
                 if let Some(project_id) = self.selected_project_id {
-                    self.send_github_request(
-                        Operation::SetGitHubAssociation(project_id),
-                        ClientRequest::SetGitHubAssociation {
-                            project_id,
-                            remote_name,
-                        },
-                    );
+                    self.request_github_association_change(project_id, Some(remote_name));
                 }
             }
             Message::ClearGitHubAssociation => {
                 if let Some(project_id) = self.selected_project_id {
-                    self.send_github_request(
-                        Operation::ClearGitHubAssociation(project_id),
-                        ClientRequest::ClearGitHubAssociation { project_id },
-                    );
+                    self.request_github_association_change(project_id, None);
                 }
             }
             Message::SelectGitHubKind(kind) => self.open_github_surface(kind),
@@ -968,7 +981,8 @@ impl DesktopApp {
             Message::RefreshGitHubDetail => self.refresh_github_detail(),
             Message::LoadMoreGitHubComments => self.load_more_github_comments(),
             Message::OpenGitHubItemInBrowser => self.open_github_item_in_browser(),
-            Message::PrepareStartWork => self.prepare_start_work(),
+            Message::PrepareStartWork => self.prepare_start_work(false),
+            Message::PrepareAnotherWorktree => self.prepare_start_work(true),
             Message::StartWorkBranchInput(value) => {
                 if let Some(Modal::StartWork(modal)) = &mut self.modal {
                     modal.update_branch(value);
@@ -991,9 +1005,13 @@ impl DesktopApp {
                 }
             }
             Message::SubmitStartWork => self.submit_start_work(),
-            Message::OpenExistingIssueWork(worktree_id) => {
-                self.modal = None;
-                self.select_worktree(worktree_id);
+            Message::OpenExistingIssueWork(worktree_id) => self.open_issue_work(worktree_id),
+            Message::RetryStartWorkSession(worktree_id) => {
+                self.retry_start_work_session(worktree_id);
+            }
+            Message::DeleteIssueWork(worktree_id) => self.delete_issue_work(worktree_id),
+            Message::OpenWorkSourceIssue(worktree_id) => {
+                self.open_work_source_issue(worktree_id);
             }
             Message::RetryGitHub => self.retry_github_request(),
             Message::ToggleClassicThemes => {
@@ -2469,6 +2487,17 @@ impl DesktopApp {
                 github_check_state_label(pull_request.checks.state),
                 pull_request.changed_files.total,
             ));
+        } else {
+            metadata.push(
+                issue_work_status(
+                    &summary.identity,
+                    &self.snapshot.work_sources,
+                    &self.snapshot.worktrees,
+                    &self.snapshot.sessions,
+                )
+                .display_name()
+                .to_owned(),
+            );
         }
         button(
             column![
@@ -2547,10 +2576,33 @@ impl DesktopApp {
         .spacing(6)
         .align_y(Center);
         if summary.identity.kind == sylvops_core::github::GitHubItemKind::Issue {
+            let local_status = issue_work_status(
+                &summary.identity,
+                &self.snapshot.work_sources,
+                &self.snapshot.worktrees,
+                &self.snapshot.sessions,
+            );
+            let has_local_work = self.existing_issue_work(&summary.identity).is_some();
             actions = actions.push(
-                button("Start Work")
-                    .on_press_maybe((!pending).then_some(Message::PrepareStartWork))
-                    .style(primary_action_style),
+                button(if has_local_work {
+                    "Open Work"
+                } else {
+                    "Start Work"
+                })
+                .on_press_maybe((!pending).then_some(Message::PrepareStartWork))
+                .style(primary_action_style),
+            );
+            if has_local_work {
+                actions = actions.push(
+                    button("Start another Worktree")
+                        .on_press_maybe((!pending).then_some(Message::PrepareAnotherWorktree))
+                        .style(chrome_action_style),
+                );
+            }
+            actions = actions.push(
+                text(local_status.display_name())
+                    .size(UI_META_SIZE)
+                    .style(text::secondary),
             );
         }
         if self.github_surface.detail.is_loading() {
@@ -2671,6 +2723,21 @@ impl DesktopApp {
         let mut content = column![text("Selection details").font(UI_SEMIBOLD).size(24)].spacing(12);
         let mut technical = column![].spacing(8);
         let mut has_technical_details = false;
+        let work_source = selection.worktree.and_then(|worktree_id| {
+            self.snapshot
+                .work_sources
+                .iter()
+                .find(|source| source.worktree_id == worktree_id)
+        });
+        let recovery_worktree_id = work_source.and_then(|source| {
+            let active = self.snapshot.worktrees.iter().any(|worktree| {
+                worktree.id == source.worktree_id && worktree.status == WorktreeStatus::Active
+            });
+            let has_active_session = self.snapshot.sessions.iter().any(|session| {
+                session.worktree_id == source.worktree_id && state_is_active(session.state)
+            });
+            (active && !has_active_session).then_some(source.worktree_id)
+        });
         if let Some(project) = selection
             .project
             .and_then(|id| self.snapshot.projects.iter().find(|item| item.id == id))
@@ -2833,6 +2900,41 @@ impl DesktopApp {
                     "Authenticated local IPC with daemon-owned PTY".into(),
                 ));
         }
+        if let Some(source) = work_source {
+            let has_started_session = self.snapshot.sessions.iter().any(|session| {
+                session.worktree_id == source.worktree_id && session.started_at.is_some()
+            });
+            content = content
+                .push(rule::horizontal(1))
+                .push(text("Work Source").font(UI_SEMIBOLD).size(18))
+                .push(detail(
+                    "Issue",
+                    format!("{} #{}", source.item.repository, source.item.number),
+                ))
+                .push(detail("Source URL", source.canonical_url.to_string()))
+                .push(detail(
+                    "Local state",
+                    issue_work_status(
+                        &source.item,
+                        std::slice::from_ref(source),
+                        &self.snapshot.worktrees,
+                        &self.snapshot.sessions,
+                    )
+                    .display_name()
+                    .into(),
+                ))
+                .push(detail(
+                    "Remote state",
+                    self.work_source_remote_status_label(source).into(),
+                ));
+            if recovery_worktree_id.is_some() && !has_started_session {
+                content = content.push(
+                    text("Worktree created; Session not started")
+                        .font(UI_SEMIBOLD)
+                        .style(text::danger),
+                );
+            }
+        }
         let mut actions = row![].spacing(8);
         if let Some(session) = selection.session.and_then(|id| self.session(id))
             && self.active_session_id == Some(session.id)
@@ -2842,6 +2944,26 @@ impl DesktopApp {
                 button(STOP_SESSION_LABEL)
                     .on_press(Message::Stop)
                     .style(flat_danger_style),
+            );
+        }
+        if let Some(worktree_id) = recovery_worktree_id {
+            actions = actions
+                .push(
+                    button("Retry Session")
+                        .on_press(Message::RetryStartWorkSession(worktree_id))
+                        .style(primary_action_style),
+                )
+                .push(
+                    button(DELETE_CHECKOUT_LABEL)
+                        .on_press(Message::DeleteIssueWork(worktree_id))
+                        .style(flat_danger_style),
+                );
+        }
+        if let Some(source) = work_source {
+            actions = actions.push(
+                button("View source Issue")
+                    .on_press(Message::OpenWorkSourceIssue(source.worktree_id))
+                    .style(chrome_action_style),
             );
         }
         content = content.push(rule::horizontal(1)).push(actions);
@@ -3424,8 +3546,8 @@ impl DesktopApp {
         .into()
     }
 
-    fn confirmation_view(confirmation: &Confirmation) -> Element<'_, Message> {
-        let (title, explanation) = match confirmation {
+    fn confirmation_copy(confirmation: &Confirmation) -> (&'static str, String) {
+        match confirmation {
             Confirmation::StopSession {
                 session_name,
                 cwd,
@@ -3488,7 +3610,23 @@ impl DesktopApp {
                         .join(", ")
                 ),
             ),
-        };
+            Confirmation::ChangeGitHubAssociation { inspection } => (
+                "Change GitHub Repository",
+                format!(
+                    "{} this Project's GitHub Repository association? Its {} historical Work Sources are preserved with their original host, owner, repository, kind, number, and URL.",
+                    if inspection.remote_name.is_some() {
+                        "Change"
+                    } else {
+                        "Clear"
+                    },
+                    inspection.work_source_count,
+                ),
+            ),
+        }
+    }
+
+    fn confirmation_view(confirmation: &Confirmation) -> Element<'_, Message> {
+        let (title, explanation) = Self::confirmation_copy(confirmation);
         container(
             column![
                 text(title).font(UI_SEMIBOLD).size(22),
@@ -4039,6 +4177,24 @@ impl DesktopApp {
                 }
             }
             (
+                operation @ (Operation::SetGitHubAssociation(expected)
+                | Operation::ClearGitHubAssociation(expected)),
+                DaemonResponse::GitHubAssociationChangeRequiresConfirmation(inspection),
+            ) if expected == inspection.project_id
+                && self.selected_project_id == Some(inspection.project_id)
+                && match operation {
+                    Operation::SetGitHubAssociation(_) => inspection.remote_name.is_some(),
+                    Operation::ClearGitHubAssociation(_) => inspection.remote_name.is_none(),
+                    _ => false,
+                } =>
+            {
+                self.finish_github_request();
+                self.modal = Some(Modal::Confirmation(Confirmation::ChangeGitHubAssociation {
+                    inspection,
+                }));
+                self.modal_focus = ModalFocus::Pending;
+            }
+            (
                 Operation::SetGitHubAssociation(expected)
                 | Operation::ClearGitHubAssociation(expected),
                 DaemonResponse::GitHubAssociationUpdated {
@@ -4068,6 +4224,9 @@ impl DesktopApp {
                     && self.github_surface.kind().item_kind() == kind =>
             {
                 self.finish_github_request();
+                for summary in &page.items {
+                    self.record_work_source_remote_state(summary);
+                }
                 self.github_surface.receive_list(page);
             }
             (
@@ -4079,6 +4238,7 @@ impl DesktopApp {
                 && detail.summary.identity.number == number =>
             {
                 self.finish_github_request();
+                self.record_work_source_remote_state(&detail.summary);
                 match request_kind {
                     GitHubDetailRequest::Initial => self.github_surface.receive_detail(detail),
                     GitHubDetailRequest::AppendComments => {
@@ -4109,31 +4269,37 @@ impl DesktopApp {
             )) && preparation.issue.identity.number == number =>
             {
                 self.finish_github_request();
-                self.modal = Some(Modal::StartWork(Box::new(StartWorkModal::new(
-                    project_id,
-                    preparation,
-                ))));
+                let start_another_worktree = matches!(
+                    std::mem::take(&mut self.start_work_preparation_intent),
+                    StartWorkPreparationIntent::StartAnotherWorktree
+                );
+                if !start_another_worktree && let Some(existing) = preparation.existing_work.first()
+                {
+                    self.open_issue_work(existing.worktree_id);
+                    return;
+                }
+                let mut modal = StartWorkModal::new(project_id, preparation);
+                modal.start_another_worktree = start_another_worktree;
+                self.modal = Some(Modal::StartWork(Box::new(modal)));
                 self.modal_focus = ModalFocus::Pending;
             }
             (
-                Operation::StartWork(project_id, number),
+                operation @ (Operation::StartWork(..) | Operation::RetryStartWorkSession(_)),
                 DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
                     worktree,
+                    source,
                     session,
                     ..
                 }),
-            ) if worktree.project_id == project_id => {
+            ) if match operation {
+                Operation::StartWork(project_id, _) => worktree.project_id == project_id,
+                Operation::RetryStartWorkSession(worktree_id) => worktree.id == worktree_id,
+                _ => false,
+            } =>
+            {
                 let session = *session;
-                if let Some(existing) = self
-                    .snapshot
-                    .worktrees
-                    .iter_mut()
-                    .find(|existing| existing.id == worktree.id)
-                {
-                    *existing = worktree.clone();
-                } else {
-                    self.snapshot.worktrees.push(worktree.clone());
-                }
+                self.upsert_snapshot_worktree(worktree.clone());
+                self.upsert_snapshot_work_source(source);
                 if let Some(existing) = self
                     .snapshot
                     .sessions
@@ -4147,7 +4313,7 @@ impl DesktopApp {
                 self.modal = None;
                 self.content_surface = ContentSurface::Session;
                 self.main_tab = MainTab::Terminal;
-                self.selected_project_id = Some(project_id);
+                self.selected_project_id = Some(worktree.project_id);
                 self.selected_worktree_id = Some(worktree.id);
                 self.selected_session_id = Some(session.id);
                 self.active_session_id = Some(session.id);
@@ -4156,27 +4322,31 @@ impl DesktopApp {
                 }
                 self.mark_state_dirty();
                 self.attach_active();
-                self.show_success(format!("Started Work from Issue #{number}."));
+                self.show_success(match operation {
+                    Operation::StartWork(_, number) => {
+                        format!("Started Work from Issue #{number}.")
+                    }
+                    Operation::RetryStartWorkSession(_) => {
+                        "Session started in the preserved Worktree.".into()
+                    }
+                    _ => unreachable!("guarded Start Work operation"),
+                });
                 self.request_snapshot();
             }
             (
                 Operation::StartWork(project_id, _),
                 DaemonResponse::StartWorkCompleted(StartWorkOutcome::WorktreeCreated {
                     worktree,
+                    source,
                     failure,
                     ..
                 }),
             ) if worktree.project_id == project_id => {
-                if !self
-                    .snapshot
-                    .worktrees
-                    .iter()
-                    .any(|existing| existing.id == worktree.id)
-                {
-                    self.snapshot.worktrees.push(worktree.clone());
-                }
+                self.upsert_snapshot_worktree(worktree.clone());
+                self.upsert_snapshot_work_source(source);
                 self.modal = None;
                 self.content_surface = ContentSurface::Session;
+                self.main_tab = MainTab::Details;
                 self.selected_project_id = Some(project_id);
                 self.select_worktree(worktree.id);
                 self.error = Some(format!(
@@ -4187,6 +4357,7 @@ impl DesktopApp {
             }
             (Operation::PrepareStartWork(_, _), DaemonResponse::StartWorkFailure(failure)) => {
                 self.finish_github_request();
+                self.start_work_preparation_intent = StartWorkPreparationIntent::default();
                 self.error = Some(failure.diagnostic);
             }
             (Operation::StartWork(_, _), DaemonResponse::StartWorkFailure(failure)) => {
@@ -4199,6 +4370,9 @@ impl DesktopApp {
                 } else {
                     self.error = Some(failure.diagnostic);
                 }
+            }
+            (Operation::RetryStartWorkSession(_), DaemonResponse::StartWorkFailure(failure)) => {
+                self.error = Some(failure.diagnostic);
             }
             (Operation::RefreshSnapshot, DaemonResponse::Snapshot(snapshot)) => {
                 self.snapshot_pending = false;
@@ -4634,6 +4808,17 @@ impl DesktopApp {
                     Operation::OpenGitHubItem(..) => GitHubRequestTarget::Browser,
                     _ => unreachable!(),
                 };
+                if target == GitHubRequestTarget::Detail
+                    && matches!(
+                        failure.kind,
+                        sylvops_core::github::GitHubBrowseFailureKind::UnavailableItem
+                            | sylvops_core::github::GitHubBrowseFailureKind::Permission
+                    )
+                    && let Some(identity) = self.github_surface.selected.clone()
+                {
+                    self.work_source_remote_states
+                        .insert(identity, WorkSourceRemoteState::Unavailable);
+                }
                 let safe_diagnostic = bounded_redacted_diagnostic(&failure.diagnostic);
                 self.github_surface.fail(target, failure, safe_diagnostic);
             }
@@ -5323,7 +5508,7 @@ impl DesktopApp {
         );
     }
 
-    fn prepare_start_work(&mut self) {
+    fn prepare_start_work(&mut self, start_another_worktree: bool) {
         if self.github_request == RequestState::Pending {
             return;
         }
@@ -5338,11 +5523,215 @@ impl DesktopApp {
         {
             return;
         }
+        if !start_another_worktree && let Some(worktree_id) = self.existing_issue_work(&identity) {
+            self.open_issue_work(worktree_id);
+            return;
+        }
+        self.start_work_preparation_intent = if start_another_worktree {
+            StartWorkPreparationIntent::StartAnotherWorktree
+        } else {
+            StartWorkPreparationIntent::OpenExistingOrStart
+        };
         self.send_github_browse_request(
             Operation::PrepareStartWork(project_id, identity.number),
             ClientRequest::PrepareStartWork {
                 project_id,
                 issue_number: identity.number,
+            },
+        );
+    }
+
+    fn existing_issue_work(&self, identity: &GitHubItemIdentity) -> Option<WorktreeId> {
+        self.snapshot
+            .work_sources
+            .iter()
+            .filter(|source| &source.item == identity)
+            .filter(|source| {
+                self.snapshot.worktrees.iter().any(|worktree| {
+                    worktree.id == source.worktree_id && worktree.status == WorktreeStatus::Active
+                })
+            })
+            .max_by_key(|source| source.created_at)
+            .map(|source| source.worktree_id)
+    }
+
+    fn upsert_snapshot_worktree(&mut self, worktree: Worktree) {
+        if let Some(existing) = self
+            .snapshot
+            .worktrees
+            .iter_mut()
+            .find(|existing| existing.id == worktree.id)
+        {
+            *existing = worktree;
+        } else {
+            self.snapshot.worktrees.push(worktree);
+        }
+    }
+
+    fn upsert_snapshot_work_source(&mut self, source: sylvops_core::github::WorkSource) {
+        if let Some(existing) = self
+            .snapshot
+            .work_sources
+            .iter_mut()
+            .find(|existing| existing.worktree_id == source.worktree_id)
+        {
+            *existing = source;
+        } else {
+            self.snapshot.work_sources.push(source);
+        }
+    }
+
+    fn work_source_remote_status_label(
+        &self,
+        source: &sylvops_core::github::WorkSource,
+    ) -> &'static str {
+        if !self.work_source_matches_association(source) {
+            return "Repository changed";
+        }
+        match self.work_source_remote_states.get(&source.item) {
+            Some(WorkSourceRemoteState::Open) => "Open",
+            Some(WorkSourceRemoteState::Closed) => "Closed",
+            Some(WorkSourceRemoteState::Unavailable) => "Unavailable",
+            None => "Not refreshed",
+        }
+    }
+
+    fn work_source_matches_association(&self, source: &sylvops_core::github::WorkSource) -> bool {
+        self.github_status.as_ref().is_some_and(|status| {
+            status.association.as_ref().is_some_and(|association| {
+                association.project_id == source.project_id
+                    && association.repository == source.item.repository
+            })
+        })
+    }
+
+    fn record_work_source_remote_state(
+        &mut self,
+        summary: &sylvops_core::github::GitHubItemSummary,
+    ) {
+        if summary.identity.kind == sylvops_core::github::GitHubItemKind::Issue {
+            self.work_source_remote_states.insert(
+                summary.identity.clone(),
+                if summary.state == GitHubItemState::Closed {
+                    WorkSourceRemoteState::Closed
+                } else {
+                    WorkSourceRemoteState::Open
+                },
+            );
+        }
+    }
+
+    fn open_issue_work(&mut self, worktree_id: WorktreeId) {
+        self.modal = None;
+        self.content_surface = ContentSurface::Session;
+        self.select_worktree(worktree_id);
+        if let Some(session_id) = self.selected_session_id {
+            self.select_session(session_id);
+            self.main_tab = MainTab::Terminal;
+        } else {
+            self.main_tab = MainTab::Details;
+        }
+    }
+
+    fn retry_start_work_session(&mut self, worktree_id: WorktreeId) {
+        let has_source = self
+            .snapshot
+            .work_sources
+            .iter()
+            .any(|source| source.worktree_id == worktree_id);
+        let worktree_ready = self.snapshot.worktrees.iter().any(|worktree| {
+            worktree.id == worktree_id
+                && !worktree.is_root_checkout
+                && worktree.status == WorktreeStatus::Active
+        });
+        if !has_source || !worktree_ready {
+            self.error = Some("Retry Session requires an active sourced Worktree.".into());
+            return;
+        }
+        if self
+            .snapshot
+            .sessions
+            .iter()
+            .any(|session| session.worktree_id == worktree_id && state_is_active(session.state))
+        {
+            self.error = Some("This Worktree already has an active Session.".into());
+            return;
+        }
+        let previous_provider = self
+            .sessions_for(worktree_id)
+            .first()
+            .map(|session| session.provider_kind);
+        let provider = previous_provider
+            .filter(|kind| {
+                self.providers
+                    .iter()
+                    .any(|health| health.kind == *kind && health.can_start_task_bootstrap())
+            })
+            .or_else(|| {
+                self.providers
+                    .iter()
+                    .find(|health| health.can_start_task_bootstrap())
+                    .map(|health| health.kind)
+            });
+        let Some(provider) = provider else {
+            self.error = Some(
+                "Retry Session needs an available, authenticated task-capable Provider.".into(),
+            );
+            return;
+        };
+        let (columns, rows) = self.terminal_dimensions();
+        self.send_request(
+            Operation::RetryStartWorkSession(worktree_id),
+            ClientRequest::RetryStartWorkSession {
+                worktree_id,
+                provider,
+                columns,
+                rows,
+            },
+        );
+    }
+
+    fn delete_issue_work(&mut self, worktree_id: WorktreeId) {
+        self.select_worktree(worktree_id);
+        self.inspect_worktree_removal();
+    }
+
+    fn open_work_source_issue(&mut self, worktree_id: WorktreeId) {
+        let Some(source) = self
+            .snapshot
+            .work_sources
+            .iter()
+            .find(|source| source.worktree_id == worktree_id)
+            .cloned()
+        else {
+            self.error = Some("This Worktree no longer has a Work Source.".into());
+            return;
+        };
+        if !self.work_source_matches_association(&source) {
+            self.error = Some(
+                "Repository changed: the Work Source is preserved, but this Project now uses a different GitHub Repository."
+                    .into(),
+            );
+            return;
+        }
+        self.selected_project_id = Some(source.project_id);
+        self.content_surface = ContentSurface::GitHub;
+        let _ = self
+            .github_surface
+            .open(source.project_id, GitHubSurfaceKind::Issues);
+        let Some(query) = self.github_surface.select(source.item.clone(), true) else {
+            return;
+        };
+        self.send_github_browse_request(
+            Operation::ViewGitHubItem(
+                source.project_id,
+                source.item.kind,
+                source.item.number,
+                GitHubDetailRequest::Initial,
+            ),
+            ClientRequest::ViewGitHubItem {
+                project_id: source.project_id,
+                query,
             },
         );
     }
@@ -5404,6 +5793,39 @@ impl DesktopApp {
             self.error = Some("GitHub browsing: the background service is busy. Try again.".into());
             RequestState::Idle
         };
+    }
+
+    fn request_github_association_change(
+        &mut self,
+        project_id: ProjectId,
+        remote_name: Option<GitRemoteName>,
+    ) {
+        self.send_confirmed_github_association_change(project_id, remote_name, None);
+    }
+
+    fn send_confirmed_github_association_change(
+        &mut self,
+        project_id: ProjectId,
+        remote_name: Option<GitRemoteName>,
+        authorization_token: Option<GitHubAssociationChangeAuthorization>,
+    ) {
+        match remote_name {
+            Some(remote_name) => self.send_github_request(
+                Operation::SetGitHubAssociation(project_id),
+                ClientRequest::SetGitHubAssociation {
+                    project_id,
+                    remote_name,
+                    authorization_token,
+                },
+            ),
+            None => self.send_github_request(
+                Operation::ClearGitHubAssociation(project_id),
+                ClientRequest::ClearGitHubAssociation {
+                    project_id,
+                    authorization_token,
+                },
+            ),
+        }
     }
 
     fn github_identity_matches_association(&self, identity: &GitHubItemIdentity) -> bool {
@@ -6219,6 +6641,14 @@ impl DesktopApp {
                         .collect(),
                 );
                 self.modal = None;
+            }
+            Confirmation::ChangeGitHubAssociation { inspection } => {
+                self.modal = None;
+                self.send_confirmed_github_association_change(
+                    inspection.project_id,
+                    inspection.remote_name,
+                    Some(inspection.authorization_token),
+                );
             }
         }
     }
@@ -7192,6 +7622,7 @@ const fn operation_error_context(operation: Operation) -> &'static str {
         Operation::OpenGitHubItem(..) => "Open GitHub item in browser",
         Operation::PrepareStartWork(..) => "Prepare Start Work",
         Operation::StartWork(..) => "Start Work",
+        Operation::RetryStartWorkSession(_) => "Retry Session",
         Operation::CreateWorkspace => "Create workspace",
         Operation::OpenWorkspace(_) => "Open workspace",
         Operation::InspectWorkspaceDeletion(_) | Operation::DeleteWorkspace => "Delete workspace",
@@ -11614,7 +12045,7 @@ mod tests {
             DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
                 revision: 3,
                 worktree: worktree.clone(),
-                source,
+                source: source.clone(),
                 session: Box::new(running.clone()),
             }),
         );
@@ -11631,6 +12062,424 @@ mod tests {
                 ClientRequest::AttachSession { session_id, .. }
             ) if id == running.id && session_id == running.id
         ));
+    }
+
+    #[test]
+    fn start_work_opens_existing_local_work_by_default() {
+        use sylvops_core::github::WorkSource;
+
+        let (bridge, harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        app.content_surface = ContentSurface::GitHub;
+        let _ = app
+            .github_surface
+            .open(project_id, GitHubSurfaceKind::Issues);
+        let summary = github_summary(GitHubItemKind::Issue, 128);
+        let identity = summary.identity.clone();
+        let _ = app.github_surface.select(identity.clone(), false);
+        app.github_surface.receive_detail(github_detail(summary));
+
+        let worktree_id = WorktreeId::new();
+        app.snapshot.worktrees.push(Worktree {
+            id: worktree_id,
+            project_id,
+            name: "Issue #128".into(),
+            path: "C:/managed/128".into(),
+            canonical_path: "C:/managed/128".into(),
+            branch: Some("issue/128-recover-work".into()),
+            base_ref: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Active,
+            created_at: 1,
+            last_activity_at: 1,
+            removed_at: None,
+        });
+        let mut running = session(SessionState::Running, None);
+        running.worktree_id = worktree_id;
+        let session_id = running.id;
+        app.snapshot.sessions.push(running);
+        app.snapshot.work_sources.push(WorkSource {
+            worktree_id,
+            project_id,
+            canonical_url: identity.browser_target(),
+            item: identity,
+            created_at: 1,
+        });
+
+        let _ = app.update(Message::PrepareStartWork);
+
+        assert!(!harness.has_request());
+        assert_eq!(app.content_surface, ContentSurface::Session);
+        assert_eq!(app.selected_worktree_id, Some(worktree_id));
+        assert_eq!(app.selected_session_id, Some(session_id));
+    }
+
+    #[tokio::test]
+    async fn issue_detail_shows_local_status_and_explicit_parallel_work_action() {
+        use sylvops_core::github::WorkSource;
+
+        let (bridge, mut harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        app.content_surface = ContentSurface::GitHub;
+        let _ = app
+            .github_surface
+            .open(project_id, GitHubSurfaceKind::Issues);
+        let summary = github_summary(GitHubItemKind::Issue, 128);
+        let identity = summary.identity.clone();
+        let _ = app.github_surface.select(identity.clone(), false);
+        app.github_surface.receive_detail(github_detail(summary));
+        let worktree_id = WorktreeId::new();
+        app.snapshot.worktrees.push(Worktree {
+            id: worktree_id,
+            project_id,
+            name: "Issue #128".into(),
+            path: "C:/managed/128".into(),
+            canonical_path: "C:/managed/128".into(),
+            branch: Some("issue/128-recover-work".into()),
+            base_ref: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Active,
+            created_at: 1,
+            last_activity_at: 1,
+            removed_at: None,
+        });
+        app.snapshot.work_sources.push(WorkSource {
+            worktree_id,
+            project_id,
+            canonical_url: identity.browser_target(),
+            item: identity.clone(),
+            created_at: 1,
+        });
+
+        let rendered = rendered_text(app.github_detail_view(), iced::Size::new(900.0, 700.0)).await;
+        for expected in ["Worktree ready", "Open Work", "Start another Worktree"] {
+            assert!(rendered.iter().any(|line| line.contains(expected)));
+        }
+
+        let _ = app.update(Message::PrepareAnotherWorktree);
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::PrepareStartWork(project_id, identity.number),
+                ClientRequest::PrepareStartWork {
+                    project_id,
+                    issue_number: identity.number,
+                },
+            )
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn partial_start_work_offers_retry_and_clean_state_deletion() {
+        use sylvops_core::github::{StartWorkFailure, WorkSource};
+
+        let (bridge, mut harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        let identity = github_summary(GitHubItemKind::Issue, 128).identity;
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id,
+            name: "Issue #128".into(),
+            path: "C:/managed/128".into(),
+            canonical_path: "C:/managed/128".into(),
+            branch: Some("issue/128-recover-work".into()),
+            base_ref: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Active,
+            created_at: 1,
+            last_activity_at: 1,
+            removed_at: None,
+        };
+        let source = WorkSource {
+            worktree_id: worktree.id,
+            project_id,
+            canonical_url: identity.browser_target(),
+            item: identity.clone(),
+            created_at: 1,
+        };
+        let mut health = provider_health(ProviderKind::Codex, true, true);
+        health.capabilities.task_bootstrap = true;
+        app.providers.push(health);
+
+        app.handle_response(
+            Operation::StartWork(project_id, identity.number),
+            DaemonResponse::StartWorkCompleted(StartWorkOutcome::WorktreeCreated {
+                revision: 3,
+                worktree: worktree.clone(),
+                source: source.clone(),
+                failure: StartWorkFailure::new(
+                    StartWorkFailureKind::ProviderLaunchFailed,
+                    "Provider launch failed.",
+                ),
+            }),
+        );
+        assert_eq!(
+            harness.take_request(),
+            (Operation::RefreshSnapshot, ClientRequest::GetSnapshot)
+        );
+        assert_eq!(app.main_tab, MainTab::Details);
+        let rendered = rendered_text(app.details_view(), iced::Size::new(900.0, 700.0)).await;
+        for expected in [
+            "Worktree created; Session not started",
+            "Retry Session",
+            "Delete checkout",
+            "View source Issue",
+        ] {
+            assert!(rendered.iter().any(|line| line.contains(expected)));
+        }
+
+        let _ = app.update(Message::OpenWorkSourceIssue(worktree.id));
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::ViewGitHubItem(
+                    project_id,
+                    GitHubItemKind::Issue,
+                    identity.number,
+                    GitHubDetailRequest::Initial,
+                ),
+                ClientRequest::ViewGitHubItem {
+                    project_id,
+                    query: sylvops_core::github::GitHubViewQuery {
+                        kind: GitHubItemKind::Issue,
+                        number: identity.number,
+                        comments_page_size: sylvops_core::github::GitHubPageSize::default(),
+                        comments_cursor: None,
+                        refresh: true,
+                    },
+                },
+            )
+        );
+
+        let (columns, rows) = app.terminal_dimensions();
+        let _ = app.update(Message::RetryStartWorkSession(worktree.id));
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::RetryStartWorkSession(worktree.id),
+                ClientRequest::RetryStartWorkSession {
+                    worktree_id: worktree.id,
+                    provider: ProviderKind::Codex,
+                    columns,
+                    rows,
+                },
+            )
+        );
+
+        app.handle_response(
+            Operation::RetryStartWorkSession(worktree.id),
+            DaemonResponse::StartWorkFailure(StartWorkFailure::new(
+                StartWorkFailureKind::WorktreeUnavailable,
+                "The preserved Worktree identity changed.",
+            )),
+        );
+        assert_eq!(
+            app.error.as_deref(),
+            Some("The preserved Worktree identity changed.")
+        );
+        let _ = app.update(Message::RetryStartWorkSession(worktree.id));
+        let _ = harness.take_request();
+
+        let mut running = session(SessionState::Running, None);
+        running.worktree_id = worktree.id;
+        app.handle_response(
+            Operation::RetryStartWorkSession(worktree.id),
+            DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
+                revision: 4,
+                worktree: worktree.clone(),
+                source,
+                session: Box::new(running.clone()),
+            }),
+        );
+        assert_eq!(app.main_tab, MainTab::Terminal);
+        assert_eq!(app.active_session_id, Some(running.id));
+        assert!(matches!(
+            harness.take_request(),
+            (
+                Operation::Attach(id),
+                ClientRequest::AttachSession { session_id, .. }
+            ) if id == running.id && session_id == running.id
+        ));
+        app.main_tab = MainTab::Details;
+        let rendered = rendered_text(app.details_view(), iced::Size::new(900.0, 700.0)).await;
+        for expected in ["Work Source", "#128", "View source Issue"] {
+            assert!(rendered.iter().any(|line| line.contains(expected)));
+        }
+
+        let _ = app.update(Message::DeleteIssueWork(worktree.id));
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::InspectRemoval(worktree.id),
+                ClientRequest::GetWorktreeStatus {
+                    worktree_id: worktree.id,
+                },
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_github_association_confirms_and_preserves_historical_sources() {
+        use sylvops_core::github::WorkSource;
+
+        let (bridge, mut harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        let identity = github_summary(GitHubItemKind::Issue, 128).identity;
+        app.snapshot.work_sources.push(WorkSource {
+            worktree_id: WorktreeId::new(),
+            project_id,
+            canonical_url: identity.browser_target(),
+            item: identity,
+            created_at: 1,
+        });
+
+        let _ = app.update(Message::ClearGitHubAssociation);
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::ClearGitHubAssociation(project_id),
+                ClientRequest::ClearGitHubAssociation {
+                    project_id,
+                    authorization_token: None,
+                },
+            )
+        );
+        let authorization_token =
+            GitHubAssociationChangeAuthorization::try_from("a".repeat(64)).unwrap();
+        app.handle_response(
+            Operation::ClearGitHubAssociation(project_id),
+            DaemonResponse::GitHubAssociationChangeRequiresConfirmation(
+                sylvops_core::protocol::GitHubAssociationChangeInspection {
+                    project_id,
+                    remote_name: None,
+                    work_source_count: 1,
+                    authorization_token: authorization_token.clone(),
+                },
+            ),
+        );
+        let Some(Modal::Confirmation(confirmation)) = &app.modal else {
+            panic!("clearing an association with Work Sources must require confirmation");
+        };
+        let rendered = rendered_text(
+            DesktopApp::confirmation_view(confirmation),
+            iced::Size::new(700.0, 500.0),
+        )
+        .await;
+        for expected in [
+            "Change GitHub Repository",
+            "historical Work Sources",
+            "preserved",
+        ] {
+            assert!(rendered.iter().any(|line| line.contains(expected)));
+        }
+
+        let _ = app.update(Message::ConfirmAction);
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::ClearGitHubAssociation(project_id),
+                ClientRequest::ClearGitHubAssociation {
+                    project_id,
+                    authorization_token: Some(authorization_token),
+                },
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn work_source_remote_status_reconciles_without_changing_local_work() {
+        use sylvops_core::github::{
+            GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubHost, GitHubOwner,
+            GitHubRepositoryIdentity, GitHubRepositoryName, WorkSource,
+        };
+
+        let (bridge, _harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        let mut summary = github_summary(GitHubItemKind::Issue, 128);
+        let identity = summary.identity.clone();
+        let worktree_id = WorktreeId::new();
+        app.snapshot.worktrees.push(Worktree {
+            id: worktree_id,
+            project_id,
+            name: "Issue #128".into(),
+            path: "C:/managed/128".into(),
+            canonical_path: "C:/managed/128".into(),
+            branch: Some("issue/128-recover-work".into()),
+            base_ref: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Active,
+            created_at: 1,
+            last_activity_at: 1,
+            removed_at: None,
+        });
+        app.snapshot.work_sources.push(WorkSource {
+            worktree_id,
+            project_id,
+            canonical_url: identity.browser_target(),
+            item: identity.clone(),
+            created_at: 1,
+        });
+        let _ = app
+            .github_surface
+            .open(project_id, GitHubSurfaceKind::Issues);
+        let _ = app.github_surface.select(identity.clone(), true);
+        summary.state = GitHubItemState::Closed;
+        app.handle_response(
+            Operation::ViewGitHubItem(
+                project_id,
+                GitHubItemKind::Issue,
+                identity.number,
+                GitHubDetailRequest::Initial,
+            ),
+            DaemonResponse::GitHubItem(github_detail(summary)),
+        );
+        app.content_surface = ContentSurface::Session;
+        app.select_worktree(worktree_id);
+        let rendered = rendered_text(app.details_view(), iced::Size::new(900.0, 700.0)).await;
+        assert!(rendered.iter().any(|line| line.contains("Closed")));
+
+        app.handle_response(
+            Operation::ViewGitHubItem(
+                project_id,
+                GitHubItemKind::Issue,
+                identity.number,
+                GitHubDetailRequest::Initial,
+            ),
+            DaemonResponse::GitHubBrowseFailure(GitHubBrowseFailure::new(
+                GitHubBrowseFailureKind::UnavailableItem,
+            )),
+        );
+        let rendered = rendered_text(app.details_view(), iced::Size::new(900.0, 700.0)).await;
+        assert!(rendered.iter().any(|line| line.contains("Unavailable")));
+
+        app.github_status
+            .as_mut()
+            .unwrap()
+            .association
+            .as_mut()
+            .unwrap()
+            .repository = GitHubRepositoryIdentity::new(
+            GitHubHost::new("github.example.com").unwrap(),
+            GitHubOwner::new("acme").unwrap(),
+            GitHubRepositoryName::new("different").unwrap(),
+        );
+        let rendered = rendered_text(app.details_view(), iced::Size::new(900.0, 700.0)).await;
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Repository changed"))
+        );
+        assert_eq!(app.snapshot.worktrees[0].status, WorktreeStatus::Active);
     }
 
     #[test]
