@@ -1291,6 +1291,17 @@ async fn handle_request(
             };
             send_response_queue(outgoing, request_id, &response).await
         }
+        ClientRequest::OpenGitHubItem {
+            project_id,
+            identity,
+        } => {
+            let repository = associated_github_repository(state, project_id).await?;
+            if identity.repository != repository {
+                return Err(DaemonError::GitHub(GitHubFailure::InvalidRemote));
+            }
+            crate::browser::open(&identity.browser_target()).map_err(DaemonError::Lifecycle)?;
+            send_response_queue(outgoing, request_id, &DaemonResponse::Acknowledged).await
+        }
         ClientRequest::AddWorkspace { name } => {
             let (revision, workspace) = state.database.add_workspace(name).await?;
             send_response_queue(
