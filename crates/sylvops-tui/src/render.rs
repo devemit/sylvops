@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -7,6 +9,10 @@ use ratatui::{
 };
 use sylvops_core::{
     domain::{Session, SessionState, WorktreeStatus},
+    github::{
+        GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubCheckState, GitHubItemKind,
+        GitHubItemState, GitHubReviewState,
+    },
     provider::session_can_resume,
     ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiTheme},
 };
@@ -15,6 +21,7 @@ use crate::{
     app::{App, ExplorerNode, FocusZone, HitMap, HitTarget, Mode, SettingsFocus},
     directory_browser::{DirectoryBrowser, display_path},
     forms::{Form, FormKind},
+    github_modal::{GitHubDepth, GitHubLoad, GitHubModal},
     theme::Theme,
 };
 
@@ -72,6 +79,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         }
         Mode::CommandPalette(palette) => draw_palette(frame, app, &palette, theme),
         Mode::Settings(settings) => draw_settings(frame, app, settings, theme),
+        Mode::GitHub(modal) => draw_github(frame, &modal, &mut app.hit_map, theme),
         Mode::Navigation | Mode::TerminalAttached => {}
     }
 }
@@ -1219,6 +1227,11 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         return;
     }
     if !matches!(app.mode, Mode::Navigation) {
+        if let Mode::GitHub(modal) = &app.mode {
+            let actions = github_footer_actions(modal, theme);
+            draw_action_line(frame, &mut app.hit_map, area, &actions, theme);
+            return;
+        }
         let message = match &app.mode {
             Mode::Modal(_) => "Form · ↑↓ fields · Enter continue · Esc cancel",
             Mode::DirectoryBrowser(_) => {
@@ -1229,6 +1242,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
                 "Commands · type to filter · ↑↓ select · Enter run · Esc close"
             }
             Mode::Settings(_) => "Settings · ↑↓ field · ←→ change · Enter apply · Esc cancel",
+            Mode::GitHub(_) => unreachable!("GitHub footer handled above"),
             Mode::TerminalAttached => unreachable!("Terminal attachment handled above"),
             Mode::Navigation => unreachable!("Navigation handled below"),
         };
@@ -1245,8 +1259,712 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Terminal / Changes / Details / Sessions\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Terminal / Changes / Details / Sessions\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
+}
+
+fn github_footer_actions(modal: &GitHubModal, theme: Theme) -> Vec<ActionItem> {
+    if modal.filter_editing {
+        return vec![
+            action_label("[Enter] Apply filter", HitTarget::GitHubFilter, theme.focus),
+            action_label("[Esc] Cancel", HitTarget::GitHubBack, theme.text),
+        ];
+    }
+    let mut actions = vec![
+        action_label("[i] Issues", HitTarget::GitHubIssues, theme.text),
+        action_label(
+            "[p] Pull Requests",
+            HitTarget::GitHubPullRequests,
+            theme.text,
+        ),
+    ];
+    match modal.depth {
+        GitHubDepth::List => add_github_list_actions(modal, theme, &mut actions),
+        GitHubDepth::Detail => add_github_detail_actions(modal, theme, &mut actions),
+    }
+    let refresh_available = match modal.depth {
+        GitHubDepth::List => !modal.list.is_loading(),
+        GitHubDepth::Detail => !modal.detail.is_loading(),
+    };
+    if refresh_available {
+        actions.push(action_label(
+            "[r] Refresh",
+            HitTarget::GitHubRefresh,
+            theme.text,
+        ));
+    }
+    if github_settings_recovery_available(modal) {
+        actions.push(action_label(
+            "[s] Settings",
+            HitTarget::Settings,
+            theme.text,
+        ));
+    }
+    actions.push(action_label(
+        "[Esc] Back",
+        HitTarget::GitHubBack,
+        theme.text,
+    ));
+    actions
+}
+
+fn add_github_list_actions(modal: &GitHubModal, theme: Theme, actions: &mut Vec<ActionItem>) {
+    if modal
+        .list
+        .ready()
+        .is_some_and(|page| !page.items.is_empty())
+    {
+        actions.push(action_label(
+            "[k] Up",
+            HitTarget::GitHubScroll(-1),
+            theme.text,
+        ));
+        actions.push(action_label(
+            "[j] Down",
+            HitTarget::GitHubScroll(1),
+            theme.text,
+        ));
+        if !modal.list.is_loading() {
+            actions.push(action_label(
+                "[Enter] Detail",
+                HitTarget::GitHubRow(modal.selected_index),
+                theme.focus,
+            ));
+        }
+        actions.push(action_label(
+            "[o] Browser",
+            HitTarget::GitHubOpen,
+            theme.focus,
+        ));
+    }
+    if !modal.list.is_loading() && modal.can_go_back() {
+        actions.push(action_label(
+            "[b] Previous",
+            HitTarget::GitHubPrevious,
+            theme.text,
+        ));
+    }
+    if !modal.list.is_loading()
+        && modal
+            .list
+            .ready()
+            .is_some_and(|page| page.next_cursor.is_some())
+    {
+        actions.push(action_label("[n] Next", HitTarget::GitHubNext, theme.text));
+    }
+    actions.push(action_label(
+        "[/] Filter",
+        HitTarget::GitHubFilter,
+        theme.text,
+    ));
+}
+
+fn add_github_detail_actions(modal: &GitHubModal, theme: Theme, actions: &mut Vec<ActionItem>) {
+    if modal.detail.ready().is_some() {
+        actions.push(action_label(
+            "[k] Up",
+            HitTarget::GitHubScroll(-1),
+            theme.text,
+        ));
+        actions.push(action_label(
+            "[j] Down",
+            HitTarget::GitHubScroll(1),
+            theme.text,
+        ));
+        actions.push(action_label(
+            "[o] Browser",
+            HitTarget::GitHubOpen,
+            theme.focus,
+        ));
+    }
+    if !modal.detail.is_loading()
+        && modal
+            .detail
+            .ready()
+            .is_some_and(|detail| detail.comments.next_cursor.is_some())
+    {
+        actions.push(action_label(
+            "[c] More comments",
+            HitTarget::GitHubMoreComments,
+            theme.text,
+        ));
+    }
+}
+
+fn github_settings_recovery_available(modal: &GitHubModal) -> bool {
+    if modal.configuration_error.is_some() {
+        return true;
+    }
+    let failure = match modal.depth {
+        GitHubDepth::List => match &modal.list {
+            GitHubLoad::Failed(failure) => Some(failure),
+            _ => None,
+        },
+        GitHubDepth::Detail => match &modal.detail {
+            GitHubLoad::Failed(failure) => Some(failure),
+            _ => None,
+        },
+    };
+    failure.is_some_and(|failure| {
+        matches!(
+            failure.kind,
+            GitHubBrowseFailureKind::CliUnavailable
+                | GitHubBrowseFailureKind::Authentication
+                | GitHubBrowseFailureKind::Permission
+        )
+    })
+}
+
+fn draw_github(frame: &mut Frame<'_>, modal: &GitHubModal, hits: &mut HitMap, theme: Theme) {
+    let area = centered(frame.area(), 94, 88);
+    frame.render_widget(Clear, area);
+    let title = match modal.kind {
+        GitHubItemKind::Issue => " GitHub · Issues ",
+        GitHubItemKind::PullRequest => " GitHub · Pull Requests ",
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(theme.focus)
+        .style(theme.background);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    draw_github_tabs(frame, modal, hits, layout[0], theme);
+    draw_github_filter(frame, modal, hits, layout[1], theme);
+    match modal.depth {
+        GitHubDepth::List => draw_github_list(frame, modal, hits, layout[2], theme),
+        GitHubDepth::Detail => draw_github_detail(frame, modal, layout[2], theme),
+    }
+}
+
+fn draw_github_tabs(
+    frame: &mut Frame<'_>,
+    modal: &GitHubModal,
+    hits: &mut HitMap,
+    area: Rect,
+    theme: Theme,
+) {
+    let issues = if modal.kind == GitHubItemKind::Issue {
+        theme.selected
+    } else {
+        theme.text
+    };
+    let pulls = if modal.kind == GitHubItemKind::PullRequest {
+        theme.selected
+    } else {
+        theme.text
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" [i] Issues ", issues),
+            Span::raw("  "),
+            Span::styled(" [p] Pull Requests ", pulls),
+        ])),
+        area,
+    );
+    hits.push(
+        Rect::new(area.x, area.y, 12.min(area.width), 1),
+        HitTarget::GitHubIssues,
+    );
+    if area.width > 14 {
+        hits.push(
+            Rect::new(
+                area.x.saturating_add(14),
+                area.y,
+                20.min(area.width - 14),
+                1,
+            ),
+            HitTarget::GitHubPullRequests,
+        );
+    }
+}
+
+fn draw_github_filter(
+    frame: &mut Frame<'_>,
+    modal: &GitHubModal,
+    hits: &mut HitMap,
+    area: Rect,
+    theme: Theme,
+) {
+    let cursor = if modal.filter_editing { "▏" } else { "" };
+    let value = if modal.filter_input.is_empty() {
+        "open items (type / to filter)".to_owned()
+    } else {
+        modal.filter_input.clone()
+    };
+    let hint = modal.filter_error.as_deref().unwrap_or(match modal.kind {
+        GitHubItemKind::Issue => "text · state: · author: · assignee: · label:",
+        GitHubItemKind::PullRequest => {
+            "text · state: · author: · label: · draft: · review: · check:"
+        }
+    });
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Filter: ", Modifier::BOLD),
+                Span::styled(
+                    format!("{value}{cursor}"),
+                    if modal.filter_editing {
+                        theme.focus
+                    } else {
+                        theme.text
+                    },
+                ),
+            ]),
+            Line::styled(
+                hint.to_owned(),
+                if modal.filter_error.is_some() {
+                    theme.danger
+                } else {
+                    theme.muted
+                },
+            ),
+        ]),
+        area,
+    );
+    hits.push(area, HitTarget::GitHubFilter);
+}
+
+fn draw_github_list(
+    frame: &mut Frame<'_>,
+    modal: &GitHubModal,
+    hits: &mut HitMap,
+    area: Rect,
+    theme: Theme,
+) {
+    if let Some(error) = &modal.configuration_error {
+        draw_github_message(
+            frame,
+            area,
+            "GitHub Repository setup is required",
+            error,
+            theme.danger,
+        );
+        return;
+    }
+    let area = if let Some(error) = &modal.browser_error {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(format!("Browser action failed: {error}"))
+                .style(theme.danger)
+                .wrap(Wrap { trim: false }),
+            split[0],
+        );
+        split[1]
+    } else if modal.browser_pending {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new("Opening the validated browser target…").style(theme.focus),
+            split[0],
+        );
+        split[1]
+    } else {
+        area
+    };
+    match &modal.list {
+        GitHubLoad::Idle => {
+            draw_github_message(
+                frame,
+                area,
+                "No GitHub request",
+                "Press r to load items.",
+                theme.muted,
+            );
+        }
+        GitHubLoad::Loading(None) => {
+            draw_github_message(
+                frame,
+                area,
+                "Loading GitHub items…",
+                "The request is bounded and cancellable by closing the modal.",
+                theme.focus,
+            );
+        }
+        GitHubLoad::Failed(failure) => draw_github_failure(frame, area, failure, theme),
+        GitHubLoad::Ready(page) | GitHubLoad::Loading(Some(page)) => {
+            draw_github_loaded_list(frame, modal, page, hits, area, theme);
+        }
+    }
+}
+
+fn draw_github_loaded_list(
+    frame: &mut Frame<'_>,
+    modal: &GitHubModal,
+    page: &sylvops_core::github::GitHubListPage,
+    hits: &mut HitMap,
+    area: Rect,
+    theme: Theme,
+) {
+    if page.items.is_empty() {
+        let detail = if modal.list.is_loading() {
+            "Refreshing the current bounded page…"
+        } else if modal.filter_input.is_empty() {
+            "No open items were returned. Press r to refresh."
+        } else {
+            "No items match the current filters. Press / to edit them."
+        };
+        let title = if modal.list.is_loading() {
+            "Refreshing GitHub items…"
+        } else {
+            "No GitHub items"
+        };
+        draw_github_message(frame, area, title, detail, theme.muted);
+        return;
+    }
+    let rows_visible = usize::from(area.height / 2).max(1);
+    let start = modal
+        .selected_index
+        .saturating_sub(rows_visible.saturating_sub(1))
+        .min(page.items.len().saturating_sub(rows_visible));
+    let items = page
+        .items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows_visible)
+        .map(|(index, item)| github_list_item(item, index, modal.selected_index, theme))
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items), area);
+    for (visible, index) in (start..page.items.len()).take(rows_visible).enumerate() {
+        hits.push(
+            Rect::new(
+                area.x,
+                area.y
+                    .saturating_add(u16::try_from(visible * 2).unwrap_or(u16::MAX)),
+                area.width,
+                2.min(area.height),
+            ),
+            HitTarget::GitHubRow(index),
+        );
+    }
+    if modal.list.is_loading() && area.height > 0 {
+        frame.render_widget(
+            Paragraph::new("Refreshing…")
+                .style(theme.focus)
+                .alignment(Alignment::Right),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+    }
+}
+
+fn github_list_item<'a>(
+    item: &sylvops_core::github::GitHubItemSummary,
+    index: usize,
+    selected_index: usize,
+    theme: Theme,
+) -> ListItem<'a> {
+    let mut metadata = github_list_metadata(item);
+    if let Some(pull) = &item.pull_request {
+        let _ = write!(metadata, " · {}", github_pull_request_metadata(pull));
+    }
+    let selected = index == selected_index;
+    let style = if selected { theme.selected } else { theme.text };
+    ListItem::new(vec![
+        Line::styled(format!("#{} {}", item.identity.number, item.title), style),
+        Line::styled(
+            metadata,
+            if selected {
+                theme.selected
+            } else {
+                theme.muted
+            },
+        ),
+    ])
+}
+
+fn github_list_metadata(item: &sylvops_core::github::GitHubItemSummary) -> String {
+    let state = github_item_state(item.state);
+    let author = item
+        .author
+        .as_ref()
+        .map_or("unknown", |value| value.as_str());
+    let mut metadata = format!("{state} · by {author} · updated {}", item.updated_at);
+    if !item.labels.is_empty() {
+        metadata.push_str(" · labels: ");
+        metadata.push_str(
+            &item
+                .labels
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    if !item.assignees.is_empty() {
+        metadata.push_str(" · assigned: ");
+        metadata.push_str(
+            &item
+                .assignees
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    metadata
+}
+
+fn draw_github_detail(frame: &mut Frame<'_>, modal: &GitHubModal, area: Rect, theme: Theme) {
+    if let Some(error) = &modal.configuration_error {
+        draw_github_message(
+            frame,
+            area,
+            "GitHub Repository setup is required",
+            error,
+            theme.danger,
+        );
+        return;
+    }
+    match &modal.detail {
+        GitHubLoad::Idle => draw_github_message(
+            frame,
+            area,
+            "No item selected",
+            "Press Esc to return to the list.",
+            theme.muted,
+        ),
+        GitHubLoad::Loading(None) => draw_github_message(
+            frame,
+            area,
+            "Loading GitHub item…",
+            "Fetching bounded details and comments.",
+            theme.focus,
+        ),
+        GitHubLoad::Failed(failure) => draw_github_failure(frame, area, failure, theme),
+        GitHubLoad::Ready(detail) | GitHubLoad::Loading(Some(detail)) => {
+            frame.render_widget(
+                Paragraph::new(Text::from(github_detail_lines(detail, modal, theme)))
+                    .style(theme.text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((modal.detail_scroll, 0)),
+                area,
+            );
+        }
+    }
+}
+
+fn github_detail_lines(
+    detail: &sylvops_core::github::GitHubItemDetail,
+    modal: &GitHubModal,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = github_detail_header_lines(&detail.summary, theme);
+    if modal.detail.is_loading() {
+        lines.push(Line::styled("Refreshing GitHub detail…", theme.focus));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Description", Modifier::BOLD));
+    lines.extend(
+        detail
+            .body
+            .as_str()
+            .lines()
+            .map(|line| Line::raw(line.to_owned())),
+    );
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("Comments ({})", detail.comments.comments.len()),
+        Modifier::BOLD,
+    ));
+    lines.extend(github_comment_lines(&detail.comments, theme));
+    if detail.comments.next_cursor.is_some() {
+        lines.push(Line::styled(
+            "More comments are available · press c",
+            theme.focus,
+        ));
+    }
+    if let Some(error) = &modal.browser_error {
+        lines.push(Line::styled(error.clone(), theme.danger));
+    } else if modal.browser_pending {
+        lines.push(Line::styled(
+            "Opening the validated browser target…",
+            theme.focus,
+        ));
+    }
+    lines
+}
+
+fn github_detail_header_lines(
+    item: &sylvops_core::github::GitHubItemSummary,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let author = item
+        .author
+        .as_ref()
+        .map_or("unknown", |value| value.as_str());
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "#{} · {}",
+                item.identity.number,
+                github_item_state(item.state)
+            ),
+            theme.focus,
+        ),
+        Line::styled(item.title.to_string(), Modifier::BOLD),
+        Line::styled(
+            format!(
+                "Author: {author} · Created {} · Updated {}",
+                item.created_at, item.updated_at
+            ),
+            theme.muted,
+        ),
+    ];
+    if let Some(pull) = &item.pull_request {
+        lines.push(Line::styled(
+            github_pull_request_metadata(pull),
+            theme.muted,
+        ));
+    }
+    if !item.labels.is_empty() || !item.assignees.is_empty() {
+        let labels = item
+            .labels
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let assignees = item
+            .assignees
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::styled(
+            format!(
+                "Labels: {} · Assignees: {}",
+                if labels.is_empty() { "none" } else { &labels },
+                if assignees.is_empty() {
+                    "none"
+                } else {
+                    &assignees
+                }
+            ),
+            theme.muted,
+        ));
+    }
+    lines
+}
+
+fn github_pull_request_metadata(pull: &sylvops_core::github::GitHubPullRequestSummary) -> String {
+    format!(
+        "{} → {} · {} · review {} · checks {} ({}) · {} files (+{} −{})",
+        pull.head_branch,
+        pull.base_branch,
+        if pull.draft { "draft" } else { "ready" },
+        github_review_state(pull.review),
+        github_check_state(pull.checks.state),
+        pull.checks.total,
+        pull.changed_files.total,
+        pull.changed_files.additions,
+        pull.changed_files.deletions,
+    )
+}
+
+fn github_comment_lines(
+    comments: &sylvops_core::github::GitHubCommentPage,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    if comments.comments.is_empty() {
+        return vec![Line::styled("No comments on this page.", theme.muted)];
+    }
+    let mut lines = Vec::new();
+    for comment in &comments.comments {
+        let author = comment
+            .author
+            .as_ref()
+            .map_or("unknown", |value| value.as_str());
+        lines.push(Line::styled(
+            format!("{author} · {}", comment.created_at),
+            theme.focus,
+        ));
+        lines.extend(
+            comment
+                .body
+                .as_str()
+                .lines()
+                .map(|line| Line::raw(line.to_owned())),
+        );
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+fn draw_github_failure(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    failure: &GitHubBrowseFailure,
+    theme: Theme,
+) {
+    let title = match failure.kind {
+        GitHubBrowseFailureKind::CliUnavailable => "GitHub CLI unavailable",
+        GitHubBrowseFailureKind::Authentication => "GitHub authentication required",
+        GitHubBrowseFailureKind::Permission => "GitHub Repository access denied",
+        GitHubBrowseFailureKind::RateLimited => "GitHub rate limit reached",
+        GitHubBrowseFailureKind::Network => "GitHub is offline",
+        GitHubBrowseFailureKind::TimedOut => "GitHub request timed out",
+        GitHubBrowseFailureKind::MalformedResponse => "GitHub returned malformed data",
+        GitHubBrowseFailureKind::OversizedResponse => "GitHub response exceeded safety limits",
+        GitHubBrowseFailureKind::UnavailableItem => "This GitHub item is unavailable",
+    };
+    draw_github_message(frame, area, title, &failure.diagnostic, theme.danger);
+}
+
+fn draw_github_message(frame: &mut Frame<'_>, area: Rect, title: &str, detail: &str, style: Style) {
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(title.to_owned(), style.add_modifier(Modifier::BOLD)),
+            Line::raw(""),
+            Line::styled(detail.to_owned(), style),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+const fn github_item_state(state: GitHubItemState) -> &'static str {
+    match state {
+        GitHubItemState::Open => "open",
+        GitHubItemState::Closed => "closed",
+        GitHubItemState::Merged => "merged",
+    }
+}
+
+const fn github_review_state(state: GitHubReviewState) -> &'static str {
+    match state {
+        GitHubReviewState::Approved => "approved",
+        GitHubReviewState::ChangesRequested => "changes requested",
+        GitHubReviewState::ReviewRequired => "review required",
+        GitHubReviewState::None => "none",
+    }
+}
+
+const fn github_check_state(state: GitHubCheckState) -> &'static str {
+    match state {
+        GitHubCheckState::Success => "passing",
+        GitHubCheckState::Failure => "failing",
+        GitHubCheckState::Pending => "pending",
+        GitHubCheckState::Neutral => "neutral",
+        GitHubCheckState::Skipped => "skipped",
+        GitHubCheckState::None => "none",
+    }
 }
 
 #[allow(clippy::too_many_lines)]

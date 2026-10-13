@@ -27,6 +27,7 @@ pub(crate) fn navigation_action(app: &App, event: &Event) -> Option<Action> {
                 KeyCode::Char('n') => Some(Action::New),
                 KeyCode::Char('r') => Some(Action::Rename),
                 KeyCode::Char('d') => Some(Action::Delete),
+                KeyCode::Char('G') => Some(Action::GitHub),
                 KeyCode::Char('g') => Some(Action::Diff),
                 KeyCode::Char('s') => Some(Action::Settings),
                 KeyCode::Char('/') => Some(Action::Palette),
@@ -107,5 +108,32 @@ fn target_action(target: HitTarget) -> Option<Action> {
         HitTarget::Commands => Some(Action::Palette),
         HitTarget::Help => Some(Action::ToggleHelp),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+    use sylvops_core::domain::DaemonSnapshot;
+
+    #[test]
+    fn uppercase_g_opens_github_while_lowercase_g_keeps_diff() {
+        let app = App::new(DaemonSnapshot::default(), Vec::new(), None);
+
+        assert_eq!(
+            navigation_action(
+                &app,
+                &Event::Key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+            ),
+            Some(Action::GitHub)
+        );
+        assert_eq!(
+            navigation_action(
+                &app,
+                &Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            ),
+            Some(Action::Diff)
+        );
     }
 }

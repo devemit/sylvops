@@ -23,6 +23,7 @@ pub(crate) enum Action {
     Rename,
     Delete,
     Diff,
+    GitHub,
     Attention,
     Settings,
     Palette,
@@ -39,6 +40,7 @@ pub(crate) enum Effect {
     OpenDelete,
     LoadDiff,
     LoadGitHubStatus,
+    OpenGitHub,
     Quit,
 }
 
@@ -126,6 +128,7 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             app.set_tab(TuiContentView::Changes);
             return vec![Effect::LoadDiff];
         }
+        Action::GitHub => return vec![Effect::OpenGitHub],
         Action::Attention => {
             app.flash = Some(match app.select_attention() {
                 Some(reason) => Flash::transient(FlashKind::Info, format!("Attention: {reason}")),
@@ -217,6 +220,7 @@ mod tests {
         assert_eq!(app.main_tab, TuiContentView::Details);
         assert_eq!(app.focus, FocusZone::Main);
         assert!(reduce(&mut app, Action::Quit).contains(&Effect::Quit));
+        assert_eq!(reduce(&mut app, Action::GitHub), vec![Effect::OpenGitHub]);
     }
 
     #[test]

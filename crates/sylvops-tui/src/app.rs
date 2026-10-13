@@ -19,7 +19,10 @@ use sylvops_core::{
     ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
 };
 
-use crate::{directory_browser::DirectoryBrowser, forms::Form, terminal::AttachedTerminal};
+use crate::{
+    directory_browser::DirectoryBrowser, forms::Form, github_modal::GitHubModal,
+    terminal::AttachedTerminal,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FocusZone {
@@ -109,6 +112,7 @@ pub(crate) enum Mode {
     Confirmation(Confirmation),
     CommandPalette(Palette),
     Settings(Settings),
+    GitHub(Box<GitHubModal>),
     TerminalAttached,
 }
 
@@ -200,6 +204,17 @@ pub(crate) enum HitTarget {
     Confirm,
     Cancel,
     PaletteRow(usize),
+    GitHubIssues,
+    GitHubPullRequests,
+    GitHubRow(usize),
+    GitHubFilter,
+    GitHubRefresh,
+    GitHubOpen,
+    GitHubPrevious,
+    GitHubNext,
+    GitHubMoreComments,
+    GitHubScroll(isize),
+    GitHubBack,
 }
 
 #[derive(Clone, Debug)]
