@@ -4702,9 +4702,11 @@ name = "sylvops-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm 0.29.0",
+ "junction",
  "ratatui",
  "sylvops-core",
  "sylvops-daemon",
+ "tempfile",
  "tokio",
  "vt100",
 ]

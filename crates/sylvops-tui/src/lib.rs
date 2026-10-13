@@ -47,7 +47,7 @@ use terminal::{AttachedTerminal, encode_key, is_detach_key};
 
 const TICK: Duration = Duration::from_millis(60);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
-const MAX_FORM_VALUE_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_FORM_VALUE_BYTES: usize = 8 * 1024;
 
 struct FormOutcome {
     message: String,
@@ -799,9 +799,8 @@ async fn open_directory_browser(app: &mut App) {
         Mode::Modal(form) if matches!(form.kind, FormKind::RegisterProject(_)) => form.clone(),
         _ => return,
     };
-    app.mode = Mode::DirectoryBrowser(
-        DirectoryBrowser::new(form, app.invocation_directory.clone()).await,
-    );
+    app.mode =
+        Mode::DirectoryBrowser(DirectoryBrowser::new(form, app.invocation_directory.clone()).await);
 }
 
 async fn handle_directory_browser(app: &mut App, input: Event) {
@@ -828,6 +827,7 @@ async fn handle_directory_browser(app: &mut App, input: Event) {
         _ => None,
     };
     let mut activate = clicked_row.is_some();
+    let mut refresh = false;
     if let Mode::DirectoryBrowser(browser) = &mut app.mode {
         if let Some(index) = clicked_row {
             browser.selected = index.min(browser.visible_entries().len().saturating_sub(1));
@@ -845,6 +845,10 @@ async fn handle_directory_browser(app: &mut App, input: Event) {
                 KeyCode::Up => browser.move_selection(-1),
                 KeyCode::Backspace => browser.pop_filter(),
                 KeyCode::Enter => activate = true,
+                KeyCode::Char('h') if key.modifiers.is_empty() => browser.toggle_hidden(),
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    refresh = true;
+                }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     browser.push_filter(&character.to_string());
                 }
@@ -854,6 +858,9 @@ async fn handle_directory_browser(app: &mut App, input: Event) {
         }
     }
     if !activate {
+        if refresh && let Mode::DirectoryBrowser(browser) = &mut app.mode {
+            browser.refresh().await;
+        }
         return;
     }
     let entry = match &app.mode {
@@ -888,9 +895,8 @@ fn restore_directory_browser_form(app: &mut App, selected: Option<PathBuf>) {
         if let Some(path) = selected.to_str() {
             form.set_repository_path(path.into());
         } else {
-            form.submission_error = Some(
-                "The selected directory cannot be represented by the IPC path format.".into(),
-            );
+            form.submission_error =
+                Some("The selected directory cannot be represented by the IPC path format.".into());
         }
     }
     app.mode = Mode::Modal(form);
@@ -1036,10 +1042,8 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
         _ => message,
     };
     let selection = match &response {
-        DaemonResponse::ProjectAdded { root_worktree, .. } => {
-            Some(ExplorerNode::Worktree(root_worktree.id))
-        }
-        DaemonResponse::ProjectReady { root_worktree, .. } => {
+        DaemonResponse::ProjectAdded { root_worktree, .. }
+        | DaemonResponse::ProjectReady { root_worktree, .. } => {
             Some(ExplorerNode::Worktree(root_worktree.id))
         }
         DaemonResponse::WorktreeCreated { worktree, .. } => {
@@ -3954,6 +3958,44 @@ mod tests {
         push_bounded(&mut value, "éx");
         assert!(value.ends_with('é'));
         assert_eq!(value.len(), MAX_FORM_VALUE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn directory_browser_cancel_restores_the_form_after_a_filesystem_error() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace_id = populated_snapshot().workspaces[0].id;
+        let mut form = Form::repository(workspace_id);
+        form.set_repository_path("keep-this-value".into());
+        let mut browser = DirectoryBrowser::new(form, temporary.path().into()).await;
+        browser.navigate(temporary.path().join("removed")).await;
+        assert!(browser.error.is_some());
+
+        let mut app = App::new_at(
+            populated_snapshot(),
+            Vec::new(),
+            None,
+            temporary.path().into(),
+        );
+        app.mode = Mode::DirectoryBrowser(browser);
+        restore_directory_browser_form(&mut app, None);
+
+        let Mode::Modal(form) = app.mode else {
+            panic!("cancel must restore the registration form");
+        };
+        assert_eq!(form.repository_path(), Some("keep-this-value"));
+
+        let browser = DirectoryBrowser::new(form, temporary.path().into()).await;
+        app.mode = Mode::DirectoryBrowser(browser);
+        select_browser_current_directory(&mut app);
+        let Mode::Modal(form) = app.mode else {
+            panic!("selection must return to the registration form");
+        };
+        assert_eq!(
+            form.repository_path(),
+            std::path::absolute(temporary.path())
+                .expect("absolute temporary path")
+                .to_str()
+        );
     }
 
     #[test]
