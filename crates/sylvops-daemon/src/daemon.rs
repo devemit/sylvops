@@ -20,7 +20,7 @@ use sylvops_core::{
         DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, WorktreeStatus,
         state_allows_deletion, state_allows_resume, state_is_active,
     },
-    github::{GitHubFailure, GitHubIntegrationStatus},
+    github::{GitHubFailure, GitHubIntegrationStatus, GitHubRepositoryIdentity},
     ids::{ProjectId, ProviderProfileId, SessionId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, Frame, HelloRequest, MessageClass,
@@ -922,7 +922,7 @@ async fn serve_client(mut stream: BoxStream, state: DaemonState) -> Result<()> {
     let (connection_failed, mut connection_failures) = mpsc::channel(1);
     let mut writer_finished = false;
 
-    let result: Result<()> = async {
+    let result: Result<()> = Box::pin(async {
         loop {
             tokio::select! {
             received = incoming.recv() => {
@@ -984,7 +984,7 @@ async fn serve_client(mut stream: BoxStream, state: DaemonState) -> Result<()> {
             }
             }
         }
-    }
+    })
     .await;
 
     for (session_id, task) in attachments {
@@ -1274,6 +1274,22 @@ async fn handle_request(
                 });
             }
             Ok(())
+        }
+        ClientRequest::ListGitHubItems { project_id, query } => {
+            let repository = associated_github_repository(state, project_id).await?;
+            let response = match state.github.list_items(&repository, &query).await {
+                Ok(page) => DaemonResponse::GitHubItems(page),
+                Err(failure) => DaemonResponse::GitHubBrowseFailure(failure),
+            };
+            send_response_queue(outgoing, request_id, &response).await
+        }
+        ClientRequest::ViewGitHubItem { project_id, query } => {
+            let repository = associated_github_repository(state, project_id).await?;
+            let response = match state.github.view_item(&repository, &query).await {
+                Ok(detail) => DaemonResponse::GitHubItem(detail),
+                Err(failure) => DaemonResponse::GitHubBrowseFailure(failure),
+            };
+            send_response_queue(outgoing, request_id, &response).await
         }
         ClientRequest::AddWorkspace { name } => {
             let (revision, workspace) = state.database.add_workspace(name).await?;
@@ -3342,6 +3358,24 @@ async fn project_operation_lock(state: &DaemonState, id: ProjectId) -> Arc<Mutex
         .entry(id)
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+async fn associated_github_repository(
+    state: &DaemonState,
+    project_id: ProjectId,
+) -> Result<GitHubRepositoryIdentity> {
+    state
+        .database
+        .project(project_id)
+        .await
+        .map_err(|_| DaemonError::GitHub(GitHubFailure::ProjectUnavailable))?;
+    state
+        .database
+        .github_association(project_id)
+        .await
+        .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?
+        .map(|association| association.repository)
+        .ok_or(DaemonError::GitHub(GitHubFailure::RepositoryUnavailable))
 }
 
 async fn stop_all_sessions(state: &DaemonState) {

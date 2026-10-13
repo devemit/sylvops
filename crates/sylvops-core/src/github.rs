@@ -13,6 +13,19 @@ pub const MAX_GIT_REMOTE_NAME_LENGTH: usize = 128;
 pub const MAX_GITHUB_DIAGNOSTIC_LENGTH: usize = 512;
 pub const MAX_GITHUB_REMOTES: usize = 64;
 pub const MAX_GITHUB_CONNECTIONS: usize = 64;
+pub const MAX_GITHUB_PAGE_SIZE: u8 = 50;
+pub const MAX_GITHUB_FILTER_LABELS: usize = 20;
+pub const MAX_GITHUB_ITEM_LABELS: usize = 50;
+pub const MAX_GITHUB_ITEM_ASSIGNEES: usize = 50;
+pub const MAX_GITHUB_TITLE_LENGTH: usize = 512;
+pub const MAX_GITHUB_BODY_LENGTH: usize = 64 * 1024;
+pub const MAX_GITHUB_COMMENT_BODY_LENGTH: usize = 32 * 1024;
+pub const MAX_GITHUB_CURSOR_LENGTH: usize = 1_024;
+pub const MAX_GITHUB_SEARCH_LENGTH: usize = 256;
+pub const MAX_GITHUB_LOGIN_LENGTH: usize = 128;
+pub const MAX_GITHUB_LABEL_LENGTH: usize = 128;
+pub const MAX_GITHUB_BRANCH_LENGTH: usize = 255;
+pub const MAX_GITHUB_TIMESTAMP_LENGTH: usize = 64;
 
 macro_rules! validated_string {
     ($name:ident, $validator:ident) => {
@@ -72,6 +85,15 @@ validated_string!(GitHubHost, validate_host);
 validated_string!(GitHubOwner, validate_owner);
 validated_string!(GitHubRepositoryName, validate_repository);
 validated_string!(GitRemoteName, validate_remote_name);
+validated_string!(GitHubCursor, validate_cursor);
+validated_string!(GitHubSearchText, validate_search_text);
+validated_string!(GitHubLogin, validate_login);
+validated_string!(GitHubLabelName, validate_label);
+validated_string!(GitHubBranchName, validate_branch);
+validated_string!(GitHubTimestamp, validate_timestamp);
+validated_string!(GitHubTitle, validate_title);
+validated_string!(GitHubBody, validate_body);
+validated_string!(GitHubCommentBody, validate_comment_body);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct GitHubRepositoryIdentity {
@@ -261,6 +283,641 @@ pub struct GitHubIntegrationStatus {
     pub association: Option<GitHubAssociation>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubItemKind {
+    Issue,
+    PullRequest,
+}
+
+impl GitHubItemKind {
+    #[must_use]
+    pub const fn search_qualifier(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pr",
+        }
+    }
+
+    #[must_use]
+    pub const fn browser_segment(self) -> &'static str {
+        match self {
+            Self::Issue => "issues",
+            Self::PullRequest => "pull",
+        }
+    }
+}
+
+impl fmt::Display for GitHubItemKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pull-request",
+        })
+    }
+}
+
+impl FromStr for GitHubItemKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "issue" | "issues" => Ok(Self::Issue),
+            "pull-request" | "pull-requests" | "pr" | "prs" => Ok(Self::PullRequest),
+            _ => Err("GitHub item kind must be issue or pull-request".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitHubItemNumber(u64);
+
+impl GitHubItemNumber {
+    /// Creates a positive GitHub issue or Pull Request number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` is zero.
+    pub fn new(value: u64) -> Result<Self, String> {
+        if value == 0 {
+            Err("GitHub item number must be positive".into())
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for GitHubItemNumber {
+    type Error = String;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<GitHubItemNumber> for u64 {
+    fn from(value: GitHubItemNumber) -> Self {
+        value.0
+    }
+}
+
+impl FromStr for GitHubItemNumber {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse::<u64>()
+            .map_err(|_| "GitHub item number is invalid".to_owned())?
+            .try_into()
+    }
+}
+
+impl fmt::Display for GitHubItemNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl Serialize for GitHubItemNumber {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for GitHubItemNumber {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        u64::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GitHubPageSize(u8);
+
+impl GitHubPageSize {
+    /// Creates a page size between one and fifty items.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` is outside the supported page-size range.
+    pub fn new(value: u8) -> Result<Self, String> {
+        if (1..=MAX_GITHUB_PAGE_SIZE).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(format!(
+                "GitHub page size must be between 1 and {MAX_GITHUB_PAGE_SIZE}"
+            ))
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for GitHubPageSize {
+    fn default() -> Self {
+        Self(30)
+    }
+}
+
+impl FromStr for GitHubPageSize {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse::<u8>()
+            .map_err(|_| "GitHub page size is invalid".to_owned())?
+            .try_into()
+    }
+}
+
+impl fmt::Display for GitHubPageSize {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl TryFrom<u8> for GitHubPageSize {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<GitHubPageSize> for u8 {
+    fn from(value: GitHubPageSize) -> Self {
+        value.0
+    }
+}
+
+impl Serialize for GitHubPageSize {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for GitHubPageSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        u8::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct GitHubItemIdentity {
+    pub repository: GitHubRepositoryIdentity,
+    pub kind: GitHubItemKind,
+    pub number: GitHubItemNumber,
+}
+
+impl GitHubItemIdentity {
+    #[must_use]
+    pub const fn new(
+        repository: GitHubRepositoryIdentity,
+        kind: GitHubItemKind,
+        number: GitHubItemNumber,
+    ) -> Self {
+        Self {
+            repository,
+            kind,
+            number,
+        }
+    }
+
+    #[must_use]
+    pub fn browser_target(&self) -> GitHubBrowserTarget {
+        GitHubBrowserTarget(format!(
+            "https://{}/{}/{}/{}/{}",
+            self.repository.host(),
+            self.repository.owner(),
+            self.repository.repository(),
+            self.kind.browser_segment(),
+            self.number
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GitHubBrowserTarget(String);
+
+impl GitHubBrowserTarget {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for GitHubBrowserTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for GitHubBrowserTarget {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() > 4_096 || value.chars().any(char::is_control) {
+            return Err("GitHub browser target is invalid".into());
+        }
+        let parsed = url::Url::parse(&value).map_err(|_| "GitHub browser target is invalid")?;
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err("GitHub browser target is invalid".into());
+        }
+        let host = GitHubHost::new(
+            parsed
+                .host_str()
+                .ok_or("GitHub browser target has no host")?,
+        )?;
+        let segments = parsed
+            .path_segments()
+            .ok_or("GitHub browser target has no path")?
+            .collect::<Vec<_>>();
+        let [owner, repository, kind, number] = segments.as_slice() else {
+            return Err("GitHub browser target path is invalid".into());
+        };
+        let owner = GitHubOwner::new(*owner)?;
+        let repository = GitHubRepositoryName::new(*repository)?;
+        let kind = match *kind {
+            "issues" => GitHubItemKind::Issue,
+            "pull" => GitHubItemKind::PullRequest,
+            _ => return Err("GitHub browser target kind is invalid".into()),
+        };
+        let number = number.parse::<GitHubItemNumber>()?;
+        let canonical = GitHubItemIdentity::new(
+            GitHubRepositoryIdentity::new(host, owner, repository),
+            kind,
+            number,
+        )
+        .browser_target();
+        if canonical.0 != value {
+            return Err("GitHub browser target is not canonical".into());
+        }
+        Ok(canonical)
+    }
+}
+
+impl Serialize for GitHubBrowserTarget {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for GitHubBrowserTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubListState {
+    #[default]
+    Open,
+    Closed,
+    All,
+}
+
+impl fmt::Display for GitHubListState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::All => "all",
+        })
+    }
+}
+
+impl FromStr for GitHubListState {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "open" => Ok(Self::Open),
+            "closed" => Ok(Self::Closed),
+            "all" => Ok(Self::All),
+            _ => Err("GitHub state must be open, closed, or all".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubReviewFilter {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
+impl fmt::Display for GitHubReviewFilter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Approved => "approved",
+            Self::ChangesRequested => "changes-requested",
+            Self::ReviewRequired => "review-required",
+        })
+    }
+}
+
+impl FromStr for GitHubReviewFilter {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "approved" => Ok(Self::Approved),
+            "changes-requested" => Ok(Self::ChangesRequested),
+            "review-required" => Ok(Self::ReviewRequired),
+            _ => {
+                Err("GitHub review must be approved, changes-requested, or review-required".into())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubCheckFilter {
+    Success,
+    Failure,
+    Pending,
+}
+
+impl fmt::Display for GitHubCheckFilter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Pending => "pending",
+        })
+    }
+}
+
+impl FromStr for GitHubCheckFilter {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "success" => Ok(Self::Success),
+            "failure" => Ok(Self::Failure),
+            "pending" => Ok(Self::Pending),
+            _ => Err("GitHub check must be success, failure, or pending".into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+pub struct GitHubListFilters {
+    pub state: GitHubListState,
+    pub text: Option<GitHubSearchText>,
+    pub author: Option<GitHubLogin>,
+    pub assignee: Option<GitHubLogin>,
+    pub labels: Vec<GitHubLabelName>,
+    pub draft: Option<bool>,
+    pub review: Option<GitHubReviewFilter>,
+    pub check: Option<GitHubCheckFilter>,
+}
+
+#[derive(Deserialize)]
+struct RawGitHubListFilters {
+    #[serde(default)]
+    state: GitHubListState,
+    text: Option<GitHubSearchText>,
+    author: Option<GitHubLogin>,
+    assignee: Option<GitHubLogin>,
+    #[serde(default)]
+    labels: Vec<GitHubLabelName>,
+    draft: Option<bool>,
+    review: Option<GitHubReviewFilter>,
+    check: Option<GitHubCheckFilter>,
+}
+
+impl<'de> Deserialize<'de> for GitHubListFilters {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawGitHubListFilters::deserialize(deserializer)?;
+        if raw.labels.len() > MAX_GITHUB_FILTER_LABELS {
+            return Err(serde::de::Error::custom("too many GitHub label filters"));
+        }
+        Ok(Self {
+            state: raw.state,
+            text: raw.text,
+            author: raw.author,
+            assignee: raw.assignee,
+            labels: raw.labels,
+            draft: raw.draft,
+            review: raw.review,
+            check: raw.check,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubListQuery {
+    pub kind: GitHubItemKind,
+    pub filters: GitHubListFilters,
+    pub page_size: GitHubPageSize,
+    pub cursor: Option<GitHubCursor>,
+    pub refresh: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubViewQuery {
+    pub kind: GitHubItemKind,
+    pub number: GitHubItemNumber,
+    pub comments_page_size: GitHubPageSize,
+    pub comments_cursor: Option<GitHubCursor>,
+    pub refresh: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubItemState {
+    Open,
+    Closed,
+    Merged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubReviewState {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubCheckState {
+    Success,
+    Failure,
+    Pending,
+    Neutral,
+    Skipped,
+    None,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubCheckSummary {
+    pub state: GitHubCheckState,
+    pub total: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubChangedFileSummary {
+    pub total: u32,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubPullRequestSummary {
+    pub head_branch: GitHubBranchName,
+    pub base_branch: GitHubBranchName,
+    pub draft: bool,
+    pub review: GitHubReviewState,
+    pub checks: GitHubCheckSummary,
+    pub changed_files: GitHubChangedFileSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubItemSummary {
+    pub identity: GitHubItemIdentity,
+    pub state: GitHubItemState,
+    pub title: GitHubTitle,
+    pub author: Option<GitHubLogin>,
+    #[serde(deserialize_with = "deserialize_item_labels")]
+    pub labels: Vec<GitHubLabelName>,
+    #[serde(deserialize_with = "deserialize_item_assignees")]
+    pub assignees: Vec<GitHubLogin>,
+    pub created_at: GitHubTimestamp,
+    pub updated_at: GitHubTimestamp,
+    pub pull_request: Option<GitHubPullRequestSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubListPage {
+    #[serde(deserialize_with = "deserialize_item_summaries")]
+    pub items: Vec<GitHubItemSummary>,
+    pub next_cursor: Option<GitHubCursor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubComment {
+    pub author: Option<GitHubLogin>,
+    pub body: GitHubCommentBody,
+    pub created_at: GitHubTimestamp,
+    pub updated_at: GitHubTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubCommentPage {
+    #[serde(deserialize_with = "deserialize_comments")]
+    pub comments: Vec<GitHubComment>,
+    pub next_cursor: Option<GitHubCursor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubItemDetail {
+    pub summary: GitHubItemSummary,
+    pub body: GitHubBody,
+    pub comments: GitHubCommentPage,
+    pub browser_target: GitHubBrowserTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubBrowseFailureKind {
+    CliUnavailable,
+    Authentication,
+    Permission,
+    RateLimited,
+    Network,
+    TimedOut,
+    MalformedResponse,
+    OversizedResponse,
+    UnavailableItem,
+}
+
+impl GitHubBrowseFailureKind {
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::RateLimited | Self::Network | Self::TimedOut)
+    }
+
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::CliUnavailable => "GitHub CLI is unavailable.",
+            Self::Authentication => "GitHub authentication is required.",
+            Self::Permission => "GitHub denied access to this repository.",
+            Self::RateLimited => "GitHub rate limited this request.",
+            Self::Network => "GitHub could not be reached.",
+            Self::TimedOut => "GitHub did not respond before the deadline.",
+            Self::MalformedResponse => "GitHub returned a malformed response.",
+            Self::OversizedResponse => "GitHub returned an oversized response.",
+            Self::UnavailableItem => "The GitHub item is unavailable.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubBrowseFailure {
+    pub kind: GitHubBrowseFailureKind,
+    #[serde(deserialize_with = "deserialize_diagnostic")]
+    pub diagnostic: String,
+    pub retryable: bool,
+}
+
+impl GitHubBrowseFailure {
+    #[must_use]
+    pub fn new(kind: GitHubBrowseFailureKind) -> Self {
+        Self {
+            kind,
+            diagnostic: kind.message().to_owned(),
+            retryable: kind.retryable(),
+        }
+    }
+}
+
 /// Parses a GitHub HTTPS, SSH URL, or SSH scp-style remote without retaining credentials or URL
 /// text.
 ///
@@ -427,6 +1084,179 @@ fn validate_remote_name(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+fn validate_cursor(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > MAX_GITHUB_CURSOR_LENGTH
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err("GitHub cursor is invalid".into());
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_search_text(value: &str) -> Result<String, String> {
+    validate_visible(value, MAX_GITHUB_SEARCH_LENGTH, "GitHub search text", false)
+}
+
+fn validate_login(value: &str) -> Result<String, String> {
+    validate_visible(value, MAX_GITHUB_LOGIN_LENGTH, "GitHub login", false)
+}
+
+fn validate_label(value: &str) -> Result<String, String> {
+    validate_visible(value, MAX_GITHUB_LABEL_LENGTH, "GitHub label", false)
+}
+
+fn validate_branch(value: &str) -> Result<String, String> {
+    validate_visible(value, MAX_GITHUB_BRANCH_LENGTH, "GitHub branch", false)
+}
+
+fn validate_timestamp(value: &str) -> Result<String, String> {
+    validate_visible(
+        value,
+        MAX_GITHUB_TIMESTAMP_LENGTH,
+        "GitHub timestamp",
+        false,
+    )
+}
+
+fn validate_title(value: &str) -> Result<String, String> {
+    validate_visible(value, MAX_GITHUB_TITLE_LENGTH, "GitHub title", false)
+}
+
+fn validate_body(value: &str) -> Result<String, String> {
+    validate_multiline(value, MAX_GITHUB_BODY_LENGTH, "GitHub body")
+}
+
+fn validate_comment_body(value: &str) -> Result<String, String> {
+    validate_multiline(value, MAX_GITHUB_COMMENT_BODY_LENGTH, "GitHub comment body")
+}
+
+fn validate_multiline(value: &str, maximum: usize, label: &str) -> Result<String, String> {
+    if value.len() > maximum
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err(format!("{label} is invalid"));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_visible(
+    value: &str,
+    maximum: usize,
+    label: &str,
+    multiline: bool,
+) -> Result<String, String> {
+    let safe_control = |character: char| multiline && matches!(character, '\n' | '\t');
+    if value.is_empty()
+        || value.len() > maximum
+        || value
+            .chars()
+            .any(|character| character.is_control() && !safe_control(character))
+    {
+        return Err(format!("{label} is invalid"));
+    }
+    Ok(value.to_owned())
+}
+
+/// Removes unsafe control characters and truncates an untrusted GitHub inline field at a UTF-8
+/// boundary.
+#[must_use]
+pub fn sanitize_github_inline(value: &str, maximum: usize) -> String {
+    truncate_utf8(
+        &value
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>(),
+        maximum,
+    )
+}
+
+/// Removes unsafe control characters while retaining newlines and tabs, then truncates an
+/// untrusted GitHub body at a UTF-8 boundary.
+#[must_use]
+pub fn sanitize_github_multiline(value: &str, maximum: usize) -> String {
+    truncate_utf8(
+        &value
+            .chars()
+            .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+            .collect::<String>(),
+        maximum,
+    )
+}
+
+fn truncate_utf8(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn deserialize_item_labels<'de, D>(deserializer: D) -> Result<Vec<GitHubLabelName>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_GITHUB_ITEM_LABELS,
+        "too many GitHub labels",
+    )
+}
+
+fn deserialize_item_assignees<'de, D>(deserializer: D) -> Result<Vec<GitHubLogin>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_GITHUB_ITEM_ASSIGNEES,
+        "too many GitHub assignees",
+    )
+}
+
+fn deserialize_item_summaries<'de, D>(deserializer: D) -> Result<Vec<GitHubItemSummary>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        usize::from(MAX_GITHUB_PAGE_SIZE),
+        "too many GitHub items",
+    )
+}
+
+fn deserialize_comments<'de, D>(deserializer: D) -> Result<Vec<GitHubComment>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        usize::from(MAX_GITHUB_PAGE_SIZE),
+        "too many GitHub comments",
+    )
+}
+
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    maximum: usize,
+    message: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let values = Vec::<T>::deserialize(deserializer)?;
+    if values.len() > maximum {
+        return Err(serde::de::Error::custom(message));
+    }
+    Ok(values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +1328,82 @@ mod tests {
             "association": null
         });
         assert!(serde_json::from_value::<GitHubIntegrationStatus>(controlled).is_err());
+    }
+
+    #[test]
+    fn github_item_contract_requires_full_identity_and_builds_canonical_targets() {
+        let repository = GitHubRepositoryIdentity::new(
+            GitHubHost::new("github.example.com").unwrap(),
+            GitHubOwner::new("acme").unwrap(),
+            GitHubRepositoryName::new("widgets").unwrap(),
+        );
+        let issue = GitHubItemIdentity::new(
+            repository.clone(),
+            GitHubItemKind::Issue,
+            GitHubItemNumber::new(42).unwrap(),
+        );
+        let pull_request = GitHubItemIdentity::new(
+            repository,
+            GitHubItemKind::PullRequest,
+            GitHubItemNumber::new(7).unwrap(),
+        );
+
+        assert_eq!(
+            issue.browser_target().as_str(),
+            "https://github.example.com/acme/widgets/issues/42"
+        );
+        assert_eq!(
+            pull_request.browser_target().as_str(),
+            "https://github.example.com/acme/widgets/pull/7"
+        );
+        assert!(
+            GitHubBrowserTarget::try_from(
+                "https://github.example.com/acme/widgets/issues/42?untrusted=1".to_owned()
+            )
+            .is_err()
+        );
+        assert!(GitHubItemNumber::new(0).is_err());
+    }
+
+    #[test]
+    fn github_browse_contract_rejects_unbounded_or_unsafe_input() {
+        assert!(GitHubPageSize::new(50).is_ok());
+        assert!(GitHubPageSize::new(51).is_err());
+        assert!(GitHubCursor::new("cursor\u{1b}[31m").is_err());
+        assert!(GitHubTitle::new("unsafe\u{1b}[31m title").is_err());
+        assert!(GitHubBody::new("line one\nline two").is_ok());
+        assert!(GitHubBody::new("unsafe\u{1b}body").is_err());
+
+        let too_many_labels = serde_json::json!({
+            "state": "open",
+            "text": null,
+            "author": null,
+            "assignee": null,
+            "labels": vec!["bug"; MAX_GITHUB_FILTER_LABELS + 1],
+            "draft": null,
+            "review": null,
+            "check": null
+        });
+        assert!(serde_json::from_value::<GitHubListFilters>(too_many_labels).is_err());
+    }
+
+    #[test]
+    fn github_browse_failures_report_retryability() {
+        for retryable in [
+            GitHubBrowseFailureKind::RateLimited,
+            GitHubBrowseFailureKind::Network,
+            GitHubBrowseFailureKind::TimedOut,
+        ] {
+            assert!(retryable.retryable());
+        }
+        for terminal in [
+            GitHubBrowseFailureKind::Authentication,
+            GitHubBrowseFailureKind::Permission,
+            GitHubBrowseFailureKind::MalformedResponse,
+            GitHubBrowseFailureKind::OversizedResponse,
+            GitHubBrowseFailureKind::UnavailableItem,
+        ] {
+            assert!(!terminal.retryable());
+        }
     }
 }

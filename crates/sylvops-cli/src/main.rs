@@ -15,6 +15,11 @@ use crossterm::{
 };
 use sylvops_core::{
     domain::{ProviderKind, SessionState},
+    github::{
+        GitHubCheckFilter, GitHubCursor, GitHubItemKind, GitHubItemNumber, GitHubLabelName,
+        GitHubListFilters, GitHubListQuery, GitHubListState, GitHubLogin, GitHubPageSize,
+        GitHubReviewFilter, GitHubSearchText, GitHubViewQuery, MAX_GITHUB_FILTER_LABELS,
+    },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     upgrade::InstallDisposition,
@@ -264,6 +269,49 @@ enum GithubCommand {
         #[arg(long)]
         project: Option<ProjectId>,
     },
+    /// List associated repository Issues or Pull Requests as bounded JSON.
+    List {
+        #[arg(long)]
+        project: ProjectId,
+        #[arg(long, default_value = "issue")]
+        kind: GitHubItemKind,
+        #[arg(long, default_value = "open")]
+        state: GitHubListState,
+        #[arg(long)]
+        text: Option<GitHubSearchText>,
+        #[arg(long)]
+        author: Option<GitHubLogin>,
+        #[arg(long)]
+        assignee: Option<GitHubLogin>,
+        #[arg(long)]
+        label: Vec<GitHubLabelName>,
+        #[arg(long)]
+        draft: Option<bool>,
+        #[arg(long)]
+        review: Option<GitHubReviewFilter>,
+        #[arg(long)]
+        check: Option<GitHubCheckFilter>,
+        #[arg(long, default_value = "30")]
+        limit: GitHubPageSize,
+        #[arg(long)]
+        cursor: Option<GitHubCursor>,
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// View one associated repository Issue or Pull Request as bounded JSON.
+    View {
+        #[arg(long)]
+        project: ProjectId,
+        #[arg(long, default_value = "issue")]
+        kind: GitHubItemKind,
+        number: GitHubItemNumber,
+        #[arg(long, default_value = "30")]
+        comments_limit: GitHubPageSize,
+        #[arg(long)]
+        comments_cursor: Option<GitHubCursor>,
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -426,6 +474,48 @@ async fn run_command(
         },
         Command::Github { command } => match command {
             GithubCommand::Status { project } => show_github_status(&paths, project).await?,
+            GithubCommand::List {
+                project,
+                kind,
+                state,
+                text,
+                author,
+                assignee,
+                label,
+                draft,
+                review,
+                check,
+                limit,
+                cursor,
+                refresh,
+            } => {
+                list_github_items(
+                    &paths, project, kind, state, text, author, assignee, label, draft, review,
+                    check, limit, cursor, refresh,
+                )
+                .await?;
+            }
+            GithubCommand::View {
+                project,
+                kind,
+                number,
+                comments_limit,
+                comments_cursor,
+                refresh,
+            } => {
+                view_github_item(
+                    &paths,
+                    project,
+                    GitHubViewQuery {
+                        kind,
+                        number,
+                        comments_page_size: comments_limit,
+                        comments_cursor,
+                        refresh,
+                    },
+                )
+                .await?;
+            }
         },
         Command::Tui => run_tui(&paths, state_dir.as_deref()).await?,
         Command::Open {
@@ -1100,6 +1190,93 @@ async fn show_github_status(
         DaemonResponse::GitHubFailure(failure) => Err(DaemonError::GitHub(failure)),
         response => unexpected("GitHub status", response),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_github_items(
+    paths: &RuntimePaths,
+    project_id: ProjectId,
+    kind: GitHubItemKind,
+    state: GitHubListState,
+    text: Option<GitHubSearchText>,
+    author: Option<GitHubLogin>,
+    assignee: Option<GitHubLogin>,
+    labels: Vec<GitHubLabelName>,
+    draft: Option<bool>,
+    review: Option<GitHubReviewFilter>,
+    check: Option<GitHubCheckFilter>,
+    page_size: GitHubPageSize,
+    cursor: Option<GitHubCursor>,
+    refresh: bool,
+) -> sylvops_daemon::Result<()> {
+    if labels.len() > MAX_GITHUB_FILTER_LABELS {
+        return Err(DaemonError::Lifecycle(format!(
+            "at most {MAX_GITHUB_FILTER_LABELS} GitHub label filters are allowed"
+        )));
+    }
+    let client = DaemonClient::connect(paths, "sylvops-cli").await?;
+    let query = GitHubListQuery {
+        kind,
+        filters: GitHubListFilters {
+            state,
+            text,
+            author,
+            assignee,
+            labels,
+            draft,
+            review,
+            check,
+        },
+        page_size,
+        cursor,
+        refresh,
+    };
+    match client
+        .request(&ClientRequest::ListGitHubItems { project_id, query })
+        .await?
+    {
+        DaemonResponse::GitHubItems(page) => print_bounded_json(&page),
+        response => github_browse_response_error("GitHub list", response),
+    }
+}
+
+async fn view_github_item(
+    paths: &RuntimePaths,
+    project_id: ProjectId,
+    query: GitHubViewQuery,
+) -> sylvops_daemon::Result<()> {
+    let client = DaemonClient::connect(paths, "sylvops-cli").await?;
+    match client
+        .request(&ClientRequest::ViewGitHubItem { project_id, query })
+        .await?
+    {
+        DaemonResponse::GitHubItem(item) => print_bounded_json(&item),
+        response => github_browse_response_error("GitHub view", response),
+    }
+}
+
+fn github_browse_response_error(
+    operation: &str,
+    response: DaemonResponse,
+) -> sylvops_daemon::Result<()> {
+    match response {
+        DaemonResponse::GitHubBrowseFailure(failure) => Err(DaemonError::Lifecycle(format!(
+            "{} Retryable: {}",
+            failure.diagnostic, failure.retryable
+        ))),
+        DaemonResponse::GitHubFailure(failure) => Err(DaemonError::GitHub(failure)),
+        response => unexpected(operation, response),
+    }
+}
+
+fn print_bounded_json(value: &impl serde::Serialize) -> sylvops_daemon::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).map_err(|error| {
+            DaemonError::Lifecycle(format!("failed to render bounded GitHub output: {error}"))
+        })?
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1889,6 +2066,81 @@ mod tests {
                     project: Some(parsed),
                 }
             }) if parsed == project_id
+        ));
+    }
+
+    #[test]
+    fn cli_accepts_bounded_github_list_filters() {
+        let project_id = ProjectId::new();
+        let arguments = Arguments::try_parse_from([
+            "sylvops",
+            "github",
+            "list",
+            "--project",
+            &project_id.to_string(),
+            "--kind",
+            "pull-request",
+            "--state",
+            "all",
+            "--text",
+            "cache",
+            "--label",
+            "enhancement",
+            "--draft",
+            "false",
+            "--review",
+            "approved",
+            "--check",
+            "success",
+            "--limit",
+            "50",
+            "--refresh",
+        ])
+        .expect("GitHub list command");
+
+        assert!(matches!(
+            arguments.command,
+            Some(Command::Github {
+                command: GithubCommand::List {
+                    project,
+                    kind: GitHubItemKind::PullRequest,
+                    state: GitHubListState::All,
+                    refresh: true,
+                    ..
+                }
+            }) if project == project_id
+        ));
+    }
+
+    #[test]
+    fn cli_accepts_github_view_comment_pagination() {
+        let project_id = ProjectId::new();
+        let arguments = Arguments::try_parse_from([
+            "sylvops",
+            "github",
+            "view",
+            "--project",
+            &project_id.to_string(),
+            "--kind",
+            "issue",
+            "42",
+            "--comments-limit",
+            "25",
+            "--comments-cursor",
+            "cursor-one",
+        ])
+        .expect("GitHub view command");
+
+        assert!(matches!(
+            arguments.command,
+            Some(Command::Github {
+                command: GithubCommand::View {
+                    project,
+                    kind: GitHubItemKind::Issue,
+                    number,
+                    ..
+                }
+            }) if project == project_id && number.get() == 42
         ));
     }
 
