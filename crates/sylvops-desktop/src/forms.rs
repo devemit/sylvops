@@ -1,6 +1,14 @@
 use sylvops_core::{
     domain::{GitWorktreeState, ProviderKind},
-    protocol::{ProjectRemovalInspection, SessionDeletionInspection, WorkspaceDeletionInspection},
+    github::{
+        MAX_START_WORK_BRANCH_LENGTH, MAX_START_WORK_INSTRUCTIONS_LENGTH, StartWorkBranch,
+        StartWorkInstructions, StartWorkPreparation,
+    },
+    ids::ProjectId,
+    protocol::{
+        ClientRequest, ProjectRemovalInspection, SessionDeletionInspection,
+        WorkspaceDeletionInspection,
+    },
     ui_forms::{Form, FormKind},
     upgrade::ActiveUpgradeSession,
 };
@@ -120,6 +128,89 @@ pub(crate) struct DataRemovalConfirmation {
     pub pending: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct StartWorkModal {
+    pub project_id: ProjectId,
+    pub preparation: StartWorkPreparation,
+    pub branch: String,
+    pub provider: Option<ProviderKind>,
+    pub instructions: String,
+    pub start_another_worktree: bool,
+    pub pending: bool,
+    pub error: Option<String>,
+}
+
+impl StartWorkModal {
+    pub(crate) fn new(project_id: ProjectId, preparation: StartWorkPreparation) -> Self {
+        Self {
+            branch: preparation.suggested_branch.as_str().to_owned(),
+            provider: preparation.eligible_providers.first().copied(),
+            start_another_worktree: false,
+            project_id,
+            preparation,
+            instructions: String::new(),
+            pending: false,
+            error: None,
+        }
+    }
+
+    pub(crate) fn update_branch(&mut self, branch: String) {
+        if !self.pending && branch.len() <= MAX_START_WORK_BRANCH_LENGTH {
+            self.branch = branch;
+            self.error = None;
+        }
+    }
+
+    pub(crate) fn update_instructions(&mut self, instructions: String) {
+        if !self.pending && instructions.len() <= MAX_START_WORK_INSTRUCTIONS_LENGTH {
+            self.instructions = instructions;
+            self.error = None;
+        }
+    }
+
+    pub(crate) fn select_provider(&mut self, provider: ProviderKind) {
+        if !self.pending && self.preparation.eligible_providers.contains(&provider) {
+            self.provider = Some(provider);
+            self.error = None;
+        }
+    }
+
+    pub(crate) fn request(&self) -> Result<ClientRequest, String> {
+        if self.pending {
+            return Err("Start Work is already in progress.".into());
+        }
+        let branch = StartWorkBranch::new(self.branch.clone())?;
+        if self.preparation.suggested_branch_conflict && branch == self.preparation.suggested_branch
+        {
+            return Err("The suggested branch already exists. Choose another branch.".into());
+        }
+        let provider = self
+            .provider
+            .filter(|provider| self.preparation.eligible_providers.contains(provider))
+            .ok_or_else(|| "Choose an eligible task-capable Provider.".to_owned())?;
+        if !self.preparation.existing_work.is_empty() && !self.start_another_worktree {
+            return Err(
+                "This Issue already has local work. Open it or choose Start another Worktree."
+                    .into(),
+            );
+        }
+        let additional_instructions = if self.instructions.trim().is_empty() {
+            None
+        } else {
+            Some(StartWorkInstructions::new(self.instructions.clone())?)
+        };
+        Ok(ClientRequest::StartWork {
+            confirmation: self.preparation.confirmation(self.project_id),
+            branch,
+            provider,
+            additional_instructions,
+            start_another_worktree: self.start_another_worktree,
+            columns: 120,
+            rows: 40,
+        })
+    }
+}
+
 impl DataRemovalConfirmation {
     pub(crate) fn update(&mut self, confirmation: String) {
         if !self.pending && confirmation.len() <= DATA_REMOVAL_CONFIRMATION.len() {
@@ -145,17 +236,26 @@ pub(crate) enum Modal {
     Form(FormModal),
     Confirmation(Confirmation),
     DataRemoval(DataRemovalConfirmation),
+    StartWork(Box<StartWorkModal>),
 }
 
 #[cfg(test)]
 mod tests {
     use sylvops_core::{
-        ids::{WorkspaceId, WorktreeId},
+        domain::ProviderKind,
+        github::{
+            GitHubBody, GitHubBrowserTarget, GitHubHost, GitHubItemIdentity, GitHubItemKind,
+            GitHubItemNumber, GitHubLabelName, GitHubOwner, GitHubRepositoryIdentity,
+            GitHubRepositoryName, GitHubTimestamp, GitHubTitle, StartWorkBase, StartWorkBranch,
+            StartWorkIssueContext, StartWorkPreparation,
+        },
+        ids::{ProjectId, WorkspaceId, WorktreeId},
+        protocol::ClientRequest,
         ui_forms::FormKind,
     };
     use sylvops_daemon::data_removal::DATA_REMOVAL_CONFIRMATION;
 
-    use super::{DataRemovalConfirmation, FirstRunStepState, first_run_steps};
+    use super::{DataRemovalConfirmation, FirstRunStepState, StartWorkModal, first_run_steps};
 
     #[test]
     fn user_data_removal_requires_the_exact_confirmation_phrase() {
@@ -203,5 +303,64 @@ mod tests {
                 FirstRunStepState::Current,
             ]
         );
+    }
+
+    #[test]
+    fn start_work_keeps_remote_context_immutable_and_user_instructions_separate() {
+        let project_id = ProjectId::new();
+        let repository = GitHubRepositoryIdentity::new(
+            GitHubHost::new("github.example.com").unwrap(),
+            GitHubOwner::new("acme").unwrap(),
+            GitHubRepositoryName::new("widgets").unwrap(),
+        );
+        let issue = StartWorkIssueContext {
+            identity: GitHubItemIdentity::new(
+                repository,
+                GitHubItemKind::Issue,
+                GitHubItemNumber::new(127).unwrap(),
+            ),
+            title: GitHubTitle::new("Start Issue work from Desktop").unwrap(),
+            body: GitHubBody::new("Immutable untrusted Issue body").unwrap(),
+            labels: vec![GitHubLabelName::new("ready-for-agent").unwrap()],
+            assignees: Vec::new(),
+            updated_at: GitHubTimestamp::new("2026-10-13T12:00:00Z").unwrap(),
+            canonical_url: GitHubBrowserTarget::try_from(
+                "https://github.example.com/acme/widgets/issues/127".to_owned(),
+            )
+            .unwrap(),
+        };
+        let preparation = StartWorkPreparation {
+            issue: issue.clone(),
+            base: StartWorkBase::new(
+                WorktreeId::new(),
+                "main",
+                "0123456789abcdef0123456789abcdef01234567",
+            )
+            .unwrap(),
+            suggested_branch: StartWorkBranch::new("issue/127-start-issue-work").unwrap(),
+            suggested_branch_conflict: false,
+            eligible_providers: vec![ProviderKind::Codex],
+            existing_work: Vec::new(),
+        };
+        let mut modal = StartWorkModal::new(project_id, preparation);
+        modal.update_instructions("Use the authenticated IPC seam.".into());
+
+        assert_eq!(modal.preparation.issue, issue);
+        let ClientRequest::StartWork {
+            additional_instructions,
+            provider,
+            ..
+        } = modal.request().unwrap()
+        else {
+            panic!("expected Start Work request");
+        };
+        assert_eq!(provider, ProviderKind::Codex);
+        assert_eq!(
+            additional_instructions.unwrap().as_str(),
+            "Use the authenticated IPC seam."
+        );
+
+        modal.update_branch("unsafe branch".into());
+        assert!(modal.request().is_err());
     }
 }

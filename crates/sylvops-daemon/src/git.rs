@@ -354,6 +354,25 @@ pub async fn create_managed_worktree(
     })
 }
 
+/// Reports whether a validated local branch already exists without contacting a remote.
+///
+/// # Errors
+///
+/// Returns an error when the Project root or branch is invalid or Git cannot inspect the ref.
+pub async fn branch_exists(project: &Project, branch: &str) -> Result<bool> {
+    validate_branch_name(branch)?;
+    let repository = canonical_registered_path(&project.canonical_repository_path).await?;
+    verify_repository_root(&repository).await?;
+    validate_branch_with_git(&repository, branch).await?;
+    let branch_ref = format!("refs/heads/{branch}");
+    Ok(run_git(
+        &repository,
+        &["show-ref", "--verify", "--quiet", &branch_ref],
+    )
+    .await?
+    .success)
+}
+
 /// Inspects tracked, untracked, and ignored state and returns a state-bound removal token.
 ///
 /// # Errors

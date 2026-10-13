@@ -12,8 +12,9 @@ use crate::{
     },
     github::{
         GitHubAssociation, GitHubBrowseFailure, GitHubFailure, GitHubIntegrationStatus,
-        GitHubItemDetail, GitHubItemIdentity, GitHubListPage, GitHubListQuery, GitHubViewQuery,
-        GitRemoteName,
+        GitHubItemDetail, GitHubItemIdentity, GitHubItemNumber, GitHubListPage, GitHubListQuery,
+        GitHubViewQuery, GitRemoteName, StartWorkBranch, StartWorkConfirmation, StartWorkFailure,
+        StartWorkInstructions, StartWorkOutcome, StartWorkPreparation, WorkSource,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     provider::ProviderHealth,
@@ -22,7 +23,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 18;
+pub const PROTOCOL_MINOR: u16 = 19;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -513,6 +514,22 @@ pub enum ClientRequest {
         project_id: ProjectId,
         identity: GitHubItemIdentity,
     },
+    PrepareStartWork {
+        project_id: ProjectId,
+        issue_number: GitHubItemNumber,
+    },
+    StartWork {
+        confirmation: StartWorkConfirmation,
+        branch: StartWorkBranch,
+        provider: ProviderKind,
+        additional_instructions: Option<StartWorkInstructions>,
+        start_another_worktree: bool,
+        columns: u16,
+        rows: u16,
+    },
+    GetWorkSource {
+        worktree_id: WorktreeId,
+    },
     AddWorkspace {
         name: String,
     },
@@ -651,6 +668,10 @@ pub enum DaemonResponse {
     GitHubItems(GitHubListPage),
     GitHubItem(GitHubItemDetail),
     GitHubBrowseFailure(GitHubBrowseFailure),
+    StartWorkPrepared(StartWorkPreparation),
+    StartWorkCompleted(StartWorkOutcome),
+    StartWorkFailure(StartWorkFailure),
+    WorkSource(Option<WorkSource>),
     WorkspaceAdded {
         revision: u64,
         workspace: Workspace,
@@ -934,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_18_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_19_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -949,7 +970,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 18);
+        assert_eq!(PROTOCOL_MINOR, 19);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -967,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_18_github_contracts_round_trip() {
+    fn protocol_1_19_github_contracts_round_trip() {
         use crate::github::{
             GitHubAssociation, GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubHost,
             GitHubIntegrationStatus, GitHubItemKind, GitHubItemNumber, GitHubListFilters,
@@ -1063,11 +1084,11 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 18);
+        assert_eq!(PROTOCOL_MINOR, 19);
     }
 
     #[test]
-    fn protocol_1_18_typed_github_browser_request_round_trips() {
+    fn protocol_1_19_typed_github_browser_request_round_trips() {
         use crate::github::{
             GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, GitHubOwner,
             GitHubRepositoryIdentity, GitHubRepositoryName,
@@ -1086,13 +1107,77 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 18);
+        assert_eq!(PROTOCOL_MINOR, 19);
+    }
+
+    #[test]
+    fn protocol_1_19_start_work_contracts_round_trip() {
+        use crate::github::{
+            GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, GitHubOwner,
+            GitHubRepositoryIdentity, GitHubRepositoryName, GitHubTimestamp, StartWorkBase,
+            StartWorkBranch, StartWorkConfirmation, StartWorkFailure, StartWorkFailureKind,
+            StartWorkInstructions,
+        };
+
+        let project_id = ProjectId::new();
+        let worktree_id = WorktreeId::new();
+        let issue = GitHubItemIdentity::new(
+            GitHubRepositoryIdentity::new(
+                GitHubHost::new("github.example.com").unwrap(),
+                GitHubOwner::new("acme").unwrap(),
+                GitHubRepositoryName::new("widgets").unwrap(),
+            ),
+            GitHubItemKind::Issue,
+            GitHubItemNumber::new(127).unwrap(),
+        );
+        let confirmation = StartWorkConfirmation {
+            project_id,
+            issue,
+            issue_updated_at: GitHubTimestamp::new("2026-10-13T12:00:00Z").unwrap(),
+            base: StartWorkBase::new(
+                worktree_id,
+                "main",
+                "0123456789abcdef0123456789abcdef01234567",
+            )
+            .unwrap(),
+        };
+        let requests = [
+            ClientRequest::PrepareStartWork {
+                project_id,
+                issue_number: GitHubItemNumber::new(127).unwrap(),
+            },
+            ClientRequest::StartWork {
+                confirmation,
+                branch: StartWorkBranch::new("issue/127-start-work").unwrap(),
+                provider: ProviderKind::Codex,
+                additional_instructions: Some(
+                    StartWorkInstructions::new("Use the IPC seam.").unwrap(),
+                ),
+                start_another_worktree: false,
+                columns: 120,
+                rows: 40,
+            },
+            ClientRequest::GetWorkSource { worktree_id },
+        ];
+        for request in requests {
+            let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
+            assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+
+        let response = DaemonResponse::StartWorkFailure(StartWorkFailure::new(
+            StartWorkFailureKind::BaseMoved,
+            "The Project root Worktree moved after confirmation.",
+        ));
+        let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
+        assert_eq!(PROTOCOL_MINOR, 19);
     }
 
     #[test]
     fn protocol_1_12_provider_runtime_data_round_trips() {
         let capabilities = ProviderCapabilities {
             interactive: true,
+            task_bootstrap: true,
             resume: true,
             status_hooks: true,
             model_selection: true,

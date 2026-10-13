@@ -18,8 +18,9 @@ use sylvops_core::domain::{
     WorktreeStatus, state_allows_deletion,
 };
 use sylvops_core::github::{
-    GitHubAssociation, GitHubHost, GitHubOwner, GitHubRemote, GitHubRepositoryIdentity,
-    GitHubRepositoryName, GitRemoteName, MAX_GITHUB_CONNECTIONS,
+    GitHubAssociation, GitHubBrowserTarget, GitHubHost, GitHubItemIdentity, GitHubItemKind,
+    GitHubItemNumber, GitHubOwner, GitHubRemote, GitHubRepositoryIdentity, GitHubRepositoryName,
+    GitRemoteName, MAX_GITHUB_CONNECTIONS, MAX_START_WORK_SOURCES, WorkSource,
 };
 use sylvops_core::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
 use sylvops_core::status::{ConversationIdentityTransition, ProviderConversationId};
@@ -69,6 +70,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         7,
         "project_github_associations",
         include_str!("../migrations/0007_project_github_associations.sql"),
+    ),
+    (
+        8,
+        "work_sources",
+        include_str!("../migrations/0008_work_sources.sql"),
     ),
 ];
 
@@ -151,6 +157,15 @@ enum DatabaseCommand {
         id: ProjectId,
         reply: oneshot::Sender<Result<(u64, Option<GitHubAssociation>)>>,
     },
+    GetWorkSource {
+        id: WorktreeId,
+        reply: oneshot::Sender<Result<Option<WorkSource>>>,
+    },
+    GetIssueWorkSources {
+        project_id: ProjectId,
+        item: GitHubItemIdentity,
+        reply: oneshot::Sender<Result<Vec<WorkSource>>>,
+    },
     Worktree {
         id: WorktreeId,
         reply: oneshot::Sender<Result<Worktree>>,
@@ -170,6 +185,11 @@ enum DatabaseCommand {
     AddWorktree {
         record: NewManagedWorktree,
         reply: oneshot::Sender<Result<(u64, Worktree)>>,
+    },
+    AddSourcedWorktree {
+        record: NewManagedWorktree,
+        source: NewWorkSource,
+        reply: oneshot::Sender<Result<(u64, Worktree, WorkSource)>>,
     },
     RenameWorktree {
         id: WorktreeId,
@@ -299,6 +319,12 @@ pub struct NewManagedWorktree {
     pub branch: String,
     pub base_ref: String,
     pub base_commit: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewWorkSource {
+    pub item: GitHubItemIdentity,
+    pub canonical_url: GitHubBrowserTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -658,6 +684,38 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Loads the immutable Work Source attached to a Worktree, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, query, or persisted-value validation error.
+    pub async fn work_source(&self, id: WorktreeId) -> Result<Option<WorkSource>> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::GetWorkSource { id, reply }
+        })
+        .await
+    }
+
+    /// Loads the bounded local Worktrees sourced from one Issue identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, query, or persisted-value validation error.
+    pub async fn issue_work_sources(
+        &self,
+        project_id: ProjectId,
+        item: GitHubItemIdentity,
+    ) -> Result<Vec<WorkSource>> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::GetIssueWorkSources {
+                project_id,
+                item,
+                reply,
+            }
+        })
+        .await
+    }
+
     /// Loads one persisted session.
     ///
     /// # Errors
@@ -695,6 +753,26 @@ impl DatabaseHandle {
         request(&self.inner.commands, |reply| DatabaseCommand::AddWorktree {
             record,
             reply,
+        })
+        .await
+    }
+
+    /// Persists a verified managed Worktree and its single immutable Work Source atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, foreign-key, uniqueness, transaction, or SQLite error.
+    pub async fn add_sourced_worktree(
+        &self,
+        record: NewManagedWorktree,
+        source: NewWorkSource,
+    ) -> Result<(u64, Worktree, WorkSource)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::AddSourcedWorktree {
+                record,
+                source,
+                reply,
+            }
         })
         .await
     }
@@ -1081,6 +1159,16 @@ fn database_thread(
                 });
                 let _ = reply.send(result);
             }
+            DatabaseCommand::GetWorkSource { id, reply } => {
+                let _ = reply.send(load_work_source(&connection, id));
+            }
+            DatabaseCommand::GetIssueWorkSources {
+                project_id,
+                item,
+                reply,
+            } => {
+                let _ = reply.send(load_issue_work_sources(&connection, project_id, &item));
+            }
             DatabaseCommand::Worktree { id, reply } => {
                 let _ = reply.send(load_worktree(&connection, id));
             }
@@ -1102,6 +1190,19 @@ fn database_thread(
                     revision = revision.saturating_add(1);
                     (revision, worktree)
                 });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::AddSourcedWorktree {
+                record,
+                source,
+                reply,
+            } => {
+                let result = insert_sourced_worktree(&mut connection, &record, &source).map(
+                    |(worktree, source)| {
+                        revision = revision.saturating_add(1);
+                        (revision, worktree, source)
+                    },
+                );
                 let _ = reply.send(result);
             }
             DatabaseCommand::RenameWorktree { id, name, reply } => {
@@ -1621,6 +1722,52 @@ fn load_github_associations(connection: &Connection) -> Result<Vec<GitHubAssocia
         .map_err(database_error)
 }
 
+fn load_work_source(connection: &Connection, id: WorktreeId) -> Result<Option<WorkSource>> {
+    connection
+        .query_row(
+            "SELECT worktree_id, project_id, host, owner, repository, item_kind, item_number, \
+                    canonical_url, created_at FROM work_sources WHERE worktree_id = ?1",
+            [id.to_string()],
+            work_source_from_row,
+        )
+        .optional()
+        .map_err(database_error)
+}
+
+fn load_issue_work_sources(
+    connection: &Connection,
+    project_id: ProjectId,
+    item: &GitHubItemIdentity,
+) -> Result<Vec<WorkSource>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT work_sources.worktree_id, work_sources.project_id, host, owner, repository, \
+                    item_kind, item_number, canonical_url, work_sources.created_at \
+             FROM work_sources JOIN worktrees ON worktrees.id = work_sources.worktree_id \
+             WHERE work_sources.project_id = ?1 AND host = ?2 AND owner = ?3 \
+               AND repository = ?4 AND item_kind = ?5 AND item_number = ?6 \
+               AND worktrees.status <> 'removed' \
+             ORDER BY work_sources.created_at DESC LIMIT ?7",
+        )
+        .map_err(database_error)?;
+    statement
+        .query_map(
+            params![
+                project_id.to_string(),
+                item.repository.host().as_str(),
+                item.repository.owner().as_str(),
+                item.repository.repository().as_str(),
+                item.kind.to_string(),
+                i64::try_from(item.number.get()).unwrap_or(i64::MAX),
+                i64::try_from(MAX_START_WORK_SOURCES).unwrap_or(i64::MAX),
+            ],
+            work_source_from_row,
+        )
+        .map_err(database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(database_error)
+}
+
 fn set_github_association(
     connection: &mut Connection,
     id: ProjectId,
@@ -1889,7 +2036,71 @@ fn insert_worktree(connection: &mut Connection, record: &NewManagedWorktree) -> 
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
+    let worktree = insert_worktree_record(&transaction, record, now)?;
+    insert_entity_audit(
+        &transaction,
+        "worktree_created",
+        "worktree",
+        &record.id.to_string(),
+    )?;
+    transaction.commit().map_err(database_error)?;
+    Ok(worktree)
+}
+
+fn insert_sourced_worktree(
+    connection: &mut Connection,
+    record: &NewManagedWorktree,
+    source: &NewWorkSource,
+) -> Result<(Worktree, WorkSource)> {
+    if source.item.kind != GitHubItemKind::Issue {
+        return Err(DaemonError::Database(
+            "Work Source must identify a valid GitHub Issue".into(),
+        ));
+    }
+    let now = now_millis();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let worktree = insert_worktree_record(&transaction, record, now)?;
     transaction
+        .execute(
+            "INSERT INTO work_sources(worktree_id, project_id, host, owner, repository, \
+             item_kind, item_number, canonical_url, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.id.to_string(),
+                record.project_id.to_string(),
+                source.item.repository.host().as_str(),
+                source.item.repository.owner().as_str(),
+                source.item.repository.repository().as_str(),
+                source.item.kind.to_string(),
+                i64::try_from(source.item.number.get()).map_err(|_| {
+                    DaemonError::Database("Work Source item number is too large".into())
+                })?,
+                source.canonical_url.as_str(),
+                now,
+            ],
+        )
+        .map_err(database_error)?;
+    insert_entity_audit(
+        &transaction,
+        "worktree_created_from_issue",
+        "worktree",
+        &record.id.to_string(),
+    )?;
+    let source = load_work_source(&transaction, record.id)?.ok_or_else(|| {
+        DaemonError::Database("Work Source disappeared during its transaction".into())
+    })?;
+    transaction.commit().map_err(database_error)?;
+    Ok((worktree, source))
+}
+
+fn insert_worktree_record(
+    connection: &Connection,
+    record: &NewManagedWorktree,
+    now: i64,
+) -> Result<Worktree> {
+    connection
         .execute(
             "INSERT INTO worktrees(id, project_id, name, path, canonical_path, branch, base_ref, \
              base_commit, is_root_checkout, status, created_at, last_activity_at) \
@@ -1908,21 +2119,13 @@ fn insert_worktree(connection: &mut Connection, record: &NewManagedWorktree) -> 
             ],
         )
         .map_err(database_error)?;
-    transaction
+    connection
         .execute(
             "UPDATE projects SET last_activity_at = ?2 WHERE id = ?1",
             params![record.project_id.to_string(), now],
         )
         .map_err(database_error)?;
-    insert_entity_audit(
-        &transaction,
-        "worktree_created",
-        "worktree",
-        &record.id.to_string(),
-    )?;
-    let worktree = load_worktree(&transaction, record.id)?;
-    transaction.commit().map_err(database_error)?;
-    Ok(worktree)
+    load_worktree(connection, record.id)
 }
 
 fn rename_worktree(connection: &mut Connection, id: WorktreeId, name: &str) -> Result<Worktree> {
@@ -2713,6 +2916,43 @@ fn github_association_from_row(row: &Row<'_>) -> rusqlite::Result<GitHubAssociat
         repository: GitHubRepositoryIdentity::new(host, owner, repository),
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+    })
+}
+
+fn work_source_from_row(row: &Row<'_>) -> rusqlite::Result<WorkSource> {
+    let host = row
+        .get::<_, String>(2)?
+        .parse::<GitHubHost>()
+        .map_err(|error| invalid_value(2, error))?;
+    let owner = row
+        .get::<_, String>(3)?
+        .parse::<GitHubOwner>()
+        .map_err(|error| invalid_value(3, error))?;
+    let repository = row
+        .get::<_, String>(4)?
+        .parse::<GitHubRepositoryName>()
+        .map_err(|error| invalid_value(4, error))?;
+    let kind = row
+        .get::<_, String>(5)?
+        .parse::<GitHubItemKind>()
+        .map_err(|error| invalid_value(5, error))?;
+    let raw_number = row.get::<_, i64>(6)?;
+    let number = u64::try_from(raw_number)
+        .ok()
+        .and_then(|value| GitHubItemNumber::new(value).ok())
+        .ok_or_else(|| invalid_value(6, "invalid Work Source item number".into()))?;
+    let canonical_url = GitHubBrowserTarget::try_from(row.get::<_, String>(7)?)
+        .map_err(|error| invalid_value(7, error))?;
+    Ok(WorkSource {
+        worktree_id: parse_text(row, 0)?,
+        project_id: parse_text(row, 1)?,
+        item: GitHubItemIdentity::new(
+            GitHubRepositoryIdentity::new(host, owner, repository),
+            kind,
+            number,
+        ),
+        canonical_url,
+        created_at: row.get(8)?,
     })
 }
 
@@ -3978,5 +4218,80 @@ mod tests {
                 .is_none()
         );
         database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sourced_worktree_persists_identity_without_prompt_content() {
+        use sylvops_core::github::{
+            GitHubBrowserTarget, GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber,
+            GitHubOwner, GitHubRepositoryIdentity, GitHubRepositoryName,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let database = DatabaseHandle::open(&path).unwrap();
+        let (_, workspace) = database.add_workspace("Workspace".into()).await.unwrap();
+        let (_, project, _) = database
+            .add_project(RepositoryRegistration {
+                workspace_id: workspace.id,
+                name: "Project".into(),
+                repository_path: "C:/repo".into(),
+                canonical_repository_path: "C:/repo".into(),
+                branch: Some("main".into()),
+                default_branch: Some("main".into()),
+                remote_url: None,
+                base_commit: "0123456789abcdef".into(),
+            })
+            .await
+            .unwrap();
+        let worktree_id = WorktreeId::new();
+        let item = GitHubItemIdentity::new(
+            GitHubRepositoryIdentity::new(
+                GitHubHost::new("github.example.com").unwrap(),
+                GitHubOwner::new("acme").unwrap(),
+                GitHubRepositoryName::new("widgets").unwrap(),
+            ),
+            GitHubItemKind::Issue,
+            GitHubItemNumber::new(127).unwrap(),
+        );
+        let canonical_url = GitHubBrowserTarget::try_from(
+            "https://github.example.com/acme/widgets/issues/127".to_owned(),
+        )
+        .unwrap();
+        let (_, worktree, source) = database
+            .add_sourced_worktree(
+                NewManagedWorktree {
+                    id: worktree_id,
+                    project_id: project.id,
+                    name: "Issue 127".into(),
+                    path: "C:/managed/127".into(),
+                    canonical_path: "C:/managed/127".into(),
+                    branch: "issue/127-start-work".into(),
+                    base_ref: "main".into(),
+                    base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                },
+                NewWorkSource {
+                    item,
+                    canonical_url,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(source.worktree_id, worktree.id);
+        database.shutdown().await.unwrap();
+
+        let database = DatabaseHandle::open(&path).unwrap();
+        assert_eq!(
+            database.work_source(worktree_id).await.unwrap(),
+            Some(source)
+        );
+        database.shutdown().await.unwrap();
+
+        let bytes = std::fs::read(path).unwrap();
+        assert!(
+            !bytes
+                .windows(b"secret prompt".len())
+                .any(|window| window == b"secret prompt")
+        );
     }
 }
