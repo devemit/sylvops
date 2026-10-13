@@ -1436,24 +1436,24 @@ fn draw_directory_browser(
         Paragraph::new(format!("Current\n{}", display_path(&browser.current))).style(theme.text),
         inner[0],
     );
-    let filter = if browser.filter.is_empty() {
-        "Filter: (type a directory name)".into()
-    } else {
-        format!("Filter: {}", browser.filter)
-    };
-    frame.render_widget(Paragraph::new(filter).style(theme.muted), inner[1]);
+    frame.render_widget(
+        Paragraph::new(directory_browser_filter(browser)).style(theme.muted),
+        inner[1],
+    );
 
     let entries = browser.visible_entries();
     let visible_rows = usize::from(inner[2].height);
+    let feedback = directory_browser_feedback(browser, theme);
+    let entry_rows = visible_rows.saturating_sub(feedback.len()).max(1);
     let offset = browser
         .selected
         .saturating_add(1)
-        .saturating_sub(visible_rows);
+        .saturating_sub(entry_rows);
     let lines = entries
         .iter()
         .enumerate()
         .skip(offset)
-        .take(visible_rows)
+        .take(entry_rows)
         .map(|(index, entry)| {
             hits.push(
                 Rect::new(
@@ -1485,9 +1485,7 @@ fn draw_directory_browser(
         })
         .collect::<Vec<_>>();
     let mut list = lines;
-    if let Some(error) = &browser.error {
-        list.push(Line::from(Span::styled(error, theme.danger)));
-    }
+    list.extend(feedback);
     frame.render_widget(Paragraph::new(list).wrap(Wrap { trim: false }), inner[2]);
 
     let select_style = if browser.can_select_current() {
@@ -1515,11 +1513,38 @@ fn draw_directory_browser(
     );
     frame.render_widget(
         Block::default()
-            .title(" Directory browser · type filter · ↑↓ move · Enter open/select · Esc cancel ")
+            .title(" Directory browser · h hidden · Ctrl+R refresh · ↑↓ move · Enter open/select · Esc cancel ")
             .borders(Borders::ALL)
             .border_style(theme.border),
         area,
     );
+}
+
+fn directory_browser_feedback(browser: &DirectoryBrowser, theme: Theme) -> Vec<Line<'static>> {
+    let mut feedback = Vec::new();
+    if let Some(notice) = browser.scan_notice() {
+        feedback.push(Line::from(Span::styled(notice, theme.muted)));
+    }
+    if let Some(notice) = browser.truncation_notice() {
+        feedback.push(Line::from(Span::styled(notice, theme.muted)));
+    }
+    if let Some(error) = &browser.error {
+        feedback.push(Line::from(Span::styled(error.clone(), theme.danger)));
+    }
+    feedback
+}
+
+fn directory_browser_filter(browser: &DirectoryBrowser) -> String {
+    let hidden = if browser.show_hidden {
+        "shown"
+    } else {
+        "hidden"
+    };
+    if browser.filter.is_empty() {
+        format!("Filter: (type a directory name) · hidden: {hidden}")
+    } else {
+        format!("Filter: {} · hidden: {hidden}", browser.filter)
+    }
 }
 
 fn draw_confirmation(
