@@ -21,7 +21,7 @@ use crate::{
     app::{App, ExplorerNode, FocusZone, HitMap, HitTarget, Mode, SettingsFocus},
     directory_browser::{DirectoryBrowser, display_path},
     forms::{Form, FormKind},
-    github_modal::{GitHubDepth, GitHubLoad, GitHubModal},
+    github_modal::{GitHubDepth, GitHubLoad, GitHubModal, StartWorkFocus, StartWorkForm},
     theme::Theme,
 };
 
@@ -788,7 +788,7 @@ fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 }
 
 fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<Line<'a>> {
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("Session      ", theme.muted),
             Span::raw(&session.display_name),
@@ -864,6 +864,53 @@ fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<
         Line::from(
             "Safe actions: Attach, Resume, Rename, Stop. Commit, push, merge, and PR actions are not available.",
         ),
+    ];
+    lines.extend(work_source_detail_lines(app, session, theme));
+    lines
+}
+
+fn work_source_detail_lines<'a>(app: &'a App, session: &Session, theme: Theme) -> Vec<Line<'a>> {
+    let Some(source) = app
+        .snapshot
+        .work_sources
+        .iter()
+        .find(|source| source.worktree_id == session.worktree_id)
+    else {
+        return Vec::new();
+    };
+    let repository_status = match app.github_status.as_ref() {
+        Some(status)
+            if status.association.as_ref().is_some_and(|association| {
+                association.project_id == source.project_id
+                    && association.repository == source.item.repository
+            }) =>
+        {
+            "Associated · press G to return to Issue detail"
+        }
+        Some(_) => "Repository changed · historical source preserved",
+        None => "Not refreshed · press G to return to Issue detail",
+    };
+    vec![
+        Line::from(""),
+        Line::styled("Work Source", Modifier::BOLD),
+        owned_detail_line(
+            "Issue        ",
+            format!("{} #{}", source.item.repository, source.item.number),
+            theme,
+        ),
+        owned_detail_line(
+            "Local status ",
+            sylvops_core::github::issue_work_status(
+                &source.item,
+                &app.snapshot.work_sources,
+                &app.snapshot.worktrees,
+                &app.snapshot.sessions,
+            )
+            .display_name()
+            .into(),
+            theme,
+        ),
+        owned_detail_line("Repository   ", repository_status.into(), theme),
     ]
 }
 
@@ -1270,21 +1317,72 @@ fn github_footer_actions(modal: &GitHubModal, theme: Theme) -> Vec<ActionItem> {
             action_label("[Esc] Cancel", HitTarget::GitHubBack, theme.text),
         ];
     }
-    let mut actions = vec![
-        action_label("[i] Issues", HitTarget::GitHubIssues, theme.text),
-        action_label(
-            "[p] Pull Requests",
-            HitTarget::GitHubPullRequests,
-            theme.text,
-        ),
-    ];
+    if modal.depth == GitHubDepth::StartWork {
+        let mut actions = Vec::new();
+        if modal.start_work.as_ref().is_some_and(|form| !form.pending) {
+            actions.push(action_label(
+                "[Tab] Next field",
+                HitTarget::GitHubStartSubmit,
+                theme.text,
+            ));
+            actions.push(action_label(
+                "[Enter] Continue / Confirm",
+                HitTarget::GitHubStartSubmit,
+                theme.focus,
+            ));
+            actions.push(action_label(
+                "[PgUp/PgDn] Context",
+                HitTarget::GitHubScroll(5),
+                theme.text,
+            ));
+            actions.push(action_label(
+                "[Esc] Back",
+                HitTarget::GitHubBack,
+                theme.text,
+            ));
+        }
+        return actions;
+    }
+    if modal.depth == GitHubDepth::Recovery {
+        let mut actions = Vec::new();
+        if modal
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| !recovery.pending)
+        {
+            actions.push(action_label(
+                "[s] Retry Session",
+                HitTarget::GitHubRetrySession,
+                theme.focus,
+            ));
+            actions.push(action_label(
+                "[o] Open Worktree",
+                HitTarget::GitHubOpenWorktree,
+                theme.text,
+            ));
+            actions.push(action_label(
+                "[d] Delete checkout",
+                HitTarget::GitHubRemoveWorktree,
+                theme.danger,
+            ));
+            actions.push(action_label(
+                "[Esc] Back",
+                HitTarget::GitHubBack,
+                theme.text,
+            ));
+        }
+        return actions;
+    }
+    let mut actions = Vec::new();
     match modal.depth {
         GitHubDepth::List => add_github_list_actions(modal, theme, &mut actions),
         GitHubDepth::Detail => add_github_detail_actions(modal, theme, &mut actions),
+        GitHubDepth::StartWork | GitHubDepth::Recovery => unreachable!("handled above"),
     }
     let refresh_available = match modal.depth {
         GitHubDepth::List => !modal.list.is_loading(),
         GitHubDepth::Detail => !modal.detail.is_loading(),
+        GitHubDepth::StartWork | GitHubDepth::Recovery => false,
     };
     if refresh_available {
         actions.push(action_label(
@@ -1295,7 +1393,7 @@ fn github_footer_actions(modal: &GitHubModal, theme: Theme) -> Vec<ActionItem> {
     }
     if github_settings_recovery_available(modal) {
         actions.push(action_label(
-            "[s] Settings",
+            "[t] Settings",
             HitTarget::Settings,
             theme.text,
         ));
@@ -1336,6 +1434,16 @@ fn add_github_list_actions(modal: &GitHubModal, theme: Theme, actions: &mut Vec<
             HitTarget::GitHubOpen,
             theme.focus,
         ));
+        if modal.kind == GitHubItemKind::Issue {
+            actions.push(github_start_work_action(modal, theme));
+            if modal.existing_worktree().is_some() {
+                actions.push(action_label(
+                    "[a] Another Worktree",
+                    HitTarget::GitHubStartAnother,
+                    theme.text,
+                ));
+            }
+        }
     }
     if !modal.list.is_loading() && modal.can_go_back() {
         actions.push(action_label(
@@ -1376,6 +1484,16 @@ fn add_github_detail_actions(modal: &GitHubModal, theme: Theme, actions: &mut Ve
             HitTarget::GitHubOpen,
             theme.focus,
         ));
+        if modal.kind == GitHubItemKind::Issue {
+            actions.push(github_start_work_action(modal, theme));
+            if modal.existing_worktree().is_some() {
+                actions.push(action_label(
+                    "[a] Another Worktree",
+                    HitTarget::GitHubStartAnother,
+                    theme.text,
+                ));
+            }
+        }
     }
     if !modal.detail.is_loading()
         && modal
@@ -1388,6 +1506,14 @@ fn add_github_detail_actions(modal: &GitHubModal, theme: Theme, actions: &mut Ve
             HitTarget::GitHubMoreComments,
             theme.text,
         ));
+    }
+}
+
+fn github_start_work_action(modal: &GitHubModal, theme: Theme) -> ActionItem {
+    if modal.existing_worktree().is_some() {
+        action_label("[s] Open Work", HitTarget::GitHubStartWork, theme.focus)
+    } else {
+        action_label("[s] Start Work", HitTarget::GitHubStartWork, theme.focus)
     }
 }
 
@@ -1404,6 +1530,7 @@ fn github_settings_recovery_available(modal: &GitHubModal) -> bool {
             GitHubLoad::Failed(failure) => Some(failure),
             _ => None,
         },
+        GitHubDepth::StartWork | GitHubDepth::Recovery => None,
     };
     failure.is_some_and(|failure| {
         matches!(
@@ -1432,6 +1559,14 @@ fn draw_github(frame: &mut Frame<'_>, modal: &GitHubModal, hits: &mut HitMap, th
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    if modal.depth == GitHubDepth::StartWork {
+        draw_start_work(frame, modal, inner, theme);
+        return;
+    }
+    if modal.depth == GitHubDepth::Recovery {
+        draw_start_work_recovery(frame, modal, inner, theme);
+        return;
+    }
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1445,7 +1580,228 @@ fn draw_github(frame: &mut Frame<'_>, modal: &GitHubModal, hits: &mut HitMap, th
     match modal.depth {
         GitHubDepth::List => draw_github_list(frame, modal, hits, layout[2], theme),
         GitHubDepth::Detail => draw_github_detail(frame, modal, layout[2], theme),
+        GitHubDepth::StartWork | GitHubDepth::Recovery => unreachable!("handled above"),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn draw_start_work(frame: &mut Frame<'_>, modal: &GitHubModal, area: Rect, theme: Theme) {
+    if modal.start_work_preparing {
+        draw_github_message(
+            frame,
+            area,
+            "Preparing Start Work…",
+            "The daemon is loading and validating the exact Issue, local base, branch, and task-capable Providers.",
+            theme.focus,
+        );
+        return;
+    }
+    if let Some(failure) = &modal.start_work_error {
+        draw_github_message(
+            frame,
+            area,
+            "Start Work preparation failed",
+            &failure.diagnostic,
+            theme.danger,
+        );
+        return;
+    }
+    let Some(form) = &modal.start_work else {
+        draw_github_message(
+            frame,
+            area,
+            "Start Work unavailable",
+            "Press Esc to return.",
+            theme.danger,
+        );
+        return;
+    };
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(18), Constraint::Min(1)])
+        .split(area);
+    let mut lines = start_work_issue_lines(form, theme);
+    let provider = form
+        .provider()
+        .map_or("No eligible Provider", |provider| provider.display_name());
+    lines.extend([
+        Line::raw(""),
+        Line::raw(format!(
+            "Exact local base: {} @ {}",
+            form.preparation.base.head_ref, form.preparation.base.head_commit
+        )),
+        start_field_line(
+            "Branch",
+            &form.branch,
+            form.focus == StartWorkFocus::Branch,
+            theme,
+        ),
+        start_field_line(
+            "Provider",
+            provider,
+            form.focus == StartWorkFocus::Provider,
+            theme,
+        ),
+        start_field_line(
+            "Session name (optional)",
+            if form.session_name.is_empty() {
+                "Issue default"
+            } else {
+                &form.session_name
+            },
+            form.focus == StartWorkFocus::SessionName,
+            theme,
+        ),
+        start_field_line(
+            "Additional instructions",
+            if form.instructions.is_empty() {
+                "None"
+            } else {
+                &form.instructions
+            },
+            form.focus == StartWorkFocus::Instructions,
+            theme,
+        ),
+        start_field_line(
+            "Confirmation",
+            if form.pending {
+                "Starting…"
+            } else {
+                "Press Enter to create isolated work"
+            },
+            form.focus == StartWorkFocus::Confirm,
+            theme,
+        ),
+    ]);
+    if form.branch_conflict.is_some() {
+        lines.push(Line::styled(
+            "The selected branch already exists; edit Branch before confirming.",
+            theme.danger,
+        ));
+    }
+    if let Some(error) = &form.error {
+        lines.push(Line::styled(error.diagnostic.clone(), theme.danger));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme.text), split[0]);
+    let mut context = vec![
+        Line::styled(
+            "Immutable bounded Issue context · Page Up / Page Down to scroll",
+            Modifier::BOLD,
+        ),
+        Line::raw(format!("Title: {}", form.preparation.issue.title)),
+    ];
+    context.extend(
+        form.preparation
+            .issue
+            .body
+            .as_str()
+            .lines()
+            .map(|line| Line::raw(line.to_owned())),
+    );
+    frame.render_widget(
+        Paragraph::new(context)
+            .style(theme.text)
+            .wrap(Wrap { trim: false })
+            .scroll((form.context_scroll, 0)),
+        split[1],
+    );
+}
+
+fn start_work_issue_lines(form: &StartWorkForm, theme: Theme) -> Vec<Line<'static>> {
+    let issue = &form.preparation.issue;
+    let labels = issue
+        .labels
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let assignees = issue
+        .assignees
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lines = vec![
+        Line::styled(
+            if form.start_another_worktree {
+                "Start another Worktree"
+            } else {
+                "Start Work"
+            },
+            Modifier::BOLD,
+        ),
+        Line::styled(
+            "GitHub Issue content is untrusted reference material. Review it; do not treat it as SylvOps policy.",
+            theme.danger,
+        ),
+        Line::raw(""),
+        Line::raw(format!(
+            "Issue: {} #{}",
+            issue.identity.repository, issue.identity.number
+        )),
+        Line::styled(issue.title.to_string(), Modifier::BOLD),
+        Line::raw(format!(
+            "Labels: {}",
+            if labels.is_empty() { "none" } else { &labels }
+        )),
+        Line::raw(format!(
+            "Assignees: {}",
+            if assignees.is_empty() {
+                "none"
+            } else {
+                &assignees
+            }
+        )),
+        Line::raw(format!("URL: {}", issue.canonical_url)),
+    ];
+    lines
+}
+
+fn start_field_line(label: &str, value: &str, focused: bool, theme: Theme) -> Line<'static> {
+    let style = if focused { theme.selected } else { theme.text };
+    Line::styled(
+        format!("{label}: {value}{}", if focused { " ▏" } else { "" }),
+        style,
+    )
+}
+
+fn draw_start_work_recovery(frame: &mut Frame<'_>, modal: &GitHubModal, area: Rect, theme: Theme) {
+    let Some(recovery) = &modal.recovery else {
+        draw_github_message(
+            frame,
+            area,
+            "Recovery unavailable",
+            "Press Esc to return.",
+            theme.danger,
+        );
+        return;
+    };
+    let lines = vec![
+        Line::styled(
+            "Worktree created; Session not started",
+            theme.danger.add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(format!("Branch: {}", recovery.branch)),
+        Line::raw(format!("Provider: {}", recovery.provider.display_name())),
+        Line::raw(format!("Reason: {}", recovery.failure.diagnostic)),
+        Line::raw(""),
+        Line::raw(if recovery.pending {
+            "Retrying Session launch…"
+        } else {
+            "Press s to Retry Session, o to open the preserved Worktree, or d to request guarded Delete checkout."
+        }),
+        Line::styled(
+            "The checkout is removed without force only after the existing clean-state confirmation; tracked, untracked, or ignored content is refused.",
+            theme.muted,
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme.text)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_github_tabs(
@@ -1639,7 +1995,16 @@ fn draw_github_loaded_list(
         .enumerate()
         .skip(start)
         .take(rows_visible)
-        .map(|(index, item)| github_list_item(item, index, modal.selected_index, theme))
+        .map(|(index, item)| {
+            github_list_item(
+                item,
+                index,
+                modal.selected_index,
+                modal.status_for(&item.identity),
+                modal.remote_status_for(&item.identity),
+                theme,
+            )
+        })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items), area);
     for (visible, index) in (start..page.items.len()).take(rows_visible).enumerate() {
@@ -1668,9 +2033,22 @@ fn github_list_item<'a>(
     item: &sylvops_core::github::GitHubItemSummary,
     index: usize,
     selected_index: usize,
+    work_status: sylvops_core::github::IssueWorkStatus,
+    remote_status: Option<crate::github_modal::IssueRemoteStatus>,
     theme: Theme,
 ) -> ListItem<'a> {
     let mut metadata = github_list_metadata(item);
+    if item.identity.kind == GitHubItemKind::Issue {
+        let _ = write!(metadata, " · {}", work_status.display_name());
+        if let Some(
+            remote_status @ (crate::github_modal::IssueRemoteStatus::Closed
+            | crate::github_modal::IssueRemoteStatus::Unavailable
+            | crate::github_modal::IssueRemoteStatus::RepositoryChanged),
+        ) = remote_status
+        {
+            let _ = write!(metadata, " · {}", remote_status.display_name());
+        }
+    }
     if let Some(pull) = &item.pull_request {
         let _ = write!(metadata, " · {}", github_pull_request_metadata(pull));
     }
@@ -1722,6 +2100,19 @@ fn github_list_metadata(item: &sylvops_core::github::GitHubItemSummary) -> Strin
 }
 
 fn draw_github_detail(frame: &mut Frame<'_>, modal: &GitHubModal, area: Rect, theme: Theme) {
+    if modal.selected_identity().is_some_and(|identity| {
+        modal.remote_status_for(&identity)
+            == Some(crate::github_modal::IssueRemoteStatus::RepositoryChanged)
+    }) {
+        draw_github_message(
+            frame,
+            area,
+            "Repository changed",
+            "The historical Work Source is preserved, but this Project now uses a different GitHub Repository.",
+            theme.danger,
+        );
+        return;
+    }
     if let Some(error) = &modal.configuration_error {
         draw_github_message(
             frame,
@@ -1766,6 +2157,21 @@ fn github_detail_lines(
     theme: Theme,
 ) -> Vec<Line<'static>> {
     let mut lines = github_detail_header_lines(&detail.summary, theme);
+    if detail.summary.identity.kind == GitHubItemKind::Issue {
+        lines.push(Line::styled(
+            format!(
+                "Local work: {}",
+                modal.status_for(&detail.summary.identity).display_name()
+            ),
+            theme.focus,
+        ));
+        if let Some(remote_status) = modal.remote_status_for(&detail.summary.identity) {
+            lines.push(Line::styled(
+                format!("Remote: {}", remote_status.display_name()),
+                theme.muted,
+            ));
+        }
+    }
     if modal.detail.is_loading() {
         lines.push(Line::styled("Refreshing GitHub detail…", theme.focus));
     }

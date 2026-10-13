@@ -206,6 +206,7 @@ impl StartWorkModal {
             confirmation: self.preparation.confirmation(self.project_id),
             branch,
             provider,
+            display_name: None,
             additional_instructions,
             start_another_worktree: self.start_another_worktree,
             columns: 120,

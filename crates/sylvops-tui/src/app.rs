@@ -214,6 +214,12 @@ pub(crate) enum HitTarget {
     GitHubNext,
     GitHubMoreComments,
     GitHubScroll(isize),
+    GitHubStartWork,
+    GitHubStartAnother,
+    GitHubStartSubmit,
+    GitHubRetrySession,
+    GitHubOpenWorktree,
+    GitHubRemoveWorktree,
     GitHubBack,
 }
 
@@ -338,6 +344,9 @@ impl App {
         let selected_before = self.selected_node();
         let fallback_candidates = self.selection_fallback_candidates();
         self.snapshot = snapshot;
+        if let Mode::GitHub(modal) = &mut self.mode {
+            modal.sync_local_work(&self.snapshot);
+        }
 
         let attached_missing = self
             .attached
@@ -940,7 +949,7 @@ impl App {
         self.selected_session_id = None;
     }
 
-    fn reveal_and_select(&mut self, node: ExplorerNode) {
+    pub(crate) fn reveal_and_select(&mut self, node: ExplorerNode) {
         self.workspace_expanded = true;
         match node {
             ExplorerNode::Worktree(worktree_id) => {

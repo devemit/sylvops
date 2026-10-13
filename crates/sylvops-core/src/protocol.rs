@@ -23,7 +23,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 20;
+pub const PROTOCOL_MINOR: u16 = 21;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -538,6 +538,7 @@ pub enum ClientRequest {
         confirmation: StartWorkConfirmation,
         branch: StartWorkBranch,
         provider: ProviderKind,
+        display_name: Option<String>,
         additional_instructions: Option<StartWorkInstructions>,
         start_another_worktree: bool,
         columns: u16,
@@ -546,6 +547,7 @@ pub enum ClientRequest {
     RetryStartWorkSession {
         worktree_id: WorktreeId,
         provider: ProviderKind,
+        display_name: Option<String>,
         columns: u16,
         rows: u16,
     },
@@ -978,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_20_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_21_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -993,7 +995,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 20);
+        assert_eq!(PROTOCOL_MINOR, 21);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1011,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_20_github_contracts_round_trip() {
+    fn protocol_1_21_github_contracts_round_trip() {
         use crate::github::{
             GitHubAssociation, GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubHost,
             GitHubIntegrationStatus, GitHubItemKind, GitHubItemNumber, GitHubListFilters,
@@ -1111,11 +1113,11 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 20);
+        assert_eq!(PROTOCOL_MINOR, 21);
     }
 
     #[test]
-    fn protocol_1_20_github_association_authorization_round_trips_redacted() {
+    fn protocol_1_21_github_association_authorization_round_trips_redacted() {
         let confirmation = DaemonResponse::GitHubAssociationChangeRequiresConfirmation(
             GitHubAssociationChangeInspection {
                 project_id: ProjectId::new(),
@@ -1132,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_20_typed_github_browser_request_round_trips() {
+    fn protocol_1_21_typed_github_browser_request_round_trips() {
         use crate::github::{
             GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, GitHubOwner,
             GitHubRepositoryIdentity, GitHubRepositoryName,
@@ -1151,11 +1153,11 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 20);
+        assert_eq!(PROTOCOL_MINOR, 21);
     }
 
     #[test]
-    fn protocol_1_20_start_work_recovery_contracts_round_trip() {
+    fn protocol_1_21_start_work_recovery_contracts_round_trip() {
         use crate::github::{
             GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, GitHubOwner,
             GitHubRepositoryIdentity, GitHubRepositoryName, GitHubTimestamp, StartWorkBase,
@@ -1194,6 +1196,7 @@ mod tests {
                 confirmation,
                 branch: StartWorkBranch::new("issue/127-start-work").unwrap(),
                 provider: ProviderKind::Codex,
+                display_name: Some("Issue 127".into()),
                 additional_instructions: Some(
                     StartWorkInstructions::new("Use the IPC seam.").unwrap(),
                 ),
@@ -1204,6 +1207,7 @@ mod tests {
             ClientRequest::RetryStartWorkSession {
                 worktree_id,
                 provider: ProviderKind::Codex,
+                display_name: Some("Issue 127 retry".into()),
                 columns: 120,
                 rows: 40,
             },
@@ -1220,7 +1224,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 20);
+        assert_eq!(PROTOCOL_MINOR, 21);
     }
 
     #[test]
