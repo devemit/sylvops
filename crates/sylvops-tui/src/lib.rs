@@ -1,6 +1,7 @@
 //! Hierarchical, keyboard-and-mouse mission control backed exclusively by daemon IPC.
 
 mod app;
+mod directory_browser;
 mod forms;
 mod input;
 mod reducer;
@@ -8,7 +9,11 @@ mod render;
 mod terminal;
 mod theme;
 
-use std::{io::stdout, time::Duration};
+use std::{
+    io::stdout,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use app::{
     App, ConfirmAction, Confirmation, ExplorerNode, Flash, FlashKind, HitTarget, Mode,
@@ -22,6 +27,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use directory_browser::{DirectoryBrowser, DirectoryBrowserEntry};
 use forms::{Form, FormKind};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use reducer::{Effect, reduce};
@@ -91,11 +97,15 @@ impl PaletteItem {
 /// Returns an IPC, terminal initialization, rendering, input, or daemon-operation error.
 #[allow(clippy::too_many_lines)]
 pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
+    let invocation_directory = std::env::current_dir().map_err(|error| {
+        DaemonError::Lifecycle(format!("cannot capture TUI invocation directory: {error}"))
+    })?;
     let client = DaemonClient::connect(paths, "sylvops-tui").await?;
-    let mut app = App::new(
+    let mut app = App::new_at(
         snapshot(&client).await?,
         list_providers(&client).await?,
         load_tui_state(&client).await?,
+        invocation_directory,
     );
     let mut events = client.subscribe();
     let _guard = TerminalGuard::enter()?;
@@ -188,6 +198,10 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             Mode::Navigation => handle_navigation(&client, &mut app, input).await?,
             Mode::Modal(_) => {
                 handle_form(&client, &mut app, input).await?;
+                false
+            }
+            Mode::DirectoryBrowser(_) => {
+                handle_directory_browser(&mut app, input).await;
                 false
             }
             Mode::Confirmation(_) => {
@@ -623,6 +637,10 @@ async fn handle_form(
         app.mode = Mode::Navigation;
         return Ok(());
     }
+    if matches!(mouse_target, Some(HitTarget::ModalBrowse)) {
+        open_directory_browser(app).await;
+        return Ok(());
+    }
     if let Some(HitTarget::ModalField(index)) = mouse_target {
         if let Mode::Modal(form) = &mut app.mode {
             form.active = index.min(form.visible_field_indices().len().saturating_sub(1));
@@ -645,6 +663,7 @@ async fn handle_form(
     }
     let mut submit = matches!(mouse_target, Some(HitTarget::ModalSubmit));
     let mut probe_provider = false;
+    let mut browse = false;
     match input {
         Event::Paste(text) => {
             if let Mode::Modal(form) = &mut app.mode
@@ -666,6 +685,9 @@ async fn handle_form(
                 KeyCode::Right if form.is_session() => form.select_next_provider(1),
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     probe_provider = form.is_session();
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    browse = matches!(form.kind, FormKind::RegisterProject(_));
                 }
                 KeyCode::Backspace => {
                     if let Some(index) = form.active_field_index() {
@@ -695,6 +717,10 @@ async fn handle_form(
         probe_form_provider(client, app).await?;
         return Ok(());
     }
+    if browse {
+        open_directory_browser(app).await;
+        return Ok(());
+    }
     if !submit {
         return Ok(());
     }
@@ -706,10 +732,16 @@ async fn handle_form(
     if !valid {
         return Ok(());
     }
-    let form = match &app.mode {
+    let mut form = match &app.mode {
         Mode::Modal(form) => form.clone(),
         _ => return Ok(()),
     };
+    if let Err(error) = prepare_form_for_submission(&mut form, &app.invocation_directory) {
+        if let Mode::Modal(current) = &mut app.mode {
+            current.submission_error = Some(error.into());
+        }
+        return Ok(());
+    }
     match perform_form(client, &form).await {
         Ok(outcome) => {
             app.mode = Mode::Navigation;
@@ -755,9 +787,129 @@ async fn handle_form(
         }
         Err(error) => {
             if let Mode::Modal(current) = &mut app.mode {
-                current.submission_error = Some(error.to_string());
+                current.submission_error = Some(bounded_feedback(error.to_string()));
             }
         }
+    }
+    Ok(())
+}
+
+async fn open_directory_browser(app: &mut App) {
+    let form = match &app.mode {
+        Mode::Modal(form) if matches!(form.kind, FormKind::RegisterProject(_)) => form.clone(),
+        _ => return,
+    };
+    app.mode = Mode::DirectoryBrowser(
+        DirectoryBrowser::new(form, app.invocation_directory.clone()).await,
+    );
+}
+
+async fn handle_directory_browser(app: &mut App, input: Event) {
+    let mouse_target = if let Event::Mouse(mouse) = &input
+        && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+    {
+        app.hit_map.target_at(mouse.column, mouse.row)
+    } else {
+        None
+    };
+    if matches!(mouse_target, Some(HitTarget::DirectoryBrowserCancel))
+        || matches!(&input, Event::Key(key) if key.code == KeyCode::Esc)
+    {
+        restore_directory_browser_form(app, None);
+        return;
+    }
+    if matches!(mouse_target, Some(HitTarget::DirectoryBrowserSelect)) {
+        select_browser_current_directory(app);
+        return;
+    }
+
+    let clicked_row = match mouse_target {
+        Some(HitTarget::DirectoryBrowserRow(index)) => Some(index),
+        _ => None,
+    };
+    let mut activate = clicked_row.is_some();
+    if let Mode::DirectoryBrowser(browser) = &mut app.mode {
+        if let Some(index) = clicked_row {
+            browser.selected = index.min(browser.visible_entries().len().saturating_sub(1));
+        }
+        match input {
+            Event::Paste(text) => browser.push_filter(&text),
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
+                browser.move_selection(1);
+            }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+                browser.move_selection(-1);
+            }
+            Event::Key(key) => match key.code {
+                KeyCode::Down => browser.move_selection(1),
+                KeyCode::Up => browser.move_selection(-1),
+                KeyCode::Backspace => browser.pop_filter(),
+                KeyCode::Enter => activate = true,
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    browser.push_filter(&character.to_string());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if !activate {
+        return;
+    }
+    let entry = match &app.mode {
+        Mode::DirectoryBrowser(browser) => browser.selected_entry(),
+        _ => None,
+    };
+    match entry {
+        Some(DirectoryBrowserEntry::SelectCurrent) => select_browser_current_directory(app),
+        Some(DirectoryBrowserEntry::Navigate { path, .. }) => {
+            if let Mode::DirectoryBrowser(browser) = &mut app.mode {
+                browser.navigate(path).await;
+            }
+        }
+        None => {}
+    }
+}
+
+fn select_browser_current_directory(app: &mut App) {
+    let selected = match &app.mode {
+        Mode::DirectoryBrowser(browser) if browser.can_select_current() => browser.current.clone(),
+        _ => return,
+    };
+    restore_directory_browser_form(app, Some(selected));
+}
+
+fn restore_directory_browser_form(app: &mut App, selected: Option<PathBuf>) {
+    let Mode::DirectoryBrowser(browser) = &app.mode else {
+        return;
+    };
+    let mut form = browser.form.clone();
+    if let Some(selected) = selected {
+        if let Some(path) = selected.to_str() {
+            form.set_repository_path(path.into());
+        } else {
+            form.submission_error = Some(
+                "The selected directory cannot be represented by the IPC path format.".into(),
+            );
+        }
+    }
+    app.mode = Mode::Modal(form);
+}
+
+fn prepare_form_for_submission(
+    form: &mut Form,
+    invocation_directory: &Path,
+) -> Result<(), &'static str> {
+    let Some(submitted) = form.repository_path().map(str::trim) else {
+        return Ok(());
+    };
+    let submitted = Path::new(submitted);
+    if !submitted.is_absolute() {
+        let absolute = invocation_directory.join(submitted);
+        let path = absolute
+            .to_str()
+            .ok_or("The repository path cannot be represented by the IPC path format.")?;
+        form.set_repository_path(path.into());
     }
     Ok(())
 }
@@ -825,11 +977,11 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
                 .await?,
         ),
         FormKind::RegisterProject(workspace_id) => (
-            "Repository registered",
+            "Repository ready",
             client
-                .request(&ClientRequest::AddProject {
+                .request(&ClientRequest::EnsureProject {
                     workspace_id,
-                    repository_path: form.fields[0].value.trim().into(),
+                    repository_path: form.repository_path().unwrap_or_default().trim().into(),
                 })
                 .await?,
         ),
@@ -878,8 +1030,16 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
                 .await?,
         ),
     };
+    let message = match &response {
+        DaemonResponse::ProjectReady { created: true, .. } => "Repository registered",
+        DaemonResponse::ProjectReady { created: false, .. } => "Existing repository selected",
+        _ => message,
+    };
     let selection = match &response {
         DaemonResponse::ProjectAdded { root_worktree, .. } => {
+            Some(ExplorerNode::Worktree(root_worktree.id))
+        }
+        DaemonResponse::ProjectReady { root_worktree, .. } => {
             Some(ExplorerNode::Worktree(root_worktree.id))
         }
         DaemonResponse::WorktreeCreated { worktree, .. } => {
