@@ -3,6 +3,7 @@
 mod app;
 mod directory_browser;
 mod forms;
+mod github_modal;
 mod input;
 mod reducer;
 mod render;
@@ -29,10 +30,12 @@ use crossterm::{
 };
 use directory_browser::{DirectoryBrowser, DirectoryBrowserEntry};
 use forms::{Form, FormKind};
+use github_modal::{GitHubDepth, GitHubEscape, GitHubModal, GitHubQuery, GitHubRequestTarget};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use reducer::{Effect, reduce};
 use sylvops_core::{
     domain::{AttachmentRole, DaemonSnapshot, SessionState},
+    github::{GitHubItemIdentity, GitHubItemKind},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, MAX_PTY_CHUNK_SIZE, MAX_TERMINAL_COLUMNS,
@@ -110,12 +113,23 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         invocation_directory,
     );
     let mut events = client.subscribe();
+    let (github_results_tx, mut github_results) = tokio::sync::mpsc::channel(16);
+    let mut github_tasks = GitHubTasks::default();
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .map_err(|error| DaemonError::Lifecycle(format!("cannot initialize TUI: {error}")))?;
 
     loop {
         app.expire_flash();
+        for _ in 0..16 {
+            match github_results.try_recv() {
+                Ok(result) => apply_github_result(&mut app, result)?,
+                Err(
+                    tokio::sync::mpsc::error::TryRecvError::Empty
+                    | tokio::sync::mpsc::error::TryRecvError::Disconnected,
+                ) => break,
+            }
+        }
         let mut refresh = false;
         for _ in 0..512 {
             match events.try_recv() {
@@ -208,7 +222,16 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             continue;
         }
         let quit = match app.mode {
-            Mode::Navigation => handle_navigation(&client, &mut app, input).await?,
+            Mode::Navigation => {
+                handle_navigation(
+                    &client,
+                    &github_results_tx,
+                    &mut github_tasks,
+                    &mut app,
+                    input,
+                )
+                .await?
+            }
             Mode::Modal(_) => {
                 handle_form(&client, &mut app, input).await?;
                 false
@@ -229,6 +252,17 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 handle_settings(&client, &mut app, &input).await?;
                 false
             }
+            Mode::GitHub(_) => {
+                handle_github(
+                    &client,
+                    &github_results_tx,
+                    &mut github_tasks,
+                    &mut app,
+                    &input,
+                )
+                .await?;
+                false
+            }
             Mode::TerminalAttached => {
                 handle_terminal(&client, &mut app, input).await?;
                 false
@@ -243,6 +277,8 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
 
 async fn handle_navigation(
     client: &DaemonClient,
+    github_results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    github_tasks: &mut GitHubTasks,
     app: &mut App,
     event: Event,
 ) -> Result<bool, DaemonError> {
@@ -257,11 +293,13 @@ async fn handle_navigation(
         return Ok(false);
     };
     let effects = reduce(app, action);
-    execute_effects(client, app, effects).await
+    execute_effects(client, github_results, github_tasks, app, effects).await
 }
 
 async fn execute_effects(
     client: &DaemonClient,
+    github_results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    github_tasks: &mut GitHubTasks,
     app: &mut App,
     effects: Vec<Effect>,
 ) -> Result<bool, DaemonError> {
@@ -274,10 +312,561 @@ async fn execute_effects(
             Effect::OpenDelete => open_destructive_confirmation(client, app).await?,
             Effect::LoadDiff => show_diff(client, app).await?,
             Effect::LoadGitHubStatus => refresh_github_status(client, app).await?,
+            Effect::OpenGitHub => open_github(client, github_results, github_tasks, app),
             Effect::Quit => return Ok(true),
         }
     }
     Ok(false)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum GitHubDecision {
+    None,
+    List(sylvops_core::github::GitHubListQuery),
+    Detail {
+        query: sylvops_core::github::GitHubViewQuery,
+        append_comments: bool,
+    },
+    Browser(GitHubItemIdentity),
+    Settings,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitHubAction {
+    Issues,
+    PullRequests,
+    Move(isize),
+    Select(usize),
+    OpenDetail,
+    Refresh,
+    Filter,
+    OpenBrowser,
+    PreviousPage,
+    NextPage,
+    MoreComments,
+    Settings,
+    Back,
+}
+
+fn github_input_decision(
+    modal: &mut GitHubModal,
+    input: &Event,
+    clicked: Option<HitTarget>,
+) -> GitHubDecision {
+    if modal.filter_editing {
+        if let Event::Key(key) = input {
+            match key.code {
+                KeyCode::Esc => {
+                    modal.escape();
+                }
+                KeyCode::Enter => match modal.apply_filter() {
+                    Ok(query) => return GitHubDecision::List(query),
+                    Err(error) => modal.set_filter_error(error),
+                },
+                KeyCode::Backspace => {
+                    modal.filter_input.pop();
+                    modal.filter_error = None;
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    push_bounded(&mut modal.filter_input, &character.to_string());
+                    modal.filter_error = None;
+                }
+                _ => {}
+            }
+        }
+        return GitHubDecision::None;
+    }
+
+    let action = clicked
+        .and_then(github_mouse_action)
+        .or_else(|| github_keyboard_action(input));
+    action.map_or(GitHubDecision::None, |action| {
+        apply_github_action(modal, action)
+    })
+}
+
+fn github_mouse_action(target: HitTarget) -> Option<GitHubAction> {
+    match target {
+        HitTarget::GitHubIssues => Some(GitHubAction::Issues),
+        HitTarget::GitHubPullRequests => Some(GitHubAction::PullRequests),
+        HitTarget::GitHubRow(index) => Some(GitHubAction::Select(index)),
+        HitTarget::GitHubFilter => Some(GitHubAction::Filter),
+        HitTarget::GitHubRefresh => Some(GitHubAction::Refresh),
+        HitTarget::GitHubOpen => Some(GitHubAction::OpenBrowser),
+        HitTarget::GitHubPrevious => Some(GitHubAction::PreviousPage),
+        HitTarget::GitHubNext => Some(GitHubAction::NextPage),
+        HitTarget::GitHubMoreComments => Some(GitHubAction::MoreComments),
+        HitTarget::GitHubScroll(delta) => Some(GitHubAction::Move(delta)),
+        HitTarget::GitHubBack => Some(GitHubAction::Back),
+        HitTarget::Settings => Some(GitHubAction::Settings),
+        _ => None,
+    }
+}
+
+fn github_keyboard_action(input: &Event) -> Option<GitHubAction> {
+    let Event::Key(key) = input else {
+        return None;
+    };
+    match key.code {
+        KeyCode::Char('i') => Some(GitHubAction::Issues),
+        KeyCode::Char('p') => Some(GitHubAction::PullRequests),
+        KeyCode::Down | KeyCode::Char('j') => Some(GitHubAction::Move(1)),
+        KeyCode::Up | KeyCode::Char('k') => Some(GitHubAction::Move(-1)),
+        KeyCode::Enter => Some(GitHubAction::OpenDetail),
+        KeyCode::Char('r') => Some(GitHubAction::Refresh),
+        KeyCode::Char('/') => Some(GitHubAction::Filter),
+        KeyCode::Char('o') => Some(GitHubAction::OpenBrowser),
+        KeyCode::Char('n') => Some(GitHubAction::NextPage),
+        KeyCode::Char('b') => Some(GitHubAction::PreviousPage),
+        KeyCode::Char('c') => Some(GitHubAction::MoreComments),
+        KeyCode::Char('s') => Some(GitHubAction::Settings),
+        KeyCode::Esc => Some(GitHubAction::Back),
+        _ => None,
+    }
+}
+
+fn apply_github_action(modal: &mut GitHubModal, action: GitHubAction) -> GitHubDecision {
+    match action {
+        GitHubAction::Issues => modal
+            .switch_kind(GitHubItemKind::Issue)
+            .map_or(GitHubDecision::None, GitHubDecision::List),
+        GitHubAction::PullRequests => modal
+            .switch_kind(GitHubItemKind::PullRequest)
+            .map_or(GitHubDecision::None, GitHubDecision::List),
+        GitHubAction::Move(delta) => {
+            if modal.depth == GitHubDepth::List {
+                modal.move_selection(delta);
+            } else {
+                modal.scroll_detail(delta);
+            }
+            GitHubDecision::None
+        }
+        GitHubAction::Select(index) if modal.depth == GitHubDepth::List => {
+            modal.selected_index = index;
+            apply_github_action(modal, GitHubAction::OpenDetail)
+        }
+        GitHubAction::OpenDetail if modal.depth == GitHubDepth::List => modal
+            .open_selected()
+            .map_or(GitHubDecision::None, |query| GitHubDecision::Detail {
+                query,
+                append_comments: false,
+            }),
+        GitHubAction::Refresh => modal
+            .refresh()
+            .map_or(GitHubDecision::None, github_query_decision),
+        GitHubAction::Filter if modal.depth == GitHubDepth::List => {
+            modal.start_filtering();
+            GitHubDecision::None
+        }
+        GitHubAction::OpenBrowser => modal
+            .begin_browser_open()
+            .map_or(GitHubDecision::None, GitHubDecision::Browser),
+        GitHubAction::NextPage if modal.depth == GitHubDepth::List => modal
+            .next_page()
+            .map_or(GitHubDecision::None, GitHubDecision::List),
+        GitHubAction::PreviousPage if modal.depth == GitHubDepth::List => modal
+            .previous_page()
+            .map_or(GitHubDecision::None, GitHubDecision::List),
+        GitHubAction::MoreComments if modal.depth == GitHubDepth::Detail => modal
+            .load_more_comments()
+            .map_or(GitHubDecision::None, |query| GitHubDecision::Detail {
+                query,
+                append_comments: true,
+            }),
+        GitHubAction::Settings => GitHubDecision::Settings,
+        GitHubAction::Back => github_escape_decision(modal),
+        GitHubAction::OpenDetail
+        | GitHubAction::Select(_)
+        | GitHubAction::Filter
+        | GitHubAction::PreviousPage
+        | GitHubAction::NextPage
+        | GitHubAction::MoreComments => GitHubDecision::None,
+    }
+}
+
+fn github_query_decision(query: GitHubQuery) -> GitHubDecision {
+    match query {
+        GitHubQuery::List(query) => GitHubDecision::List(query),
+        GitHubQuery::Detail(query) => GitHubDecision::Detail {
+            query,
+            append_comments: false,
+        },
+    }
+}
+
+fn github_escape_decision(modal: &mut GitHubModal) -> GitHubDecision {
+    if modal.escape() == GitHubEscape::Close {
+        GitHubDecision::Close
+    } else {
+        GitHubDecision::None
+    }
+}
+
+#[derive(Debug)]
+enum GitHubAsyncResult {
+    List {
+        request_id: u64,
+        project_id: ProjectId,
+        response: Result<DaemonResponse, String>,
+    },
+    Detail {
+        request_id: u64,
+        project_id: ProjectId,
+        append_comments: bool,
+        response: Result<DaemonResponse, String>,
+    },
+    Browser {
+        request_id: u64,
+        project_id: ProjectId,
+        response: Result<DaemonResponse, String>,
+    },
+}
+
+#[derive(Default)]
+struct GitHubTasks {
+    next_request_id: u64,
+    list: Option<tokio::task::AbortHandle>,
+    detail: Option<tokio::task::AbortHandle>,
+    browser: Option<tokio::task::AbortHandle>,
+}
+
+impl GitHubTasks {
+    fn next_request_id(&mut self) -> u64 {
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.next_request_id
+    }
+
+    fn replace_list(&mut self, handle: tokio::task::AbortHandle) {
+        abort_task(&mut self.list);
+        abort_task(&mut self.detail);
+        self.list = Some(handle);
+    }
+
+    fn replace_detail(&mut self, handle: tokio::task::AbortHandle) {
+        abort_task(&mut self.detail);
+        self.detail = Some(handle);
+    }
+
+    fn replace_browser(&mut self, handle: tokio::task::AbortHandle) {
+        abort_task(&mut self.browser);
+        self.browser = Some(handle);
+    }
+
+    fn cancel_all(&mut self) {
+        abort_task(&mut self.list);
+        abort_task(&mut self.detail);
+        abort_task(&mut self.browser);
+    }
+}
+
+impl Drop for GitHubTasks {
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
+fn abort_task(task: &mut Option<tokio::task::AbortHandle>) {
+    if let Some(task) = task.take() {
+        task.abort();
+    }
+}
+
+fn open_github(
+    client: &DaemonClient,
+    results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    tasks: &mut GitHubTasks,
+    app: &mut App,
+) {
+    let Some(project_id) = app.selected_project_id else {
+        app.flash = Some(Flash::error("Select a Project before browsing GitHub."));
+        return;
+    };
+    tasks.cancel_all();
+    let (modal, query) = GitHubModal::open(project_id);
+    app.mode = Mode::GitHub(Box::new(modal));
+    queue_github_list(client, results, tasks, app, project_id, query);
+}
+
+async fn handle_github(
+    client: &DaemonClient,
+    results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    tasks: &mut GitHubTasks,
+    app: &mut App,
+    input: &Event,
+) -> Result<(), DaemonError> {
+    let clicked = if let Event::Mouse(mouse) = input
+        && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+    {
+        app.hit_map.target_at(mouse.column, mouse.row)
+    } else {
+        None
+    };
+    let Mode::GitHub(mut modal) = app.mode.clone() else {
+        return Ok(());
+    };
+    let project_id = modal.project_id;
+    let decision = github_input_decision(&mut modal, input, clicked);
+    app.mode = if decision == GitHubDecision::Close {
+        tasks.cancel_all();
+        Mode::Navigation
+    } else {
+        Mode::GitHub(modal)
+    };
+    match decision {
+        GitHubDecision::List(query) => {
+            queue_github_list(client, results, tasks, app, project_id, query);
+        }
+        GitHubDecision::Detail {
+            query,
+            append_comments,
+        } => queue_github_detail(
+            client,
+            results,
+            tasks,
+            app,
+            project_id,
+            query,
+            append_comments,
+        ),
+        GitHubDecision::Browser(identity) => {
+            queue_github_browser(client, results, tasks, app, project_id, identity);
+        }
+        GitHubDecision::Settings => {
+            tasks.cancel_all();
+            app.open_settings();
+            refresh_github_status(client, app).await?;
+        }
+        GitHubDecision::None | GitHubDecision::Close => {}
+    }
+    Ok(())
+}
+
+fn queue_github_list(
+    client: &DaemonClient,
+    results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    tasks: &mut GitHubTasks,
+    app: &mut App,
+    project_id: ProjectId,
+    query: sylvops_core::github::GitHubListQuery,
+) {
+    let request_id = tasks.next_request_id();
+    if let Mode::GitHub(modal) = &mut app.mode {
+        modal.register_list_request(request_id);
+    }
+    let request = github_list_request(project_id, query);
+    let handle = dispatch_github_request(client, results, request, move |response| {
+        GitHubAsyncResult::List {
+            request_id,
+            project_id,
+            response,
+        }
+    });
+    tasks.replace_list(handle);
+}
+
+fn queue_github_detail(
+    client: &DaemonClient,
+    results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    tasks: &mut GitHubTasks,
+    app: &mut App,
+    project_id: ProjectId,
+    query: sylvops_core::github::GitHubViewQuery,
+    append_comments: bool,
+) {
+    let request_id = tasks.next_request_id();
+    if let Mode::GitHub(modal) = &mut app.mode {
+        modal.register_detail_request(request_id);
+    }
+    let request = github_detail_request(project_id, query);
+    let handle = dispatch_github_request(client, results, request, move |response| {
+        GitHubAsyncResult::Detail {
+            request_id,
+            project_id,
+            append_comments,
+            response,
+        }
+    });
+    tasks.replace_detail(handle);
+}
+
+fn queue_github_browser(
+    client: &DaemonClient,
+    results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    tasks: &mut GitHubTasks,
+    app: &mut App,
+    project_id: ProjectId,
+    identity: GitHubItemIdentity,
+) {
+    let request_id = tasks.next_request_id();
+    if let Mode::GitHub(modal) = &mut app.mode {
+        modal.register_browser_request(request_id);
+    }
+    let request = github_browser_request(project_id, identity);
+    let handle = dispatch_github_request(client, results, request, move |response| {
+        GitHubAsyncResult::Browser {
+            request_id,
+            project_id,
+            response,
+        }
+    });
+    tasks.replace_browser(handle);
+}
+
+fn dispatch_github_request(
+    client: &DaemonClient,
+    results: &tokio::sync::mpsc::Sender<GitHubAsyncResult>,
+    request: ClientRequest,
+    result: impl FnOnce(Result<DaemonResponse, String>) -> GitHubAsyncResult + Send + 'static,
+) -> tokio::task::AbortHandle {
+    let client = client.clone();
+    let results = results.clone();
+    tokio::spawn(async move {
+        let response = client
+            .request(&request)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = results.send(result(response)).await;
+    })
+    .abort_handle()
+}
+
+fn github_list_request(
+    project_id: ProjectId,
+    query: sylvops_core::github::GitHubListQuery,
+) -> ClientRequest {
+    ClientRequest::ListGitHubItems { project_id, query }
+}
+
+fn github_detail_request(
+    project_id: ProjectId,
+    query: sylvops_core::github::GitHubViewQuery,
+) -> ClientRequest {
+    ClientRequest::ViewGitHubItem { project_id, query }
+}
+
+fn github_browser_request(project_id: ProjectId, identity: GitHubItemIdentity) -> ClientRequest {
+    ClientRequest::OpenGitHubItem {
+        project_id,
+        identity,
+    }
+}
+
+fn apply_github_result(app: &mut App, result: GitHubAsyncResult) -> Result<(), DaemonError> {
+    let Mode::GitHub(modal) = &mut app.mode else {
+        return Ok(());
+    };
+    match result {
+        GitHubAsyncResult::List {
+            request_id,
+            project_id,
+            response,
+            ..
+        } if modal.project_id == project_id && modal.accepts_list(request_id) => {
+            apply_github_list_response(modal, response)?;
+        }
+        GitHubAsyncResult::Detail {
+            request_id,
+            project_id,
+            append_comments,
+            response,
+            ..
+        } if modal.project_id == project_id && modal.accepts_detail(request_id) => {
+            apply_github_detail_response(modal, append_comments, response)?;
+        }
+        GitHubAsyncResult::Browser {
+            request_id,
+            project_id,
+            response,
+            ..
+        } if modal.project_id == project_id && modal.accepts_browser(request_id) => {
+            apply_github_browser_response(modal, response)?;
+        }
+        GitHubAsyncResult::List { .. }
+        | GitHubAsyncResult::Detail { .. }
+        | GitHubAsyncResult::Browser { .. } => {}
+    }
+    Ok(())
+}
+
+fn apply_github_list_response(
+    modal: &mut GitHubModal,
+    response: Result<DaemonResponse, String>,
+) -> Result<(), DaemonError> {
+    match response {
+        Ok(DaemonResponse::GitHubItems(page)) => modal.receive_list(page),
+        Ok(DaemonResponse::GitHubBrowseFailure(failure)) => {
+            let diagnostic = bounded_feedback(failure.diagnostic.clone());
+            modal.fail(GitHubRequestTarget::List, failure, diagnostic);
+        }
+        Ok(DaemonResponse::GitHubFailure(failure)) => {
+            modal.set_configuration_error(failure.message().into());
+        }
+        Ok(DaemonResponse::Error(error)) => {
+            modal.set_configuration_error(bounded_feedback(error.message));
+        }
+        Err(error) => modal.set_configuration_error(bounded_feedback(error)),
+        Ok(response) => {
+            return Err(DaemonError::Lifecycle(format!(
+                "unexpected GitHub list response: {response:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn apply_github_detail_response(
+    modal: &mut GitHubModal,
+    append_comments: bool,
+    response: Result<DaemonResponse, String>,
+) -> Result<(), DaemonError> {
+    match response {
+        Ok(DaemonResponse::GitHubItem(detail)) if append_comments => modal.append_comments(detail),
+        Ok(DaemonResponse::GitHubItem(detail)) => modal.receive_detail(detail),
+        Ok(DaemonResponse::GitHubBrowseFailure(failure)) => {
+            let diagnostic = bounded_feedback(failure.diagnostic.clone());
+            modal.fail(GitHubRequestTarget::Detail, failure, diagnostic);
+        }
+        Ok(DaemonResponse::GitHubFailure(failure)) => {
+            modal.set_configuration_error(failure.message().into());
+        }
+        Ok(DaemonResponse::Error(error)) => {
+            modal.set_configuration_error(bounded_feedback(error.message));
+        }
+        Err(error) => modal.set_configuration_error(bounded_feedback(error)),
+        Ok(response) => {
+            return Err(DaemonError::Lifecycle(format!(
+                "unexpected GitHub detail response: {response:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn apply_github_browser_response(
+    modal: &mut GitHubModal,
+    response: Result<DaemonResponse, String>,
+) -> Result<(), DaemonError> {
+    match response {
+        Ok(DaemonResponse::Acknowledged) => modal.browser_opened(),
+        Ok(DaemonResponse::GitHubBrowseFailure(failure)) => {
+            let diagnostic = bounded_feedback(failure.diagnostic.clone());
+            modal.fail(GitHubRequestTarget::Browser, failure, diagnostic);
+        }
+        Ok(DaemonResponse::GitHubFailure(failure)) => {
+            modal.browser_failed(failure.message().into());
+        }
+        Ok(DaemonResponse::Error(error)) => {
+            modal.browser_failed(bounded_feedback(error.message));
+        }
+        Err(error) => modal.browser_failed(bounded_feedback(error)),
+        Ok(response) => {
+            return Err(DaemonError::Lifecycle(format!(
+                "unexpected GitHub browser response: {response:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn refresh_github_status(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
@@ -2047,6 +2636,14 @@ mod tests {
     use sylvops_core::domain::{
         Project, ProviderKind, Session, Workspace, Worktree, WorktreeStatus,
     };
+    use sylvops_core::github::{
+        GitHubBody, GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubChangedFileSummary,
+        GitHubCheckState, GitHubCheckSummary, GitHubCommentPage, GitHubCursor, GitHubHost,
+        GitHubItemDetail, GitHubItemNumber, GitHubItemState, GitHubItemSummary, GitHubLabelName,
+        GitHubListPage, GitHubLogin, GitHubOwner, GitHubPullRequestSummary,
+        GitHubRepositoryIdentity, GitHubRepositoryName, GitHubReviewState, GitHubTimestamp,
+        GitHubTitle,
+    };
     use sylvops_core::provider::{AuthenticationRequirement, ProviderCapabilities, ProviderHealth};
 
     fn provider_health(kind: ProviderKind) -> ProviderHealth {
@@ -2133,6 +2730,61 @@ mod tests {
                 failure_reason: None,
             }],
             provider_profiles: Vec::new(),
+        }
+    }
+
+    fn github_identity(kind: GitHubItemKind, number: u64) -> GitHubItemIdentity {
+        GitHubItemIdentity::new(
+            GitHubRepositoryIdentity::new(
+                GitHubHost::new("github.example.com").unwrap(),
+                GitHubOwner::new("acme").unwrap(),
+                GitHubRepositoryName::new("widgets").unwrap(),
+            ),
+            kind,
+            GitHubItemNumber::new(number).unwrap(),
+        )
+    }
+
+    fn github_summary(kind: GitHubItemKind, number: u64) -> GitHubItemSummary {
+        GitHubItemSummary {
+            identity: github_identity(kind, number),
+            state: GitHubItemState::Open,
+            title: GitHubTitle::new(format!("Bounded item {number}")).unwrap(),
+            author: None,
+            labels: vec![GitHubLabelName::new("ready").unwrap()],
+            assignees: vec![GitHubLogin::new("maintainer").unwrap()],
+            created_at: GitHubTimestamp::new("2026-10-13T12:00:00Z").unwrap(),
+            updated_at: GitHubTimestamp::new("2026-10-13T13:00:00Z").unwrap(),
+            pull_request: (kind == GitHubItemKind::PullRequest).then_some(
+                GitHubPullRequestSummary {
+                    head_branch: sylvops_core::github::GitHubBranchName::new("feature").unwrap(),
+                    base_branch: sylvops_core::github::GitHubBranchName::new("main").unwrap(),
+                    draft: false,
+                    review: GitHubReviewState::ReviewRequired,
+                    checks: GitHubCheckSummary {
+                        state: GitHubCheckState::Pending,
+                        total: 3,
+                    },
+                    changed_files: GitHubChangedFileSummary {
+                        total: 4,
+                        additions: 12,
+                        deletions: 3,
+                    },
+                },
+            ),
+        }
+    }
+
+    fn github_detail(kind: GitHubItemKind, number: u64) -> GitHubItemDetail {
+        let summary = github_summary(kind, number);
+        GitHubItemDetail {
+            browser_target: summary.identity.browser_target(),
+            summary,
+            body: GitHubBody::new("Untrusted bounded body\nSecond line").unwrap(),
+            comments: GitHubCommentPage {
+                comments: Vec::new(),
+                next_cursor: Some(GitHubCursor::new("comments-page-2").unwrap()),
+            },
         }
     }
 
@@ -4175,6 +4827,536 @@ mod tests {
         push_bounded(&mut value, "éx");
         assert!(value.ends_with('é'));
         assert_eq!(value.len(), MAX_FORM_VALUE_BYTES);
+    }
+
+    #[test]
+    fn github_shortcuts_cover_nested_navigation_filters_pagination_and_browser_identity() {
+        use crossterm::event::KeyEvent;
+
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let project_id = ProjectId::new();
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.receive_list(GitHubListPage {
+            items: vec![
+                github_summary(GitHubItemKind::Issue, 10),
+                github_summary(GitHubItemKind::Issue, 11),
+            ],
+            next_cursor: Some(GitHubCursor::new("page-2").unwrap()),
+        });
+
+        assert_eq!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('j')), None),
+            GitHubDecision::None
+        );
+        assert_eq!(modal.selected_index, 1);
+        github_input_decision(&mut modal, &key(KeyCode::Char('k')), None);
+        assert_eq!(modal.selected_index, 0);
+
+        let browser = github_input_decision(&mut modal, &key(KeyCode::Char('o')), None);
+        assert_eq!(
+            browser,
+            GitHubDecision::Browser(github_identity(GitHubItemKind::Issue, 10))
+        );
+        modal.browser_opened();
+
+        assert!(matches!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('n')), None),
+            GitHubDecision::List(_)
+        ));
+        modal.receive_list(GitHubListPage {
+            items: vec![github_summary(GitHubItemKind::Issue, 12)],
+            next_cursor: None,
+        });
+        assert!(matches!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('b')), None),
+            GitHubDecision::List(_)
+        ));
+
+        modal.receive_list(GitHubListPage {
+            items: vec![github_summary(GitHubItemKind::Issue, 10)],
+            next_cursor: None,
+        });
+        assert!(matches!(
+            github_input_decision(&mut modal, &key(KeyCode::Enter), None),
+            GitHubDecision::Detail {
+                append_comments: false,
+                ..
+            }
+        ));
+        modal.receive_detail(github_detail(GitHubItemKind::Issue, 10));
+        assert!(matches!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('c')), None),
+            GitHubDecision::Detail {
+                append_comments: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            github_input_decision(&mut modal, &key(KeyCode::Esc), None),
+            GitHubDecision::None
+        );
+        assert_eq!(modal.depth, GitHubDepth::List);
+
+        github_input_decision(&mut modal, &key(KeyCode::Char('/')), None);
+        assert!(modal.filter_editing);
+        github_input_decision(&mut modal, &key(KeyCode::Char('b')), None);
+        github_input_decision(&mut modal, &key(KeyCode::Char('u')), None);
+        github_input_decision(&mut modal, &key(KeyCode::Char('g')), None);
+        assert!(matches!(
+            github_input_decision(&mut modal, &key(KeyCode::Enter), None),
+            GitHubDecision::List(_)
+        ));
+        assert_eq!(modal.filters.text.as_ref().unwrap().as_str(), "bug");
+
+        assert!(matches!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('p')), None),
+            GitHubDecision::List(_)
+        ));
+        assert_eq!(modal.kind, GitHubItemKind::PullRequest);
+        modal.receive_list(GitHubListPage {
+            items: Vec::new(),
+            next_cursor: None,
+        });
+        assert!(matches!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('r')), None),
+            GitHubDecision::List(_)
+        ));
+        assert!(matches!(
+            github_input_decision(&mut modal, &key(KeyCode::Char('i')), None),
+            GitHubDecision::List(_)
+        ));
+        assert_eq!(
+            github_input_decision(&mut modal, &key(KeyCode::Esc), None),
+            GitHubDecision::Close
+        );
+    }
+
+    #[test]
+    fn github_boundaries_filter_recovery_and_click_dispatch_are_state_bound() {
+        use crossterm::event::KeyEvent;
+
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let (mut modal, _) = GitHubModal::open(ProjectId::new());
+        modal.receive_list(GitHubListPage {
+            items: vec![
+                github_summary(GitHubItemKind::Issue, 1),
+                github_summary(GitHubItemKind::Issue, 2),
+            ],
+            next_cursor: None,
+        });
+        modal.move_selection(-1);
+        assert_eq!(modal.selected_index, 0);
+        modal.move_selection(99);
+        assert_eq!(modal.selected_index, 1);
+        assert!(modal.previous_page().is_none());
+        assert!(modal.next_page().is_none());
+
+        github_input_decision(&mut modal, &key(KeyCode::Char('/')), None);
+        for character in "draft:true".chars() {
+            github_input_decision(&mut modal, &key(KeyCode::Char(character)), None);
+        }
+        assert_eq!(
+            github_input_decision(&mut modal, &key(KeyCode::Enter), None),
+            GitHubDecision::None
+        );
+        assert!(modal.filter_error.is_some());
+        github_input_decision(&mut modal, &key(KeyCode::Esc), None);
+        assert!(!modal.filter_editing);
+
+        let clicked = github_input_decision(
+            &mut modal,
+            &Event::FocusGained,
+            Some(HitTarget::GitHubRow(0)),
+        );
+        assert!(matches!(
+            clicked,
+            GitHubDecision::Detail {
+                append_comments: false,
+                ..
+            }
+        ));
+        modal.receive_detail(github_detail(GitHubItemKind::Issue, 1));
+        assert_eq!(modal.detail_scroll, 0);
+        github_input_decision(
+            &mut modal,
+            &Event::FocusGained,
+            Some(HitTarget::GitHubScroll(1)),
+        );
+        assert_eq!(modal.detail_scroll, 1);
+    }
+
+    #[test]
+    fn github_async_results_keep_loading_visible_ignore_stale_data_and_recover() {
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.register_list_request(1);
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.mode = Mode::GitHub(Box::new(modal));
+
+        let render_text = |app: &mut App| {
+            let backend = ratatui::backend::TestBackend::new(100, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render::draw(frame, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        };
+        assert!(render_text(&mut app).contains("Loading GitHub items"));
+
+        {
+            let Mode::GitHub(modal) = &mut app.mode else {
+                panic!("GitHub modal expected");
+            };
+            modal.switch_kind(GitHubItemKind::PullRequest).unwrap();
+            modal.register_list_request(2);
+        }
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::List {
+                request_id: 1,
+                project_id,
+                response: Ok(DaemonResponse::GitHubItems(GitHubListPage {
+                    items: vec![github_summary(GitHubItemKind::Issue, 99)],
+                    next_cursor: None,
+                })),
+            },
+        )
+        .unwrap();
+        assert!(render_text(&mut app).contains("Loading GitHub items"));
+
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::List {
+                request_id: 2,
+                project_id,
+                response: Ok(DaemonResponse::GitHubBrowseFailure(
+                    GitHubBrowseFailure::new(GitHubBrowseFailureKind::Network),
+                )),
+            },
+        )
+        .unwrap();
+        assert!(render_text(&mut app).contains("GitHub is offline"));
+
+        {
+            let Mode::GitHub(modal) = &mut app.mode else {
+                panic!("GitHub modal expected");
+            };
+            match modal.refresh().unwrap() {
+                GitHubQuery::List(_) => {}
+                GitHubQuery::Detail(_) => panic!("list recovery expected"),
+            }
+            modal.register_list_request(3);
+        }
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::List {
+                request_id: 3,
+                project_id,
+                response: Ok(DaemonResponse::GitHubItems(GitHubListPage {
+                    items: Vec::new(),
+                    next_cursor: None,
+                })),
+            },
+        )
+        .unwrap();
+        assert!(render_text(&mut app).contains("No GitHub items"));
+    }
+
+    #[test]
+    fn github_request_ids_reject_an_older_result_with_the_same_query() {
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.receive_list(GitHubListPage {
+            items: Vec::new(),
+            next_cursor: None,
+        });
+        assert!(matches!(modal.refresh(), Some(GitHubQuery::List(_))));
+        modal.register_list_request(4);
+        modal.register_list_request(5);
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.mode = Mode::GitHub(Box::new(modal));
+
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::List {
+                request_id: 4,
+                project_id,
+                response: Ok(DaemonResponse::GitHubItems(GitHubListPage {
+                    items: vec![github_summary(GitHubItemKind::PullRequest, 88)],
+                    next_cursor: None,
+                })),
+            },
+        )
+        .unwrap();
+        let Mode::GitHub(modal) = &app.mode else {
+            panic!("GitHub modal expected");
+        };
+        assert!(modal.list.is_loading());
+        assert!(modal.list.ready().unwrap().items.is_empty());
+
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::List {
+                request_id: 5,
+                project_id,
+                response: Ok(DaemonResponse::GitHubItems(GitHubListPage {
+                    items: Vec::new(),
+                    next_cursor: None,
+                })),
+            },
+        )
+        .unwrap();
+        let Mode::GitHub(modal) = &app.mode else {
+            panic!("GitHub modal expected");
+        };
+        assert!(!modal.list.is_loading());
+    }
+
+    #[test]
+    fn github_browser_request_uses_only_typed_identity_and_list_failures_are_visible() {
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let identity = github_identity(GitHubItemKind::Issue, 126);
+        assert_eq!(
+            github_browser_request(project_id, identity.clone()),
+            ClientRequest::OpenGitHubItem {
+                project_id,
+                identity: identity.clone(),
+            }
+        );
+
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.receive_list(GitHubListPage {
+            items: vec![github_summary(GitHubItemKind::Issue, 126)],
+            next_cursor: None,
+        });
+        assert_eq!(modal.begin_browser_open(), Some(identity.clone()));
+        modal.register_browser_request(7);
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.mode = Mode::GitHub(Box::new(modal));
+        apply_github_result(
+            &mut app,
+            GitHubAsyncResult::Browser {
+                request_id: 7,
+                project_id,
+                response: Err("platform browser unavailable".into()),
+            },
+        )
+        .unwrap();
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Browser action failed: platform browser unavailable"));
+    }
+
+    #[tokio::test]
+    async fn github_request_tasks_are_bounded_and_superseded_work_is_cancelled() {
+        let mut tasks = GitHubTasks::default();
+        assert_eq!(tasks.next_request_id(), 1);
+        assert_eq!(tasks.next_request_id(), 2);
+
+        let first = tokio::spawn(std::future::pending::<()>());
+        tasks.replace_list(first.abort_handle());
+        let replacement = tokio::spawn(std::future::pending::<()>());
+        tasks.replace_list(replacement.abort_handle());
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let detail = tokio::spawn(std::future::pending::<()>());
+        tasks.replace_detail(detail.abort_handle());
+        let browser = tokio::spawn(std::future::pending::<()>());
+        tasks.replace_browser(browser.abort_handle());
+        tasks.cancel_all();
+        assert!(replacement.await.unwrap_err().is_cancelled());
+        assert!(detail.await.unwrap_err().is_cancelled());
+        assert!(browser.await.unwrap_err().is_cancelled());
+    }
+
+    #[test]
+    fn github_modal_renders_contextual_actions_metadata_and_hit_targets() {
+        let project_id = populated_snapshot().projects[0].id;
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.receive_list(GitHubListPage {
+            items: vec![github_summary(GitHubItemKind::Issue, 126)],
+            next_cursor: Some(GitHubCursor::new("next").unwrap()),
+        });
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.mode = Mode::GitHub(Box::new(modal));
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(text.contains("GitHub · Issues"));
+        assert!(text.contains("#126 Bounded item 126"));
+        assert!(text.contains("[Enter] Detail"));
+        assert!(text.contains("[n] Next"));
+        for target in [
+            HitTarget::GitHubIssues,
+            HitTarget::GitHubPullRequests,
+            HitTarget::GitHubRow(0),
+            HitTarget::GitHubFilter,
+            HitTarget::GitHubRefresh,
+            HitTarget::GitHubOpen,
+            HitTarget::GitHubNext,
+            HitTarget::GitHubBack,
+        ] {
+            assert!(app.hit_map.0.iter().any(|region| region.target == target));
+        }
+        assert!(
+            !app.hit_map
+                .0
+                .iter()
+                .any(|region| region.target == HitTarget::GitHubPrevious)
+        );
+    }
+
+    #[test]
+    fn github_detail_renders_pull_request_state_and_only_available_actions() {
+        let project_id = populated_snapshot().projects[0].id;
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.switch_kind(GitHubItemKind::PullRequest);
+        modal.receive_detail(github_detail(GitHubItemKind::PullRequest, 42));
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.mode = Mode::GitHub(Box::new(modal));
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(text.contains("feature → main"));
+        assert!(text.contains("review required"));
+        assert!(text.contains("pending (3)"));
+        assert!(text.contains("4 files (+12 −3)"));
+        assert!(text.contains("Labels: ready · Assignees: maintainer"));
+        assert!(text.contains("[c] More comments"));
+        assert!(!text.contains("[n] Next"));
+
+        let Mode::GitHub(modal) = &mut app.mode else {
+            panic!("GitHub modal expected");
+        };
+        assert!(matches!(modal.refresh(), Some(GitHubQuery::Detail(_))));
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let refreshing = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(refreshing.contains("Refreshing GitHub detail"));
+        assert!(!refreshing.contains("[c] More comments"));
+    }
+
+    #[test]
+    fn github_failure_states_have_distinct_rendered_recovery_copy() {
+        let cases = [
+            (
+                GitHubBrowseFailureKind::CliUnavailable,
+                "GitHub CLI unavailable",
+            ),
+            (
+                GitHubBrowseFailureKind::Authentication,
+                "GitHub authentication required",
+            ),
+            (
+                GitHubBrowseFailureKind::Permission,
+                "GitHub Repository access denied",
+            ),
+            (
+                GitHubBrowseFailureKind::RateLimited,
+                "GitHub rate limit reached",
+            ),
+            (GitHubBrowseFailureKind::Network, "GitHub is offline"),
+            (
+                GitHubBrowseFailureKind::TimedOut,
+                "GitHub request timed out",
+            ),
+            (
+                GitHubBrowseFailureKind::MalformedResponse,
+                "GitHub returned malformed data",
+            ),
+            (
+                GitHubBrowseFailureKind::OversizedResponse,
+                "GitHub response exceeded safety limits",
+            ),
+            (
+                GitHubBrowseFailureKind::UnavailableItem,
+                "This GitHub item is unavailable",
+            ),
+        ];
+        for (kind, expected) in cases {
+            let project_id = populated_snapshot().projects[0].id;
+            let (mut modal, _) = GitHubModal::open(project_id);
+            let failure = GitHubBrowseFailure::new(kind);
+            modal.fail(
+                GitHubRequestTarget::List,
+                failure.clone(),
+                failure.diagnostic,
+            );
+            let mut app = App::new(populated_snapshot(), Vec::new(), None);
+            app.mode = Mode::GitHub(Box::new(modal));
+            let backend = ratatui::backend::TestBackend::new(100, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(text.contains(expected), "missing {expected} for {kind:?}");
+            assert!(text.contains("[r] Refresh"));
+        }
+    }
+
+    #[test]
+    fn github_filters_are_excluded_from_persisted_tui_navigation() {
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let mut app = App::new(snapshot, Vec::new(), None);
+        let persisted_before = app.persisted_state();
+        let (mut modal, _) = GitHubModal::open(project_id);
+        modal.filter_input = "state:closed label:bug scheduler".into();
+        modal.apply_filter().unwrap();
+        app.mode = Mode::GitHub(Box::new(modal));
+
+        assert_eq!(app.persisted_state(), persisted_before);
     }
 
     #[tokio::test]
