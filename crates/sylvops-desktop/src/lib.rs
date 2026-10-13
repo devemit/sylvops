@@ -19,7 +19,8 @@ use std::{
 use bridge::{Bridge, BridgeEvent, GitHubDetailRequest, Operation, TerminalInputError};
 use chrono::{DateTime, Local, Locale};
 use forms::{
-    Confirmation, DataRemovalConfirmation, FirstRunStepState, FormModal, Modal, first_run_steps,
+    Confirmation, DataRemovalConfirmation, FirstRunStepState, FormModal, Modal, StartWorkModal,
+    first_run_steps,
 };
 use github_surface::{
     GitHubLoad, GitHubRequestTarget, GitHubSurfaceKind, GitHubSurfaceState, failure_copy,
@@ -57,6 +58,7 @@ use sylvops_core::{
     github::{
         GitHubCheckFilter, GitHubCheckState, GitHubIntegrationStatus, GitHubItemIdentity,
         GitHubItemState, GitHubListState, GitHubReviewFilter, GitHubReviewState, GitRemoteName,
+        StartWorkFailureKind, StartWorkOutcome,
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
@@ -612,6 +614,13 @@ enum Message {
     RefreshGitHubDetail,
     LoadMoreGitHubComments,
     OpenGitHubItemInBrowser,
+    PrepareStartWork,
+    StartWorkBranchInput(String),
+    StartWorkInstructionsInput(String),
+    SelectStartWorkProvider(ProviderKind),
+    StartAnotherWorktree,
+    SubmitStartWork,
+    OpenExistingIssueWork(WorktreeId),
     RetryGitHub,
     ToggleClassicThemes,
     ToggleTechnicalDetails,
@@ -959,6 +968,33 @@ impl DesktopApp {
             Message::RefreshGitHubDetail => self.refresh_github_detail(),
             Message::LoadMoreGitHubComments => self.load_more_github_comments(),
             Message::OpenGitHubItemInBrowser => self.open_github_item_in_browser(),
+            Message::PrepareStartWork => self.prepare_start_work(),
+            Message::StartWorkBranchInput(value) => {
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.update_branch(value);
+                }
+            }
+            Message::StartWorkInstructionsInput(value) => {
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.update_instructions(value);
+                }
+            }
+            Message::SelectStartWorkProvider(provider) => {
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.select_provider(provider);
+                }
+            }
+            Message::StartAnotherWorktree => {
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.start_another_worktree = true;
+                    modal.error = None;
+                }
+            }
+            Message::SubmitStartWork => self.submit_start_work(),
+            Message::OpenExistingIssueWork(worktree_id) => {
+                self.modal = None;
+                self.select_worktree(worktree_id);
+            }
             Message::RetryGitHub => self.retry_github_request(),
             Message::ToggleClassicThemes => {
                 self.disclosures.classic_themes = !self.disclosures.classic_themes;
@@ -2510,6 +2546,13 @@ impl DesktopApp {
         ]
         .spacing(6)
         .align_y(Center);
+        if summary.identity.kind == sylvops_core::github::GitHubItemKind::Issue {
+            actions = actions.push(
+                button("Start Work")
+                    .on_press_maybe((!pending).then_some(Message::PrepareStartWork))
+                    .style(primary_action_style),
+            );
+        }
         if self.github_surface.detail.is_loading() {
             actions = actions.push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
         }
@@ -2831,6 +2874,7 @@ impl DesktopApp {
             Modal::Form(form) => Self::form_view(form, self.presentation().density),
             Modal::Confirmation(confirmation) => Self::confirmation_view(confirmation),
             Modal::DataRemoval(confirmation) => Self::data_removal_view(confirmation),
+            Modal::StartWork(start_work) => Self::start_work_view(start_work),
         }
     }
 
@@ -3510,6 +3554,118 @@ impl DesktopApp {
         .into()
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn start_work_view(modal: &StartWorkModal) -> Element<'_, Message> {
+        let issue = &modal.preparation.issue;
+        let labels = github_join_labels(&issue.labels);
+        let assignees = github_join_logins(&issue.assignees);
+        let mut actions = row![
+            space::horizontal(),
+            button("Cancel").on_press_maybe((!modal.pending).then_some(Message::CancelModal)),
+            button(if modal.pending {
+                "Starting…"
+            } else {
+                "Start Work"
+            })
+            .on_press_maybe(
+                (!modal.pending && modal.request().is_ok()).then_some(Message::SubmitStartWork),
+            )
+            .style(primary_action_style),
+        ]
+        .spacing(8);
+        let mut content = column![
+            row![
+                text("Start Work from Issue").font(UI_SEMIBOLD).size(22),
+                space::horizontal(),
+                button(line_icon(LineIcon::Close, 16))
+                    .on_press_maybe((!modal.pending).then_some(Message::CancelModal))
+                    .style(chrome_action_style),
+            ]
+            .align_y(Center),
+            text("GitHub Issue context · untrusted reference material")
+                .font(UI_SEMIBOLD)
+                .style(text::secondary),
+            text(format!(
+                "{} · Issue #{} · {}",
+                issue.identity.repository, issue.identity.number, issue.canonical_url
+            ))
+            .size(UI_META_SIZE),
+            text(issue.title.as_str()).font(UI_SEMIBOLD).size(17),
+            text(format!("Labels: {labels} · Assignees: {assignees}"))
+                .size(UI_META_SIZE)
+                .style(text::secondary),
+            container(scrollable(
+                text(issue.body.as_str()).wrapping(text::Wrapping::Word)
+            ))
+            .padding(10)
+            .height(Length::Fixed(130.0))
+            .width(Fill)
+            .style(workspace_surface),
+            rule::horizontal(1),
+            text("Confirmed local base").font(UI_SEMIBOLD),
+            text(format!(
+                "{} @ {}",
+                modal.preparation.base.head_ref, modal.preparation.base.head_commit
+            ))
+            .size(UI_META_SIZE),
+            text_input("issue/127-short-description", &modal.branch)
+                .on_input_maybe((!modal.pending).then_some(Message::StartWorkBranchInput)),
+            pick_list(
+                modal.preparation.eligible_providers.as_slice(),
+                modal.provider,
+                Message::SelectStartWorkProvider,
+            )
+            .placeholder("Choose task-capable Provider"),
+            text("Additional instructions (optional)").font(UI_SEMIBOLD),
+            text_input("Additional instructions (optional)", &modal.instructions)
+                .on_input_maybe((!modal.pending).then_some(Message::StartWorkInstructionsInput),),
+        ]
+        .spacing(10);
+        if modal.preparation.suggested_branch_conflict
+            && modal.branch == modal.preparation.suggested_branch.as_str()
+        {
+            content = content.push(
+                text("That branch already exists. Edit the branch before starting.")
+                    .style(text::danger),
+            );
+        }
+        if let Some(existing) = modal.preparation.existing_work.first() {
+            content = content.push(
+                column![
+                    text("This Issue already has local work.").font(UI_SEMIBOLD),
+                    row![
+                        button("Open existing Worktree")
+                            .on_press(Message::OpenExistingIssueWork(existing.worktree_id)),
+                        button(if modal.start_another_worktree {
+                            "Another Worktree selected"
+                        } else {
+                            "Start another Worktree"
+                        })
+                        .on_press_maybe(
+                            (!modal.pending && !modal.start_another_worktree)
+                                .then_some(Message::StartAnotherWorktree),
+                        ),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(6),
+            );
+        }
+        if let Some(error) = &modal.error {
+            content = content.push(text(error).style(text::danger));
+        }
+        actions = actions.align_y(Center);
+        content = content.push(actions);
+        container(scrollable(content).height(Fill))
+            .padding(22)
+            .width(Fill)
+            .max_width(720)
+            .height(Fill)
+            .max_height(760)
+            .style(modal_card)
+            .into()
+    }
+
     fn footer(&self) -> Element<'_, Message> {
         let presentation = self.presentation();
         let density = presentation.density;
@@ -3686,6 +3842,7 @@ impl DesktopApp {
                             | Operation::ListGitHubItems(..)
                             | Operation::ViewGitHubItem(..)
                             | Operation::OpenGitHubItem(..)
+                            | Operation::PrepareStartWork(..)
                     )
                 });
                 if let Some(github_operation) = github_operation {
@@ -3707,6 +3864,15 @@ impl DesktopApp {
                         confirmation.pending = false;
                     }
                     self.error = Some(contextual_error(operation, &message));
+                    return;
+                }
+                if matches!(operation, Some(Operation::StartWork(..))) {
+                    if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                        modal.pending = false;
+                        modal.error = Some(message);
+                    } else {
+                        self.error = Some(contextual_error(operation, &message));
+                    }
                     return;
                 }
                 if matches!(&operation, Some(Operation::ProbeProvider(_))) {
@@ -3934,6 +4100,105 @@ impl DesktopApp {
                 self.finish_github_request();
                 self.github_surface.browser_opened();
                 self.show_success("Opened GitHub item in the browser.");
+            }
+            (
+                Operation::PrepareStartWork(project_id, number),
+                DaemonResponse::StartWorkPrepared(preparation),
+            ) if self.github_operation_matches_surface(Operation::PrepareStartWork(
+                project_id, number,
+            )) && preparation.issue.identity.number == number =>
+            {
+                self.finish_github_request();
+                self.modal = Some(Modal::StartWork(Box::new(StartWorkModal::new(
+                    project_id,
+                    preparation,
+                ))));
+                self.modal_focus = ModalFocus::Pending;
+            }
+            (
+                Operation::StartWork(project_id, number),
+                DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
+                    worktree,
+                    session,
+                    ..
+                }),
+            ) if worktree.project_id == project_id => {
+                let session = *session;
+                if let Some(existing) = self
+                    .snapshot
+                    .worktrees
+                    .iter_mut()
+                    .find(|existing| existing.id == worktree.id)
+                {
+                    *existing = worktree.clone();
+                } else {
+                    self.snapshot.worktrees.push(worktree.clone());
+                }
+                if let Some(existing) = self
+                    .snapshot
+                    .sessions
+                    .iter_mut()
+                    .find(|existing| existing.id == session.id)
+                {
+                    *existing = session.clone();
+                } else {
+                    self.snapshot.sessions.push(session.clone());
+                }
+                self.modal = None;
+                self.content_surface = ContentSurface::Session;
+                self.main_tab = MainTab::Terminal;
+                self.selected_project_id = Some(project_id);
+                self.selected_worktree_id = Some(worktree.id);
+                self.selected_session_id = Some(session.id);
+                self.active_session_id = Some(session.id);
+                if !self.open_sessions.contains(&session.id) {
+                    self.open_sessions.push(session.id);
+                }
+                self.mark_state_dirty();
+                self.attach_active();
+                self.show_success(format!("Started Work from Issue #{number}."));
+                self.request_snapshot();
+            }
+            (
+                Operation::StartWork(project_id, _),
+                DaemonResponse::StartWorkCompleted(StartWorkOutcome::WorktreeCreated {
+                    worktree,
+                    failure,
+                    ..
+                }),
+            ) if worktree.project_id == project_id => {
+                if !self
+                    .snapshot
+                    .worktrees
+                    .iter()
+                    .any(|existing| existing.id == worktree.id)
+                {
+                    self.snapshot.worktrees.push(worktree.clone());
+                }
+                self.modal = None;
+                self.content_surface = ContentSurface::Session;
+                self.selected_project_id = Some(project_id);
+                self.select_worktree(worktree.id);
+                self.error = Some(format!(
+                    "Worktree created; Session not started. {} Open the Worktree to retry Session launch or inspect it.",
+                    failure.diagnostic
+                ));
+                self.request_snapshot();
+            }
+            (Operation::PrepareStartWork(_, _), DaemonResponse::StartWorkFailure(failure)) => {
+                self.finish_github_request();
+                self.error = Some(failure.diagnostic);
+            }
+            (Operation::StartWork(_, _), DaemonResponse::StartWorkFailure(failure)) => {
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.pending = false;
+                    modal.error = Some(failure.diagnostic);
+                    if failure.kind == StartWorkFailureKind::BranchConflict {
+                        modal.preparation.suggested_branch_conflict = true;
+                    }
+                } else {
+                    self.error = Some(failure.diagnostic);
+                }
             }
             (Operation::RefreshSnapshot, DaemonResponse::Snapshot(snapshot)) => {
                 self.snapshot_pending = false;
@@ -4378,7 +4643,8 @@ impl DesktopApp {
                 | Operation::ClearGitHubAssociation(_)
                 | Operation::ListGitHubItems(..)
                 | Operation::ViewGitHubItem(..)
-                | Operation::OpenGitHubItem(..)),
+                | Operation::OpenGitHubItem(..)
+                | Operation::PrepareStartWork(..)),
                 DaemonResponse::GitHubFailure(failure),
             ) => {
                 let matches_surface = self.github_operation_matches_surface(operation);
@@ -4403,6 +4669,7 @@ impl DesktopApp {
                         | Operation::ListGitHubItems(..)
                         | Operation::ViewGitHubItem(..)
                         | Operation::OpenGitHubItem(..)
+                        | Operation::PrepareStartWork(..)
                 );
                 if github_operation {
                     let matches_surface = self.github_operation_matches_surface(operation);
@@ -4423,6 +4690,15 @@ impl DesktopApp {
                         confirmation.pending = false;
                     }
                     self.error = Some(contextual_error(Some(operation), &message));
+                    return;
+                }
+                if matches!(operation, Operation::StartWork(..)) {
+                    if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                        modal.pending = false;
+                        modal.error = Some(message);
+                    } else {
+                        self.error = Some(contextual_error(Some(operation), &message));
+                    }
                     return;
                 }
                 if matches!(operation, Operation::ProbeProvider(_)) {
@@ -4457,7 +4733,8 @@ impl DesktopApp {
                 | Operation::ClearGitHubAssociation(_)
                 | Operation::ListGitHubItems(..)
                 | Operation::ViewGitHubItem(..)
-                | Operation::OpenGitHubItem(..)),
+                | Operation::OpenGitHubItem(..)
+                | Operation::PrepareStartWork(..)),
                 _response,
             ) => {
                 let matches_surface = self.github_operation_matches_surface(operation);
@@ -5046,6 +5323,57 @@ impl DesktopApp {
         );
     }
 
+    fn prepare_start_work(&mut self) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        let (Some(project_id), Some(identity)) = (
+            self.github_surface.project_id(),
+            self.github_surface.selected.clone(),
+        ) else {
+            return;
+        };
+        if identity.kind != sylvops_core::github::GitHubItemKind::Issue
+            || !self.github_identity_matches_association(&identity)
+        {
+            return;
+        }
+        self.send_github_browse_request(
+            Operation::PrepareStartWork(project_id, identity.number),
+            ClientRequest::PrepareStartWork {
+                project_id,
+                issue_number: identity.number,
+            },
+        );
+    }
+
+    fn submit_start_work(&mut self) {
+        let prepared = match &self.modal {
+            Some(Modal::StartWork(modal)) => modal.request().map(|request| {
+                (
+                    Operation::StartWork(modal.project_id, modal.preparation.issue.identity.number),
+                    request,
+                )
+            }),
+            _ => return,
+        };
+        let (operation, request) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.error = Some(error);
+                }
+                return;
+            }
+        };
+        if self.bridge.request(operation, request)
+            && let Some(Modal::StartWork(modal)) = &mut self.modal
+        {
+            modal.pending = true;
+            modal.error = None;
+        }
+    }
+
     fn retry_github_request(&mut self) {
         if self.github_surface.selected.is_some() {
             self.refresh_github_detail();
@@ -5108,6 +5436,19 @@ impl DesktopApp {
                         .selected
                         .as_ref()
                         .is_some_and(|identity| identity.kind == kind && identity.number == number)
+            }
+            Operation::PrepareStartWork(project_id, number)
+            | Operation::StartWork(project_id, number) => {
+                self.selected_project_id == Some(project_id)
+                    && self.github_surface.project_id() == Some(project_id)
+                    && self
+                        .github_surface
+                        .selected
+                        .as_ref()
+                        .is_some_and(|identity| {
+                            identity.kind == sylvops_core::github::GitHubItemKind::Issue
+                                && identity.number == number
+                        })
             }
             _ => false,
         }
@@ -6849,6 +7190,8 @@ const fn operation_error_context(operation: Operation) -> &'static str {
         Operation::ListGitHubItems(..) => "Browse GitHub",
         Operation::ViewGitHubItem(..) => "Load GitHub item",
         Operation::OpenGitHubItem(..) => "Open GitHub item in browser",
+        Operation::PrepareStartWork(..) => "Prepare Start Work",
+        Operation::StartWork(..) => "Start Work",
         Operation::CreateWorkspace => "Create workspace",
         Operation::OpenWorkspace(_) => "Open workspace",
         Operation::InspectWorkspaceDeletion(_) | Operation::DeleteWorkspace => "Delete workspace",
@@ -8524,6 +8867,27 @@ mod tests {
                 next_cursor: None,
             },
             browser_target,
+        }
+    }
+
+    fn start_work_preparation(
+        worktree_id: WorktreeId,
+    ) -> sylvops_core::github::StartWorkPreparation {
+        use sylvops_core::github::{StartWorkBase, StartWorkBranch, StartWorkIssueContext};
+        let detail = github_detail(github_summary(GitHubItemKind::Issue, 127));
+        let issue = StartWorkIssueContext::try_from(detail).unwrap();
+        sylvops_core::github::StartWorkPreparation {
+            issue,
+            base: StartWorkBase::new(
+                worktree_id,
+                "main",
+                "0123456789abcdef0123456789abcdef01234567",
+            )
+            .unwrap(),
+            suggested_branch: StartWorkBranch::new("issue/127-bounded-remote-title").unwrap(),
+            suggested_branch_conflict: false,
+            eligible_providers: vec![ProviderKind::Codex],
+            existing_work: Vec::new(),
         }
     }
 
@@ -11146,6 +11510,127 @@ mod tests {
                 .map(|association| association.project_id),
             Some(second_project_id)
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn desktop_start_work_prepares_recovers_from_stale_state_and_opens_the_terminal() {
+        use sylvops_core::github::{StartWorkFailure, WorkSource};
+
+        let (bridge, mut harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        app.content_surface = ContentSurface::GitHub;
+        let _ = app
+            .github_surface
+            .open(project_id, GitHubSurfaceKind::Issues);
+        let summary = github_summary(GitHubItemKind::Issue, 127);
+        let identity = summary.identity.clone();
+        let _ = app.github_surface.select(identity.clone(), false);
+        app.github_surface.receive_detail(github_detail(summary));
+
+        let _ = app.update(Message::PrepareStartWork);
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::PrepareStartWork(project_id, identity.number),
+                ClientRequest::PrepareStartWork {
+                    project_id,
+                    issue_number: identity.number,
+                },
+            )
+        );
+        let preparation = start_work_preparation(WorktreeId::new());
+        app.handle_response(
+            Operation::PrepareStartWork(project_id, identity.number),
+            DaemonResponse::StartWorkPrepared(preparation.clone()),
+        );
+        assert!(matches!(app.modal, Some(Modal::StartWork(_))));
+        for size in [
+            iced::Size::new(1200.0, 850.0),
+            iced::Size::new(760.0, 620.0),
+            iced::Size::new(520.0, 440.0),
+        ] {
+            let rendered = rendered_text(app.modal_view(app.modal.as_ref().unwrap()), size).await;
+            for expected in [
+                "Start Work from Issue",
+                "untrusted reference material",
+                "Confirmed local base",
+                "Additional instructions",
+            ] {
+                assert!(rendered.iter().any(|line| line.contains(expected)));
+            }
+        }
+
+        let _ = app.update(Message::StartWorkInstructionsInput(
+            "Keep the presentation bounded.".into(),
+        ));
+        let _ = app.update(Message::SubmitStartWork);
+        let (operation, request) = harness.take_request();
+        assert_eq!(operation, Operation::StartWork(project_id, identity.number));
+        assert!(matches!(request, ClientRequest::StartWork { .. }));
+        app.handle_response(
+            operation,
+            DaemonResponse::StartWorkFailure(StartWorkFailure::new(
+                StartWorkFailureKind::BaseMoved,
+                "The base moved.",
+            )),
+        );
+        let Some(Modal::StartWork(modal)) = &app.modal else {
+            panic!("stale confirmation should keep the Start Work form open");
+        };
+        assert_eq!(modal.instructions, "Keep the presentation bounded.");
+        assert_eq!(modal.error.as_deref(), Some("The base moved."));
+        assert!(!modal.pending);
+
+        let _ = app.update(Message::SubmitStartWork);
+        let (operation, _) = harness.take_request();
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id,
+            name: "Issue #127".into(),
+            path: "C:/managed/127".into(),
+            canonical_path: "C:/managed/127".into(),
+            branch: Some("issue/127-bounded-remote-title".into()),
+            base_ref: preparation.base.head_commit.clone(),
+            base_commit: preparation.base.head_commit.clone(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Active,
+            created_at: 1,
+            last_activity_at: 1,
+            removed_at: None,
+        };
+        let mut running = session(SessionState::Running, None);
+        running.worktree_id = worktree.id;
+        let source = WorkSource {
+            worktree_id: worktree.id,
+            project_id,
+            item: identity.clone(),
+            canonical_url: identity.browser_target(),
+            created_at: 1,
+        };
+        app.handle_response(
+            operation,
+            DaemonResponse::StartWorkCompleted(StartWorkOutcome::Started {
+                revision: 3,
+                worktree: worktree.clone(),
+                source,
+                session: Box::new(running.clone()),
+            }),
+        );
+
+        assert!(app.modal.is_none());
+        assert_eq!(app.content_surface, ContentSurface::Session);
+        assert_eq!(app.main_tab, MainTab::Terminal);
+        assert_eq!(app.selected_worktree_id, Some(worktree.id));
+        assert_eq!(app.active_session_id, Some(running.id));
+        assert!(matches!(
+            harness.take_request(),
+            (
+                Operation::Attach(id),
+                ClientRequest::AttachSession { session_id, .. }
+            ) if id == running.id && session_id == running.id
+        ));
     }
 
     #[test]

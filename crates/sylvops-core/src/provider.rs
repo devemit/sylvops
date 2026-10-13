@@ -38,6 +38,7 @@ pub struct ProviderRuntimeCapabilities {
 #[allow(clippy::struct_excessive_bools)]
 pub struct ProviderCapabilities {
     pub interactive: bool,
+    pub task_bootstrap: bool,
     pub resume: bool,
     pub status_hooks: bool,
     pub model_selection: bool,
@@ -62,6 +63,11 @@ impl ProviderHealth {
     #[must_use]
     pub fn can_start_interactive_session(&self) -> bool {
         self.session_start_error().is_none()
+    }
+
+    #[must_use]
+    pub fn can_start_task_bootstrap(&self) -> bool {
+        self.capabilities.task_bootstrap && self.session_start_error().is_none()
     }
 
     #[must_use]
@@ -453,6 +459,7 @@ mod tests {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 interactive: true,
+                task_bootstrap: false,
                 resume: true,
                 status_hooks: true,
                 model_selection: true,
@@ -713,6 +720,18 @@ mod tests {
         let mut observational = ready;
         observational.capabilities.interactive = false;
         assert!(!observational.can_start_interactive_session());
+    }
+
+    #[test]
+    fn task_bootstrap_readiness_requires_the_explicit_capability() {
+        let mut provider = health(ProviderKind::Codex);
+        assert!(!provider.can_start_task_bootstrap());
+
+        provider.capabilities.task_bootstrap = true;
+        assert!(provider.can_start_task_bootstrap());
+
+        provider.available = false;
+        assert!(!provider.can_start_task_bootstrap());
     }
 
     #[test]

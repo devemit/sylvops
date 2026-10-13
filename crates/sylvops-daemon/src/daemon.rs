@@ -17,10 +17,15 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use sylvops_core::{
     domain::{
-        DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, WorktreeStatus,
-        state_allows_deletion, state_allows_resume, state_is_active,
+        DaemonHealth, ProviderKind, ProviderProfile, Session, SessionState, Worktree,
+        WorktreeStatus, state_allows_deletion, state_allows_resume, state_is_active,
     },
-    github::{GitHubFailure, GitHubIntegrationStatus, GitHubRepositoryIdentity},
+    github::{
+        GitHubFailure, GitHubIntegrationStatus, GitHubItemKind, GitHubItemNumber, GitHubPageSize,
+        GitHubRepositoryIdentity, GitHubViewQuery, StartWorkBase, StartWorkFailure,
+        StartWorkFailureKind, StartWorkIssueContext, StartWorkOutcome, StartWorkPreparation,
+        build_task_bootstrap_prompt, issue_branch_suggestion,
+    },
     ids::{ProjectId, ProviderProfileId, SessionId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, Frame, HelloRequest, MessageClass,
@@ -51,8 +56,8 @@ use crate::{
     DaemonError, Result, config_store,
     data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan},
     database::{
-        DatabaseHandle, NewSession, ProjectRemovalState, VerifiedConversationIdentityUpdate,
-        WorkspaceDeletionState,
+        DatabaseHandle, NewSession, NewWorkSource, ProjectRemovalState,
+        VerifiedConversationIdentityUpdate, WorkspaceDeletionState,
     },
     git,
     hook::{HookCredentials, HookDelivery, HookReceiver},
@@ -930,8 +935,8 @@ async fn serve_client(mut stream: BoxStream, state: DaemonState) -> Result<()> {
                     .ok_or_else(|| DaemonError::Lifecycle("client reader stopped".into()))??;
                 let request = decode_request(&frame)?;
                 let request_id = frame.message_id;
-                if let Err(error) = handle_request(request, request_id, client_id, client_process_id, &state,
-                    &outgoing, &connection_failed, &mut attachments).await {
+                if let Err(error) = Box::pin(handle_request(request, request_id, client_id, client_process_id, &state,
+                    &outgoing, &connection_failed, &mut attachments)).await {
                     match error {
                         DaemonError::GitHub(failure) => {
                             send_response_queue(
@@ -1301,6 +1306,496 @@ async fn handle_request(
             }
             crate::browser::open(&identity.browser_target()).map_err(DaemonError::Lifecycle)?;
             send_response_queue(outgoing, request_id, &DaemonResponse::Acknowledged).await
+        }
+        ClientRequest::PrepareStartWork {
+            project_id,
+            issue_number,
+        } => {
+            let Ok(project) = state.database.project(project_id).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::ProjectUnavailable,
+                    "The selected Project is no longer available.",
+                )
+                .await;
+            };
+            let Some(association) = state.database.github_association(project_id).await? else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::AssociationChanged,
+                    "The Project is not associated with a GitHub Repository.",
+                )
+                .await;
+            };
+            let remotes = git::github_remotes(&project).await.unwrap_or_default();
+            if !remotes.iter().any(|remote| {
+                remote.name == association.remote_name
+                    && remote.repository == association.repository
+            }) {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::AssociationChanged,
+                    "The Project's selected GitHub remote changed.",
+                )
+                .await;
+            }
+            let snapshot = state.database.snapshot().await?;
+            let Some(root_worktree) = snapshot
+                .worktrees
+                .into_iter()
+                .find(|worktree| worktree.project_id == project_id && worktree.is_root_checkout)
+            else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::ProjectUnavailable,
+                    "The Project root Worktree is unavailable.",
+                )
+                .await;
+            };
+            let Ok(root_state) = git::inspect_worktree(&root_worktree).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::ProjectUnavailable,
+                    "The Project root Worktree could not be verified.",
+                )
+                .await;
+            };
+            let issue =
+                match load_start_work_issue(state, &association.repository, issue_number).await {
+                    Ok(issue) => issue,
+                    Err(failure) => {
+                        return send_response_queue(
+                            outgoing,
+                            request_id,
+                            &DaemonResponse::StartWorkFailure(failure),
+                        )
+                        .await;
+                    }
+                };
+            let head_ref = root_state.branch.as_deref().unwrap_or("HEAD");
+            let Ok(base) = StartWorkBase::new(root_worktree.id, head_ref, root_state.head_commit)
+            else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::ProjectUnavailable,
+                    "The Project root Worktree has an invalid HEAD identity.",
+                )
+                .await;
+            };
+            let suggested_branch = issue_branch_suggestion(issue_number, &issue.title);
+            let suggested_branch_conflict = git::branch_exists(&project, suggested_branch.as_str())
+                .await
+                .unwrap_or(true);
+            let eligible_providers = state
+                .providers
+                .probe_all()
+                .await
+                .into_iter()
+                .filter(sylvops_core::provider::ProviderHealth::can_start_task_bootstrap)
+                .map(|health| health.kind)
+                .collect();
+            let existing_work = state
+                .database
+                .issue_work_sources(project_id, issue.identity.clone())
+                .await?;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::StartWorkPrepared(StartWorkPreparation {
+                    issue,
+                    base,
+                    suggested_branch,
+                    suggested_branch_conflict,
+                    eligible_providers,
+                    existing_work,
+                }),
+            )
+            .await
+        }
+        ClientRequest::StartWork {
+            confirmation,
+            branch,
+            provider,
+            additional_instructions,
+            start_another_worktree,
+            columns,
+            rows,
+        } => {
+            validate_terminal_size(columns, rows).map_err(DaemonError::InvalidSession)?;
+            let _lifecycle_activity = state.lifecycle.begin()?;
+            if *state.shutdown.borrow() {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::InvalidRequest,
+                    "The daemon is quiescing for application replacement.",
+                )
+                .await;
+            }
+            let project_id = confirmation.project_id;
+            let operation_lock = project_operation_lock(state, project_id).await;
+            let _operation_guard = operation_lock.lock().await;
+            let Ok(project) = state.database.project(project_id).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::ProjectUnavailable,
+                    "The selected Project changed after confirmation.",
+                )
+                .await;
+            };
+            let association = match state.database.github_association(project_id).await? {
+                Some(association) if association.repository == confirmation.issue.repository => {
+                    association
+                }
+                _ => {
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::AssociationChanged,
+                        "The Project's GitHub Repository association changed after confirmation.",
+                    )
+                    .await;
+                }
+            };
+            let remotes = git::github_remotes(&project).await.unwrap_or_default();
+            if !remotes.iter().any(|remote| {
+                remote.name == association.remote_name
+                    && remote.repository == association.repository
+            }) {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::AssociationChanged,
+                    "The Project's selected GitHub remote changed after confirmation.",
+                )
+                .await;
+            }
+            let snapshot = state.database.snapshot().await?;
+            let Some(root_worktree) = snapshot.worktrees.into_iter().find(|worktree| {
+                worktree.project_id == project_id
+                    && worktree.is_root_checkout
+                    && worktree.id == confirmation.base.worktree_id
+            }) else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::BaseMoved,
+                    "The Project root Worktree changed after confirmation.",
+                )
+                .await;
+            };
+            let Ok(root_state) = git::inspect_worktree(&root_worktree).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::BaseMoved,
+                    "The Project root Worktree could not be revalidated.",
+                )
+                .await;
+            };
+            let actual_ref = root_state.branch.as_deref().unwrap_or("HEAD");
+            if actual_ref != confirmation.base.head_ref.as_str()
+                || root_state.head_commit != confirmation.base.head_commit
+            {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::BaseMoved,
+                    "The Project root Worktree HEAD moved after confirmation.",
+                )
+                .await;
+            }
+            let issue = match load_start_work_issue(
+                state,
+                &association.repository,
+                confirmation.issue.number,
+            )
+            .await
+            {
+                Ok(issue) => issue,
+                Err(failure) => {
+                    return send_response_queue(
+                        outgoing,
+                        request_id,
+                        &DaemonResponse::StartWorkFailure(failure),
+                    )
+                    .await;
+                }
+            };
+            if issue.identity != confirmation.issue
+                || issue.updated_at != confirmation.issue_updated_at
+            {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::IssueChanged,
+                    "The GitHub Issue changed after confirmation. Prepare Start Work again.",
+                )
+                .await;
+            }
+            let existing_work = state
+                .database
+                .issue_work_sources(project_id, issue.identity.clone())
+                .await?;
+            if !start_another_worktree && !existing_work.is_empty() {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::ExistingWork,
+                    "This Issue already has local work. Open it or explicitly start another Worktree.",
+                )
+                .await;
+            }
+            let Ok(health) = state.providers.probe(provider).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::UnsupportedProvider,
+                    "The selected Provider could not be revalidated.",
+                )
+                .await;
+            };
+            persist_provider_health(state, &health).await?;
+            if !health.can_start_task_bootstrap() {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::UnsupportedProvider,
+                    "The selected Provider no longer supports task bootstrap.",
+                )
+                .await;
+            }
+            let Ok(current_project) = state.database.project(project_id).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::ProjectUnavailable,
+                    "The selected Project changed immediately before Worktree creation.",
+                )
+                .await;
+            };
+            if !same_project_identity(&project, &current_project) {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::ProjectUnavailable,
+                    "The selected Project identity changed immediately before Worktree creation.",
+                )
+                .await;
+            }
+            let Some(current_association) = state.database.github_association(project_id).await?
+            else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::AssociationChanged,
+                    "The GitHub Repository association changed immediately before Worktree creation.",
+                )
+                .await;
+            };
+            if current_association != association {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::AssociationChanged,
+                    "The GitHub Repository association changed immediately before Worktree creation.",
+                )
+                .await;
+            }
+            let current_remotes = git::github_remotes(&current_project)
+                .await
+                .unwrap_or_default();
+            if !current_remotes.iter().any(|remote| {
+                remote.name == current_association.remote_name
+                    && remote.repository == current_association.repository
+            }) {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::AssociationChanged,
+                    "The selected GitHub remote changed immediately before Worktree creation.",
+                )
+                .await;
+            }
+            match git::branch_exists(&project, branch.as_str()).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::BranchConflict,
+                        "The selected branch already exists.",
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::InvalidRequest,
+                        "The selected branch could not be validated.",
+                    )
+                    .await;
+                }
+            }
+            let latest_snapshot = state.database.snapshot().await?;
+            let Some(latest_root) = latest_snapshot.worktrees.into_iter().find(|worktree| {
+                worktree.id == confirmation.base.worktree_id
+                    && worktree.project_id == project_id
+                    && worktree.is_root_checkout
+            }) else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::BaseMoved,
+                    "The Project root Worktree changed immediately before Worktree creation.",
+                )
+                .await;
+            };
+            let Ok(latest_root_state) = git::inspect_worktree(&latest_root).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::BaseMoved,
+                    "The Project root Worktree could not be verified immediately before mutation.",
+                )
+                .await;
+            };
+            let latest_ref = latest_root_state.branch.as_deref().unwrap_or("HEAD");
+            if latest_ref != confirmation.base.head_ref.as_str()
+                || latest_root_state.head_commit != confirmation.base.head_commit
+            {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::BaseMoved,
+                    "The Project root Worktree HEAD moved immediately before mutation.",
+                )
+                .await;
+            }
+            let Ok(latest_health) = state.providers.probe(provider).await else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::UnsupportedProvider,
+                    "The selected Provider could not be verified immediately before mutation.",
+                )
+                .await;
+            };
+            if !latest_health.can_start_task_bootstrap() {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::UnsupportedProvider,
+                    "The selected Provider no longer supports task bootstrap immediately before mutation.",
+                )
+                .await;
+            }
+            let mut record = match git::create_managed_worktree(
+                &project,
+                &state.managed_worktree_root,
+                WorktreeId::new(),
+                Some(format!("Issue #{}", issue.identity.number)),
+                branch.as_str(),
+                Some(&confirmation.base.head_commit),
+            )
+            .await
+            {
+                Ok(record) => record,
+                Err(error) => {
+                    let message = error.to_string();
+                    let kind = if message.contains("already exists") {
+                        StartWorkFailureKind::BranchConflict
+                    } else {
+                        StartWorkFailureKind::InvalidRequest
+                    };
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        kind,
+                        "The managed Worktree could not be created from the confirmed base.",
+                    )
+                    .await;
+                }
+            };
+            record.base_ref = confirmation.base.head_ref.as_str().to_owned();
+            let Ok((worktree_revision, worktree, source)) = state
+                .database
+                .add_sourced_worktree(
+                    record,
+                    NewWorkSource {
+                        item: issue.identity.clone(),
+                        canonical_url: issue.canonical_url.clone(),
+                    },
+                )
+                .await
+            else {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::PersistenceFailed,
+                    "The Worktree was created on disk, but its Work Source could not be recorded.",
+                )
+                .await;
+            };
+            let _ = state.events.send(DaemonEvent::WorktreeAdded {
+                revision: worktree_revision,
+                worktree: worktree.clone(),
+            });
+            let prompt = build_task_bootstrap_prompt(&issue, additional_instructions.as_ref());
+            let launch = launch_new_session(
+                state,
+                worktree.clone(),
+                provider,
+                Some(format!("Issue #{}", issue.identity.number)),
+                None,
+                None,
+                Some(prompt),
+                true,
+                columns,
+                rows,
+            )
+            .await;
+            let outcome = match launch {
+                Ok((revision, session)) => {
+                    let _ = state.events.send(DaemonEvent::SessionCreated {
+                        revision,
+                        session: session.clone(),
+                    });
+                    StartWorkOutcome::Started {
+                        revision,
+                        worktree,
+                        source,
+                        session: Box::new(session),
+                    }
+                }
+                Err(_) => StartWorkOutcome::WorktreeCreated {
+                    revision: worktree_revision,
+                    worktree,
+                    source,
+                    failure: StartWorkFailure::new(
+                        StartWorkFailureKind::ProviderLaunchFailed,
+                        "The Worktree was created and preserved, but the Provider Session did not start.",
+                    ),
+                },
+            };
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::StartWorkCompleted(outcome),
+            )
+            .await
+        }
+        ClientRequest::GetWorkSource { worktree_id } => {
+            let source = state.database.work_source(worktree_id).await?;
+            send_response_queue(outgoing, request_id, &DaemonResponse::WorkSource(source)).await
         }
         ClientRequest::AddWorkspace { name } => {
             let (revision, workspace) = state.database.add_workspace(name).await?;
@@ -1732,76 +2227,19 @@ async fn handle_request(
             let operation_lock = worktree_operation_lock(state, worktree_id).await;
             let _operation_guard = operation_lock.lock().await;
             let worktree = verified_worktree(state, worktree_id).await?;
-            let session_id = SessionId::new();
-            let health = state.providers.probe(provider).await?;
-            persist_provider_health(state, &health).await?;
-            if !health.available {
-                return Err(DaemonError::Provider(
-                    health
-                        .diagnostic
-                        .unwrap_or_else(|| format!("provider {provider} is unavailable")),
-                ));
-            }
-            if health.capabilities.authentication == AuthenticationRequirement::ExistingLogin
-                && !health.authenticated
-            {
-                return Err(DaemonError::Provider(health.diagnostic.unwrap_or_else(
-                    || format!("{provider} is not authenticated; sign in explicitly"),
-                )));
-            }
-            let display_name = validated_session_name(display_name, provider)?;
-            let lifecycle_endpoint = if state.providers.supports_lifecycle_events(provider)? {
-                Some(
-                    state
-                        .hook_credentials
-                        .register(provider, session_id, worktree_id)?,
-                )
-            } else {
-                None
-            };
-            let spec = match state.providers.launch(
+            let (revision, running) = launch_new_session(
+                state,
+                worktree,
                 provider,
-                LaunchContext {
-                    session_id,
-                    worktree_id,
-                    cwd: PathBuf::from(&worktree.canonical_path),
-                    model,
-                    effort,
-                    initial_prompt: initial_prompt.clone(),
-                    lifecycle_endpoint,
-                },
-            ) {
-                Ok(spec) => spec,
-                Err(error) => {
-                    state.hook_credentials.invalidate(session_id);
-                    return Err(error);
-                }
-            };
-            let command = match path_text(&spec.launch.executable) {
-                Ok(command) => command,
-                Err(error) => {
-                    state.hook_credentials.invalidate(session_id);
-                    state
-                        .providers
-                        .cleanup_runtime_paths(provider, &spec.owned_paths);
-                    return Err(error);
-                }
-            };
-            let arguments_json = persisted_launch_arguments(state, session_id, provider, &spec)?;
-            let record = NewSession {
-                id: session_id,
-                worktree_id,
                 display_name,
-                provider_profile_id: Some(provider_profile_id(provider)),
-                provider_kind: provider,
-                command,
-                arguments_json,
-                cwd: worktree.canonical_path.clone(),
-                external_session_id: None,
-                resumed_from_session_id: None,
-            };
-            let (revision, running) =
-                spawn_managed_session(state, record, spec, columns, rows).await?;
+                model,
+                effort,
+                initial_prompt,
+                false,
+                columns,
+                rows,
+            )
+            .await?;
             send_response_queue(
                 outgoing,
                 request_id,
@@ -2574,6 +3012,96 @@ async fn send_resync(
         },
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn launch_new_session(
+    state: &DaemonState,
+    worktree: Worktree,
+    provider: ProviderKind,
+    display_name: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    initial_prompt: Option<String>,
+    require_task_bootstrap: bool,
+    columns: u16,
+    rows: u16,
+) -> Result<(u64, Session)> {
+    let session_id = SessionId::new();
+    let worktree_id = worktree.id;
+    let health = state.providers.probe(provider).await?;
+    persist_provider_health(state, &health).await?;
+    if require_task_bootstrap && !health.can_start_task_bootstrap() {
+        return Err(DaemonError::Provider(
+            "provider no longer supports task bootstrap".into(),
+        ));
+    }
+    if !health.available {
+        return Err(DaemonError::Provider(
+            health
+                .diagnostic
+                .unwrap_or_else(|| format!("provider {provider} is unavailable")),
+        ));
+    }
+    if health.capabilities.authentication == AuthenticationRequirement::ExistingLogin
+        && !health.authenticated
+    {
+        return Err(DaemonError::Provider(health.diagnostic.unwrap_or_else(
+            || format!("{provider} is not authenticated; sign in explicitly"),
+        )));
+    }
+    let display_name = validated_session_name(display_name, provider)?;
+    let lifecycle_endpoint = if state.providers.supports_lifecycle_events(provider)? {
+        Some(
+            state
+                .hook_credentials
+                .register(provider, session_id, worktree_id)?,
+        )
+    } else {
+        None
+    };
+    let spec = match state.providers.launch(
+        provider,
+        LaunchContext {
+            session_id,
+            worktree_id,
+            cwd: PathBuf::from(&worktree.canonical_path),
+            model,
+            effort,
+            initial_prompt,
+            lifecycle_endpoint,
+        },
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            state.hook_credentials.invalidate(session_id);
+            return Err(error);
+        }
+    };
+    let command = match path_text(&spec.launch.executable) {
+        Ok(command) => command,
+        Err(error) => {
+            state.hook_credentials.invalidate(session_id);
+            state
+                .providers
+                .cleanup_runtime_paths(provider, &spec.owned_paths);
+            return Err(error);
+        }
+    };
+    let arguments_json = persisted_launch_arguments(state, session_id, provider, &spec)?;
+    let record = NewSession {
+        id: session_id,
+        worktree_id,
+        display_name,
+        provider_profile_id: Some(provider_profile_id(provider)),
+        provider_kind: provider,
+        command,
+        arguments_json,
+        cwd: worktree.canonical_path,
+        external_session_id: None,
+        resumed_from_session_id: None,
+    };
+    spawn_managed_session(state, record, spec, columns, rows).await
 }
 
 async fn spawn_managed_session(
@@ -3389,6 +3917,60 @@ async fn associated_github_repository(
         .ok_or(DaemonError::GitHub(GitHubFailure::RepositoryUnavailable))
 }
 
+fn same_project_identity(
+    expected: &sylvops_core::domain::Project,
+    current: &sylvops_core::domain::Project,
+) -> bool {
+    expected.id == current.id
+        && expected.workspace_id == current.workspace_id
+        && expected.canonical_repository_path == current.canonical_repository_path
+}
+
+async fn load_start_work_issue(
+    state: &DaemonState,
+    repository: &GitHubRepositoryIdentity,
+    issue_number: GitHubItemNumber,
+) -> std::result::Result<StartWorkIssueContext, StartWorkFailure> {
+    let query = GitHubViewQuery {
+        kind: GitHubItemKind::Issue,
+        number: issue_number,
+        comments_page_size: GitHubPageSize::new(1)
+            .expect("one comment is within the protocol page bound"),
+        comments_cursor: None,
+        refresh: true,
+    };
+    let detail = state
+        .github
+        .view_item(repository, &query)
+        .await
+        .map_err(|failure| {
+            StartWorkFailure::new(
+                StartWorkFailureKind::IssueUnavailable,
+                failure.kind.message(),
+            )
+        })?;
+    StartWorkIssueContext::try_from(detail).map_err(|_| {
+        StartWorkFailure::new(
+            StartWorkFailureKind::IssueUnavailable,
+            "The selected GitHub item is not an Issue.",
+        )
+    })
+}
+
+async fn send_start_work_failure(
+    outgoing: &ClientSink,
+    request_id: Uuid,
+    kind: StartWorkFailureKind,
+    diagnostic: &str,
+) -> Result<()> {
+    send_response_queue(
+        outgoing,
+        request_id,
+        &DaemonResponse::StartWorkFailure(StartWorkFailure::new(kind, diagnostic)),
+    )
+    .await
+}
+
 async fn stop_all_sessions(state: &DaemonState) {
     let sessions: Vec<_> = state.sessions.read().await.values().cloned().collect();
     for session in &sessions {
@@ -3659,10 +4241,11 @@ impl Drop for ClientGuard {
 mod tests {
     use super::{
         ApplicationMutationCoordinator, CONTROL_OPCODE, HookTracking, LifecycleCoordinator,
-        decode_request, provider_external_id_update,
+        decode_request, provider_external_id_update, same_project_identity,
     };
     use sylvops_core::{
-        domain::SessionState,
+        domain::{Project, SessionState},
+        ids::{ProjectId, WorkspaceId},
         protocol::{ClientRequest, Frame, MessageClass},
         status::{ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId},
     };
@@ -3678,6 +4261,30 @@ mod tests {
         frame.payload = vec![0xc1];
         let error = decode_request(&frame).expect_err("malformed request must be rejected");
         assert!(error.to_string().len() < 512);
+    }
+
+    #[test]
+    fn start_work_project_identity_ignores_display_and_activity_changes() {
+        let mut original = Project {
+            id: ProjectId::new(),
+            workspace_id: WorkspaceId::new(),
+            name: "Original".into(),
+            repository_path: "C:/repo".into(),
+            canonical_repository_path: "C:/repo".into(),
+            default_branch: Some("main".into()),
+            remote_url: None,
+            created_at: 1,
+            last_activity_at: 1,
+        };
+        let mut current = original.clone();
+        current.name = "Renamed".into();
+        current.last_activity_at = 99;
+        assert!(same_project_identity(&original, &current));
+
+        current.canonical_repository_path = "C:/other".into();
+        assert!(!same_project_identity(&original, &current));
+        original.workspace_id = WorkspaceId::new();
+        assert!(!same_project_identity(&original, &current));
     }
 
     #[tokio::test]

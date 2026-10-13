@@ -531,6 +531,7 @@ impl ClaudeAdapter {
     fn capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             interactive: true,
+            task_bootstrap: false,
             resume: true,
             status_hooks: true,
             model_selection: true,
@@ -1322,6 +1323,7 @@ impl CodexAdapter {
     async fn probe_health(&self) -> ProviderHealth {
         let capabilities = ProviderCapabilities {
             interactive: true,
+            task_bootstrap: true,
             resume: true,
             status_hooks: true,
             model_selection: true,
@@ -1411,6 +1413,7 @@ impl CodexAdapter {
                     diagnostic: Some("Codex discovery state is unavailable".into()),
                     capabilities: ProviderCapabilities {
                         interactive: true,
+                        task_bootstrap: true,
                         resume: true,
                         status_hooks: true,
                         model_selection: true,
@@ -1494,6 +1497,7 @@ impl ProviderRuntime for CodexAdapter {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             interactive: true,
+            task_bootstrap: true,
             resume: true,
             status_hooks: true,
             model_selection: true,

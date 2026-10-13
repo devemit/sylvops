@@ -55,6 +55,8 @@ pub(crate) enum Operation {
         GitHubDetailRequest,
     ),
     OpenGitHubItem(ProjectId, GitHubItemKind, GitHubItemNumber),
+    PrepareStartWork(ProjectId, GitHubItemNumber),
+    StartWork(ProjectId, GitHubItemNumber),
     CreateWorkspace,
     OpenWorkspace(WorkspaceId),
     InspectWorkspaceDeletion(WorkspaceId),
@@ -90,7 +92,7 @@ pub(crate) enum Operation {
 enum BridgeCommand {
     Request {
         operation: Operation,
-        request: ClientRequest,
+        request: Box<ClientRequest>,
     },
     RemoveUserData {
         confirmation: String,
@@ -249,7 +251,10 @@ impl Bridge {
             return false;
         }
         self.commands
-            .try_send(BridgeCommand::Request { operation, request })
+            .try_send(BridgeCommand::Request {
+                operation,
+                request: Box::new(request),
+            })
             .is_ok()
     }
 
@@ -324,7 +329,7 @@ impl Bridge {
 impl BridgeHarness {
     pub(crate) fn take_request(&mut self) -> (Operation, ClientRequest) {
         match self.commands.try_recv() {
-            Ok(BridgeCommand::Request { operation, request }) => (operation, request),
+            Ok(BridgeCommand::Request { operation, request }) => (operation, *request),
             Ok(command) => panic!("unexpected harness command: {command:?}"),
             Err(error) => panic!("expected a bridge request: {error}"),
         }
