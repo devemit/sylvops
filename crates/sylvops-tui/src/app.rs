@@ -18,9 +18,7 @@ use sylvops_core::{
     ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
 };
 
-use crate::{
-    directory_browser::DirectoryBrowser, forms::Form, terminal::AttachedTerminal,
-};
+use crate::{directory_browser::DirectoryBrowser, forms::Form, terminal::AttachedTerminal};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FocusZone {
@@ -255,6 +253,7 @@ pub(crate) struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(
         snapshot: DaemonSnapshot,
         providers: Vec<ProviderHealth>,
