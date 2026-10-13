@@ -50,6 +50,7 @@ use sylvops_core::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
         Worktree, WorktreeStatus,
     },
+    github::{GitHubIntegrationStatus, GitRemoteName},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, ProjectRemovalRefusal, SessionDeletionRefusal,
@@ -218,6 +219,8 @@ struct DesktopApp {
     bridge: Bridge,
     snapshot: DaemonSnapshot,
     providers: Vec<ProviderHealth>,
+    github_status: Option<GitHubIntegrationStatus>,
+    github_request: RequestState,
     connection: ConnectionState,
     selected_project_id: Option<ProjectId>,
     selected_worktree_id: Option<WorktreeId>,
@@ -255,7 +258,7 @@ struct DesktopApp {
     resume_pending: HashSet<SessionId>,
     window_mode: window::Mode,
     update_status: UpgradeStatus,
-    install_request: InstallRequestState,
+    install_request: RequestState,
     modal_focus: ModalFocus,
     disclosures: DisclosureState,
 }
@@ -268,7 +271,7 @@ struct DisclosureState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum InstallRequestState {
+enum RequestState {
     #[default]
     Idle,
     Pending,
@@ -443,6 +446,9 @@ enum Message {
     Stop,
     Refresh,
     ToggleSettings,
+    RefreshGitHub,
+    AssociateGitHub(GitRemoteName),
+    ClearGitHubAssociation,
     ToggleClassicThemes,
     ToggleTechnicalDetails,
     CopyTechnicalValue(String),
@@ -496,6 +502,8 @@ impl DesktopApp {
             bridge,
             snapshot: DaemonSnapshot::default(),
             providers: Vec::new(),
+            github_status: None,
+            github_request: RequestState::Idle,
             connection: ConnectionState::Connecting,
             selected_project_id: None,
             selected_worktree_id: None,
@@ -533,7 +541,7 @@ impl DesktopApp {
             resume_pending: HashSet::new(),
             window_mode: window::Mode::Windowed,
             update_status: UpgradeStatus::Idle,
-            install_request: InstallRequestState::Idle,
+            install_request: RequestState::Idle,
             modal_focus: ModalFocus::Idle,
             disclosures: DisclosureState::default(),
         }
@@ -724,6 +732,26 @@ impl DesktopApp {
                     self.modal = None;
                 } else {
                     self.open_settings();
+                }
+            }
+            Message::RefreshGitHub => self.refresh_github_status(),
+            Message::AssociateGitHub(remote_name) => {
+                if let Some(project_id) = self.selected_project_id {
+                    self.send_github_request(
+                        Operation::SetGitHubAssociation(project_id),
+                        ClientRequest::SetGitHubAssociation {
+                            project_id,
+                            remote_name,
+                        },
+                    );
+                }
+            }
+            Message::ClearGitHubAssociation => {
+                if let Some(project_id) = self.selected_project_id {
+                    self.send_github_request(
+                        Operation::ClearGitHubAssociation(project_id),
+                        ClientRequest::ClearGitHubAssociation { project_id },
+                    );
                 }
             }
             Message::ToggleClassicThemes => {
@@ -2103,6 +2131,7 @@ impl DesktopApp {
         ]
         .spacing(density.region_spacing);
         let appearance = self.appearance_theme_gallery();
+        let github_settings = self.github_settings_view();
         let update_settings = self.update_settings_view();
         let advanced_settings = self.advanced_settings_view();
         let settings = column![
@@ -2127,6 +2156,8 @@ impl DesktopApp {
                     appearance,
                     appearance_controls,
                     rule::horizontal(1),
+                    github_settings,
+                    rule::horizontal(1),
                     update_settings,
                     rule::horizontal(1),
                     advanced_settings,
@@ -2144,6 +2175,99 @@ impl DesktopApp {
             .height(Fill)
             .style(modal_card)
             .into()
+    }
+
+    fn github_settings_view(&self) -> Element<'_, Message> {
+        let mut content = column![text("Integrations").font(UI_SEMIBOLD).size(16)].spacing(8);
+        if let Some(status) = &self.github_status {
+            content = content.push(text(if let Some(path) = &status.executable_path {
+                format!("GitHub CLI: {}", human_readable_path(path))
+            } else {
+                "GitHub CLI: not found".into()
+            }));
+            for connection in &status.connections {
+                content = content.push(
+                    column![
+                        text(format!(
+                            "{} · {}",
+                            connection.host,
+                            connection.state.display_name()
+                        )),
+                        text(&connection.diagnostic)
+                            .size(UI_META_SIZE)
+                            .style(text::secondary),
+                    ]
+                    .spacing(2),
+                );
+            }
+            if self.selected_project_id.is_some() {
+                content = content.push(text("Project association").font(UI_SEMIBOLD));
+                if status.remotes.is_empty() {
+                    content = content.push(
+                        text("No validated GitHub remotes are configured in this Project.")
+                            .style(text::secondary),
+                    );
+                }
+                for remote in &status.remotes {
+                    let selected = status.association.as_ref().is_some_and(|association| {
+                        association.remote_name == remote.name
+                            && association.repository == remote.repository
+                    });
+                    content = content.push(
+                        button(text(if selected {
+                            format!("Connected: {remote}")
+                        } else {
+                            format!("Connect {remote}")
+                        }))
+                        .on_press_maybe(
+                            (self.github_request == RequestState::Idle && !selected)
+                                .then(|| Message::AssociateGitHub(remote.name.clone())),
+                        )
+                        .style(if selected {
+                            primary_action_style
+                        } else {
+                            chrome_action_style
+                        }),
+                    );
+                }
+                if status.association.is_some() {
+                    content = content.push(
+                        button("Clear Project association")
+                            .on_press_maybe(
+                                (self.github_request == RequestState::Idle)
+                                    .then_some(Message::ClearGitHubAssociation),
+                            )
+                            .style(chrome_action_style),
+                    );
+                }
+            } else {
+                content = content.push(
+                    text("Select a Project to choose or clear its GitHub remote.")
+                        .style(text::secondary),
+                );
+            }
+        } else {
+            content = content.push(
+                text(if self.github_request == RequestState::Pending {
+                    "Checking GitHub CLI…"
+                } else {
+                    "GitHub status has not been checked."
+                })
+                .style(text::secondary),
+            );
+        }
+        content = content.push(
+            button(if self.github_request == RequestState::Pending {
+                "Checking…"
+            } else {
+                "Refresh GitHub status"
+            })
+            .on_press_maybe(
+                (self.github_request == RequestState::Idle).then_some(Message::RefreshGitHub),
+            )
+            .style(chrome_action_style),
+        );
+        content.into()
     }
 
     fn appearance_theme_gallery(&self) -> Element<'_, Message> {
@@ -2762,6 +2886,16 @@ impl DesktopApp {
                 if matches!(operation, Some(Operation::RefreshSnapshot)) {
                     self.snapshot_pending = false;
                 }
+                if matches!(
+                    operation,
+                    Some(
+                        Operation::GetGitHubStatus
+                            | Operation::SetGitHubAssociation(_)
+                            | Operation::ClearGitHubAssociation(_)
+                    )
+                ) {
+                    self.github_request = RequestState::Idle;
+                }
                 if matches!(operation, Some(Operation::SaveDesktopState)) {
                     self.state_save_pending = false;
                 }
@@ -2884,11 +3018,16 @@ impl DesktopApp {
             }
             DaemonEvent::UpgradeProgress { status } => {
                 if matches!(status, UpgradeStatus::Installing { .. })
-                    && self.install_request == InstallRequestState::Idle
+                    && self.install_request == RequestState::Idle
                 {
                     self.closing_since = Some(Instant::now());
                 }
                 self.update_status = status;
+            }
+            DaemonEvent::GitHubAssociationUpdated { project_id, .. }
+                if self.selected_project_id == Some(project_id) =>
+            {
+                self.refresh_github_status();
             }
             _ => self.request_snapshot(),
         }
@@ -2897,7 +3036,7 @@ impl DesktopApp {
     #[allow(clippy::too_many_lines)]
     fn handle_response(&mut self, operation: Operation, response: DaemonResponse) {
         if matches!(operation, Operation::InstallUpdate) {
-            self.install_request = InstallRequestState::Idle;
+            self.install_request = RequestState::Idle;
             if matches!(self.update_status, UpgradeStatus::Installing { .. }) {
                 self.closing_since = Some(Instant::now());
             }
@@ -2910,6 +3049,25 @@ impl DesktopApp {
             }))
         );
         match (operation, response) {
+            (Operation::GetGitHubStatus, DaemonResponse::GitHubStatus(status)) => {
+                self.github_request = RequestState::Idle;
+                self.github_status = Some(status);
+            }
+            (
+                Operation::SetGitHubAssociation(expected)
+                | Operation::ClearGitHubAssociation(expected),
+                DaemonResponse::GitHubAssociationUpdated {
+                    project_id,
+                    association,
+                    ..
+                },
+            ) if expected == project_id => {
+                self.github_request = RequestState::Idle;
+                if let Some(status) = &mut self.github_status {
+                    status.association = association;
+                }
+                self.show_success("GitHub Project association updated.");
+            }
             (Operation::RefreshSnapshot, DaemonResponse::Snapshot(snapshot)) => {
                 self.snapshot_pending = false;
                 self.snapshot = snapshot;
@@ -3327,8 +3485,25 @@ impl DesktopApp {
                         .into(),
                 );
             }
+            (
+                operation @ (Operation::GetGitHubStatus
+                | Operation::SetGitHubAssociation(_)
+                | Operation::ClearGitHubAssociation(_)),
+                DaemonResponse::GitHubFailure(failure),
+            ) => {
+                self.github_request = RequestState::Idle;
+                self.error = Some(contextual_error(Some(operation), failure.message()));
+            }
             (operation, DaemonResponse::Error(failure)) => {
                 let message = bounded_redacted_diagnostic(&failure.message);
+                if matches!(
+                    operation,
+                    Operation::GetGitHubStatus
+                        | Operation::SetGitHubAssociation(_)
+                        | Operation::ClearGitHubAssociation(_)
+                ) {
+                    self.github_request = RequestState::Idle;
+                }
                 if let Operation::Resume(session_id) = operation {
                     self.resume_pending.remove(&session_id);
                 }
@@ -3378,6 +3553,18 @@ impl DesktopApp {
         if !self.bridge.request(operation, request) {
             self.error = Some("The background service is busy. Try again.".into());
         }
+    }
+
+    fn send_github_request(&mut self, operation: Operation, request: ClientRequest) {
+        if self.github_request == RequestState::Pending {
+            return;
+        }
+        self.github_request = if self.bridge.request(operation, request) {
+            RequestState::Pending
+        } else {
+            self.error = Some("The background service is busy. Try again.".into());
+            RequestState::Idle
+        };
     }
 
     fn queue_terminal_input(&mut self, session_id: SessionId, bytes: Vec<u8>) {
@@ -3430,11 +3617,11 @@ impl DesktopApp {
                 requesting_process_id: std::process::id(),
             },
         ) {
-            InstallRequestState::Pending
+            RequestState::Pending
         } else {
-            InstallRequestState::Idle
+            RequestState::Idle
         };
-        if self.install_request == InstallRequestState::Idle {
+        if self.install_request == RequestState::Idle {
             self.error = Some("The background service is busy. Try again.".into());
         }
     }
@@ -3776,6 +3963,7 @@ impl DesktopApp {
         self.disclosures.settings_theme_focus =
             theme_gallery_index(self.desktop_state.theme).min(FEATURED_THEME_COUNT - 1);
         self.modal = Some(Modal::Settings);
+        self.refresh_github_status();
     }
 
     fn cycle_keyboard_target(&mut self, direction: i8) {
@@ -3978,6 +4166,15 @@ impl DesktopApp {
         self.snapshot_pending = self
             .bridge
             .request(Operation::RefreshSnapshot, ClientRequest::GetSnapshot);
+    }
+
+    fn refresh_github_status(&mut self) {
+        self.send_github_request(
+            Operation::GetGitHubStatus,
+            ClientRequest::GetGitHubStatus {
+                project_id: self.selected_project_id,
+            },
+        );
     }
 
     fn open_project_form(&mut self) {
@@ -5467,6 +5664,10 @@ const fn operation_error_context(operation: Operation) -> &'static str {
     match operation {
         Operation::RefreshSnapshot => "Refresh",
         Operation::ProbeProvider(_) => "Provider check",
+        Operation::GetGitHubStatus => "GitHub status",
+        Operation::SetGitHubAssociation(_) | Operation::ClearGitHubAssociation(_) => {
+            "GitHub association"
+        }
         Operation::CreateWorkspace => "Create workspace",
         Operation::OpenWorkspace(_) => "Open workspace",
         Operation::InspectWorkspaceDeletion(_) | Operation::DeleteWorkspace => "Delete workspace",
@@ -8453,7 +8654,7 @@ mod tests {
                 confirmation_error.layout_nodes,
             ],
             [
-                183, 124, 90, 177, 126, 85, 209, 152, 111, 92, 19, 233, 158, 146
+                183, 124, 90, 183, 126, 85, 209, 152, 111, 92, 19, 239, 158, 146
             ]
         );
         let baselines = [
@@ -9095,6 +9296,75 @@ mod tests {
             assert_eq!(&bytes[..4], &[0, 1, 0, 0]);
         }
         assert_ne!(terminal_font(DesktopTerminalFont::System), UI_FONT);
+    }
+
+    #[tokio::test]
+    async fn settings_render_github_health_and_association_controls_without_an_active_session() {
+        use sylvops_core::github::{
+            GitHubAssociation, GitHubConnection, GitHubConnectionState, GitHubHost,
+            GitHubIntegrationStatus, GitHubOwner, GitHubRemote, GitHubRepositoryIdentity,
+            GitHubRepositoryName, GitRemoteName,
+        };
+
+        let (mut app, project_id, _, _, _) = desktop_hierarchy();
+        app.snapshot.sessions.clear();
+        app.active_session_id = None;
+        let repository = GitHubRepositoryIdentity::new(
+            GitHubHost::new("github.example.com").unwrap(),
+            GitHubOwner::new("acme").unwrap(),
+            GitHubRepositoryName::new("widgets").unwrap(),
+        );
+        let remote_name = GitRemoteName::new("upstream").unwrap();
+        app.github_status = Some(GitHubIntegrationStatus {
+            executable_path: Some("gh".into()),
+            connections: vec![GitHubConnection {
+                host: GitHubHost::new("github.example.com").unwrap(),
+                state: GitHubConnectionState::Ready,
+                diagnostic: "GitHub CLI is ready.".into(),
+                checked_at: 1,
+            }],
+            remotes: vec![GitHubRemote {
+                name: remote_name.clone(),
+                repository: repository.clone(),
+            }],
+            association: None,
+        });
+        app.modal = Some(Modal::Settings);
+
+        let rendered = rendered_text(app.settings_view(), iced::Size::new(900.0, 700.0)).await;
+        assert!(rendered.iter().any(|line| line.contains("Integrations")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("github.example.com · Ready"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Connect upstream"))
+        );
+
+        let association = GitHubAssociation {
+            project_id,
+            remote_name,
+            repository,
+            created_at: 1,
+            updated_at: 1,
+        };
+        app.handle_response(
+            Operation::SetGitHubAssociation(project_id),
+            DaemonResponse::GitHubAssociationUpdated {
+                revision: 2,
+                project_id,
+                association: Some(association.clone()),
+            },
+        );
+        assert_eq!(
+            app.github_status
+                .as_ref()
+                .and_then(|status| status.association.as_ref()),
+            Some(&association)
+        );
     }
 
     #[test]

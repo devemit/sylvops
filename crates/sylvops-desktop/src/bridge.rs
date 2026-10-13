@@ -37,6 +37,9 @@ const CRITICAL_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) enum Operation {
     RefreshSnapshot,
     ProbeProvider(ProviderKind),
+    GetGitHubStatus,
+    SetGitHubAssociation(ProjectId),
+    ClearGitHubAssociation(ProjectId),
     CreateWorkspace,
     OpenWorkspace(WorkspaceId),
     InspectWorkspaceDeletion(WorkspaceId),

@@ -19,6 +19,10 @@ name = "fake-claude"
 path = "src/bin/fake-claude.rs"
 
 [[bin]]
+name = "fake-gh"
+path = "src/bin/fake-gh.rs"
+
+[[bin]]
 name = "release-manifest"
 path = "src/bin/release-manifest.rs"
 

@@ -11,6 +11,7 @@ use std::{
 use sha2::{Digest, Sha256};
 use sylvops_core::{
     domain::{GitDiff, GitWorktreeState, Project, Worktree, WorktreeStatus},
+    github::{GitHubRemote, GitRemoteName, MAX_GITHUB_REMOTES, parse_github_remote},
     ids::{WorkspaceId, WorktreeId},
 };
 use tokio::{io::AsyncReadExt, time::timeout};
@@ -23,12 +24,59 @@ use crate::{
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 const DIFF_LIMIT: u64 = 512 * 1024;
+const MAX_URLS_PER_REMOTE: usize = 16;
 
 #[derive(Debug)]
 struct GitOutput {
     success: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+/// Lists bounded, unambiguous GitHub remotes configured in a Project's repository.
+///
+/// Non-GitHub, malformed, credentialed, and multiply-targeted remotes are ignored. Git
+/// configuration is never changed.
+///
+/// # Errors
+///
+/// Returns an error when the repository cannot be inspected through bounded Git commands or Git
+/// returns invalid metadata.
+pub async fn github_remotes(project: &Project) -> Result<Vec<GitHubRemote>> {
+    let repository = Path::new(&project.canonical_repository_path);
+    let listed = run_git(repository, &["remote"]).await?;
+    if !listed.success {
+        return Err(DaemonError::Git("cannot list repository remotes".into()));
+    }
+    let mut remotes = Vec::new();
+    for name in output_text(&listed.stdout)?
+        .lines()
+        .take(MAX_GITHUB_REMOTES)
+    {
+        let Ok(name) = GitRemoteName::new(name) else {
+            continue;
+        };
+        let urls = run_git(repository, &["remote", "get-url", "--all", name.as_str()]).await?;
+        if !urls.success {
+            continue;
+        }
+        let mut identities = Vec::new();
+        for url in output_text(&urls.stdout)?.lines().take(MAX_URLS_PER_REMOTE) {
+            if let Ok(identity) = parse_github_remote(url)
+                && !identities.contains(&identity)
+            {
+                identities.push(identity);
+            }
+        }
+        if let [repository] = identities.as_slice() {
+            remotes.push(GitHubRemote {
+                name,
+                repository: repository.clone(),
+            });
+        }
+    }
+    remotes.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(remotes)
 }
 
 /// Creates and validates the private root used for managed worktrees.
@@ -926,6 +974,73 @@ mod tests {
         assert!(registration.branch.is_some());
         assert!(registration.remote_url.is_none());
         assert_ne!(registration.base_commit, "");
+    }
+
+    #[tokio::test]
+    async fn discovers_each_valid_github_remote_without_mutating_git_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        initialize_repository(&repository);
+        for (name, url) in [
+            ("origin", "https://github.com/acme/widgets.git"),
+            ("upstream", "git@github.example.com:platform/widgets.git"),
+            ("local", "../mirror.git"),
+            (
+                "credentialed",
+                "https://token@github.com/private/widgets.git",
+            ),
+        ] {
+            assert!(
+                ProcessCommand::new("git")
+                    .args([
+                        "-C",
+                        repository.to_str().unwrap(),
+                        "remote",
+                        "add",
+                        name,
+                        url
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        for arguments in [
+            &[
+                "-C",
+                repository.to_str().unwrap(),
+                "remote",
+                "add",
+                "ambiguous",
+                "https://github.com/acme/widgets.git",
+            ][..],
+            &[
+                "-C",
+                repository.to_str().unwrap(),
+                "remote",
+                "set-url",
+                "--add",
+                "ambiguous",
+                "https://github.com/other/widgets.git",
+            ][..],
+        ] {
+            assert!(
+                ProcessCommand::new("git")
+                    .args(arguments)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let project = test_project(&std::fs::canonicalize(&repository).unwrap());
+
+        let remotes = github_remotes(&project).await.unwrap();
+
+        assert_eq!(remotes.len(), 2);
+        assert_eq!(remotes[0].name.as_str(), "origin");
+        assert_eq!(remotes[0].repository.owner().as_str(), "acme");
+        assert_eq!(remotes[1].name.as_str(), "upstream");
+        assert_eq!(remotes[1].repository.host().as_str(), "github.example.com");
     }
 
     #[tokio::test]

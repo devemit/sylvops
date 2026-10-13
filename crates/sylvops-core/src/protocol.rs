@@ -10,6 +10,7 @@ use crate::{
         AttachmentRole, DaemonHealth, DaemonSnapshot, GitDiff, GitWorktreeState, Project,
         ProviderKind, Session, SessionState, Workspace, Worktree,
     },
+    github::{GitHubAssociation, GitHubFailure, GitHubIntegrationStatus, GitRemoteName},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     provider::ProviderHealth,
     status::NormalizedProviderEvent,
@@ -17,7 +18,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 15;
+pub const PROTOCOL_MINOR: u16 = 16;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -486,6 +487,16 @@ pub enum ClientRequest {
     ProbeProvider {
         kind: ProviderKind,
     },
+    GetGitHubStatus {
+        project_id: Option<ProjectId>,
+    },
+    SetGitHubAssociation {
+        project_id: ProjectId,
+        remote_name: GitRemoteName,
+    },
+    ClearGitHubAssociation {
+        project_id: ProjectId,
+    },
     AddWorkspace {
         name: String,
     },
@@ -614,6 +625,13 @@ pub enum DaemonResponse {
     DesktopStateSaved,
     Providers(Vec<ProviderHealth>),
     Provider(ProviderHealth),
+    GitHubStatus(GitHubIntegrationStatus),
+    GitHubFailure(GitHubFailure),
+    GitHubAssociationUpdated {
+        revision: u64,
+        project_id: ProjectId,
+        association: Option<GitHubAssociation>,
+    },
     WorkspaceAdded {
         revision: u64,
         workspace: Workspace,
@@ -729,6 +747,11 @@ pub enum DaemonEvent {
         revision: u64,
         project_id: ProjectId,
         workspace_id: WorkspaceId,
+    },
+    GitHubAssociationUpdated {
+        revision: u64,
+        project_id: ProjectId,
+        association: Option<GitHubAssociation>,
     },
     WorktreeAdded {
         revision: u64,
@@ -892,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_15_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_16_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -907,7 +930,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 15);
+        assert_eq!(PROTOCOL_MINOR, 16);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -922,6 +945,73 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &install).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), install);
+    }
+
+    #[test]
+    fn protocol_1_16_github_connection_and_association_round_trip() {
+        use crate::github::{
+            GitHubAssociation, GitHubHost, GitHubIntegrationStatus, GitHubOwner, GitHubRemote,
+            GitHubRepositoryIdentity, GitHubRepositoryName, GitRemoteName,
+        };
+
+        let project_id = ProjectId::new();
+        let repository = GitHubRepositoryIdentity::new(
+            GitHubHost::new("github.example.com").unwrap(),
+            GitHubOwner::new("acme").unwrap(),
+            GitHubRepositoryName::new("widgets").unwrap(),
+        );
+        let remote_name = GitRemoteName::new("upstream").unwrap();
+        let requests = [
+            ClientRequest::GetGitHubStatus {
+                project_id: Some(project_id),
+            },
+            ClientRequest::SetGitHubAssociation {
+                project_id,
+                remote_name: remote_name.clone(),
+            },
+            ClientRequest::ClearGitHubAssociation { project_id },
+        ];
+        for request in requests {
+            let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
+            assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+
+        let association = GitHubAssociation {
+            project_id,
+            remote_name: remote_name.clone(),
+            repository: repository.clone(),
+            created_at: 1,
+            updated_at: 2,
+        };
+        let response = DaemonResponse::GitHubStatus(GitHubIntegrationStatus {
+            executable_path: Some("gh".into()),
+            connections: Vec::new(),
+            remotes: vec![GitHubRemote {
+                name: remote_name,
+                repository,
+            }],
+            association: Some(association.clone()),
+        });
+        let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
+        let update = DaemonResponse::GitHubAssociationUpdated {
+            revision: 7,
+            project_id,
+            association: Some(association.clone()),
+        };
+        let frame = Frame::message(MessageClass::Response, 10, &update).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), update);
+        let event = DaemonEvent::GitHubAssociationUpdated {
+            revision: 7,
+            project_id,
+            association: Some(association),
+        };
+        let frame = Frame::message(MessageClass::Event, 11, &event).unwrap();
+        assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
+        let failure = DaemonResponse::GitHubFailure(crate::github::GitHubFailure::InvalidRemote);
+        let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
+        assert_eq!(PROTOCOL_MINOR, 16);
     }
 
     #[test]

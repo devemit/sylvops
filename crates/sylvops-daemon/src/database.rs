@@ -17,6 +17,10 @@ use sylvops_core::domain::{
     DaemonSnapshot, Project, ProviderProfile, Session, SessionState, Workspace, Worktree,
     WorktreeStatus, state_allows_deletion,
 };
+use sylvops_core::github::{
+    GitHubAssociation, GitHubHost, GitHubOwner, GitHubRemote, GitHubRepositoryIdentity,
+    GitHubRepositoryName, GitRemoteName, MAX_GITHUB_CONNECTIONS,
+};
 use sylvops_core::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
 use sylvops_core::status::{ConversationIdentityTransition, ProviderConversationId};
 use sylvops_core::ui::{DesktopState, TuiState};
@@ -60,6 +64,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         6,
         "workspace_deletion_generation",
         include_str!("../migrations/0006_workspace_deletion_generation.sql"),
+    ),
+    (
+        7,
+        "project_github_associations",
+        include_str!("../migrations/0007_project_github_associations.sql"),
     ),
 ];
 
@@ -125,6 +134,22 @@ enum DatabaseCommand {
     RemoveProject {
         expected: ProjectRemovalState,
         reply: oneshot::Sender<Result<(u64, Project)>>,
+    },
+    GetGitHubAssociation {
+        id: ProjectId,
+        reply: oneshot::Sender<Result<Option<GitHubAssociation>>>,
+    },
+    GetGitHubAssociations {
+        reply: oneshot::Sender<Result<Vec<GitHubAssociation>>>,
+    },
+    SetGitHubAssociation {
+        id: ProjectId,
+        remote: GitHubRemote,
+        reply: oneshot::Sender<Result<(u64, GitHubAssociation)>>,
+    },
+    ClearGitHubAssociation {
+        id: ProjectId,
+        reply: oneshot::Sender<Result<(u64, Option<GitHubAssociation>)>>,
     },
     Worktree {
         id: WorktreeId,
@@ -578,6 +603,61 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Loads a Project's selected GitHub Repository association without advancing revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, cancellation, query, or persisted-value validation error.
+    pub async fn github_association(&self, id: ProjectId) -> Result<Option<GitHubAssociation>> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::GetGitHubAssociation { id, reply }
+        })
+        .await
+    }
+
+    /// Loads all bounded GitHub associations without advancing revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, cancellation, query, or persisted-value validation error.
+    pub async fn github_associations(&self) -> Result<Vec<GitHubAssociation>> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::GetGitHubAssociations { reply }
+        })
+        .await
+    }
+
+    /// Persists a validated remote already present in the Project repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, not-found, transaction, or SQLite error.
+    pub async fn set_github_association(
+        &self,
+        id: ProjectId,
+        remote: GitHubRemote,
+    ) -> Result<(u64, GitHubAssociation)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::SetGitHubAssociation { id, remote, reply }
+        })
+        .await
+    }
+
+    /// Clears a Project's GitHub association, advancing revision only when one existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, not-found, transaction, or SQLite error.
+    pub async fn clear_github_association(
+        &self,
+        id: ProjectId,
+    ) -> Result<(u64, Option<GitHubAssociation>)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::ClearGitHubAssociation { id, reply }
+        })
+        .await
+    }
+
     /// Loads one persisted session.
     ///
     /// # Errors
@@ -975,6 +1055,29 @@ fn database_thread(
                 let result = remove_project(&mut connection, &expected).map(|project| {
                     revision = revision.saturating_add(1);
                     (revision, project)
+                });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::GetGitHubAssociation { id, reply } => {
+                let _ = reply.send(load_github_association(&connection, id));
+            }
+            DatabaseCommand::GetGitHubAssociations { reply } => {
+                let _ = reply.send(load_github_associations(&connection));
+            }
+            DatabaseCommand::SetGitHubAssociation { id, remote, reply } => {
+                let result =
+                    set_github_association(&mut connection, id, &remote).map(|association| {
+                        revision = revision.saturating_add(1);
+                        (revision, association)
+                    });
+                let _ = reply.send(result);
+            }
+            DatabaseCommand::ClearGitHubAssociation { id, reply } => {
+                let result = clear_github_association(&mut connection, id).map(|changed| {
+                    if changed {
+                        revision = revision.saturating_add(1);
+                    }
+                    (revision, None)
                 });
                 let _ = reply.send(result);
             }
@@ -1484,6 +1587,103 @@ fn load_project(connection: &Connection, id: ProjectId) -> Result<Project> {
         .optional()
         .map_err(database_error)?
         .ok_or_else(|| DaemonError::Database(format!("project {id} does not exist")))
+}
+
+fn load_github_association(
+    connection: &Connection,
+    id: ProjectId,
+) -> Result<Option<GitHubAssociation>> {
+    connection
+        .query_row(
+            "SELECT project_id, remote_name, host, owner, repository, created_at, updated_at \
+             FROM project_github_associations WHERE project_id = ?1",
+            [id.to_string()],
+            github_association_from_row,
+        )
+        .optional()
+        .map_err(database_error)
+}
+
+fn load_github_associations(connection: &Connection) -> Result<Vec<GitHubAssociation>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT project_id, remote_name, host, owner, repository, created_at, updated_at \
+             FROM project_github_associations ORDER BY project_id LIMIT ?1",
+        )
+        .map_err(database_error)?;
+    statement
+        .query_map(
+            [i64::try_from(MAX_GITHUB_CONNECTIONS).unwrap_or(i64::MAX)],
+            github_association_from_row,
+        )
+        .map_err(database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(database_error)
+}
+
+fn set_github_association(
+    connection: &mut Connection,
+    id: ProjectId,
+    remote: &GitHubRemote,
+) -> Result<GitHubAssociation> {
+    let now = now_millis();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    load_project(&transaction, id)?;
+    transaction
+        .execute(
+            "INSERT INTO project_github_associations \
+             (project_id, remote_name, host, owner, repository, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+             ON CONFLICT(project_id) DO UPDATE SET \
+             remote_name = excluded.remote_name, host = excluded.host, owner = excluded.owner, \
+             repository = excluded.repository, updated_at = excluded.updated_at",
+            params![
+                id.to_string(),
+                remote.name.as_str(),
+                remote.repository.host().as_str(),
+                remote.repository.owner().as_str(),
+                remote.repository.repository().as_str(),
+                now,
+            ],
+        )
+        .map_err(database_error)?;
+    insert_entity_audit(
+        &transaction,
+        "github_association_set",
+        "project",
+        &id.to_string(),
+    )?;
+    let association = load_github_association(&transaction, id)?.ok_or_else(|| {
+        DaemonError::Database("GitHub association disappeared during its transaction".into())
+    })?;
+    transaction.commit().map_err(database_error)?;
+    Ok(association)
+}
+
+fn clear_github_association(connection: &mut Connection, id: ProjectId) -> Result<bool> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    load_project(&transaction, id)?;
+    let changed = transaction
+        .execute(
+            "DELETE FROM project_github_associations WHERE project_id = ?1",
+            [id.to_string()],
+        )
+        .map_err(database_error)?
+        == 1;
+    if changed {
+        insert_entity_audit(
+            &transaction,
+            "github_association_cleared",
+            "project",
+            &id.to_string(),
+        )?;
+    }
+    transaction.commit().map_err(database_error)?;
+    Ok(changed)
 }
 
 fn load_project_removal_state(
@@ -2488,6 +2688,31 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
         remote_url: row.get(6)?,
         created_at: row.get(7)?,
         last_activity_at: row.get(8)?,
+    })
+}
+
+fn github_association_from_row(row: &Row<'_>) -> rusqlite::Result<GitHubAssociation> {
+    let host = row
+        .get::<_, String>(2)?
+        .parse::<GitHubHost>()
+        .map_err(|error| invalid_value(2, error))?;
+    let owner = row
+        .get::<_, String>(3)?
+        .parse::<GitHubOwner>()
+        .map_err(|error| invalid_value(3, error))?;
+    let repository = row
+        .get::<_, String>(4)?
+        .parse::<GitHubRepositoryName>()
+        .map_err(|error| invalid_value(4, error))?;
+    Ok(GitHubAssociation {
+        project_id: parse_text(row, 0)?,
+        remote_name: row
+            .get::<_, String>(1)?
+            .parse::<GitRemoteName>()
+            .map_err(|error| invalid_value(1, error))?,
+        repository: GitHubRepositoryIdentity::new(host, owner, repository),
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 
@@ -3684,5 +3909,74 @@ mod tests {
 
         let error = DatabaseHandle::open(&path).unwrap_err();
         assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[tokio::test]
+    async fn github_association_persists_and_only_mutations_advance_revision() {
+        use sylvops_core::github::{
+            GitHubHost, GitHubOwner, GitHubRemote, GitHubRepositoryIdentity, GitHubRepositoryName,
+            GitRemoteName,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let database = DatabaseHandle::open(&path).unwrap();
+        let (_, workspace) = database.add_workspace("Workspace".into()).await.unwrap();
+        let (_, project, _) = database
+            .add_project(RepositoryRegistration {
+                workspace_id: workspace.id,
+                name: "Project".into(),
+                repository_path: "C:/repo".into(),
+                canonical_repository_path: "C:/repo".into(),
+                branch: Some("main".into()),
+                default_branch: Some("main".into()),
+                remote_url: None,
+                base_commit: "0123456789abcdef".into(),
+            })
+            .await
+            .unwrap();
+        let before = database.snapshot().await.unwrap().revision;
+        let remote = GitHubRemote {
+            name: GitRemoteName::new("upstream").unwrap(),
+            repository: GitHubRepositoryIdentity::new(
+                GitHubHost::new("github.example.com").unwrap(),
+                GitHubOwner::new("acme").unwrap(),
+                GitHubRepositoryName::new("widgets").unwrap(),
+            ),
+        };
+
+        assert!(
+            database
+                .github_association(project.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(database.snapshot().await.unwrap().revision, before);
+        let (set_revision, association) = database
+            .set_github_association(project.id, remote.clone())
+            .await
+            .unwrap();
+        assert!(set_revision > before);
+        assert_eq!(association.remote_name, remote.name);
+        database.shutdown().await.unwrap();
+
+        let database = DatabaseHandle::open(&path).unwrap();
+        assert_eq!(
+            database.github_association(project.id).await.unwrap(),
+            Some(association)
+        );
+        let (clear_revision, cleared) =
+            database.clear_github_association(project.id).await.unwrap();
+        assert!(clear_revision > 1);
+        assert!(cleared.is_none());
+        assert!(
+            database
+                .github_association(project.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        database.shutdown().await.unwrap();
     }
 }
