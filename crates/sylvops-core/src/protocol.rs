@@ -10,7 +10,10 @@ use crate::{
         AttachmentRole, DaemonHealth, DaemonSnapshot, GitDiff, GitWorktreeState, Project,
         ProviderKind, Session, SessionState, Workspace, Worktree,
     },
-    github::{GitHubAssociation, GitHubFailure, GitHubIntegrationStatus, GitRemoteName},
+    github::{
+        GitHubAssociation, GitHubBrowseFailure, GitHubFailure, GitHubIntegrationStatus,
+        GitHubItemDetail, GitHubListPage, GitHubListQuery, GitHubViewQuery, GitRemoteName,
+    },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     provider::ProviderHealth,
     status::NormalizedProviderEvent,
@@ -18,7 +21,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 16;
+pub const PROTOCOL_MINOR: u16 = 17;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -497,6 +500,14 @@ pub enum ClientRequest {
     ClearGitHubAssociation {
         project_id: ProjectId,
     },
+    ListGitHubItems {
+        project_id: ProjectId,
+        query: GitHubListQuery,
+    },
+    ViewGitHubItem {
+        project_id: ProjectId,
+        query: GitHubViewQuery,
+    },
     AddWorkspace {
         name: String,
     },
@@ -632,6 +643,9 @@ pub enum DaemonResponse {
         project_id: ProjectId,
         association: Option<GitHubAssociation>,
     },
+    GitHubItems(GitHubListPage),
+    GitHubItem(GitHubItemDetail),
+    GitHubBrowseFailure(GitHubBrowseFailure),
     WorkspaceAdded {
         revision: u64,
         workspace: Workspace,
@@ -915,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_16_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_17_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -930,7 +944,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 16);
+        assert_eq!(PROTOCOL_MINOR, 17);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -948,10 +962,12 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_16_github_connection_and_association_round_trip() {
+    fn protocol_1_17_github_contracts_round_trip() {
         use crate::github::{
-            GitHubAssociation, GitHubHost, GitHubIntegrationStatus, GitHubOwner, GitHubRemote,
-            GitHubRepositoryIdentity, GitHubRepositoryName, GitRemoteName,
+            GitHubAssociation, GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubHost,
+            GitHubIntegrationStatus, GitHubItemKind, GitHubItemNumber, GitHubListFilters,
+            GitHubListPage, GitHubListQuery, GitHubOwner, GitHubPageSize, GitHubRemote,
+            GitHubRepositoryIdentity, GitHubRepositoryName, GitHubViewQuery, GitRemoteName,
         };
 
         let project_id = ProjectId::new();
@@ -970,6 +986,26 @@ mod tests {
                 remote_name: remote_name.clone(),
             },
             ClientRequest::ClearGitHubAssociation { project_id },
+            ClientRequest::ListGitHubItems {
+                project_id,
+                query: GitHubListQuery {
+                    kind: GitHubItemKind::Issue,
+                    filters: GitHubListFilters::default(),
+                    page_size: GitHubPageSize::new(20).unwrap(),
+                    cursor: None,
+                    refresh: false,
+                },
+            },
+            ClientRequest::ViewGitHubItem {
+                project_id,
+                query: GitHubViewQuery {
+                    kind: GitHubItemKind::PullRequest,
+                    number: GitHubItemNumber::new(7).unwrap(),
+                    comments_page_size: GitHubPageSize::new(20).unwrap(),
+                    comments_cursor: None,
+                    refresh: true,
+                },
+            },
         ];
         for request in requests {
             let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
@@ -1011,7 +1047,18 @@ mod tests {
         let failure = DaemonResponse::GitHubFailure(crate::github::GitHubFailure::InvalidRemote);
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 16);
+        let page = DaemonResponse::GitHubItems(GitHubListPage {
+            items: Vec::new(),
+            next_cursor: None,
+        });
+        let frame = Frame::message(MessageClass::Response, 10, &page).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), page);
+        let failure = DaemonResponse::GitHubBrowseFailure(GitHubBrowseFailure::new(
+            GitHubBrowseFailureKind::RateLimited,
+        ));
+        let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
+        assert_eq!(PROTOCOL_MINOR, 17);
     }
 
     #[test]

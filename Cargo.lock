@@ -4593,6 +4593,7 @@ dependencies = [
  "ed25519-dalek",
  "junction",
  "semver",
+ "serde",
  "serde_json",
  "sha2",
  "sylvops-core",
