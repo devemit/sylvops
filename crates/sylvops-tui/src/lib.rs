@@ -2000,6 +2000,7 @@ async fn handle_settings(
                 ClientRequest::SetGitHubAssociation {
                     project_id,
                     remote_name,
+                    authorization_token: None,
                 },
             )
             .await?;
@@ -2014,7 +2015,10 @@ async fn handle_settings(
             apply_github_association(
                 client,
                 app,
-                ClientRequest::ClearGitHubAssociation { project_id },
+                ClientRequest::ClearGitHubAssociation {
+                    project_id,
+                    authorization_token: None,
+                },
             )
             .await?;
         }
@@ -2729,6 +2733,7 @@ mod tests {
                 exit_code: None,
                 failure_reason: None,
             }],
+            work_sources: Vec::new(),
             provider_profiles: Vec::new(),
         }
     }

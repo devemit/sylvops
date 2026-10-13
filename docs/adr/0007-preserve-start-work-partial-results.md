@@ -1,0 +1,3 @@
+# Preserve recoverable Start Work results
+
+Start Work is an explicit daemon workflow, but its Git worktree creation and Provider Session launch cannot be transactional. Each Worktree has one primary Issue as its Work Source, and a Session inherits that source; if Worktree creation succeeds but Session launch fails, SylvOps preserves the valid Worktree and reports a structured partial-success result with explicit retry and clean-checkout removal actions instead of attempting an automatic rollback. This exposes more recovery state to clients, but it avoids deleting user-visible Git state after a partially completed operation and keeps cleanup consistent with SylvOps' conservative Worktree rules.

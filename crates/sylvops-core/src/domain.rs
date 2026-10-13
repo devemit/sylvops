@@ -4,7 +4,15 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
+use crate::{
+    github::WorkSource,
+    ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId},
+};
+
+pub const SNAPSHOT_WORK_SOURCE_BYTE_BUDGET: usize = 256 * 1_024;
+pub const MAX_ENCODED_WORK_SOURCE_BYTES: usize = 1_536;
+pub const MAX_SNAPSHOT_WORK_SOURCES: usize =
+    SNAPSHOT_WORK_SOURCE_BYTE_BUDGET / MAX_ENCODED_WORK_SOURCE_BYTES;
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -189,7 +197,24 @@ pub struct DaemonSnapshot {
     pub projects: Vec<Project>,
     pub worktrees: Vec<Worktree>,
     pub sessions: Vec<Session>,
+    #[serde(default, deserialize_with = "deserialize_snapshot_work_sources")]
+    pub work_sources: Vec<WorkSource>,
     pub provider_profiles: Vec<ProviderProfile>,
+}
+
+fn deserialize_snapshot_work_sources<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<WorkSource>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let sources = Vec::<WorkSource>::deserialize(deserializer)?;
+    if sources.len() > MAX_SNAPSHOT_WORK_SOURCES {
+        return Err(serde::de::Error::custom(
+            "too many Work Sources in daemon snapshot",
+        ));
+    }
+    Ok(sources)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -285,8 +310,16 @@ pub fn session_record_can_resume(session: &Session, sessions: &[Session]) -> boo
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderKind, SessionState, active_session_priority, state_allows_deletion,
-        state_allows_resume, state_is_active,
+        DaemonSnapshot, MAX_ENCODED_WORK_SOURCE_BYTES, MAX_SNAPSHOT_WORK_SOURCES, ProviderKind,
+        SNAPSHOT_WORK_SOURCE_BYTE_BUDGET, SessionState, active_session_priority,
+        state_allows_deletion, state_allows_resume, state_is_active,
+    };
+    use crate::{
+        github::{
+            GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, GitHubOwner,
+            GitHubRepositoryIdentity, GitHubRepositoryName, WorkSource,
+        },
+        ids::{ProjectId, WorktreeId},
     };
 
     #[test]
@@ -361,5 +394,74 @@ mod tests {
         assert_eq!(active_session_priority(SessionState::Starting), 2);
         assert!(!state_is_active(SessionState::FinishedSeen));
         assert_eq!(active_session_priority(SessionState::FinishedSeen), 3);
+    }
+
+    #[test]
+    fn daemon_snapshot_rejects_unbounded_work_sources() {
+        let project_id = ProjectId::new();
+        let item = GitHubItemIdentity::new(
+            GitHubRepositoryIdentity::new(
+                GitHubHost::new("github.example.com").unwrap(),
+                GitHubOwner::new("acme").unwrap(),
+                GitHubRepositoryName::new("widgets").unwrap(),
+            ),
+            GitHubItemKind::Issue,
+            GitHubItemNumber::new(128).unwrap(),
+        );
+        let source = WorkSource {
+            worktree_id: WorktreeId::new(),
+            project_id,
+            canonical_url: item.browser_target(),
+            item,
+            created_at: 1,
+        };
+        let value = serde_json::json!({
+            "revision": 0,
+            "captured_at": 0,
+            "workspaces": [],
+            "projects": [],
+            "worktrees": [],
+            "sessions": [],
+            "work_sources": vec![source; MAX_SNAPSHOT_WORK_SOURCES + 1],
+            "provider_profiles": [],
+        });
+
+        assert!(serde_json::from_value::<DaemonSnapshot>(value).is_err());
+    }
+
+    #[test]
+    fn maximum_snapshot_work_sources_stay_within_their_frame_budget() {
+        let host = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
+        let project_id = ProjectId::new();
+        let item = GitHubItemIdentity::new(
+            GitHubRepositoryIdentity::new(
+                GitHubHost::new(host).unwrap(),
+                GitHubOwner::new("o".repeat(100)).unwrap(),
+                GitHubRepositoryName::new("r".repeat(100)).unwrap(),
+            ),
+            GitHubItemKind::Issue,
+            GitHubItemNumber::new(u64::MAX).unwrap(),
+        );
+        let source = WorkSource {
+            worktree_id: WorktreeId::new(),
+            project_id,
+            canonical_url: item.browser_target(),
+            item,
+            created_at: i64::MAX,
+        };
+
+        assert!(rmp_serde::to_vec_named(&source).unwrap().len() <= MAX_ENCODED_WORK_SOURCE_BYTES);
+        assert!(
+            rmp_serde::to_vec_named(&vec![source; MAX_SNAPSHOT_WORK_SOURCES])
+                .unwrap()
+                .len()
+                <= SNAPSHOT_WORK_SOURCE_BYTE_BUDGET
+        );
     }
 }

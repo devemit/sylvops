@@ -29,6 +29,24 @@ _Avoid_: Agent when referring to the Session's launch kind
 A client's live connection to a Session's terminal.
 _Avoid_: Session, process
 
+### GitHub work
+
+**GitHub Repository**:
+The remote GitHub repository explicitly associated with a Project as the source of its Issues and Pull Requests.
+_Avoid_: Repository when the local Project or its checkout is meant
+
+**Issue**:
+A GitHub work item describing a problem or requested change in a GitHub Repository.
+_Avoid_: Ticket, task
+
+**Start Work**:
+The explicit guided action that creates an isolated managed Worktree and starts a task-capable Provider Session from an Issue.
+_Avoid_: Open agent, automatic fix
+
+**Work Source**:
+The single Issue whose identity and content initiated a Worktree and its Sessions. One Issue may be the Work Source for multiple Worktrees.
+_Avoid_: Attachment, ticket, prompt
+
 ### Supervision removal
 
 **Stop Session**:

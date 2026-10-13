@@ -23,7 +23,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 19;
+pub const PROTOCOL_MINOR: u16 = 20;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -434,6 +434,20 @@ opaque_authorization!(
     "workspace deletion authorization must be 64 hexadecimal characters"
 );
 
+opaque_authorization!(
+    GitHubAssociationChangeAuthorization,
+    "GitHubAssociationChangeAuthorization([REDACTED])",
+    "GitHub association change authorization must be 64 hexadecimal characters"
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitHubAssociationChangeInspection {
+    pub project_id: ProjectId,
+    pub remote_name: Option<GitRemoteName>,
+    pub work_source_count: u64,
+    pub authorization_token: GitHubAssociationChangeAuthorization,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkspaceDeletionRefusal {
     ProjectsRemain {
@@ -498,9 +512,11 @@ pub enum ClientRequest {
     SetGitHubAssociation {
         project_id: ProjectId,
         remote_name: GitRemoteName,
+        authorization_token: Option<GitHubAssociationChangeAuthorization>,
     },
     ClearGitHubAssociation {
         project_id: ProjectId,
+        authorization_token: Option<GitHubAssociationChangeAuthorization>,
     },
     ListGitHubItems {
         project_id: ProjectId,
@@ -524,6 +540,12 @@ pub enum ClientRequest {
         provider: ProviderKind,
         additional_instructions: Option<StartWorkInstructions>,
         start_another_worktree: bool,
+        columns: u16,
+        rows: u16,
+    },
+    RetryStartWorkSession {
+        worktree_id: WorktreeId,
+        provider: ProviderKind,
         columns: u16,
         rows: u16,
     },
@@ -665,6 +687,7 @@ pub enum DaemonResponse {
         project_id: ProjectId,
         association: Option<GitHubAssociation>,
     },
+    GitHubAssociationChangeRequiresConfirmation(GitHubAssociationChangeInspection),
     GitHubItems(GitHubListPage),
     GitHubItem(GitHubItemDetail),
     GitHubBrowseFailure(GitHubBrowseFailure),
@@ -955,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_19_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_20_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -970,7 +993,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 19);
+        assert_eq!(PROTOCOL_MINOR, 20);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -988,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_19_github_contracts_round_trip() {
+    fn protocol_1_20_github_contracts_round_trip() {
         use crate::github::{
             GitHubAssociation, GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubHost,
             GitHubIntegrationStatus, GitHubItemKind, GitHubItemNumber, GitHubListFilters,
@@ -1010,8 +1033,12 @@ mod tests {
             ClientRequest::SetGitHubAssociation {
                 project_id,
                 remote_name: remote_name.clone(),
+                authorization_token: None,
             },
-            ClientRequest::ClearGitHubAssociation { project_id },
+            ClientRequest::ClearGitHubAssociation {
+                project_id,
+                authorization_token: None,
+            },
             ClientRequest::ListGitHubItems {
                 project_id,
                 query: GitHubListQuery {
@@ -1049,7 +1076,7 @@ mod tests {
             executable_path: Some("gh".into()),
             connections: Vec::new(),
             remotes: vec![GitHubRemote {
-                name: remote_name,
+                name: remote_name.clone(),
                 repository,
             }],
             association: Some(association.clone()),
@@ -1084,11 +1111,28 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 19);
+        assert_eq!(PROTOCOL_MINOR, 20);
     }
 
     #[test]
-    fn protocol_1_19_typed_github_browser_request_round_trips() {
+    fn protocol_1_20_github_association_authorization_round_trips_redacted() {
+        let confirmation = DaemonResponse::GitHubAssociationChangeRequiresConfirmation(
+            GitHubAssociationChangeInspection {
+                project_id: ProjectId::new(),
+                remote_name: Some(crate::github::GitRemoteName::new("upstream").unwrap()),
+                work_source_count: 2,
+                authorization_token: GitHubAssociationChangeAuthorization::try_from("a".repeat(64))
+                    .unwrap(),
+            },
+        );
+        let frame = Frame::message(MessageClass::Response, 10, &confirmation).unwrap();
+
+        assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), confirmation);
+        assert!(!format!("{confirmation:?}").contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn protocol_1_20_typed_github_browser_request_round_trips() {
         use crate::github::{
             GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, GitHubOwner,
             GitHubRepositoryIdentity, GitHubRepositoryName,
@@ -1107,11 +1151,11 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 19);
+        assert_eq!(PROTOCOL_MINOR, 20);
     }
 
     #[test]
-    fn protocol_1_19_start_work_contracts_round_trip() {
+    fn protocol_1_20_start_work_recovery_contracts_round_trip() {
         use crate::github::{
             GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, GitHubOwner,
             GitHubRepositoryIdentity, GitHubRepositoryName, GitHubTimestamp, StartWorkBase,
@@ -1157,6 +1201,12 @@ mod tests {
                 columns: 120,
                 rows: 40,
             },
+            ClientRequest::RetryStartWorkSession {
+                worktree_id,
+                provider: ProviderKind::Codex,
+                columns: 120,
+                rows: 40,
+            },
             ClientRequest::GetWorkSource { worktree_id },
         ];
         for request in requests {
@@ -1170,7 +1220,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 19);
+        assert_eq!(PROTOCOL_MINOR, 20);
     }
 
     #[test]

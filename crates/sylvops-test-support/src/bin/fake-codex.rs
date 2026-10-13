@@ -27,6 +27,7 @@ fn run() -> io::Result<()> {
         return Ok(());
     }
     if arguments == ["login", "status"] {
+        invalidate_codex_home_if_requested()?;
         println!("Logged in (fake fixture)");
         return Ok(());
     }
@@ -97,6 +98,24 @@ fn run() -> io::Result<()> {
         io::stdout().flush()?;
     }
     Ok(())
+}
+
+fn invalidate_codex_home_if_requested() -> io::Result<()> {
+    let Some(home) = env::var_os("CODEX_HOME").map(std::path::PathBuf::from) else {
+        return Ok(());
+    };
+    let marker = home.join(".fake-codex-invalidate-home");
+    if !marker.is_file() {
+        return Ok(());
+    }
+    let invalidated = home.with_extension("invalidated");
+    if invalidated.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "fake Codex invalidated home already exists",
+        ));
+    }
+    std::fs::rename(home, invalidated)
 }
 
 fn initial_prompt(arguments: &[String]) -> Option<&str> {

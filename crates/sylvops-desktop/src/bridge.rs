@@ -57,6 +57,7 @@ pub(crate) enum Operation {
     OpenGitHubItem(ProjectId, GitHubItemKind, GitHubItemNumber),
     PrepareStartWork(ProjectId, GitHubItemNumber),
     StartWork(ProjectId, GitHubItemNumber),
+    RetryStartWorkSession(WorktreeId),
     CreateWorkspace,
     OpenWorkspace(WorkspaceId),
     InspectWorkspaceDeletion(WorkspaceId),
