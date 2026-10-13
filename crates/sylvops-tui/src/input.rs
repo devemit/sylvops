@@ -101,8 +101,11 @@ fn target_action(target: HitTarget) -> Option<Action> {
         HitTarget::New => Some(Action::New),
         HitTarget::Rename => Some(Action::Rename),
         HitTarget::Delete => Some(Action::Delete),
+        HitTarget::Diff => Some(Action::Diff),
         HitTarget::Attention => Some(Action::Attention),
         HitTarget::Settings => Some(Action::Settings),
+        HitTarget::Commands => Some(Action::Palette),
+        HitTarget::Help => Some(Action::ToggleHelp),
         _ => None,
     }
 }
