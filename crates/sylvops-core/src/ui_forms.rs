@@ -105,6 +105,25 @@ impl Form {
         matches!(self.kind, FormKind::CreateSession(_))
     }
 
+    pub fn repository_path(&self) -> Option<&str> {
+        if !matches!(self.kind, FormKind::RegisterProject(_)) {
+            return None;
+        }
+        self.fields.first().map(|field| field.value.as_str())
+    }
+
+    pub fn set_repository_path(&mut self, path: String) -> bool {
+        if !matches!(self.kind, FormKind::RegisterProject(_)) {
+            return false;
+        }
+        let Some(field) = self.fields.first_mut() else {
+            return false;
+        };
+        field.value = path;
+        self.clear_errors();
+        true
+    }
+
     pub fn provider(&self) -> Option<&ProviderHealth> {
         self.providers.get(self.provider_index)
     }

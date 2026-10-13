@@ -13,7 +13,8 @@ use sylvops_core::{
 
 use crate::{
     app::{App, ExplorerNode, FocusZone, HitMap, HitTarget, Mode, SettingsFocus},
-    forms::Form,
+    directory_browser::{DirectoryBrowser, display_path},
+    forms::{Form, FormKind},
     theme::Theme,
 };
 
@@ -63,6 +64,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     match app.mode.clone() {
         Mode::Modal(form) => draw_form(frame, &form, &mut app.hit_map, theme, app.density),
+        Mode::DirectoryBrowser(browser) => {
+            draw_directory_browser(frame, &browser, &mut app.hit_map, theme);
+        }
         Mode::Confirmation(confirm) => {
             draw_confirmation(frame, &confirm, &mut app.hit_map, theme, app.density);
         }
@@ -1217,6 +1221,9 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     if !matches!(app.mode, Mode::Navigation) {
         let message = match &app.mode {
             Mode::Modal(_) => "Form · ↑↓ fields · Enter continue · Esc cancel",
+            Mode::DirectoryBrowser(_) => {
+                "Directories · type filter · ↑↓ select · Enter open/select · Esc cancel"
+            }
             Mode::Confirmation(_) => "Confirmation · y confirm · Esc cancel",
             Mode::CommandPalette(_) => {
                 "Commands · type to filter · ↑↓ select · Enter run · Esc close"
@@ -1238,7 +1245,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Terminal / Changes / Details / Sessions\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Terminal / Changes / Details / Sessions\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 
@@ -1360,6 +1367,21 @@ fn draw_form(
             row = row.saturating_add(1);
         }
     }
+    if matches!(form.kind, FormKind::RegisterProject(_)) {
+        lines.push(Line::from(Span::styled(
+            "[ Browse directories · Ctrl+B ]",
+            theme.focus,
+        )));
+        hits.push(
+            Rect::new(
+                area.x.saturating_add(1),
+                row,
+                area.width.saturating_sub(2),
+                1,
+            ),
+            HitTarget::ModalBrowse,
+        );
+    }
     if let Some(error) = &form.submission_error {
         lines.push(Line::from(Span::styled(error, theme.danger)));
     }
@@ -1388,6 +1410,109 @@ fn draw_form(
             )
             .style(theme.text)
             .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_directory_browser(
+    frame: &mut Frame<'_>,
+    browser: &DirectoryBrowser,
+    hits: &mut HitMap,
+    theme: Theme,
+) {
+    let area = centered(frame.area(), 86, 82);
+    frame.render_widget(Clear, area);
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .margin(1)
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(format!("Current\n{}", display_path(&browser.current)))
+            .style(theme.text),
+        inner[0],
+    );
+    let filter = if browser.filter.is_empty() {
+        "Filter: (type a directory name)".into()
+    } else {
+        format!("Filter: {}", browser.filter)
+    };
+    frame.render_widget(Paragraph::new(filter).style(theme.muted), inner[1]);
+
+    let entries = browser.visible_entries();
+    let visible_rows = usize::from(inner[2].height);
+    let offset = browser
+        .selected
+        .saturating_add(1)
+        .saturating_sub(visible_rows);
+    let lines = entries
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_rows)
+        .map(|(index, entry)| {
+            hits.push(
+                Rect::new(
+                    inner[2].x,
+                    inner[2].y.saturating_add((index - offset) as u16),
+                    inner[2].width,
+                    1,
+                ),
+                HitTarget::DirectoryBrowserRow(index),
+            );
+            Line::from(Span::styled(
+                format!(
+                    "{} {}",
+                    if index == browser.selected { "›" } else { " " },
+                    entry.label()
+                ),
+                if index == browser.selected {
+                    theme.focus
+                } else {
+                    theme.text
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut list = lines;
+    if let Some(error) = &browser.error {
+        list.push(Line::from(Span::styled(error, theme.danger)));
+    }
+    frame.render_widget(Paragraph::new(list).wrap(Wrap { trim: false }), inner[2]);
+
+    let select_style = if browser.can_select_current() {
+        theme.success
+    } else {
+        theme.muted
+    };
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(vec![
+            Span::styled("[ Select current ]", select_style),
+            Span::raw("   "),
+            Span::styled("[ Cancel ]", theme.muted),
+        ])]),
+        inner[3],
+    );
+    if browser.can_select_current() {
+        hits.push(
+            Rect::new(inner[3].x, inner[3].y, 18, 1),
+            HitTarget::DirectoryBrowserSelect,
+        );
+    }
+    hits.push(
+        Rect::new(inner[3].x.saturating_add(21), inner[3].y, 12, 1),
+        HitTarget::DirectoryBrowserCancel,
+    );
+    frame.render_widget(
+        Block::default()
+            .title(" Directory browser · type filter · ↑↓ move · Enter open/select · Esc cancel ")
+            .borders(Borders::ALL)
+            .border_style(theme.border),
         area,
     );
 }

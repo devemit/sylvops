@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -17,7 +18,9 @@ use sylvops_core::{
     ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
 };
 
-use crate::{forms::Form, terminal::AttachedTerminal};
+use crate::{
+    directory_browser::DirectoryBrowser, forms::Form, terminal::AttachedTerminal,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FocusZone {
@@ -100,6 +103,7 @@ pub(crate) struct Settings {
 pub(crate) enum Mode {
     Navigation,
     Modal(Form),
+    DirectoryBrowser(DirectoryBrowser),
     Confirmation(Confirmation),
     CommandPalette(Palette),
     Settings(Settings),
@@ -184,6 +188,10 @@ pub(crate) enum HitTarget {
     ModalProviderProbe,
     ModalSubmit,
     ModalCancel,
+    ModalBrowse,
+    DirectoryBrowserRow(usize),
+    DirectoryBrowserSelect,
+    DirectoryBrowserCancel,
     Confirm,
     Cancel,
     PaletteRow(usize),
@@ -243,6 +251,7 @@ pub(crate) struct App {
     pub resume_pending: Option<SessionId>,
     pub hit_map: HitMap,
     pub navigation_dirty_at: Option<Instant>,
+    pub invocation_directory: PathBuf,
 }
 
 impl App {
@@ -250,6 +259,16 @@ impl App {
         snapshot: DaemonSnapshot,
         providers: Vec<ProviderHealth>,
         persisted: Option<TuiState>,
+    ) -> Self {
+        let invocation_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::new_at(snapshot, providers, persisted, invocation_directory)
+    }
+
+    pub fn new_at(
+        snapshot: DaemonSnapshot,
+        providers: Vec<ProviderHealth>,
+        persisted: Option<TuiState>,
+        invocation_directory: PathBuf,
     ) -> Self {
         let selected_workspace = persisted.as_ref().is_some_and(|state| {
             state.selected_project_id.is_none()
@@ -285,6 +304,7 @@ impl App {
             resume_pending: None,
             hit_map: HitMap::default(),
             navigation_dirty_at: None,
+            invocation_directory,
         };
         app.restore_selection();
         app.reconcile_active_session_selection();
