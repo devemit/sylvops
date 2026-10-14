@@ -2577,41 +2577,12 @@ impl DesktopApp {
         .align_y(Center);
         let actions: Element<'_, Message> =
             if summary.identity.kind == sylvops_core::github::GitHubItemKind::Issue {
-                let local_status = issue_work_status(
-                    &summary.identity,
-                    &self.snapshot.work_sources,
-                    &self.snapshot.worktrees,
-                    &self.snapshot.sessions,
-                );
-                let has_local_work = self.existing_issue_work(&summary.identity).is_some();
-                let mut work_actions = row![
-                    button(if has_local_work {
-                        "Open Work"
-                    } else {
-                        "Start Work"
-                    })
-                    .on_press_maybe((!pending).then_some(Message::PrepareStartWork))
-                    .style(primary_action_style),
+                column![
+                    navigation_actions,
+                    self.github_issue_work_actions(summary, pending)
                 ]
                 .spacing(6)
-                .align_y(Center);
-                if has_local_work {
-                    work_actions = work_actions.push(
-                        button("Start another Worktree")
-                            .on_press_maybe((!pending).then_some(Message::PrepareAnotherWorktree))
-                            .style(chrome_action_style),
-                    );
-                }
-                work_actions = work_actions.push(
-                    text(local_status.display_name())
-                        .size(UI_META_SIZE)
-                        .style(text::secondary),
-                );
-                if self.github_surface.detail.is_loading() {
-                    work_actions = work_actions
-                        .push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
-                }
-                column![navigation_actions, work_actions].spacing(6).into()
+                .into()
             } else {
                 if self.github_surface.detail.is_loading() {
                     navigation_actions = navigation_actions
@@ -2655,6 +2626,47 @@ impl DesktopApp {
             );
         }
         heading.into()
+    }
+
+    fn github_issue_work_actions<'a>(
+        &'a self,
+        summary: &'a sylvops_core::github::GitHubItemSummary,
+        pending: bool,
+    ) -> Element<'a, Message> {
+        let local_status = issue_work_status(
+            &summary.identity,
+            &self.snapshot.work_sources,
+            &self.snapshot.worktrees,
+            &self.snapshot.sessions,
+        );
+        let has_local_work = self.existing_issue_work(&summary.identity).is_some();
+        let mut actions = row![
+            button(if has_local_work {
+                "Open Work"
+            } else {
+                "Start Work"
+            })
+            .on_press_maybe((!pending).then_some(Message::PrepareStartWork))
+            .style(primary_action_style),
+        ]
+        .spacing(6)
+        .align_y(Center);
+        if has_local_work {
+            actions = actions.push(
+                button("Start another Worktree")
+                    .on_press_maybe((!pending).then_some(Message::PrepareAnotherWorktree))
+                    .style(chrome_action_style),
+            );
+        }
+        actions = actions.push(
+            text(local_status.display_name())
+                .size(UI_META_SIZE)
+                .style(text::secondary),
+        );
+        if self.github_surface.detail.is_loading() {
+            actions = actions.push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
+        }
+        actions.into()
     }
 
     fn github_comments_view<'a>(

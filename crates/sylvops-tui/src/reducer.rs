@@ -6,7 +6,9 @@ use sylvops_core::{
     ui::{TuiContentView, TuiNavigatorView},
 };
 
-use crate::app::{App, ExplorerNode, Flash, FlashKind, FocusZone, Mode, Palette};
+use crate::app::{
+    App, ExplorerNode, Flash, FlashKind, FocusZone, Mode, NavigatorResizeState, Palette,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
@@ -74,7 +76,6 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             app.move_active_session(delta);
         }
         Action::Move(delta) if app.focus == FocusZone::Explorer => app.move_explorer(delta),
-        Action::Move(_) => {}
         Action::MoveExplorer(delta) => {
             app.focus = FocusZone::Explorer;
             if app.navigator_view == TuiNavigatorView::Active {
@@ -99,12 +100,16 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             return select_active_session(app, session_id, Some(Effect::OpenDelete), false);
         }
         Action::SelectNavigatorView(view) => app.select_navigator_view(view),
-        Action::BeginNavigatorResize => app.navigator_resizing = true,
-        Action::ResizeNavigator(column) if app.navigator_resizing => {
+        Action::BeginNavigatorResize => {
+            app.navigator_resizing = NavigatorResizeState::Dragging;
+        }
+        Action::ResizeNavigator(column)
+            if app.navigator_resizing == NavigatorResizeState::Dragging =>
+        {
             app.set_navigator_width(column);
         }
-        Action::ResizeNavigator(_) => {}
-        Action::EndNavigatorResize => app.navigator_resizing = false,
+        Action::Move(_) | Action::ResizeNavigator(_) => {}
+        Action::EndNavigatorResize => app.navigator_resizing = NavigatorResizeState::Idle,
         Action::AdjustNavigatorWidth(delta) => app.adjust_navigator_width(delta),
         Action::SelectTab(tab) => app.set_tab(tab),
         Action::Primary => {

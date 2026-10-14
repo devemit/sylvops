@@ -48,10 +48,7 @@ use sylvops_core::{
         MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal,
         SessionDeletionRefusal, WorkspaceDeletionRefusal,
     },
-    ui::{
-        DEFAULT_TUI_NAVIGATOR_WIDTH, TuiContentView, TuiDensity, TuiNavigatorView,
-        TuiSessionPresentation, TuiState, TuiTheme,
-    },
+    ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
     upgrade::UpgradeStatus,
 };
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
@@ -3342,6 +3339,7 @@ mod tests {
         WorkSource,
     };
     use sylvops_core::provider::{AuthenticationRequirement, ProviderCapabilities, ProviderHealth};
+    use sylvops_core::ui::{DEFAULT_TUI_NAVIGATOR_WIDTH, TuiNavigatorView};
 
     fn provider_health(kind: ProviderKind) -> ProviderHealth {
         ProviderHealth {

@@ -39,6 +39,13 @@ pub(crate) enum FocusZone {
     Main,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum NavigatorResizeState {
+    #[default]
+    Idle,
+    Dragging,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum ConfirmAction {
     DeleteWorkspace {
@@ -277,7 +284,7 @@ pub(crate) struct App {
     pub session_presentation: TuiSessionPresentation,
     pub navigator_view: TuiNavigatorView,
     pub navigator_width: u16,
-    pub navigator_resizing: bool,
+    pub navigator_resizing: NavigatorResizeState,
     pub density: TuiDensity,
     pub selected_project_id: Option<ProjectId>,
     pub selected_worktree_id: Option<WorktreeId>,
@@ -335,7 +342,7 @@ impl App {
             session_presentation: persisted.session_presentation,
             navigator_view: persisted.navigator_view,
             navigator_width: persisted.navigator_width,
-            navigator_resizing: false,
+            navigator_resizing: NavigatorResizeState::Idle,
             density: persisted.density,
             selected_project_id: persisted.selected_project_id,
             selected_worktree_id: persisted.selected_worktree_id,
@@ -1105,7 +1112,7 @@ impl App {
 
     pub fn select_navigator_view(&mut self, view: TuiNavigatorView) {
         self.navigator_view = view;
-        self.navigator_resizing = false;
+        self.navigator_resizing = NavigatorResizeState::Idle;
         self.focus = FocusZone::Explorer;
         self.reconcile_active_session_selection();
         self.mark_navigation_dirty();

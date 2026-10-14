@@ -21,7 +21,10 @@ use sylvops_core::{
 };
 
 use crate::{
-    app::{App, ExplorerNode, FocusZone, HitMap, HitTarget, MAIN_VIEWS, Mode, SettingsFocus},
+    app::{
+        App, ExplorerNode, FocusZone, HitMap, HitTarget, MAIN_VIEWS, Mode, NavigatorResizeState,
+        SettingsFocus,
+    },
     directory_browser::{DirectoryBrowser, display_path},
     forms::{Form, FormKind},
     github_modal::{GitHubDepth, GitHubLoad, GitHubModal, StartWorkFocus, StartWorkForm},
@@ -183,11 +186,13 @@ fn draw_navigator_divider(frame: &mut Frame<'_>, app: &mut App, area: Rect, them
                 .map(|_| Line::from("│"))
                 .collect::<Vec<_>>(),
         ))
-        .style(if app.navigator_resizing {
-            theme.focus
-        } else {
-            theme.border
-        }),
+        .style(
+            if app.navigator_resizing == NavigatorResizeState::Dragging {
+                theme.focus
+            } else {
+                theme.border
+            },
+        ),
         area,
     );
     app.hit_map.push(area, HitTarget::NavigatorDivider);
@@ -494,10 +499,11 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         );
     }
     match app.main_tab {
-        TuiContentView::Terminal => draw_terminal(frame, app, areas.workspace, theme),
+        TuiContentView::Terminal | TuiContentView::Sessions => {
+            draw_terminal(frame, app, areas.workspace, theme);
+        }
         TuiContentView::Changes => draw_changes(frame, app, areas.workspace, theme),
         TuiContentView::Details => draw_details(frame, app, areas.workspace, theme),
-        TuiContentView::Sessions => draw_terminal(frame, app, areas.workspace, theme),
     }
 }
 

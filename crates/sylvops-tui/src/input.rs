@@ -2,7 +2,7 @@ use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind
 use sylvops_core::ui::{TuiContentView, TuiNavigatorView};
 
 use crate::{
-    app::{App, HitTarget},
+    app::{App, HitTarget, NavigatorResizeState},
     reducer::Action,
 };
 
@@ -59,10 +59,14 @@ pub(crate) fn navigation_action(app: &App, event: &Event) -> Option<Action> {
             }
         }
         Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::Drag(MouseButton::Left) if app.navigator_resizing => {
+            MouseEventKind::Drag(MouseButton::Left)
+                if app.navigator_resizing == NavigatorResizeState::Dragging =>
+            {
                 Some(Action::ResizeNavigator(mouse.column))
             }
-            MouseEventKind::Up(MouseButton::Left) if app.navigator_resizing => {
+            MouseEventKind::Up(MouseButton::Left)
+                if app.navigator_resizing == NavigatorResizeState::Dragging =>
+            {
                 Some(Action::EndNavigatorResize)
             }
             MouseEventKind::ScrollDown
