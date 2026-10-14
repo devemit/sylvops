@@ -585,7 +585,7 @@ mod tests {
             .await
             .expect("bounded scan");
         assert!(scan.read_truncated);
-        assert!(scan.directories.is_empty());
+        assert_eq!(scan.directories, []);
     }
 
     #[tokio::test]

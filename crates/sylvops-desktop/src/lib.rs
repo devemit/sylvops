@@ -11795,8 +11795,8 @@ mod tests {
                 assert!(bounds.width > 0.0 && bounds.height > 0.0, "{label}");
             }
         }
-        assert!(app.snapshot.worktrees.is_empty());
-        assert!(app.snapshot.sessions.is_empty());
+        assert_eq!(app.snapshot.worktrees, []);
+        assert_eq!(app.snapshot.sessions, []);
     }
 
     #[tokio::test]

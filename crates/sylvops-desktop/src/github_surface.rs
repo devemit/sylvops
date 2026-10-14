@@ -487,8 +487,8 @@ mod tests {
             .map(GitHubBrowseFailure::new)
             .map(|failure| failure_copy(&failure));
         for (index, copy) in copies.iter().enumerate() {
-            assert!(!copy.title.is_empty());
-            assert!(!copy.action.is_empty());
+            assert_ne!(copy.title, "");
+            assert_ne!(copy.action, "");
             assert!(
                 copies[index + 1..]
                     .iter()

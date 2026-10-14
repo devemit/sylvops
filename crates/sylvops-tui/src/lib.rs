@@ -3768,8 +3768,14 @@ mod tests {
         );
 
         let stale = SessionId::new();
-        assert!(reduce(&mut app, reducer::Action::OpenActiveSession(stale)).is_empty());
-        assert!(reduce(&mut app, reducer::Action::StopActiveSession(stale)).is_empty());
+        assert_eq!(
+            reduce(&mut app, reducer::Action::OpenActiveSession(stale)),
+            []
+        );
+        assert_eq!(
+            reduce(&mut app, reducer::Action::StopActiveSession(stale)),
+            []
+        );
         assert_eq!(app.selected_session_id, Some(selected));
     }
 
@@ -5844,7 +5850,7 @@ mod tests {
             panic!("GitHub modal expected");
         };
         assert!(modal.list.is_loading());
-        assert!(modal.list.ready().unwrap().items.is_empty());
+        assert_eq!(modal.list.ready().unwrap().items, []);
 
         apply_github_result(
             &mut app,

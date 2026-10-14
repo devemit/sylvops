@@ -159,7 +159,7 @@ async fn scenario() {
             .contains(&ProviderKind::Shell)
     );
     assert!(!preparation.suggested_branch_conflict);
-    assert!(preparation.existing_work.is_empty());
+    assert_eq!(preparation.existing_work, []);
 
     let missing_retry = client
         .request(&ClientRequest::RetryStartWorkSession {
