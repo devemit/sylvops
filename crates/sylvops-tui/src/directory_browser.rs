@@ -443,9 +443,14 @@ fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn platform_roots() -> Vec<PathBuf> {
-    ('A'..='Z')
-        .map(|drive| PathBuf::from(format!("{drive}:\\")))
+    // SAFETY: GetLogicalDrives takes no pointers or caller-owned buffers and returns a bitmask.
+    let logical_drives = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+    (b'A'..=b'Z')
+        .enumerate()
+        .filter(|(index, _)| logical_drives & (1_u32 << index) != 0)
+        .map(|(_, drive)| PathBuf::from(format!("{}:\\", char::from(drive))))
         .collect()
 }
 
@@ -686,10 +691,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_drive_roots_support_drive_changes_parent_and_separators() {
+    fn windows_drive_roots_include_the_current_volume_and_use_windows_separators() {
         let roots = platform_roots();
-        assert!(roots.contains(&PathBuf::from(r"C:\")));
-        assert!(roots.contains(&PathBuf::from(r"D:\")));
+        let current = std::env::current_dir().unwrap();
+        assert!(roots.iter().any(|root| current.starts_with(root)));
         assert!(roots.iter().all(|root| root.is_absolute()));
         assert!(Path::new(r"C:\").parent().is_none());
         assert_eq!(
