@@ -48,7 +48,9 @@ use sylvops_core::{
         MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal,
         SessionDeletionRefusal, WorkspaceDeletionRefusal,
     },
-    ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
+    ui::{
+        TuiContentView, TuiDensity, TuiNavigatorView, TuiSessionPresentation, TuiState, TuiTheme,
+    },
     upgrade::UpgradeStatus,
 };
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
@@ -205,10 +207,15 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 .size()
                 .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
             let focus = app.focus;
+            let navigator_width = app.navigator_width;
             resize_attached(
                 &client,
                 &mut app,
-                terminal_content_area(Rect::new(0, 0, size.width, size.height), focus),
+                terminal_content_area(
+                    Rect::new(0, 0, size.width, size.height),
+                    focus,
+                    navigator_width,
+                ),
             )
             .await?;
         }
@@ -3206,14 +3213,16 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
     Ok(())
 }
 
-fn terminal_content_area(area: Rect, focus: app::FocusZone) -> Rect {
+fn terminal_content_area(area: Rect, focus: app::FocusZone, navigator_width: u16) -> Rect {
     let body = Rect::new(
         area.x,
         area.y.saturating_add(1),
         area.width,
         area.height.saturating_sub(2),
     );
-    let main = render::view_areas(body, focus).main.unwrap_or(body);
+    let main = render::view_areas(body, focus, navigator_width)
+        .main
+        .unwrap_or(body);
     Rect::new(
         main.x,
         main.y.saturating_add(3),
@@ -3565,6 +3574,7 @@ mod tests {
             .extend([starting, needs_feedback, inactive]);
 
         let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        app.select_navigator_view(TuiNavigatorView::Active);
         assert_eq!(
             app.active_sessions()
                 .into_iter()
@@ -3618,7 +3628,8 @@ mod tests {
             let backend = ratatui::backend::TestBackend::new(width, 32);
             let mut terminal = Terminal::new(backend).unwrap();
             let mut app = App::new(snapshot.clone(), Vec::new(), None);
-            app.focus = app::FocusZone::Main;
+            app.select_navigator_view(TuiNavigatorView::Active);
+            app.navigator_width = 80;
             app.session_presentation = presentation;
             terminal
                 .draw(|frame| render::draw(frame, &mut app))
@@ -3709,12 +3720,18 @@ mod tests {
             snapshot.sessions.push(session);
         }
         let mut app = App::new(snapshot, Vec::new(), None);
-        app.focus = app::FocusZone::Main;
+        app.focus = app::FocusZone::Explorer;
 
-        let key_four = Event::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        let active_key = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert_eq!(
-            input::navigation_action(&app, &key_four),
-            Some(reducer::Action::SelectTab(TuiContentView::Sessions))
+            input::navigation_action(&app, &active_key),
+            Some(reducer::Action::SelectNavigatorView(
+                TuiNavigatorView::Active
+            ))
+        );
+        reduce(
+            &mut app,
+            reducer::Action::SelectNavigatorView(TuiNavigatorView::Active),
         );
         let first = app.selected_session_id;
         reduce(&mut app, reducer::Action::Move(1));
@@ -3780,11 +3797,79 @@ mod tests {
     }
 
     #[test]
+    fn navigator_view_and_mouse_resize_are_persisted_and_bounded() {
+        use crossterm::event::{KeyEvent, MouseEvent};
+
+        let persisted = TuiState {
+            selected_content_view: TuiContentView::Sessions,
+            navigator_view: TuiNavigatorView::Active,
+            navigator_width: u16::MAX,
+            ..TuiState::default()
+        };
+        let mut app = App::new(populated_snapshot(), Vec::new(), Some(persisted));
+        assert_eq!(app.main_tab, TuiContentView::Terminal);
+        assert_eq!(app.navigator_view, TuiNavigatorView::Active);
+        assert_eq!(app.navigator_width, 80);
+
+        let backend = ratatui::backend::TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let divider = app
+            .hit_map
+            .0
+            .iter()
+            .find(|region| region.target == HitTarget::NavigatorDivider)
+            .expect("navigator divider")
+            .area;
+        let down = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: divider.x,
+            row: divider.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            input::navigation_action(&app, &down),
+            Some(reducer::Action::BeginNavigatorResize)
+        );
+        reduce(&mut app, reducer::Action::BeginNavigatorResize);
+        let drag = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 50,
+            row: divider.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            input::navigation_action(&app, &drag),
+            Some(reducer::Action::ResizeNavigator(50))
+        );
+        reduce(&mut app, reducer::Action::ResizeNavigator(50));
+        assert_eq!(app.navigator_width, 50);
+
+        let explorer_key = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(
+            input::navigation_action(&app, &explorer_key),
+            Some(reducer::Action::SelectNavigatorView(
+                TuiNavigatorView::Explorer
+            ))
+        );
+        reduce(
+            &mut app,
+            reducer::Action::SelectNavigatorView(TuiNavigatorView::Explorer),
+        );
+        let saved = app.persisted_state();
+        assert_eq!(saved.navigator_view, TuiNavigatorView::Explorer);
+        assert_eq!(saved.navigator_width, 50);
+        assert_eq!(saved.selected_content_view, TuiContentView::Terminal);
+    }
+
+    #[test]
     fn sessions_empty_state_keeps_context_and_guides_creation_or_selection() {
         let mut snapshot = populated_snapshot();
         snapshot.sessions[0].state = SessionState::FinishedSeen;
         let mut app = App::new(snapshot, Vec::new(), None);
-        app.focus = app::FocusZone::Main;
+        app.select_navigator_view(TuiNavigatorView::Active);
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -4045,8 +4130,7 @@ mod tests {
         );
 
         app.snapshot.sessions[0].state = SessionState::Running;
-        app.focus = app::FocusZone::Main;
-        app.set_tab(TuiContentView::Sessions);
+        app.select_navigator_view(TuiNavigatorView::Active);
         terminal
             .draw(|frame| render::draw(frame, &mut app))
             .unwrap();
@@ -4060,7 +4144,7 @@ mod tests {
                     .symbol()
             })
             .collect::<String>();
-        assert!(footer.contains("Sessions"));
+        assert!(footer.contains("Active"));
         assert!(footer.contains("Open"));
         assert!(!footer.contains("Rename"));
         let footer_open = app
@@ -4667,7 +4751,7 @@ mod tests {
             "1 Terminal",
             "2 Changes",
             "3 Details",
-            "4 Sessions",
+            "[a] Active",
             "Running",
         ] {
             assert!(

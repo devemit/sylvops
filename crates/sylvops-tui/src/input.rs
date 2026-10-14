@@ -1,5 +1,5 @@
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
-use sylvops_core::ui::TuiContentView;
+use sylvops_core::ui::{TuiContentView, TuiNavigatorView};
 
 use crate::{
     app::{App, HitTarget},
@@ -10,7 +10,12 @@ pub(crate) fn navigation_action(app: &App, event: &Event) -> Option<Action> {
     match event {
         Event::Key(key) => {
             if let KeyCode::Char(shortcut) = key.code
-                && let Some(view) = TuiContentView::from_shortcut(shortcut)
+                && let Some(view) = match shortcut {
+                    '1' => Some(TuiContentView::Terminal),
+                    '2' => Some(TuiContentView::Changes),
+                    '3' => Some(TuiContentView::Details),
+                    _ => None,
+                }
             {
                 return Some(Action::SelectTab(view));
             }
@@ -20,11 +25,25 @@ pub(crate) fn navigation_action(app: &App, event: &Event) -> Option<Action> {
                 KeyCode::Tab | KeyCode::BackTab => Some(Action::ToggleFocus),
                 KeyCode::Down | KeyCode::Char('j') => Some(Action::Move(1)),
                 KeyCode::Up | KeyCode::Char('k') => Some(Action::Move(-1)),
+                KeyCode::Right
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && navigator_resize_available(app) =>
+                {
+                    Some(Action::AdjustNavigatorWidth(2))
+                }
+                KeyCode::Left
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && navigator_resize_available(app) =>
+                {
+                    Some(Action::AdjustNavigatorWidth(-2))
+                }
                 KeyCode::Right | KeyCode::Char('l') => Some(Action::Expand),
                 KeyCode::Left | KeyCode::Char('h') => Some(Action::Collapse),
                 KeyCode::Enter => Some(Action::Primary),
                 KeyCode::Char('u') => Some(Action::Resume),
                 KeyCode::Char('n') => Some(Action::New),
+                KeyCode::Char('e') => Some(Action::SelectNavigatorView(TuiNavigatorView::Explorer)),
+                KeyCode::Char('a') => Some(Action::SelectNavigatorView(TuiNavigatorView::Active)),
                 KeyCode::Char('r') => Some(Action::Rename),
                 KeyCode::Char('d') => Some(Action::Delete),
                 KeyCode::Char('G') => Some(Action::GitHub),
@@ -39,6 +58,12 @@ pub(crate) fn navigation_action(app: &App, event: &Event) -> Option<Action> {
             }
         }
         Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) if app.navigator_resizing => {
+                Some(Action::ResizeNavigator(mouse.column))
+            }
+            MouseEventKind::Up(MouseButton::Left) if app.navigator_resizing => {
+                Some(Action::EndNavigatorResize)
+            }
             MouseEventKind::ScrollDown
                 if explorer_target(app.hit_map.target_at(mouse.column, mouse.row)) =>
             {
@@ -69,6 +94,13 @@ pub(crate) fn navigation_action(app: &App, event: &Event) -> Option<Action> {
     }
 }
 
+fn navigator_resize_available(app: &App) -> bool {
+    app.hit_map
+        .0
+        .iter()
+        .any(|region| region.target == HitTarget::NavigatorDivider)
+}
+
 fn overview_target(target: Option<HitTarget>) -> bool {
     matches!(
         target,
@@ -84,7 +116,7 @@ fn overview_target(target: Option<HitTarget>) -> bool {
 fn explorer_target(target: Option<HitTarget>) -> bool {
     matches!(
         target,
-        Some(HitTarget::ExplorerRow(_) | HitTarget::FocusExplorer)
+        Some(HitTarget::ExplorerRow(_) | HitTarget::ActiveSession(_) | HitTarget::FocusExplorer)
     )
 }
 
@@ -95,6 +127,11 @@ fn target_action(target: HitTarget) -> Option<Action> {
         HitTarget::ActiveSession(session_id) => Some(Action::SelectActiveSession(session_id)),
         HitTarget::ActiveSessionOpen(session_id) => Some(Action::OpenActiveSession(session_id)),
         HitTarget::ActiveSessionStop(session_id) => Some(Action::StopActiveSession(session_id)),
+        HitTarget::NavigatorExplorer => {
+            Some(Action::SelectNavigatorView(TuiNavigatorView::Explorer))
+        }
+        HitTarget::NavigatorActive => Some(Action::SelectNavigatorView(TuiNavigatorView::Active)),
+        HitTarget::NavigatorDivider => Some(Action::BeginNavigatorResize),
         HitTarget::FocusExplorer => Some(Action::Focus(crate::app::FocusZone::Explorer)),
         HitTarget::FocusMain => Some(Action::Focus(crate::app::FocusZone::Main)),
         HitTarget::Attach => Some(Action::Primary),

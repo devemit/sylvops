@@ -988,6 +988,8 @@ mod tests {
                 selected_session_id: Some(crate::ids::SessionId::new()),
                 selected_content_view: TuiContentView::Details,
                 session_presentation: TuiSessionPresentation::List,
+                navigator_view: crate::ui::TuiNavigatorView::Active,
+                navigator_width: 48,
                 theme: TuiTheme::Catppuccin,
                 density: TuiDensity::Compact,
             },

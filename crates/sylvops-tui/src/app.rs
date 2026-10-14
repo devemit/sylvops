@@ -16,13 +16,22 @@ use sylvops_core::{
         ProjectRemovalAuthorization, SessionDeletionAuthorization, WorkspaceDeletionAuthorization,
     },
     provider::ProviderHealth,
-    ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
+    ui::{
+        MAX_TUI_NAVIGATOR_WIDTH, MIN_TUI_NAVIGATOR_WIDTH, TuiContentView, TuiDensity,
+        TuiNavigatorView, TuiSessionPresentation, TuiState, TuiTheme,
+    },
 };
 
 use crate::{
     directory_browser::DirectoryBrowser, forms::Form, github_modal::GitHubModal,
     terminal::AttachedTerminal,
 };
+
+pub(crate) const MAIN_VIEWS: [TuiContentView; 3] = [
+    TuiContentView::Terminal,
+    TuiContentView::Changes,
+    TuiContentView::Details,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FocusZone {
@@ -171,6 +180,9 @@ pub(crate) enum HitTarget {
     ActiveSession(SessionId),
     ActiveSessionOpen(SessionId),
     ActiveSessionStop(SessionId),
+    NavigatorExplorer,
+    NavigatorActive,
+    NavigatorDivider,
     FocusExplorer,
     FocusMain,
     Attach,
@@ -262,6 +274,9 @@ pub(crate) struct App {
     pub main_tab: TuiContentView,
     pub theme: TuiTheme,
     pub session_presentation: TuiSessionPresentation,
+    pub navigator_view: TuiNavigatorView,
+    pub navigator_width: u16,
+    pub navigator_resizing: bool,
     pub density: TuiDensity,
     pub selected_project_id: Option<ProjectId>,
     pub selected_worktree_id: Option<WorktreeId>,
@@ -303,7 +318,7 @@ impl App {
                 && state.selected_worktree_id.is_none()
                 && state.selected_session_id.is_none()
         });
-        let persisted = persisted.unwrap_or_default();
+        let persisted = persisted.unwrap_or_default().normalized();
         let mut app = Self {
             mode: if snapshot.workspaces.is_empty() {
                 Mode::Modal(Form::workspace())
@@ -317,6 +332,9 @@ impl App {
             main_tab: persisted.selected_content_view,
             theme: persisted.theme,
             session_presentation: persisted.session_presentation,
+            navigator_view: persisted.navigator_view,
+            navigator_width: persisted.navigator_width,
+            navigator_resizing: false,
             density: persisted.density,
             selected_project_id: persisted.selected_project_id,
             selected_worktree_id: persisted.selected_worktree_id,
@@ -546,7 +564,7 @@ impl App {
     }
 
     fn reconcile_active_session_selection(&mut self) {
-        if self.main_tab != TuiContentView::Sessions {
+        if self.navigator_view != TuiNavigatorView::Active {
             return;
         }
         let ids = self
@@ -1034,9 +1052,12 @@ impl App {
             selected_session_id: self.selected_session_id,
             selected_content_view: self.main_tab,
             session_presentation: self.session_presentation,
+            navigator_view: self.navigator_view,
+            navigator_width: self.navigator_width,
             theme: self.theme,
             density: self.density,
         }
+        .normalized()
     }
 
     pub fn open_settings(&mut self) {
@@ -1072,10 +1093,30 @@ impl App {
     }
 
     pub fn set_tab(&mut self, tab: TuiContentView) {
-        self.main_tab = tab;
-        self.reconcile_active_session_selection();
+        self.main_tab = if tab == TuiContentView::Sessions {
+            TuiContentView::Terminal
+        } else {
+            tab
+        };
         self.focus = FocusZone::Main;
         self.mark_navigation_dirty();
+    }
+
+    pub fn select_navigator_view(&mut self, view: TuiNavigatorView) {
+        self.navigator_view = view;
+        self.navigator_resizing = false;
+        self.focus = FocusZone::Explorer;
+        self.reconcile_active_session_selection();
+        self.mark_navigation_dirty();
+    }
+
+    pub fn set_navigator_width(&mut self, width: u16) {
+        self.navigator_width = width.clamp(MIN_TUI_NAVIGATOR_WIDTH, MAX_TUI_NAVIGATOR_WIDTH);
+        self.mark_navigation_dirty();
+    }
+
+    pub fn adjust_navigator_width(&mut self, delta: i16) {
+        self.set_navigator_width(self.navigator_width.saturating_add_signed(delta));
     }
 
     pub fn expire_flash(&mut self) {

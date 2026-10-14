@@ -2841,13 +2841,15 @@ fn load_tui_state(connection: &Connection) -> Result<Option<TuiState>> {
         if value.len() > MAX_TUI_STATE_BYTES {
             None
         } else {
-            serde_json::from_str(&value).ok()
+            serde_json::from_str::<TuiState>(&value)
+                .ok()
+                .map(TuiState::normalized)
         }
     }))
 }
 
 fn save_tui_state(connection: &Connection, state: &TuiState) -> Result<()> {
-    let value = serde_json::to_string(state)
+    let value = serde_json::to_string(&state.clone().normalized())
         .map_err(|error| DaemonError::Database(format!("cannot serialize TUI state: {error}")))?;
     if value.len() > MAX_TUI_STATE_BYTES {
         return Err(DaemonError::Database("TUI state exceeds size limit".into()));
@@ -3348,6 +3350,8 @@ mod tests {
             selected_session_id: Some(SessionId::new()),
             selected_content_view: TuiContentView::Changes,
             session_presentation: TuiSessionPresentation::List,
+            navigator_view: sylvops_core::ui::TuiNavigatorView::Active,
+            navigator_width: 48,
             theme: TuiTheme::GruvboxDark,
             density: TuiDensity::Compact,
         };
@@ -3391,7 +3395,7 @@ mod tests {
         let desktop = database.desktop_state().await.unwrap().unwrap();
         assert_eq!(tui.theme, TuiTheme::TerminalDefault);
         assert_eq!(tui.density, TuiDensity::Comfortable);
-        assert_eq!(tui.selected_content_view, TuiContentView::Sessions);
+        assert_eq!(tui.selected_content_view, TuiContentView::Terminal);
         assert_eq!(tui.session_presentation, TuiSessionPresentation::Cards);
         assert_eq!(desktop.theme, DesktopTheme::Nord);
         assert_eq!(desktop.density, DesktopDensity::Compact);
