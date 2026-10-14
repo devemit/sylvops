@@ -37,6 +37,10 @@ pub(crate) struct ViewAreas {
 
 const SETTINGS_LABEL: &str = " [s] Settings ";
 
+const fn focus_marker(focused: bool) -> &'static str {
+    if focused { "● " } else { "  " }
+}
+
 struct ActionItem {
     label: String,
     target: HitTarget,
@@ -148,15 +152,28 @@ fn draw_navigator(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         .constraints([Constraint::Length(1), Constraint::Min(2)])
         .split(area);
     let active_count = app.active_sessions().len();
-    let explorer_label = "[e] Explorer";
-    let active_label = format!("[a] Active ({active_count})");
-    let explorer_style = if app.navigator_view == TuiNavigatorView::Explorer {
+    let navigator_focused = app.focus == FocusZone::Explorer;
+    let explorer_selected = app.navigator_view == TuiNavigatorView::Explorer;
+    let active_selected = app.navigator_view == TuiNavigatorView::Active;
+    let explorer_label = format!(
+        "{}[e] Explorer",
+        focus_marker(navigator_focused && explorer_selected)
+    );
+    let active_label = format!(
+        "{}[a] Active ({active_count})",
+        focus_marker(navigator_focused && active_selected)
+    );
+    let explorer_style = if navigator_focused && explorer_selected {
         theme.focus
+    } else if explorer_selected {
+        theme.selected
     } else {
         theme.text
     };
-    let active_style = if app.navigator_view == TuiNavigatorView::Active {
+    let active_style = if navigator_focused && active_selected {
         theme.focus
+    } else if active_selected {
+        theme.selected
     } else {
         theme.text
     };
@@ -167,7 +184,7 @@ fn draw_navigator(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         ])),
         sections[0],
     );
-    let explorer_width = text_width(explorer_label).saturating_add(2);
+    let explorer_width = text_width(&explorer_label).saturating_add(2);
     app.hit_map.push(
         Rect::new(sections[0].x, sections[0].y, explorer_width, 1),
         HitTarget::NavigatorExplorer,
@@ -290,15 +307,10 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             })
             .collect()
     };
-    let focused = app.focus == FocusZone::Explorer;
     let block = Block::default()
-        .title(if focused {
-            " Explorer [active] "
-        } else {
-            " Explorer "
-        })
+        .title(" Explorer ")
         .borders(Borders::ALL)
-        .border_style(if focused { theme.focus } else { theme.border });
+        .border_style(theme.border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let action_height = u16::from(inner.height > 0);
@@ -403,11 +415,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         .iter()
         .position(|view| *view == app.main_tab)
         .unwrap_or(0);
-    let focus_label = if app.focus == FocusZone::Main {
-        " Main [active]"
-    } else {
-        " Main"
-    };
+    let focus_label = format!(" {}Main", focus_marker(app.focus == FocusZone::Main));
     let title = app.selected_session().map_or_else(
         || format!("{focus_label} · Session workspace "),
         |session| {
@@ -429,7 +437,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
                     .border_style(theme.border),
             )
             .style(theme.text)
-            .highlight_style(theme.focus),
+            .highlight_style(theme.focus.add_modifier(Modifier::REVERSED)),
         chunks[0],
     );
     let tab_count = u16::try_from(MAIN_VIEWS.len()).unwrap_or(1);
@@ -1209,12 +1217,17 @@ fn primary_session_action(app: &App, terse: bool, theme: Theme) -> Option<Action
 }
 
 fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
-    let terse = app.density == TuiDensity::Compact;
+    let terse = app.density == TuiDensity::Compact || width < 60;
+    let navigator_label = if app.navigator_view == TuiNavigatorView::Active {
+        "Active"
+    } else {
+        "Explorer"
+    };
     let mut items = vec![action_label(
-        if app.navigator_view == TuiNavigatorView::Active {
-            "Active"
+        if terse {
+            format!("F:{navigator_label}")
         } else {
-            "Explorer"
+            format!("Focus: {navigator_label}")
         },
         HitTarget::FocusExplorer,
         theme.focus,
@@ -1251,10 +1264,14 @@ fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionIte
     items
 }
 
-fn main_footer_actions(app: &App, theme: Theme) -> Vec<ActionItem> {
-    let terse = app.density == TuiDensity::Compact;
+fn main_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
+    let terse = app.density == TuiDensity::Compact || width < 60;
     let mut items = vec![action_label(
-        app.main_tab.label(),
+        if terse {
+            format!("F:{}", app.main_tab.label())
+        } else {
+            format!("Focus: {}", app.main_tab.label())
+        },
         HitTarget::FocusMain,
         theme.focus,
     )];
@@ -1307,7 +1324,7 @@ fn add_terminal_footer_action(app: &App, items: &mut Vec<ActionItem>, theme: The
 fn footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
     let mut actions = match app.focus {
         FocusZone::Explorer => explorer_footer_actions(app, width, theme),
-        FocusZone::Main => main_footer_actions(app, theme),
+        FocusZone::Main => main_footer_actions(app, width, theme),
     };
     actions.push(action_label(
         "[/] Commands",

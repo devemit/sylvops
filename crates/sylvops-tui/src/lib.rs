@@ -4075,7 +4075,7 @@ mod tests {
                 .map(ratatui::buffer::Cell::symbol)
                 .collect::<String>();
             assert!(
-                rendered.contains("Main [active]"),
+                rendered.contains("● Main"),
                 "missing explicit Main focus at {width}x{height}"
             );
             assert!(app.hit_map.0.iter().all(|region| {
@@ -4102,7 +4102,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("Explorer [active]"));
+        assert!(rendered.contains("● [e] Explorer"));
         assert!(
             !app.hit_map
                 .0
@@ -4167,7 +4167,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("[active]"));
+        assert!(rendered.contains("● [a] Active"));
 
         app.snapshot.sessions[0].state = SessionState::NeedsFeedback;
         terminal
