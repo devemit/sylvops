@@ -189,7 +189,7 @@ async fn browse_lists_are_cursor_paginated_sanitized_cached_and_refreshable() {
     let mut next = query;
     next.cursor = Some(GitHubCursor::new("cursor-one").unwrap());
     let second = gateway.list_items(&repository, &next).await.unwrap();
-    assert!(second.items.is_empty());
+    assert_eq!(second.items, []);
     assert!(second.next_cursor.is_none());
 }
 

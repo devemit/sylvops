@@ -690,7 +690,7 @@ async fn late_session_start_recovers_after_warning() {
     })
     .await;
 
-    std::fs::write(&session_start_fixture, "immediate").expect("immediate SessionStart fixture");
+    std::fs::remove_file(&session_start_fixture).expect("restore immediate SessionStart default");
     let failed_session_id = match client
         .request(&ClientRequest::CreateSession {
             worktree_id,
