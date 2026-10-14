@@ -9647,9 +9647,9 @@ mod tests {
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        17_553_005_048_791_564_145,
-        4_748_588_602_932_006_218,
-        14_916_496_382_630_693_852,
+        367_342_573_165_280_833,
+        3_283_789_886_928_374_606,
+        13_610_258_227_980_294_238,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
