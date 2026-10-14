@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs::OpenOptions,
     io::{Write, stdout},
     path::{Path, PathBuf},
@@ -1154,42 +1155,62 @@ async fn show_github_status(
         .await?
     {
         DaemonResponse::GitHubStatus(status) => {
-            println!(
-                "GitHub CLI: {}",
-                status
-                    .executable_path
-                    .as_deref()
-                    .unwrap_or("not found")
-                    .chars()
-                    .take(4_096)
-                    .collect::<String>()
-            );
-            for connection in status.connections {
-                println!("{}: {}", connection.host, connection.state.display_name());
-                println!("  diagnostic: {}", connection.diagnostic);
-            }
-            if project_id.is_some() {
-                println!("Validated remotes:");
-                if status.remotes.is_empty() {
-                    println!("  none");
-                } else {
-                    for remote in status.remotes {
-                        println!("  {remote}");
-                    }
-                }
-                match status.association {
-                    Some(association) => println!(
-                        "Association: {} ({})",
-                        association.remote_name, association.repository
-                    ),
-                    None => println!("Association: none"),
-                }
-            }
+            print!("{}", render_github_status(&status, project_id.is_some()));
             Ok(())
         }
         DaemonResponse::GitHubFailure(failure) => Err(DaemonError::GitHub(failure)),
         response => unexpected("GitHub status", response),
     }
+}
+
+fn render_github_status(
+    status: &sylvops_core::github::GitHubIntegrationStatus,
+    include_project: bool,
+) -> String {
+    let mut output = String::new();
+    writeln!(
+        output,
+        "GitHub CLI: {}",
+        status
+            .executable_path
+            .as_deref()
+            .unwrap_or("not found")
+            .chars()
+            .take(4_096)
+            .collect::<String>()
+    )
+    .expect("writing to a String cannot fail");
+    for connection in &status.connections {
+        writeln!(
+            output,
+            "{}: {}",
+            connection.host,
+            connection.state.display_name()
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(output, "  diagnostic: {}", connection.diagnostic)
+            .expect("writing to a String cannot fail");
+    }
+    if include_project {
+        output.push_str("Validated remotes:\n");
+        if status.remotes.is_empty() {
+            output.push_str("  none\n");
+        } else {
+            for remote in &status.remotes {
+                writeln!(output, "  {remote}").expect("writing to a String cannot fail");
+            }
+        }
+        match &status.association {
+            Some(association) => writeln!(
+                output,
+                "Association: {} ({})",
+                association.remote_name, association.repository
+            )
+            .expect("writing to a String cannot fail"),
+            None => output.push_str("Association: none\n"),
+        }
+    }
+    output
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1270,13 +1291,14 @@ fn github_browse_response_error(
 }
 
 fn print_bounded_json(value: &impl serde::Serialize) -> sylvops_daemon::Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).map_err(|error| {
-            DaemonError::Lifecycle(format!("failed to render bounded GitHub output: {error}"))
-        })?
-    );
+    println!("{}", render_bounded_github_json(value)?);
     Ok(())
+}
+
+fn render_bounded_github_json(value: &impl serde::Serialize) -> sylvops_daemon::Result<String> {
+    serde_json::to_string_pretty(value).map_err(|error| {
+        DaemonError::Lifecycle(format!("failed to render bounded GitHub output: {error}"))
+    })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2142,6 +2164,61 @@ mod tests {
                 }
             }) if project == project_id && number.get() == 42
         ));
+    }
+
+    #[test]
+    fn cli_github_renderers_preserve_the_bounded_daemon_contracts() {
+        use sylvops_core::github::{
+            GitHubAssociation, GitHubConnection, GitHubConnectionState, GitHubHost,
+            GitHubIntegrationStatus, GitHubListPage, GitHubOwner, GitHubRemote,
+            GitHubRepositoryIdentity, GitHubRepositoryName, GitRemoteName,
+        };
+
+        let project_id = ProjectId::new();
+        let repository = GitHubRepositoryIdentity::new(
+            GitHubHost::new("github.example.com").unwrap(),
+            GitHubOwner::new("acme").unwrap(),
+            GitHubRepositoryName::new("widgets").unwrap(),
+        );
+        let status = GitHubIntegrationStatus {
+            executable_path: Some("C:/Program Files/GitHub CLI/gh.exe".into()),
+            connections: vec![GitHubConnection {
+                host: repository.host().clone(),
+                state: GitHubConnectionState::Ready,
+                diagnostic: "GitHub CLI is ready.".into(),
+                checked_at: 1,
+            }],
+            remotes: vec![GitHubRemote {
+                name: GitRemoteName::new("origin").unwrap(),
+                repository: repository.clone(),
+            }],
+            association: Some(GitHubAssociation {
+                project_id,
+                remote_name: GitRemoteName::new("origin").unwrap(),
+                repository,
+                created_at: 1,
+                updated_at: 1,
+            }),
+        };
+
+        let rendered = render_github_status(&status, true);
+        for expected in [
+            "GitHub CLI: C:/Program Files/GitHub CLI/gh.exe",
+            "github.example.com: Ready",
+            "diagnostic: GitHub CLI is ready.",
+            "Validated remotes:",
+            "origin (github.example.com/acme/widgets)",
+            "Association: origin (github.example.com/acme/widgets)",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected:?}");
+        }
+
+        let page = GitHubListPage {
+            items: Vec::new(),
+            next_cursor: None,
+        };
+        let json = render_bounded_github_json(&page).unwrap();
+        assert_eq!(serde_json::from_str::<GitHubListPage>(&json).unwrap(), page);
     }
 
     #[test]

@@ -125,4 +125,4 @@ An application release is ready when all of the following are true:
 - Windows arm64 and Linux arm64 packages.
 - Additional system-wide or administrator-managed deployment channels beyond the Linux Debian package.
 - Automatic removal of user data, repositories, worktrees, or branches.
-- Feature expansion such as additional providers, GitHub workflows, remote execution, and notifications until installation and upgrades meet this plan's acceptance criteria.
+- Feature expansion such as Claude cloud Sessions, GitHub mutation and Pull Request checkout/review workflows, remote execution, and notifications until installation and upgrades meet this plan's acceptance criteria.
