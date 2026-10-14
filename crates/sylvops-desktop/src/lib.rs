@@ -9681,6 +9681,26 @@ mod tests {
         18_015_716_783_138_635_235,
         9_742_952_928_827_259_349,
     ];
+    const APPROVED_GITHUB_VISUAL_CHECKSUMS: [u64; 18] = [
+        7_324_839_588_326_477_968,
+        10_978_089_343_351_588_123,
+        12_804_328_079_797_604_390,
+        11_451_136_536_029_105_741,
+        4_552_333_724_261_698_469,
+        3_571_644_860_129_249_990,
+        7_417_629_772_838_843_652,
+        8_813_915_493_752_769_034,
+        16_036_153_239_282_467_090,
+        15_004_240_999_661_487_353,
+        10_792_402_431_044_772_732,
+        11_976_515_902_143_919_346,
+        3_079_897_196_383_514_458,
+        2_457_788_971_749_134_353,
+        7_292_543_907_018_699_530,
+        8_560_418_880_652_404_936,
+        7_026_253_662_136_001_823,
+        13_307_167_032_141_301_744,
+    ];
 
     async fn render_desktop_baseline(
         app: &DesktopApp,
@@ -9689,6 +9709,25 @@ mod tests {
     ) -> RenderedBaseline {
         let theme = app.theme();
         render_element_baseline(app.view(), &theme, width, height).await
+    }
+
+    async fn render_github_responsive_baselines(app: &mut DesktopApp) -> [RenderedBaseline; 3] {
+        app.desktop_state.window_width = 1_440;
+        app.desktop_state.window_height = 900;
+        app.narrow_main = false;
+        let wide = render_desktop_baseline(app, 1_440, 900).await;
+
+        app.desktop_state.window_width = 900;
+        app.desktop_state.window_height = 700;
+        app.narrow_main = false;
+        let compact = render_desktop_baseline(app, 900, 700).await;
+
+        app.desktop_state.window_width = 680;
+        app.desktop_state.window_height = 480;
+        app.narrow_main = true;
+        let narrow = render_desktop_baseline(app, 680, 480).await;
+
+        [wide, compact, narrow]
     }
 
     async fn layout_test_element(
@@ -11738,6 +11777,185 @@ mod tests {
         }
         assert!(app.snapshot.worktrees.is_empty());
         assert!(app.snapshot.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn github_visual_acceptance_covers_responsive_and_recovery_states() {
+        use sylvops_core::github::{
+            GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubListPage, StartWorkFailure,
+            WorkSource,
+        };
+
+        let (bridge, _harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.github_status = Some(github_status_for(project_id));
+        app.content_surface = ContentSurface::GitHub;
+        app.github_surface
+            .open(project_id, GitHubSurfaceKind::Issues);
+
+        app.desktop_state.window_width = 680;
+        app.desktop_state.window_height = 480;
+        app.narrow_main = true;
+        let loading_text = rendered_text(app.workspace_view(), iced::Size::new(680.0, 480.0)).await;
+        assert!(
+            loading_text
+                .iter()
+                .any(|line| line.contains("Loading GitHub items"))
+        );
+        let loading = render_github_responsive_baselines(&mut app).await;
+
+        app.github_surface.receive_list(GitHubListPage {
+            items: Vec::new(),
+            next_cursor: None,
+        });
+        app.desktop_state.window_width = 900;
+        app.desktop_state.window_height = 700;
+        app.narrow_main = false;
+        let empty_text = rendered_text(app.workspace_view(), iced::Size::new(900.0, 700.0)).await;
+        assert!(
+            empty_text
+                .iter()
+                .any(|line| line.contains("No issues match these filters"))
+        );
+        let empty = render_github_responsive_baselines(&mut app).await;
+
+        let summary = github_summary(GitHubItemKind::Issue, 130);
+        let identity = summary.identity.clone();
+        app.github_surface.receive_list(GitHubListPage {
+            items: vec![summary.clone()],
+            next_cursor: None,
+        });
+        app.github_surface.select(identity.clone(), false);
+        app.github_surface.receive_detail(github_detail(summary));
+        app.desktop_state.window_width = 1_440;
+        app.desktop_state.window_height = 900;
+        let detail_text =
+            rendered_text(app.workspace_view(), iced::Size::new(1_440.0, 900.0)).await;
+        for expected in [
+            "Bounded remote title",
+            "Bounded detail body",
+            "Open in browser",
+        ] {
+            assert!(
+                detail_text.iter().any(|line| line.contains(expected)),
+                "missing {expected:?} from GitHub detail"
+            );
+        }
+        let detail = render_github_responsive_baselines(&mut app).await;
+
+        app.github_surface.back_to_list();
+        let failure = GitHubBrowseFailure::new(GitHubBrowseFailureKind::Network);
+        app.github_surface.fail(
+            GitHubRequestTarget::List,
+            failure.clone(),
+            failure.diagnostic,
+        );
+        app.desktop_state.window_width = 680;
+        app.desktop_state.window_height = 480;
+        app.narrow_main = true;
+        let error_text = rendered_text(app.workspace_view(), iced::Size::new(680.0, 480.0)).await;
+        assert!(error_text.iter().any(|line| line == "GitHub is offline"));
+        let error = render_github_responsive_baselines(&mut app).await;
+
+        app.modal = Some(Modal::Confirmation(Confirmation::ChangeGitHubAssociation {
+            inspection: sylvops_core::protocol::GitHubAssociationChangeInspection {
+                project_id,
+                remote_name: None,
+                work_source_count: 2,
+                authorization_token: GitHubAssociationChangeAuthorization::try_from("a".repeat(64))
+                    .unwrap(),
+            },
+        }));
+        app.desktop_state.window_width = 900;
+        app.desktop_state.window_height = 700;
+        app.narrow_main = false;
+        let confirmation_text = rendered_text(app.view(), iced::Size::new(900.0, 700.0)).await;
+        for expected in [
+            "Change GitHub Repository",
+            "historical Work Sources",
+            "preserved",
+        ] {
+            assert!(
+                confirmation_text.iter().any(|line| line.contains(expected)),
+                "missing {expected:?} from association confirmation"
+            );
+        }
+        let confirmation = render_github_responsive_baselines(&mut app).await;
+
+        app.modal = None;
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id,
+            name: "Issue #130".into(),
+            path: "C:/managed/130".into(),
+            canonical_path: "C:/managed/130".into(),
+            branch: Some("issue/130-release-proof".into()),
+            base_ref: "main".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            is_root_checkout: false,
+            status: WorktreeStatus::Active,
+            created_at: 1,
+            last_activity_at: 1,
+            removed_at: None,
+        };
+        let source = WorkSource {
+            worktree_id: worktree.id,
+            project_id,
+            canonical_url: identity.browser_target(),
+            item: identity,
+            created_at: 1,
+        };
+        app.handle_response(
+            Operation::StartWork(project_id, source.item.number),
+            DaemonResponse::StartWorkCompleted(StartWorkOutcome::WorktreeCreated {
+                revision: 3,
+                worktree,
+                source,
+                failure: StartWorkFailure::new(
+                    StartWorkFailureKind::ProviderLaunchFailed,
+                    "Provider launch failed.",
+                ),
+            }),
+        );
+        app.desktop_state.window_width = 680;
+        app.desktop_state.window_height = 480;
+        app.narrow_main = true;
+        let partial_text = rendered_text(app.view(), iced::Size::new(680.0, 480.0)).await;
+        for expected in ["Worktree created; Session not started", "Retry Session"] {
+            assert!(
+                partial_text.iter().any(|line| line.contains(expected)),
+                "missing {expected:?} from partial Start Work recovery"
+            );
+        }
+        let partial_success = render_github_responsive_baselines(&mut app).await;
+
+        let baselines = [loading, empty, detail, error, confirmation, partial_success]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(
+            baselines
+                .iter()
+                .all(|baseline| baseline.distinct_colors >= 8)
+        );
+        assert!(baselines.iter().all(|baseline| baseline.layout_nodes >= 20));
+        assert_eq!(
+            baselines
+                .iter()
+                .map(|baseline| baseline.checksum)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            baselines.len()
+        );
+        assert_eq!(
+            baselines
+                .iter()
+                .map(|baseline| baseline.checksum)
+                .collect::<Vec<_>>(),
+            APPROVED_GITHUB_VISUAL_CHECKSUMS,
+            "update the reviewed GitHub visual baselines after inspecting every state"
+        );
     }
 
     #[test]

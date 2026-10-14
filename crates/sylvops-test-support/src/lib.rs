@@ -139,6 +139,15 @@ pub async fn git_branch_exists(repository: &Path, branch: &str) -> io::Result<bo
         .map(|status| status.success())
 }
 
+/// Returns the shared temporary artifact path used by the native fake `gh` process.
+#[doc(hidden)]
+#[must_use]
+pub fn fake_gh_artifact(host: &str, extension: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join(format!("sylvops-fake-gh-{host}"))
+        .with_extension(extension)
+}
+
 /// Apply a uniform timeout to process and IPC tests.
 ///
 /// # Errors

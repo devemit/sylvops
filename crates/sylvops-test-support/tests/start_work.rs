@@ -5,7 +5,8 @@ use std::{ffi::OsString, path::Path, process::Command, time::Duration};
 use sylvops_core::{
     domain::ProviderKind,
     github::{
-        GitHubItemNumber, GitRemoteName, StartWorkBranch, StartWorkFailureKind,
+        GitHubItemKind, GitHubItemNumber, GitHubLabelName, GitHubListFilters, GitHubListQuery,
+        GitHubPageSize, GitHubSearchText, GitRemoteName, StartWorkBranch, StartWorkFailureKind,
         StartWorkInstructions, StartWorkOutcome,
     },
     protocol::{ClientRequest, DaemonResponse},
@@ -14,6 +15,10 @@ use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 use sylvops_test_support::{AbortOnDropTask, TemporaryRepository, git_branch_exists};
 
 const ADDITIONAL_SENTINEL: &str = "ADDITIONAL_PRIVATE_SENTINEL";
+const SEARCH_SENTINEL: &str = "SEARCH_PRIVATE_SENTINEL";
+const FILTER_SENTINEL: &str = "FILTER_PRIVATE_SENTINEL";
+const CREDENTIAL_SENTINEL: &str = "ghp_PRIVATE_SENTINEL";
+const REMOTE_PROMPT_SENTINEL: &str = "REMOTE_PROMPT_PRIVATE_SENTINEL";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_ipc_start_work_revalidates_and_preserves_only_provenance() {
@@ -32,6 +37,15 @@ async fn scenario() {
             "add",
             "origin",
             "git@enterprise.example.com:allowed/repository.git",
+        ],
+    );
+    git(
+        repository.path(),
+        &[
+            "remote",
+            "add",
+            "authentication-check",
+            "git@auth.example.com:allowed/repository.git",
         ],
     );
     git(
@@ -81,6 +95,25 @@ async fn scenario() {
         DaemonResponse::ProjectAdded { project, .. } => project.id,
         response => panic!("unexpected Project response: {response:?}"),
     };
+    let github_status = client
+        .request(&ClientRequest::GetGitHubStatus {
+            project_id: Some(project_id),
+        })
+        .await
+        .unwrap();
+    let DaemonResponse::GitHubStatus(github_status) = github_status else {
+        panic!("unexpected GitHub status response: {github_status:?}");
+    };
+    let authentication = github_status
+        .connections
+        .iter()
+        .find(|connection| connection.host.as_str() == "auth.example.com")
+        .expect("authentication host status");
+    assert_eq!(
+        authentication.state,
+        sylvops_core::github::GitHubConnectionState::AuthenticationRequired
+    );
+    assert!(!authentication.diagnostic.contains(CREDENTIAL_SENTINEL));
     assert!(matches!(
         client
             .request(&ClientRequest::SetGitHubAssociation {
@@ -91,6 +124,27 @@ async fn scenario() {
             .await
             .unwrap(),
         DaemonResponse::GitHubAssociationUpdated { .. }
+    ));
+
+    assert!(matches!(
+        client
+            .request(&ClientRequest::ListGitHubItems {
+                project_id,
+                query: GitHubListQuery {
+                    kind: GitHubItemKind::Issue,
+                    filters: GitHubListFilters {
+                        text: Some(GitHubSearchText::new(SEARCH_SENTINEL).unwrap()),
+                        labels: vec![GitHubLabelName::new(FILTER_SENTINEL).unwrap()],
+                        ..GitHubListFilters::default()
+                    },
+                    page_size: GitHubPageSize::new(10).unwrap(),
+                    cursor: None,
+                    refresh: true,
+                },
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::GitHubItems(_)
     ));
 
     let preparation = prepare(&client, project_id).await;
@@ -239,6 +293,12 @@ async fn scenario() {
             .await
             .unwrap()
     );
+    assert!(
+        !git_branch_exists(repository.path(), "provider-policy-overridden")
+            .await
+            .unwrap()
+    );
+    assert!(!repository.path().join("remote-command-ran").exists());
     assert_eq!(
         client
             .request(&ClientRequest::GetWorkSource { worktree_id })
@@ -465,6 +525,33 @@ async fn scenario() {
             .unwrap(),
         DaemonResponse::WorkSource(Some(expected_source.clone()))
     );
+    let restored_association_inspection = match client
+        .request(&ClientRequest::SetGitHubAssociation {
+            project_id,
+            remote_name: GitRemoteName::new("origin").unwrap(),
+            authorization_token: None,
+        })
+        .await
+        .unwrap()
+    {
+        DaemonResponse::GitHubAssociationChangeRequiresConfirmation(inspection) => inspection,
+        response => panic!("unexpected restored association inspection: {response:?}"),
+    };
+    let restored_association = match client
+        .request(&ClientRequest::SetGitHubAssociation {
+            project_id,
+            remote_name: GitRemoteName::new("origin").unwrap(),
+            authorization_token: Some(restored_association_inspection.authorization_token),
+        })
+        .await
+        .unwrap()
+    {
+        DaemonResponse::GitHubAssociationUpdated {
+            association: Some(association),
+            ..
+        } => association,
+        response => panic!("unexpected restored association response: {response:?}"),
+    };
     client
         .request(&ClientRequest::StopSession { session_id })
         .await
@@ -477,7 +564,17 @@ async fn scenario() {
 
     let bytes = std::fs::read(&paths.database).unwrap();
     let logs = std::fs::read(&paths.daemon_log).unwrap_or_default();
-    for private in [ADDITIONAL_SENTINEL, "safe\nbody", "looks good"] {
+    for private in [
+        ADDITIONAL_SENTINEL,
+        SEARCH_SENTINEL,
+        FILTER_SENTINEL,
+        CREDENTIAL_SENTINEL,
+        REMOTE_PROMPT_SENTINEL,
+        "</untrusted_github_issue>",
+        "looks good",
+        "filter-sentinel",
+        "unsafe issue",
+    ] {
         assert!(
             !bytes
                 .windows(private.len())
@@ -491,9 +588,53 @@ async fn scenario() {
             "daemon logs leaked {private:?}"
         );
     }
+    let persisted = rusqlite::Connection::open(&paths.database).unwrap();
+    let association_identity = persisted
+        .query_row(
+            "SELECT remote_name, host, owner, repository FROM project_github_associations WHERE project_id = ?1",
+            [project_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        association_identity,
+        (
+            restored_association.remote_name.as_str().to_owned(),
+            restored_association.repository.host().as_str().to_owned(),
+            restored_association.repository.owner().as_str().to_owned(),
+            restored_association
+                .repository
+                .repository()
+                .as_str()
+                .to_owned(),
+        )
+    );
+    let persisted_sources: i64 = persisted
+        .query_row("SELECT COUNT(*) FROM work_sources", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(persisted_sources, 3);
+    drop(persisted);
 
     let mut restarted = AbortOnDropTask::spawn(daemon::run(paths.clone()));
     let client = connect_eventually(&paths).await;
+    let status = client
+        .request(&ClientRequest::GetGitHubStatus {
+            project_id: Some(project_id),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        status,
+        DaemonResponse::GitHubStatus(ref status)
+            if status.association.as_ref() == Some(&restored_association)
+    ));
     assert_eq!(
         client
             .request(&ClientRequest::GetWorkSource {
