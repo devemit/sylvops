@@ -11,6 +11,8 @@ use std::{
 
 use serde_json::json;
 
+const IMMEDIATE_SESSION_START_PROMPT: &str = "SYLVOPS_FAKE_IMMEDIATE_SESSION_START";
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -67,7 +69,16 @@ fn run() -> io::Result<()> {
     } else {
         "startup"
     };
-    match fixture("session-start", "immediate").as_str() {
+    let session_start_mode = if resumed_id.is_some()
+        || arguments
+            .iter()
+            .any(|argument| argument == IMMEDIATE_SESSION_START_PROMPT)
+    {
+        "immediate".to_owned()
+    } else {
+        fixture("session-start", "immediate")
+    };
+    match session_start_mode.as_str() {
         "late" => {
             emit_hook("UserPromptSubmit", &external_id)?;
             let late_id = external_id.clone();

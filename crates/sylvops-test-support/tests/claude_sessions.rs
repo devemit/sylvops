@@ -15,6 +15,7 @@ use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 const PROMPT_SENTINEL: &str = "SYLVOPS_PRIVATE_CLAUDE_PROMPT_74_22f1";
 const FAILURE_SENTINEL: &str = "SYLVOPS_PRIVATE_CLAUDE_FAILURE_75";
 const MALFORMED_SENTINEL: &str = "SYLVOPS_PRIVATE_MALFORMED_HOOK_75";
+const IMMEDIATE_SESSION_START_PROMPT: &str = "SYLVOPS_FAKE_IMMEDIATE_SESSION_START";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_claude_sessions_cover_attention_terminal_and_hook_recovery() {
@@ -690,7 +691,6 @@ async fn late_session_start_recovers_after_warning() {
     })
     .await;
 
-    std::fs::remove_file(&session_start_fixture).expect("restore immediate SessionStart default");
     let failed_session_id = match client
         .request(&ClientRequest::CreateSession {
             worktree_id,
@@ -698,7 +698,7 @@ async fn late_session_start_recovers_after_warning() {
             display_name: Some("crashing Claude".into()),
             model: None,
             effort: None,
-            initial_prompt: None,
+            initial_prompt: Some(IMMEDIATE_SESSION_START_PROMPT.into()),
             columns: 80,
             rows: 24,
         })
