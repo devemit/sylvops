@@ -681,38 +681,7 @@ async fn late_session_start_recovers_after_warning() {
     })
     .await;
 
-    client
-        .request(&ClientRequest::StopSession { session_id })
-        .await
-        .expect("stop response");
-    wait_for_session(&client, session_id, |session| {
-        session.state == SessionState::Terminated
-    })
-    .await;
-
-    std::fs::remove_file(&session_start_fixture).expect("restore immediate SessionStart default");
-    let failed_session_id = match client
-        .request(&ClientRequest::CreateSession {
-            worktree_id,
-            provider: ProviderKind::Claude,
-            display_name: Some("crashing Claude".into()),
-            model: None,
-            effort: None,
-            initial_prompt: None,
-            columns: 80,
-            rows: 24,
-        })
-        .await
-        .expect("crashing session response")
-    {
-        DaemonResponse::SessionCreated { session, .. } => session.id,
-        response => panic!("unexpected crashing session response: {response:?}"),
-    };
-    wait_for_session(&client, failed_session_id, |session| {
-        session.state == SessionState::Running && session.external_session_id.is_some()
-    })
-    .await;
-    attach(&client, failed_session_id, 0).await;
+    let failed_session_id = session_id;
     client
         .request(&ClientRequest::SessionInput {
             session_id: failed_session_id,

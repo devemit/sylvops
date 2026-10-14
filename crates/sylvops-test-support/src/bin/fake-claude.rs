@@ -67,7 +67,12 @@ fn run() -> io::Result<()> {
     } else {
         "startup"
     };
-    match fixture("session-start", "immediate").as_str() {
+    let session_start_mode = if resumed_id.is_some() {
+        "immediate".to_owned()
+    } else {
+        fixture("session-start", "immediate")
+    };
+    match session_start_mode.as_str() {
         "late" => {
             emit_hook("UserPromptSubmit", &external_id)?;
             let late_id = external_id.clone();
