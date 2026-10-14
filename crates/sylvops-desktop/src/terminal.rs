@@ -367,6 +367,7 @@ pub(crate) fn encode_key(
     produced_text: Option<&str>,
 ) -> Option<Vec<u8>> {
     let mut bytes = match key.as_ref() {
+        Key::Named(Named::Enter) if modifiers.shift() => vec![b'\n'],
         Key::Named(Named::Enter) => vec![b'\r'],
         Key::Named(Named::Space) => vec![b' '],
         Key::Named(Named::Tab) if modifiers.shift() => b"\x1b[Z".to_vec(),
@@ -684,6 +685,26 @@ mod tests {
                 Some(" "),
             ),
             Some(vec![b' '])
+        );
+    }
+
+    #[test]
+    fn enter_submits_while_shift_enter_inserts_a_newline() {
+        assert_eq!(
+            encode_key(
+                &Key::Named(Named::Enter),
+                keyboard::Modifiers::empty(),
+                None,
+            ),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            encode_key(
+                &Key::Named(Named::Enter),
+                keyboard::Modifiers::SHIFT,
+                None,
+            ),
+            Some(vec![b'\n'])
         );
     }
 
