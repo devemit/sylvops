@@ -1,16 +1,14 @@
-use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
-use sylvops_core::ui::TuiContentView;
-
 use crate::{
-    app::{App, HitTarget},
+    app::{App, HitTarget, main_view_from_shortcut},
     reducer::Action,
 };
+use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 
 pub(crate) fn navigation_action(app: &App, event: &Event) -> Option<Action> {
     match event {
         Event::Key(key) => {
             if let KeyCode::Char(shortcut) = key.code
-                && let Some(view) = TuiContentView::from_shortcut(shortcut)
+                && let Some(view) = main_view_from_shortcut(shortcut)
             {
                 return Some(Action::SelectTab(view));
             }

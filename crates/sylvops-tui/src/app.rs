@@ -24,6 +24,41 @@ use crate::{
     terminal::AttachedTerminal,
 };
 
+pub(crate) const MAIN_VIEWS: [TuiContentView; 4] = [
+    TuiContentView::Sessions,
+    TuiContentView::Terminal,
+    TuiContentView::Changes,
+    TuiContentView::Details,
+];
+
+pub(crate) const fn main_view_label(view: TuiContentView) -> &'static str {
+    match view {
+        TuiContentView::Sessions => "Home",
+        TuiContentView::Terminal => "Terminal",
+        TuiContentView::Changes => "Changes",
+        TuiContentView::Details => "Details",
+    }
+}
+
+pub(crate) const fn main_view_shortcut(view: TuiContentView) -> char {
+    match view {
+        TuiContentView::Sessions => '1',
+        TuiContentView::Terminal => '2',
+        TuiContentView::Changes => '3',
+        TuiContentView::Details => '4',
+    }
+}
+
+pub(crate) const fn main_view_from_shortcut(shortcut: char) -> Option<TuiContentView> {
+    match shortcut {
+        '1' => Some(TuiContentView::Sessions),
+        '2' => Some(TuiContentView::Terminal),
+        '3' => Some(TuiContentView::Changes),
+        '4' => Some(TuiContentView::Details),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FocusZone {
     Explorer,

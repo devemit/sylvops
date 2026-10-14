@@ -18,7 +18,10 @@ use sylvops_core::{
 };
 
 use crate::{
-    app::{App, ExplorerNode, FocusZone, HitMap, HitTarget, Mode, SettingsFocus},
+    app::{
+        App, ExplorerNode, FocusZone, HitMap, HitTarget, MAIN_VIEWS, Mode, SettingsFocus,
+        main_view_label, main_view_shortcut,
+    },
     directory_browser::{DirectoryBrowser, display_path},
     forms::{Form, FormKind},
     github_modal::{GitHubDepth, GitHubLoad, GitHubModal, StartWorkFocus, StartWorkForm},
@@ -319,11 +322,17 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(2)])
         .split(area);
-    let titles: Vec<_> = TuiContentView::ALL
+    let titles: Vec<_> = MAIN_VIEWS
         .into_iter()
-        .map(|view| Line::from(format!("{} {}", view.shortcut(), view.label())))
+        .map(|view| {
+            Line::from(format!(
+                "{} {}",
+                main_view_shortcut(view),
+                main_view_label(view)
+            ))
+        })
         .collect();
-    let selected = TuiContentView::ALL
+    let selected = MAIN_VIEWS
         .iter()
         .position(|view| *view == app.main_tab)
         .unwrap_or(0);
@@ -356,9 +365,9 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
             .highlight_style(theme.focus),
         chunks[0],
     );
-    let tab_count = u16::try_from(TuiContentView::ALL.len()).unwrap_or(1);
+    let tab_count = u16::try_from(MAIN_VIEWS.len()).unwrap_or(1);
     let tab_width = chunks[0].width.saturating_sub(2) / tab_count;
-    for (index, tab) in TuiContentView::ALL.into_iter().enumerate() {
+    for (index, tab) in MAIN_VIEWS.into_iter().enumerate() {
         app.hit_map.push(
             Rect::new(
                 chunks[0].x.saturating_add(
@@ -1159,7 +1168,7 @@ fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionIte
 fn main_footer_actions(app: &App, theme: Theme) -> Vec<ActionItem> {
     let terse = app.density == TuiDensity::Compact;
     let mut items = vec![action_label(
-        app.main_tab.label(),
+        main_view_label(app.main_tab),
         HitTarget::FocusMain,
         theme.focus,
     )];
@@ -1306,7 +1315,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Terminal / Changes / Details / Sessions\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Home / Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 

@@ -3711,9 +3711,9 @@ mod tests {
         let mut app = App::new(snapshot, Vec::new(), None);
         app.focus = app::FocusZone::Main;
 
-        let key_four = Event::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        let key_one = Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert_eq!(
-            input::navigation_action(&app, &key_four),
+            input::navigation_action(&app, &key_one),
             Some(reducer::Action::SelectTab(TuiContentView::Sessions))
         );
         let first = app.selected_session_id;
@@ -4060,7 +4060,7 @@ mod tests {
                     .symbol()
             })
             .collect::<String>();
-        assert!(footer.contains("Sessions"));
+        assert!(footer.contains("Home"));
         assert!(footer.contains("Open"));
         assert!(!footer.contains("Rename"));
         let footer_open = app
@@ -4664,10 +4664,10 @@ mod tests {
             .collect::<String>();
         for expected in [
             "Explorer",
-            "1 Terminal",
-            "2 Changes",
-            "3 Details",
-            "4 Sessions",
+            "1 Home",
+            "2 Terminal",
+            "3 Changes",
+            "4 Details",
             "Running",
         ] {
             assert!(
