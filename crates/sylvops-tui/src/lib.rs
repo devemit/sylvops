@@ -3218,7 +3218,7 @@ fn terminal_content_area(area: Rect, focus: app::FocusZone) -> Rect {
         main.x,
         main.y.saturating_add(3),
         main.width,
-        main.height.saturating_sub(4),
+        main.height.saturating_sub(3),
     )
 }
 
@@ -4024,21 +4024,15 @@ mod tests {
                 .iter()
                 .any(|region| region.target == HitTarget::Attention)
         );
-        let explorer = app
+        let delete_actions = app
             .hit_map
             .0
             .iter()
-            .find(|region| region.target == HitTarget::FocusExplorer)
-            .expect("Explorer region")
-            .area;
-        let delete = app
-            .hit_map
-            .0
-            .iter()
-            .find(|region| region.target == HitTarget::Delete)
-            .expect("contextual delete action")
-            .area;
-        assert!(delete.y >= explorer.y && delete.y < explorer.y + explorer.height);
+            .filter(|region| region.target == HitTarget::Delete)
+            .collect::<Vec<_>>();
+        assert_eq!(delete_actions.len(), 1);
+        let delete = delete_actions[0].area;
+        assert_eq!(delete.y, 23);
         assert_eq!(
             app.hit_map.target_at(delete.x, delete.y),
             Some(HitTarget::Delete)

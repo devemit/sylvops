@@ -225,11 +225,6 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         .border_style(if focused { theme.focus } else { theme.border });
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let action_height = u16::from(inner.height > 0);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(action_height)])
-        .split(inner);
     let mut state =
         ListState::default().with_selected((!rows.is_empty()).then_some(app.explorer_index));
     frame.render_stateful_widget(
@@ -237,7 +232,7 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             .style(theme.text)
             .highlight_symbol("› ")
             .highlight_style(theme.selected),
-        chunks[0],
+        inner,
         &mut state,
     );
     let row_height = if app.density == TuiDensity::Comfortable {
@@ -247,25 +242,23 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     };
     for (index, _) in rows
         .iter()
-        .take(usize::from(chunks[0].height / row_height))
+        .take(usize::from(inner.height / row_height))
         .enumerate()
     {
         app.hit_map.push(
             Rect::new(
-                chunks[0].x,
-                chunks[0].y.saturating_add(
+                inner.x,
+                inner.y.saturating_add(
                     u16::try_from(index)
                         .unwrap_or(u16::MAX)
                         .saturating_mul(row_height),
                 ),
-                chunks[0].width,
+                inner.width,
                 row_height,
             ),
             HitTarget::ExplorerRow(index),
         );
     }
-    let actions = contextual_actions(app, chunks[1].width, theme);
-    draw_action_line(frame, &mut app.hit_map, chunks[1], &actions, theme);
 }
 
 fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
@@ -375,18 +368,12 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         draw_sessions(frame, app, chunks[1], theme);
         return;
     }
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(chunks[1]);
     match app.main_tab {
-        TuiContentView::Terminal => draw_terminal(frame, app, content[0], theme),
-        TuiContentView::Changes => draw_changes(frame, app, content[0], theme),
-        TuiContentView::Details => draw_details(frame, app, content[0], theme),
+        TuiContentView::Terminal => draw_terminal(frame, app, chunks[1], theme),
+        TuiContentView::Changes => draw_changes(frame, app, chunks[1], theme),
+        TuiContentView::Details => draw_details(frame, app, chunks[1], theme),
         TuiContentView::Sessions => unreachable!("Sessions is rendered above"),
     }
-    let actions = contextual_actions(app, content[1].width, theme);
-    draw_action_line(frame, &mut app.hit_map, content[1], &actions, theme);
 }
 
 struct ActiveSessionItem {
@@ -1137,14 +1124,16 @@ fn primary_session_action(app: &App, terse: bool, theme: Theme) -> Option<Action
 }
 
 fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
-    let terse = app.density == TuiDensity::Compact;
+    let terse = width < 60 || app.density == TuiDensity::Compact;
     let mut items = vec![action_label(
         "Explorer",
         HitTarget::FocusExplorer,
         theme.focus,
     )];
     items.push(action_label(
-        if terse {
+        if width < 60 {
+            "[Tab]M"
+        } else if terse {
             "[Tab] Main"
         } else {
             "[Tab] Focus Main"
