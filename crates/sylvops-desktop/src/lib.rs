@@ -34,13 +34,13 @@ use iced::{
     mouse, system, time,
     widget::{
         self, button, column, container, mouse_area, opaque, pane_grid, pick_list, responsive,
-        rich_text, row, rule, scrollable, sensor, space, span, stack, text, text_input, tooltip,
+        rich_text, row, rule, scrollable, sensor, space, span, stack, text, text_input,
         vertical_slider,
     },
     window,
 };
 use iced::{font, font::Weight, widget::button::Status};
-use icons::{LineIcon, line_icon};
+use icons::{LineIcon, delete_icon, line_icon};
 use presentation::{
     ActiveTerminalAction, ButtonIntent, ButtonTokens, ControlState, DensityMetrics,
     DesktopPresentation, InteractionState as PresentationInteraction, NavigatorAction,
@@ -115,6 +115,8 @@ const DELETE_WORKSPACE_LABEL: &str = "Delete workspace";
 const REMOVE_REPOSITORY_LABEL: &str = "Remove repository";
 const DELETE_CHECKOUT_LABEL: &str = "Delete checkout";
 const DELETE_SESSION_LABEL: &str = "Delete session";
+const TRASH_ICON_SIZE: u16 = 12;
+const TRASH_CONTROL_SIZE: u32 = 24;
 const MAX_TECHNICAL_COPY_CHARS: usize = 4_096;
 const MAX_USER_DIAGNOSTIC_CHARS: usize = 1_024;
 const JETBRAINS_MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
@@ -1350,7 +1352,6 @@ impl DesktopApp {
                 actions = actions.push(delete_icon_button(
                     DELETE_WORKSPACE_LABEL,
                     Message::DeleteWorkspace(workspace_id),
-                    density.control_height,
                     self.focused_delete_action == Some(DeleteActionFocus::Workspace),
                 ));
             }
@@ -1405,7 +1406,6 @@ impl DesktopApp {
             workspace_tabs = workspace_tabs.push(delete_icon_button(
                 DELETE_WORKSPACE_LABEL,
                 Message::DeleteWorkspace(workspace_id),
-                density.control_height,
                 self.focused_delete_action == Some(DeleteActionFocus::Workspace),
             ));
         }
@@ -7785,7 +7785,6 @@ fn navigator_action_strip(
         controls = controls.push(delete_icon_button(
             label,
             Message::RunNavigatorAction(action),
-            density.control_height,
             focused,
         ));
     }
@@ -7794,12 +7793,14 @@ fn navigator_action_strip(
             .direction(scrollable::Direction::Horizontal(
                 scrollable::Scrollbar::hidden(),
             ))
-            .width(Fill)
-            .height(density.control_height),
+            .width(Length::Shrink)
+            .height(TRASH_CONTROL_SIZE),
     )
     .width(Fill)
     .height(density.control_height + 8)
     .padding([4, 7])
+    .align_x(iced::alignment::Horizontal::Right)
+    .align_y(Vertical::Center)
     .into()
 }
 
@@ -7814,43 +7815,19 @@ const fn navigator_action_label(action: NavigatorAction) -> &'static str {
 fn delete_icon_button(
     label: &'static str,
     message: Message,
-    control_height: u32,
     focused: bool,
 ) -> Element<'static, Message> {
     let accessible_content = stack![
-        line_icon(LineIcon::Delete, 15),
+        delete_icon(TRASH_ICON_SIZE, focused),
         text(label).size(1).color(Color::TRANSPARENT),
     ];
-    let control = button(accessible_content)
+    button(accessible_content)
         .on_press(message)
-        .width(control_height)
-        .height(control_height)
-        .padding(7);
-    let control = if focused {
-        control.style(focused_danger_action_style)
-    } else {
-        control.style(flat_danger_style)
-    };
-    let control: Element<'static, Message> = tooltip(
-        control,
-        container(text(label).font(UI_MEDIUM).size(UI_META_SIZE)).padding([4, 7]),
-        tooltip::Position::Bottom,
-    )
-    .gap(5)
-    .into();
-    if focused {
-        row![
-            control,
-            container(text(label).font(UI_MEDIUM).size(UI_META_SIZE))
-                .padding([4, 7])
-                .style(chrome_surface),
-        ]
-        .spacing(5)
-        .align_y(Center)
+        .width(TRASH_CONTROL_SIZE)
+        .height(TRASH_CONTROL_SIZE)
+        .padding(6)
+        .style(trash_icon_style)
         .into()
-    } else {
-        control
-    }
 }
 
 fn compact_panel_button(
@@ -8674,6 +8651,18 @@ fn focused_danger_action_style(theme: &Theme, status: Status) -> button::Style {
 
 fn flat_danger_style(theme: &Theme, status: Status) -> button::Style {
     danger_action_style(theme, status)
+}
+
+fn trash_icon_style(theme: &Theme, _status: Status) -> button::Style {
+    button::Style {
+        background: None,
+        text_color: theme.extended_palette().danger.strong.color,
+        border: Border {
+            width: 0.0,
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
 }
 
 fn contrast_safe_text(background: Color, preferred: Color) -> Color {
@@ -9652,9 +9641,9 @@ mod tests {
     ];
     #[cfg(windows)]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        5_332_527_658_901_024_356,
-        11_451_291_108_168_669_331,
-        14_916_496_382_630_693_852,
+        14_484_987_717_413_133_796,
+        2_628_475_028_499_274_563,
+        14_597_674_150_921_370_694,
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
@@ -9674,32 +9663,32 @@ mod tests {
         1_283_983_295_511_949_884,
     ];
     const APPROVED_NAVIGATOR_EDGE_CHECKSUMS: [u64; 6] = [
-        17_145_631_350_459_901_839,
-        2_984_041_840_863_012_867,
-        2_514_188_229_429_096_243,
-        16_028_725_872_950_680_537,
-        18_015_716_783_138_635_235,
-        9_742_952_928_827_259_349,
+        6_476_433_378_350_038_089,
+        1_944_536_393_953_145_853,
+        4_128_871_247_297_984_045,
+        4_133_861_854_948_821_055,
+        12_958_207_758_729_044_325,
+        14_287_710_286_098_389_717,
     ];
     const APPROVED_GITHUB_VISUAL_CHECKSUMS: [u64; 18] = [
-        7_324_839_588_326_477_968,
-        10_978_089_343_351_588_123,
-        12_804_328_079_797_604_390,
-        11_451_136_536_029_105_741,
-        4_552_333_724_261_698_469,
-        3_571_644_860_129_249_990,
-        7_417_629_772_838_843_652,
-        8_813_915_493_752_769_034,
-        16_036_153_239_282_467_090,
-        15_004_240_999_661_487_353,
-        10_792_402_431_044_772_732,
-        11_976_515_902_143_919_346,
-        3_079_897_196_383_514_458,
-        2_457_788_971_749_134_353,
-        7_292_543_907_018_699_530,
-        8_560_418_880_652_404_936,
-        7_026_253_662_136_001_823,
-        13_307_167_032_141_301_744,
+        10_766_440_891_007_153_520,
+        7_145_992_467_284_963_027,
+        16_231_782_109_456_511_676,
+        10_247_811_082_847_036_845,
+        13_955_473_173_614_205_117,
+        18_055_240_417_387_392_332,
+        2_953_249_704_069_036_452,
+        18_071_905_009_550_715_330,
+        9_995_928_176_075_538_336,
+        14_815_710_913_229_669_209,
+        12_149_998_409_095_664_980,
+        6_308_043_222_667_740_592,
+        18_215_629_177_471_831_379,
+        14_270_253_206_457_034_052,
+        6_841_481_009_947_612_944,
+        5_496_167_352_226_321_374,
+        9_189_171_660_673_595_280,
+        3_446_619_285_939_656_098,
     ];
 
     async fn render_desktop_baseline(
@@ -9997,6 +9986,13 @@ mod tests {
         origins.push(node.bounds().position());
         for child in node.children() {
             layout_origins(child, origins);
+        }
+    }
+
+    fn layout_rectangles(node: &Node, rectangles: &mut Vec<iced::Rectangle>) {
+        rectangles.push(node.bounds());
+        for child in node.children() {
+            layout_rectangles(child, rectangles);
         }
     }
 
@@ -10546,7 +10542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trash_controls_publish_target_specific_names_and_visible_keyboard_focus() {
+    async fn trash_controls_are_small_red_borderless_tooltip_free_and_trailing_aligned() {
         assert_eq!(DELETE_WORKSPACE_LABEL, "Delete workspace");
         assert_eq!(
             navigator_action_label(NavigatorAction::RemoveRepository(ProjectId::new())),
@@ -10565,11 +10561,19 @@ mod tests {
             DesktopTheme::Canopy,
             SystemAppearance::Dark,
         ));
-        let focused = focused_danger_action_style(&theme, Status::Active);
-        let unfocused = flat_danger_style(&theme, Status::Active);
-        assert!(focused.border.width > unfocused.border.width);
+        for status in [Status::Active, Status::Hovered, Status::Pressed] {
+            let style = trash_icon_style(&theme, status);
+            assert_eq!(style.background, None);
+            assert!(style.border.width.abs() <= f32::EPSILON);
+            assert_eq!(
+                style.text_color,
+                theme.extended_palette().danger.strong.color
+            );
+        }
+        assert_eq!(TRASH_ICON_SIZE, 12);
+        assert_eq!(TRASH_CONTROL_SIZE, 24);
         let source = include_str!("lib.rs");
-        assert!(source.contains("tooltip::Position::Bottom"));
+        assert!(!source.contains(concat!("tool", "tip(")));
         assert!(!source.contains("button(icon_text_label(\n                LineIcon::Delete"));
 
         for label in [
@@ -10579,37 +10583,53 @@ mod tests {
             DELETE_SESSION_LABEL,
         ] {
             let rendered = rendered_text(
-                delete_icon_button(label, Message::ClearError, 34, true),
+                delete_icon_button(label, Message::ClearError, true),
                 iced::Size::new(200.0, 80.0),
             )
             .await;
             assert!(
-                rendered.iter().any(|value| value == label),
+                rendered
+                    .iter()
+                    .filter(|value| value.as_str() == label)
+                    .count()
+                    == 1,
                 "missing accessible label for {label}: {rendered:?}"
             );
         }
 
-        let unfocused = rendered_text(
-            delete_icon_button(DELETE_SESSION_LABEL, Message::ClearError, 34, false),
-            iced::Size::new(200.0, 80.0),
-        )
-        .await;
-        let focused = rendered_text(
-            delete_icon_button(DELETE_SESSION_LABEL, Message::ClearError, 34, true),
-            iced::Size::new(200.0, 80.0),
-        )
-        .await;
-        assert!(
-            focused
-                .iter()
-                .filter(|value| value.as_str() == DELETE_SESSION_LABEL)
-                .count()
-                > unfocused
-                    .iter()
-                    .filter(|value| value.as_str() == DELETE_SESSION_LABEL)
-                    .count(),
-            "keyboard focus must reveal the target-specific tooltip"
-        );
+        let (app, _, _, _, _) = desktop_hierarchy();
+        let density = app.presentation().density;
+        for (action, label) in [
+            (
+                NavigatorAction::RemoveRepository(ProjectId::new()),
+                REMOVE_REPOSITORY_LABEL,
+            ),
+            (
+                NavigatorAction::DeleteCheckout(WorktreeId::new()),
+                DELETE_CHECKOUT_LABEL,
+            ),
+            (
+                NavigatorAction::DeleteSession(SessionId::new()),
+                DELETE_SESSION_LABEL,
+            ),
+        ] {
+            let layout = layout_element(
+                navigator_action_strip(&[action], density, false),
+                240.0,
+                50.0,
+            )
+            .await;
+            let mut rectangles = Vec::new();
+            layout_rectangles(&layout, &mut rectangles);
+            assert!(
+                rectangles.iter().any(|bounds| {
+                    (bounds.width - 24.0).abs() <= f32::EPSILON
+                        && (bounds.height - 24.0).abs() <= f32::EPSILON
+                        && bounds.x >= 200.0
+                }),
+                "{label} trash control is not a trailing-aligned 24 px target: {rectangles:?}"
+            );
+        }
     }
 
     #[test]
