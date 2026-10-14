@@ -14,10 +14,12 @@ Download release files only from the [SylvOps GitHub Releases](https://github.co
 
 Unsigned previews are testing builds, not official signed application releases. They contain a Windows x86_64 portable ZIP and Linux x86_64 portable archive, AppImage, and Debian package. They do not contain macOS packages or a native Windows installer, and they do not receive signed in-app updates.
 
-To install `v0.1.0-preview.1` on Windows from PowerShell, download the matching installer script first so it can be inspected before execution:
+The current testing build is [`v0.1.0-preview.6`](https://github.com/devemit/sylvops/releases/tag/v0.1.0-preview.6), published from commit `b97bb02be5f9ae118e43258b7595503fb22838e3` after the complete hosted CI and unsigned-preview workflow passed.
+
+To install `v0.1.0-preview.6` on Windows from PowerShell, download the matching installer script first so it can be inspected before execution:
 
 ```powershell
-$tag = 'v0.1.0-preview.1'; $script = Join-Path $env:TEMP 'install-sylvops.ps1'; Invoke-WebRequest "https://raw.githubusercontent.com/devemit/sylvops/$tag/scripts/install.ps1" -OutFile $script; & $script -Version $tag.TrimStart('v')
+$tag = 'v0.1.0-preview.6'; $script = Join-Path $env:TEMP 'install-sylvops.ps1'; Invoke-WebRequest "https://raw.githubusercontent.com/devemit/sylvops/$tag/scripts/install.ps1" -OutFile $script; & $script -Version $tag.TrimStart('v')
 ```
 
 Launch the portable installation explicitly:
@@ -31,7 +33,7 @@ Windows may identify the executable as coming from an unknown publisher. Do not 
 On Linux x86_64:
 
 ```sh
-tag=v0.1.0-preview.1; curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent.com/devemit/sylvops/$tag/scripts/install.sh" --output /tmp/install-sylvops.sh; SYLVOPS_VERSION="${tag#v}" sh /tmp/install-sylvops.sh
+tag=v0.1.0-preview.6; curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent.com/devemit/sylvops/$tag/scripts/install.sh" --output /tmp/install-sylvops.sh; SYLVOPS_VERSION="${tag#v}" sh /tmp/install-sylvops.sh
 ```
 
 The manual **Unsigned Preview** GitHub Actions workflow publishes these files as a non-latest GitHub testing release after the complete CI gate passes. The signed `v0.1.0` workflow remains separate and still fails closed unless its protected publisher credentials are configured.
