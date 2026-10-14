@@ -1,4 +1,4 @@
-use iced::{Length, Theme, widget::svg};
+use iced::{Color, Length, Theme, widget::svg};
 
 /// Application-owned 24 px line icons. Every asset shares the same stroke,
 /// caps, joins, and view box so rendering does not depend on platform glyphs.
@@ -48,9 +48,28 @@ pub(crate) fn line_icon(icon: LineIcon, size: u16) -> svg::Svg<'static> {
         })
 }
 
+pub(crate) fn delete_icon(size: u16, emphasized: bool) -> svg::Svg<'static> {
+    svg::Svg::new(svg::Handle::from_memory(LineIcon::Delete.source()))
+        .width(Length::Fixed(f32::from(size)))
+        .height(Length::Fixed(f32::from(size)))
+        .style(move |theme: &Theme, _status| svg::Style {
+            color: Some(delete_icon_color(theme, emphasized)),
+        })
+}
+
+fn delete_icon_color(theme: &Theme, emphasized: bool) -> Color {
+    let mut color = theme.extended_palette().danger.strong.color;
+    if !emphasized {
+        color.a *= 0.82;
+    }
+    color
+}
+
 #[cfg(test)]
 mod tests {
-    use super::LineIcon;
+    use iced::Theme;
+
+    use super::{LineIcon, delete_icon_color};
 
     #[test]
     fn every_icon_uses_the_same_bounded_stroke_contract() {
@@ -78,5 +97,20 @@ mod tests {
             assert!(source.contains("stroke-linejoin=\"round\""));
             assert!(source.len() < 512);
         }
+    }
+
+    #[test]
+    fn delete_icon_uses_the_danger_color_and_focus_only_changes_emphasis() {
+        let theme = Theme::Dark;
+        let danger = theme.extended_palette().danger.strong.color;
+        let focused = delete_icon_color(&theme, true);
+        let resting = delete_icon_color(&theme, false);
+
+        assert_eq!(focused, danger);
+        assert_eq!(
+            (resting.r, resting.g, resting.b),
+            (danger.r, danger.g, danger.b)
+        );
+        assert!(resting.a < focused.a);
     }
 }
