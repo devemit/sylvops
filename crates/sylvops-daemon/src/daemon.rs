@@ -4116,11 +4116,21 @@ fn github_association_change_inspection(
 }
 
 fn release_work_source_capacity(capacity: &Semaphore, excess: &AtomicUsize) {
-    let absorbed_excess = excess
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-            (value > 0).then(|| value - 1)
-        })
-        .is_ok();
+    let mut observed = excess.load(Ordering::Acquire);
+    let absorbed_excess = loop {
+        if observed == 0 {
+            break false;
+        }
+        match excess.compare_exchange_weak(
+            observed,
+            observed - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break true,
+            Err(current) => observed = current,
+        }
+    };
     if !absorbed_excess {
         capacity.add_permits(1);
     }
