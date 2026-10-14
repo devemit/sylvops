@@ -731,6 +731,12 @@ fn git(repository: &Path, arguments: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
         .arg(repository)
+        .args([
+            "-c",
+            "user.name=SylvOps Test",
+            "-c",
+            "user.email=test@example.invalid",
+        ])
         .args(arguments)
         .status()
         .unwrap();

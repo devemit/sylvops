@@ -623,7 +623,6 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let name = OsString::from_vec(vec![b'n', b'o', b'n', 0xff]);
         let path = temporary.path().join(name);
-        sync_fs::create_dir(&path).expect("non-UTF-8 directory");
         let mut browser = DirectoryBrowser::new(form(), temporary.path().into()).await;
         let parent = browser.current.clone();
         browser.navigate(path).await;
