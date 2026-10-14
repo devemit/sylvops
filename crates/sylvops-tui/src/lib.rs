@@ -205,10 +205,15 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 .size()
                 .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
             let focus = app.focus;
+            let attention_visible = app.attention_count() > 0;
             resize_attached(
                 &client,
                 &mut app,
-                terminal_content_area(Rect::new(0, 0, size.width, size.height), focus),
+                render::terminal_panel_area(
+                    Rect::new(0, 0, size.width, size.height),
+                    focus,
+                    attention_visible,
+                ),
             )
             .await?;
         }
@@ -314,6 +319,9 @@ async fn execute_effects(
             Effect::Attach => attach_selected(client, app).await?,
             Effect::Resume(session_id) => resume_session(client, app, session_id).await?,
             Effect::OpenCreate => open_create_form(app),
+            Effect::OpenCreateWorktree(project_id) => {
+                app.mode = Mode::Modal(Form::worktree(project_id));
+            }
             Effect::OpenRename => open_rename_form(app),
             Effect::OpenDelete => open_destructive_confirmation(client, app).await?,
             Effect::LoadDiff => show_diff(client, app).await?,
@@ -3206,22 +3214,6 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
     Ok(())
 }
 
-fn terminal_content_area(area: Rect, focus: app::FocusZone) -> Rect {
-    let body = Rect::new(
-        area.x,
-        area.y.saturating_add(1),
-        area.width,
-        area.height.saturating_sub(2),
-    );
-    let main = render::view_areas(body, focus).main.unwrap_or(body);
-    Rect::new(
-        main.x,
-        main.y.saturating_add(3),
-        main.width,
-        main.height.saturating_sub(4),
-    )
-}
-
 async fn snapshot(client: &DaemonClient) -> Result<DaemonSnapshot, DaemonError> {
     match client.request(&ClientRequest::GetSnapshot).await? {
         DaemonResponse::Snapshot(snapshot) => Ok(snapshot),
@@ -4742,7 +4734,7 @@ mod tests {
             (
                 ExplorerNode::Project(project_id),
                 Some("[d] Remove Project"),
-                Some("[n] New Worktree"),
+                Some("[w] New Worktree"),
                 true,
             ),
             (
@@ -4809,6 +4801,144 @@ mod tests {
         assert!(!missing.contains("[n] New Session"));
         assert!(!missing.contains("[d] Remove Worktree"));
         assert!(missing.contains("[r] Rename"));
+    }
+
+    #[test]
+    fn worktree_creation_is_available_from_every_project_context() {
+        use crossterm::event::{KeyEvent, MouseEvent};
+
+        let snapshot = populated_snapshot();
+        let project_id = snapshot.projects[0].id;
+        let worktree_id = snapshot.worktrees[0].id;
+        let session_id = snapshot.sessions[0].id;
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(snapshot, Vec::new(), None);
+        let worktree_key = Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+
+        for node in [
+            ExplorerNode::Project(project_id),
+            ExplorerNode::Worktree(worktree_id),
+            ExplorerNode::Session(session_id),
+        ] {
+            app.select_node(node);
+            assert_eq!(
+                input::navigation_action(&app, &worktree_key),
+                Some(reducer::Action::NewWorktree)
+            );
+            assert_eq!(
+                reduce(&mut app, reducer::Action::NewWorktree),
+                vec![reducer::Effect::OpenCreateWorktree(project_id)]
+            );
+
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(rendered.contains("[w] New Worktree"));
+
+            let action = app
+                .hit_map
+                .0
+                .iter()
+                .find(|region| region.target == HitTarget::NewWorktree)
+                .expect("New Worktree hit target");
+            assert_eq!(
+                input::navigation_action(
+                    &app,
+                    &Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: action.area.x,
+                        row: action.area.y,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                ),
+                Some(reducer::Action::NewWorktree)
+            );
+        }
+
+        app.select_node(ExplorerNode::Worktree(worktree_id));
+        assert_eq!(
+            input::navigation_action(
+                &app,
+                &Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            ),
+            Some(reducer::Action::New)
+        );
+        open_create_form(&mut app);
+        assert!(matches!(
+            app.mode,
+            Mode::Modal(Form {
+                kind: FormKind::CreateSession(id),
+                ..
+            }) if id == worktree_id
+        ));
+    }
+
+    #[test]
+    fn attention_banner_keeps_the_last_terminal_row_visible() {
+        let frame_area = Rect::new(0, 0, 120, 32);
+        let normal = render::terminal_panel_area(frame_area, app::FocusZone::Main, false);
+        let attention = render::terminal_panel_area(frame_area, app::FocusZone::Main, true);
+        assert_eq!(normal.height, attention.height.saturating_add(1));
+
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        let session_id = snapshot.sessions[0].id;
+        let rows = attention.height.saturating_sub(2);
+        let columns = attention.width.saturating_sub(2);
+        let mut parser = vt100::Parser::new(rows, columns, 0);
+        parser.process(format!("\x1b[{rows};1Htyped").as_bytes());
+        assert_eq!(
+            parser
+                .screen()
+                .cell(rows.saturating_sub(1), 0)
+                .map(vt100::Cell::contents),
+            Some("t")
+        );
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.focus = app::FocusZone::Main;
+        app.main_tab = TuiContentView::Terminal;
+        app.attached = Some(AttachedTerminal {
+            session_id,
+            role: AttachmentRole::Controller,
+            parser,
+            last_sequence: 1,
+            columns,
+            rows,
+        });
+        let backend = ratatui::backend::TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+
+        let complete_render = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(complete_render.contains("typed"));
+        let rendered = (attention.x.saturating_add(1)..attention.x.saturating_add(6))
+            .map(|column| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, attention.bottom().saturating_sub(2)))
+                    .unwrap()
+                    .symbol()
+            })
+            .collect::<String>();
+        assert_eq!(rendered, "typed");
     }
 
     #[test]

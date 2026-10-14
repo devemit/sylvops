@@ -1,6 +1,10 @@
 //! Pure navigation reducer. Async daemon work is represented as effects.
 
-use sylvops_core::{ids::SessionId, provider::session_can_resume, ui::TuiContentView};
+use sylvops_core::{
+    ids::{ProjectId, SessionId},
+    provider::session_can_resume,
+    ui::TuiContentView,
+};
 
 use crate::app::{App, ExplorerNode, Flash, FlashKind, FocusZone, Mode, Palette};
 
@@ -20,6 +24,7 @@ pub(crate) enum Action {
     Primary,
     Resume,
     New,
+    NewWorktree,
     Rename,
     Delete,
     Diff,
@@ -36,6 +41,7 @@ pub(crate) enum Effect {
     Attach,
     Resume(SessionId),
     OpenCreate,
+    OpenCreateWorktree(ProjectId),
     OpenRename,
     OpenDelete,
     LoadDiff,
@@ -122,6 +128,7 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             }
         }
         Action::New => return vec![Effect::OpenCreate],
+        Action::NewWorktree => return new_worktree_effect(app),
         Action::Rename => return vec![Effect::OpenRename],
         Action::Delete => return vec![Effect::OpenDelete],
         Action::Diff => {
@@ -144,6 +151,12 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
         Action::Quit => return vec![Effect::Quit],
     }
     Vec::new()
+}
+
+fn new_worktree_effect(app: &App) -> Vec<Effect> {
+    app.selected_project()
+        .map(|project| vec![Effect::OpenCreateWorktree(project.id)])
+        .unwrap_or_default()
 }
 
 fn select_active_session(

@@ -31,6 +31,22 @@ pub(crate) struct ViewAreas {
     pub main: Option<Rect>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ScreenAreas {
+    header: Rect,
+    attention: Option<Rect>,
+    body: Rect,
+    footer: Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MainAreas {
+    tabs: Rect,
+    workspace: Rect,
+    content: Rect,
+    actions: Rect,
+}
+
 const SETTINGS_LABEL: &str = " [s] Settings ";
 
 struct ActionItem {
@@ -44,28 +60,19 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let theme = Theme::resolve(app.theme);
     let area = frame.area();
     frame.render_widget(Block::default().style(theme.background), area);
-    let attention_height = u16::from(app.attention_count() > 0);
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(attention_height),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    draw_header(frame, app, vertical[0], theme);
-    if attention_height > 0 {
-        draw_attention(frame, app, vertical[1], theme);
+    let areas = screen_areas(area, app.attention_count() > 0);
+    draw_header(frame, app, areas.header, theme);
+    if let Some(attention) = areas.attention {
+        draw_attention(frame, app, attention, theme);
     }
-    let view = view_areas(vertical[2], app.focus);
+    let view = view_areas(areas.body, app.focus);
     if let Some(explorer) = view.explorer {
         draw_explorer(frame, app, explorer, theme);
     }
     if let Some(main) = view.main {
         draw_main(frame, app, main, theme);
     }
-    draw_footer(frame, app, vertical[3], theme);
+    draw_footer(frame, app, areas.footer, theme);
     if app.help {
         draw_help(frame, area, theme);
     }
@@ -82,6 +89,48 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Mode::GitHub(modal) => draw_github(frame, &modal, &mut app.hit_map, theme),
         Mode::Navigation | Mode::TerminalAttached => {}
     }
+}
+
+fn screen_areas(area: Rect, attention_visible: bool) -> ScreenAreas {
+    let attention_height = u16::from(attention_visible);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(attention_height),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    ScreenAreas {
+        header: vertical[0],
+        attention: attention_visible.then_some(vertical[1]),
+        body: vertical[2],
+        footer: vertical[3],
+    }
+}
+
+fn main_areas(area: Rect) -> MainAreas {
+    let primary = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(2)])
+        .split(area);
+    let workspace = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(primary[1]);
+    MainAreas {
+        tabs: primary[0],
+        workspace: primary[1],
+        content: workspace[0],
+        actions: workspace[1],
+    }
+}
+
+pub(crate) fn terminal_panel_area(area: Rect, focus: FocusZone, attention_visible: bool) -> Rect {
+    let body = screen_areas(area, attention_visible).body;
+    let main = view_areas(body, focus).main.unwrap_or(body);
+    main_areas(main).content
 }
 
 pub(crate) fn view_areas(area: Rect, focus: FocusZone) -> ViewAreas {
@@ -315,10 +364,7 @@ fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
 
 fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     app.hit_map.push(area, HitTarget::FocusMain);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(2)])
-        .split(area);
+    let areas = main_areas(area);
     let titles: Vec<_> = TuiContentView::ALL
         .into_iter()
         .map(|view| Line::from(format!("{} {}", view.shortcut(), view.label())))
@@ -354,17 +400,17 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
             )
             .style(theme.text)
             .highlight_style(theme.focus),
-        chunks[0],
+        areas.tabs,
     );
     let tab_count = u16::try_from(TuiContentView::ALL.len()).unwrap_or(1);
-    let tab_width = chunks[0].width.saturating_sub(2) / tab_count;
+    let tab_width = areas.tabs.width.saturating_sub(2) / tab_count;
     for (index, tab) in TuiContentView::ALL.into_iter().enumerate() {
         app.hit_map.push(
             Rect::new(
-                chunks[0].x.saturating_add(
+                areas.tabs.x.saturating_add(
                     1 + tab_width.saturating_mul(u16::try_from(index).unwrap_or(0)),
                 ),
-                chunks[0].y.saturating_add(1),
+                areas.tabs.y.saturating_add(1),
                 tab_width,
                 1,
             ),
@@ -372,21 +418,17 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         );
     }
     if app.main_tab == TuiContentView::Sessions {
-        draw_sessions(frame, app, chunks[1], theme);
+        draw_sessions(frame, app, areas.workspace, theme);
         return;
     }
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(chunks[1]);
     match app.main_tab {
-        TuiContentView::Terminal => draw_terminal(frame, app, content[0], theme),
-        TuiContentView::Changes => draw_changes(frame, app, content[0], theme),
-        TuiContentView::Details => draw_details(frame, app, content[0], theme),
+        TuiContentView::Terminal => draw_terminal(frame, app, areas.content, theme),
+        TuiContentView::Changes => draw_changes(frame, app, areas.content, theme),
+        TuiContentView::Details => draw_details(frame, app, areas.content, theme),
         TuiContentView::Sessions => unreachable!("Sessions is rendered above"),
     }
-    let actions = contextual_actions(app, content[1].width, theme);
-    draw_action_line(frame, &mut app.hit_map, content[1], &actions, theme);
+    let actions = contextual_actions(app, areas.actions.width, theme);
+    draw_action_line(frame, &mut app.hit_map, areas.actions, &actions, theme);
 }
 
 struct ActiveSessionItem {
@@ -645,16 +687,14 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             Text::from("No session selected.\n\nPress n or click New to create a shell session."),
         )
     };
-    let mut terminal = Paragraph::new(content)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(theme.border),
-        )
-        .wrap(Wrap { trim: false });
+    let mut terminal = Paragraph::new(content).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(theme.border),
+    );
     if !provider_owned {
-        terminal = terminal.style(theme.text);
+        terminal = terminal.style(theme.text).wrap(Wrap { trim: false });
     }
     frame.render_widget(terminal, area);
 }
@@ -996,13 +1036,7 @@ fn contextual_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
     let terse = width < 60 || app.density == TuiDensity::Compact;
     match app.selected_node() {
         Some(ExplorerNode::Workspace(_)) => workspace_actions(terse, theme),
-        Some(ExplorerNode::Project(_)) => entity_actions(
-            terse,
-            "[n] New Worktree",
-            "[n]Tree",
-            "[d] Remove Project",
-            theme,
-        ),
+        Some(ExplorerNode::Project(_)) => project_actions(terse, theme),
         Some(ExplorerNode::Worktree(_)) => worktree_actions(app, terse, theme),
         Some(ExplorerNode::Session(_)) => session_actions(app, terse, theme),
         None => Vec::new(),
@@ -1042,6 +1076,7 @@ fn worktree_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
             theme.success,
         ));
     }
+    actions.push(new_worktree_action(terse, theme));
     actions.push(action_label(
         if terse { "[r]Name" } else { "[r] Rename" },
         HitTarget::Rename,
@@ -1057,26 +1092,28 @@ fn worktree_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
     actions
 }
 
-fn entity_actions(
-    terse: bool,
-    create: &'static str,
-    terse_create: &'static str,
-    removal: &'static str,
-    theme: Theme,
-) -> Vec<ActionItem> {
+fn project_actions(terse: bool, theme: Theme) -> Vec<ActionItem> {
     if terse {
         vec![
-            action_label(removal, HitTarget::Delete, theme.danger),
-            action_label(terse_create, HitTarget::New, theme.success),
+            action_label("[d] Remove Project", HitTarget::Delete, theme.danger),
+            new_worktree_action(true, theme),
             action_label("[r]Name", HitTarget::Rename, theme.text),
         ]
     } else {
         vec![
-            action_label(create, HitTarget::New, theme.success),
+            new_worktree_action(false, theme),
             action_label("[r] Rename", HitTarget::Rename, theme.text),
-            action_label(removal, HitTarget::Delete, theme.danger),
+            action_label("[d] Remove Project", HitTarget::Delete, theme.danger),
         ]
     }
+}
+
+fn new_worktree_action(terse: bool, theme: Theme) -> ActionItem {
+    action_label(
+        if terse { "[w]Tree" } else { "[w] New Worktree" },
+        HitTarget::NewWorktree,
+        theme.success,
+    )
 }
 
 fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
@@ -1092,11 +1129,13 @@ fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
         theme.text,
     );
     let remove = action_label(removal, HitTarget::Delete, theme.danger);
+    let new_worktree = new_worktree_action(terse, theme);
     if terse {
         let mut actions = vec![remove];
         if let Some(primary) = primary {
             actions.push(primary);
         }
+        actions.push(new_worktree);
         actions.push(rename);
         actions
     } else {
@@ -1104,6 +1143,7 @@ fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
         if let Some(primary) = primary {
             actions.push(primary);
         }
+        actions.push(new_worktree);
         actions.push(rename);
         actions.push(remove);
         actions
@@ -1306,7 +1346,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Terminal / Changes / Details / Sessions\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Terminal / Changes / Details / Sessions\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 

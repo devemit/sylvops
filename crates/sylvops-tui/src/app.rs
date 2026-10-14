@@ -177,6 +177,7 @@ pub(crate) enum HitTarget {
     Detach,
     Resume,
     New,
+    NewWorktree,
     Rename,
     Delete,
     Diff,
