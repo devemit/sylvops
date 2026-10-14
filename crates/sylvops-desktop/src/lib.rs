@@ -2550,10 +2550,10 @@ impl DesktopApp {
             .into()
     }
 
-    fn github_detail_header(
-        &self,
-        summary: &sylvops_core::github::GitHubItemSummary,
-    ) -> Element<'_, Message> {
+    fn github_detail_header<'a>(
+        &'a self,
+        summary: &'a sylvops_core::github::GitHubItemSummary,
+    ) -> Element<'a, Message> {
         let pending = self.github_request == RequestState::Pending;
         let mut navigation_actions = row![
             button("Back to list")
