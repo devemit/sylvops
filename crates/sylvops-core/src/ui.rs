@@ -13,6 +13,9 @@ pub const MIN_DESKTOP_WIDTH: u16 = 680;
 pub const MIN_DESKTOP_HEIGHT: u16 = 480;
 pub const MAX_DESKTOP_WIDTH: u16 = 7680;
 pub const MAX_DESKTOP_HEIGHT: u16 = 4320;
+pub const DEFAULT_TUI_NAVIGATOR_WIDTH: u16 = 34;
+pub const MIN_TUI_NAVIGATOR_WIDTH: u16 = 24;
+pub const MAX_TUI_NAVIGATOR_WIDTH: u16 = 80;
 
 /// Main content shown beside the explorer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -85,10 +88,19 @@ impl TuiSessionPresentation {
     pub const ALL: [Self; 2] = [Self::Cards, Self::List];
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiNavigatorView {
+    Active,
+    #[default]
+    #[serde(other)]
+    Explorer,
+}
+
 /// Navigation state safe to persist between TUI runs.
 ///
 /// Deliberately excludes form values, searches, terminal data, and credentials.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuiState {
     pub selected_project_id: Option<ProjectId>,
@@ -97,8 +109,39 @@ pub struct TuiState {
     #[serde(alias = "selected_main_tab")]
     pub selected_content_view: TuiContentView,
     pub session_presentation: TuiSessionPresentation,
+    pub navigator_view: TuiNavigatorView,
+    pub navigator_width: u16,
     pub theme: TuiTheme,
     pub density: TuiDensity,
+}
+
+impl Default for TuiState {
+    fn default() -> Self {
+        Self {
+            selected_project_id: None,
+            selected_worktree_id: None,
+            selected_session_id: None,
+            selected_content_view: TuiContentView::Sessions,
+            session_presentation: TuiSessionPresentation::Cards,
+            navigator_view: TuiNavigatorView::Explorer,
+            navigator_width: DEFAULT_TUI_NAVIGATOR_WIDTH,
+            theme: TuiTheme::TerminalDefault,
+            density: TuiDensity::Comfortable,
+        }
+    }
+}
+
+impl TuiState {
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        if self.selected_content_view == TuiContentView::Sessions {
+            self.selected_content_view = TuiContentView::Terminal;
+        }
+        self.navigator_width = self
+            .navigator_width
+            .clamp(MIN_TUI_NAVIGATOR_WIDTH, MAX_TUI_NAVIGATOR_WIDTH);
+        self
+    }
 }
 
 /// Terminal-safe application chrome themes. Provider-owned terminal output is
@@ -427,6 +470,8 @@ mod tests {
             keys,
             [
                 "density",
+                "navigator_view",
+                "navigator_width",
                 "selected_content_view",
                 "selected_project_id",
                 "selected_session_id",
@@ -446,6 +491,12 @@ mod tests {
         let fresh = TuiState::default();
         assert_eq!(fresh.selected_content_view, TuiContentView::Sessions);
         assert_eq!(fresh.session_presentation, TuiSessionPresentation::Cards);
+        assert_eq!(fresh.navigator_view, TuiNavigatorView::Explorer);
+        assert_eq!(fresh.navigator_width, DEFAULT_TUI_NAVIGATOR_WIDTH);
+        assert_eq!(
+            fresh.clone().normalized().selected_content_view,
+            TuiContentView::Terminal
+        );
         assert_eq!(
             TuiContentView::ALL.map(|view| (view.shortcut(), view.label())),
             [
@@ -474,6 +525,7 @@ mod tests {
         .unwrap();
         assert_eq!(unknown.selected_content_view, TuiContentView::Sessions);
         assert_eq!(unknown.session_presentation, TuiSessionPresentation::Cards);
+        assert_eq!(unknown.navigator_view, TuiNavigatorView::Explorer);
     }
 
     #[test]

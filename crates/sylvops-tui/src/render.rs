@@ -14,11 +14,17 @@ use sylvops_core::{
         GitHubItemState, GitHubReviewState,
     },
     provider::session_can_resume,
-    ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiTheme},
+    ui::{
+        MAX_TUI_NAVIGATOR_WIDTH, MIN_TUI_NAVIGATOR_WIDTH, TuiContentView, TuiDensity,
+        TuiNavigatorView, TuiSessionPresentation, TuiTheme,
+    },
 };
 
 use crate::{
-    app::{App, ExplorerNode, FocusZone, HitMap, HitTarget, Mode, SettingsFocus},
+    app::{
+        App, ExplorerNode, FocusZone, HitMap, HitTarget, MAIN_VIEWS, Mode, NavigatorResizeState,
+        SettingsFocus,
+    },
     directory_browser::{DirectoryBrowser, display_path},
     forms::{Form, FormKind},
     github_modal::{GitHubDepth, GitHubLoad, GitHubModal, StartWorkFocus, StartWorkForm},
@@ -28,10 +34,29 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ViewAreas {
     pub explorer: Option<Rect>,
+    pub divider: Option<Rect>,
     pub main: Option<Rect>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ScreenAreas {
+    header: Rect,
+    attention: Option<Rect>,
+    body: Rect,
+    footer: Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MainAreas {
+    tabs: Rect,
+    workspace: Rect,
+}
+
 const SETTINGS_LABEL: &str = " [s] Settings ";
+
+const fn focus_marker(focused: bool) -> &'static str {
+    if focused { "● " } else { "  " }
+}
 
 struct ActionItem {
     label: String,
@@ -44,28 +69,22 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let theme = Theme::resolve(app.theme);
     let area = frame.area();
     frame.render_widget(Block::default().style(theme.background), area);
-    let attention_height = u16::from(app.attention_count() > 0);
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(attention_height),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    draw_header(frame, app, vertical[0], theme);
-    if attention_height > 0 {
-        draw_attention(frame, app, vertical[1], theme);
+    let areas = screen_areas(area, app.attention_count() > 0);
+    draw_header(frame, app, areas.header, theme);
+    if let Some(attention) = areas.attention {
+        draw_attention(frame, app, attention, theme);
     }
-    let view = view_areas(vertical[2], app.focus);
+    let view = view_areas(areas.body, app.focus, app.navigator_width);
     if let Some(explorer) = view.explorer {
-        draw_explorer(frame, app, explorer, theme);
+        draw_navigator(frame, app, explorer, theme);
+    }
+    if let Some(divider) = view.divider {
+        draw_navigator_divider(frame, app, divider, theme);
     }
     if let Some(main) = view.main {
         draw_main(frame, app, main, theme);
     }
-    draw_footer(frame, app, vertical[3], theme);
+    draw_footer(frame, app, areas.footer, theme);
     if app.help {
         draw_help(frame, area, theme);
     }
@@ -84,30 +103,157 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-pub(crate) fn view_areas(area: Rect, focus: FocusZone) -> ViewAreas {
+fn screen_areas(area: Rect, attention_visible: bool) -> ScreenAreas {
+    let attention_height = u16::from(attention_visible);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(attention_height),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    ScreenAreas {
+        header: vertical[0],
+        attention: attention_visible.then_some(vertical[1]),
+        body: vertical[2],
+        footer: vertical[3],
+    }
+}
+
+fn main_areas(area: Rect) -> MainAreas {
+    let primary = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(2)])
+        .split(area);
+    MainAreas {
+        tabs: primary[0],
+        workspace: primary[1],
+    }
+}
+
+pub(crate) fn terminal_panel_area(
+    area: Rect,
+    focus: FocusZone,
+    requested_width: u16,
+    attention_visible: bool,
+) -> Rect {
+    let body = screen_areas(area, attention_visible).body;
+    let main = view_areas(body, focus, requested_width)
+        .main
+        .unwrap_or(body);
+    main_areas(main).workspace
+}
+
+pub(crate) fn view_areas(area: Rect, focus: FocusZone, requested_width: u16) -> ViewAreas {
     if area.width < 72 {
         return match focus {
             FocusZone::Explorer => ViewAreas {
                 explorer: Some(area),
+                divider: None,
                 main: None,
             },
             FocusZone::Main => ViewAreas {
                 explorer: None,
+                divider: None,
                 main: Some(area),
             },
         };
     }
-    let explorer_width = if area.width >= 96 { 34 } else { 26 };
+    let maximum = area.width.saturating_sub(41).min(MAX_TUI_NAVIGATOR_WIDTH);
+    let minimum = MIN_TUI_NAVIGATOR_WIDTH.min(maximum);
+    let explorer_width = requested_width.clamp(minimum, maximum);
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(explorer_width.min(area.width / 2)),
-            Constraint::Min(30),
+            Constraint::Length(explorer_width),
+            Constraint::Length(1),
+            Constraint::Min(40),
         ])
         .split(area);
     ViewAreas {
         explorer: Some(split[0]),
-        main: Some(split[1]),
+        divider: Some(split[1]),
+        main: Some(split[2]),
+    }
+}
+
+fn draw_navigator_divider(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    frame.render_widget(
+        Paragraph::new(Text::from(
+            (0..area.height)
+                .map(|_| Line::from("│"))
+                .collect::<Vec<_>>(),
+        ))
+        .style(
+            if app.navigator_resizing == NavigatorResizeState::Dragging {
+                theme.focus
+            } else {
+                theme.border
+            },
+        ),
+        area,
+    );
+    app.hit_map.push(area, HitTarget::NavigatorDivider);
+}
+
+fn draw_navigator(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    app.hit_map.push(area, HitTarget::FocusExplorer);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(2)])
+        .split(area);
+    let active_count = app.active_sessions().len();
+    let navigator_focused = app.focus == FocusZone::Explorer;
+    let explorer_selected = app.navigator_view == TuiNavigatorView::Explorer;
+    let active_selected = app.navigator_view == TuiNavigatorView::Active;
+    let explorer_label = format!(
+        "{}[e] Explorer",
+        focus_marker(navigator_focused && explorer_selected)
+    );
+    let active_label = format!(
+        "{}[a] Active ({active_count})",
+        focus_marker(navigator_focused && active_selected)
+    );
+    let explorer_style = if navigator_focused && explorer_selected {
+        theme.focus
+    } else if explorer_selected {
+        theme.selected
+    } else {
+        theme.text
+    };
+    let active_style = if navigator_focused && active_selected {
+        theme.focus
+    } else if active_selected {
+        theme.selected
+    } else {
+        theme.text
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{explorer_label}  "), explorer_style),
+            Span::styled(active_label.clone(), active_style),
+        ])),
+        sections[0],
+    );
+    let explorer_width = text_width(&explorer_label).saturating_add(2);
+    app.hit_map.push(
+        Rect::new(sections[0].x, sections[0].y, explorer_width, 1),
+        HitTarget::NavigatorExplorer,
+    );
+    app.hit_map.push(
+        Rect::new(
+            sections[0].x.saturating_add(explorer_width),
+            sections[0].y,
+            text_width(&active_label),
+            1,
+        ),
+        HitTarget::NavigatorActive,
+    );
+    match app.navigator_view {
+        TuiNavigatorView::Explorer => draw_explorer(frame, app, sections[1], theme),
+        TuiNavigatorView::Active => draw_sessions(frame, app, sections[1], theme),
     }
 }
 
@@ -214,22 +360,12 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             })
             .collect()
     };
-    let focused = app.focus == FocusZone::Explorer;
     let block = Block::default()
-        .title(if focused {
-            " Explorer [active] "
-        } else {
-            " Explorer "
-        })
+        .title(" Explorer ")
         .borders(Borders::ALL)
-        .border_style(if focused { theme.focus } else { theme.border });
+        .border_style(theme.border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let action_height = u16::from(inner.height > 0);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(action_height)])
-        .split(inner);
     let mut state =
         ListState::default().with_selected((!rows.is_empty()).then_some(app.explorer_index));
     frame.render_stateful_widget(
@@ -237,7 +373,7 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             .style(theme.text)
             .highlight_symbol("› ")
             .highlight_style(theme.selected),
-        chunks[0],
+        inner,
         &mut state,
     );
     let row_height = if app.density == TuiDensity::Comfortable {
@@ -247,25 +383,23 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     };
     for (index, _) in rows
         .iter()
-        .take(usize::from(chunks[0].height / row_height))
+        .take(usize::from(inner.height / row_height))
         .enumerate()
     {
         app.hit_map.push(
             Rect::new(
-                chunks[0].x,
-                chunks[0].y.saturating_add(
+                inner.x,
+                inner.y.saturating_add(
                     u16::try_from(index)
                         .unwrap_or(u16::MAX)
                         .saturating_mul(row_height),
                 ),
-                chunks[0].width,
+                inner.width,
                 row_height,
             ),
             HitTarget::ExplorerRow(index),
         );
     }
-    let actions = contextual_actions(app, chunks[1].width, theme);
-    draw_action_line(frame, &mut app.hit_map, chunks[1], &actions, theme);
 }
 
 fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
@@ -315,23 +449,16 @@ fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
 
 fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     app.hit_map.push(area, HitTarget::FocusMain);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(2)])
-        .split(area);
-    let titles: Vec<_> = TuiContentView::ALL
+    let areas = main_areas(area);
+    let titles: Vec<_> = MAIN_VIEWS
         .into_iter()
         .map(|view| Line::from(format!("{} {}", view.shortcut(), view.label())))
         .collect();
-    let selected = TuiContentView::ALL
+    let selected = MAIN_VIEWS
         .iter()
         .position(|view| *view == app.main_tab)
         .unwrap_or(0);
-    let focus_label = if app.focus == FocusZone::Main {
-        " Main [active]"
-    } else {
-        " Main"
-    };
+    let focus_label = format!(" {}Main", focus_marker(app.focus == FocusZone::Main));
     let title = app.selected_session().map_or_else(
         || format!("{focus_label} · Session workspace "),
         |session| {
@@ -353,40 +480,31 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
                     .border_style(theme.border),
             )
             .style(theme.text)
-            .highlight_style(theme.focus),
-        chunks[0],
+            .highlight_style(theme.focus.add_modifier(Modifier::REVERSED)),
+        areas.tabs,
     );
-    let tab_count = u16::try_from(TuiContentView::ALL.len()).unwrap_or(1);
-    let tab_width = chunks[0].width.saturating_sub(2) / tab_count;
-    for (index, tab) in TuiContentView::ALL.into_iter().enumerate() {
+    let tab_count = u16::try_from(MAIN_VIEWS.len()).unwrap_or(1);
+    let tab_width = areas.tabs.width.saturating_sub(2) / tab_count;
+    for (index, tab) in MAIN_VIEWS.into_iter().enumerate() {
         app.hit_map.push(
             Rect::new(
-                chunks[0].x.saturating_add(
+                areas.tabs.x.saturating_add(
                     1 + tab_width.saturating_mul(u16::try_from(index).unwrap_or(0)),
                 ),
-                chunks[0].y.saturating_add(1),
+                areas.tabs.y.saturating_add(1),
                 tab_width,
                 1,
             ),
             HitTarget::Tab(tab),
         );
     }
-    if app.main_tab == TuiContentView::Sessions {
-        draw_sessions(frame, app, chunks[1], theme);
-        return;
-    }
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(chunks[1]);
     match app.main_tab {
-        TuiContentView::Terminal => draw_terminal(frame, app, content[0], theme),
-        TuiContentView::Changes => draw_changes(frame, app, content[0], theme),
-        TuiContentView::Details => draw_details(frame, app, content[0], theme),
-        TuiContentView::Sessions => unreachable!("Sessions is rendered above"),
+        TuiContentView::Terminal | TuiContentView::Sessions => {
+            draw_terminal(frame, app, areas.workspace, theme);
+        }
+        TuiContentView::Changes => draw_changes(frame, app, areas.workspace, theme),
+        TuiContentView::Details => draw_details(frame, app, areas.workspace, theme),
     }
-    let actions = contextual_actions(app, content[1].width, theme);
-    draw_action_line(frame, &mut app.hit_map, content[1], &actions, theme);
 }
 
 struct ActiveSessionItem {
@@ -645,16 +763,14 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             Text::from("No session selected.\n\nPress n or click New to create a shell session."),
         )
     };
-    let mut terminal = Paragraph::new(content)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(theme.border),
-        )
-        .wrap(Wrap { trim: false });
+    let mut terminal = Paragraph::new(content).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(theme.border),
+    );
     if !provider_owned {
-        terminal = terminal.style(theme.text);
+        terminal = terminal.style(theme.text).wrap(Wrap { trim: false });
     }
     frame.render_widget(terminal, area);
 }
@@ -996,13 +1112,7 @@ fn contextual_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
     let terse = width < 60 || app.density == TuiDensity::Compact;
     match app.selected_node() {
         Some(ExplorerNode::Workspace(_)) => workspace_actions(terse, theme),
-        Some(ExplorerNode::Project(_)) => entity_actions(
-            terse,
-            "[n] New Worktree",
-            "[n]Tree",
-            "[d] Remove Project",
-            theme,
-        ),
+        Some(ExplorerNode::Project(_)) => project_actions(terse, theme),
         Some(ExplorerNode::Worktree(_)) => worktree_actions(app, terse, theme),
         Some(ExplorerNode::Session(_)) => session_actions(app, terse, theme),
         None => Vec::new(),
@@ -1042,6 +1152,7 @@ fn worktree_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
             theme.success,
         ));
     }
+    actions.push(new_worktree_action(terse, theme));
     actions.push(action_label(
         if terse { "[r]Name" } else { "[r] Rename" },
         HitTarget::Rename,
@@ -1057,26 +1168,28 @@ fn worktree_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
     actions
 }
 
-fn entity_actions(
-    terse: bool,
-    create: &'static str,
-    terse_create: &'static str,
-    removal: &'static str,
-    theme: Theme,
-) -> Vec<ActionItem> {
+fn project_actions(terse: bool, theme: Theme) -> Vec<ActionItem> {
     if terse {
         vec![
-            action_label(removal, HitTarget::Delete, theme.danger),
-            action_label(terse_create, HitTarget::New, theme.success),
+            action_label("[d] Remove Project", HitTarget::Delete, theme.danger),
+            new_worktree_action(true, theme),
             action_label("[r]Name", HitTarget::Rename, theme.text),
         ]
     } else {
         vec![
-            action_label(create, HitTarget::New, theme.success),
+            new_worktree_action(false, theme),
             action_label("[r] Rename", HitTarget::Rename, theme.text),
-            action_label(removal, HitTarget::Delete, theme.danger),
+            action_label("[d] Remove Project", HitTarget::Delete, theme.danger),
         ]
     }
+}
+
+fn new_worktree_action(terse: bool, theme: Theme) -> ActionItem {
+    action_label(
+        if terse { "[w]Tree" } else { "[w] New Worktree" },
+        HitTarget::NewWorktree,
+        theme.success,
+    )
 }
 
 fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
@@ -1092,11 +1205,13 @@ fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
         theme.text,
     );
     let remove = action_label(removal, HitTarget::Delete, theme.danger);
+    let new_worktree = new_worktree_action(terse, theme);
     if terse {
         let mut actions = vec![remove];
         if let Some(primary) = primary {
             actions.push(primary);
         }
+        actions.push(new_worktree);
         actions.push(rename);
         actions
     } else {
@@ -1104,6 +1219,7 @@ fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
         if let Some(primary) = primary {
             actions.push(primary);
         }
+        actions.push(new_worktree);
         actions.push(rename);
         actions.push(remove);
         actions
@@ -1137,14 +1253,25 @@ fn primary_session_action(app: &App, terse: bool, theme: Theme) -> Option<Action
 }
 
 fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
-    let terse = app.density == TuiDensity::Compact;
+    let terse = width < 60 || app.density == TuiDensity::Compact;
+    let navigator_label = if app.navigator_view == TuiNavigatorView::Active {
+        "Active"
+    } else {
+        "Explorer"
+    };
     let mut items = vec![action_label(
-        "Explorer",
+        if terse {
+            format!("F:{navigator_label}")
+        } else {
+            format!("Focus: {navigator_label}")
+        },
         HitTarget::FocusExplorer,
         theme.focus,
     )];
     items.push(action_label(
-        if terse {
+        if width < 60 {
+            "[Tab]M"
+        } else if terse {
             "[Tab] Main"
         } else {
             "[Tab] Focus Main"
@@ -1152,40 +1279,44 @@ fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionIte
         HitTarget::FocusMain,
         theme.text,
     ));
-    items.extend(contextual_actions(app, width, theme));
+    if app.navigator_view == TuiNavigatorView::Active {
+        if let Some(session) = app.selected_session_id.and_then(|id| {
+            app.active_sessions()
+                .into_iter()
+                .find(|session| session.id == id)
+        }) {
+            items.push(action_label(
+                "[Enter] Open",
+                HitTarget::ActiveSessionOpen(session.id),
+                theme.focus,
+            ));
+            items.push(action_label(
+                "[d] Stop",
+                HitTarget::ActiveSessionStop(session.id),
+                theme.danger,
+            ));
+        }
+    } else {
+        items.extend(contextual_actions(app, width, theme));
+    }
     items
 }
 
-fn main_footer_actions(app: &App, theme: Theme) -> Vec<ActionItem> {
-    let terse = app.density == TuiDensity::Compact;
+fn main_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
+    let terse = app.density == TuiDensity::Compact || width < 60;
     let mut items = vec![action_label(
-        app.main_tab.label(),
+        if terse {
+            format!("F:{}", app.main_tab.label())
+        } else {
+            format!("Focus: {}", app.main_tab.label())
+        },
         HitTarget::FocusMain,
         theme.focus,
     )];
     match app.main_tab {
-        TuiContentView::Sessions => {
-            if let Some(session) = app
-                .selected_session_id
-                .and_then(|id| app.active_sessions().into_iter().find(|item| item.id == id))
-            {
-                items.push(action_label(
-                    "[Enter] Open",
-                    HitTarget::ActiveSessionOpen(session.id),
-                    theme.focus,
-                ));
-                items.push(action_label(
-                    "[d] Stop",
-                    HitTarget::ActiveSessionStop(session.id),
-                    theme.danger,
-                ));
-            } else if app.selected_worktree().is_some_and(|worktree| {
-                worktree.status == sylvops_core::domain::WorktreeStatus::Active
-            }) {
-                items.push(action_label("[n] New", HitTarget::New, theme.success));
-            }
+        TuiContentView::Sessions | TuiContentView::Terminal => {
+            add_terminal_footer_action(app, &mut items, theme);
         }
-        TuiContentView::Terminal => add_terminal_footer_action(app, &mut items, theme),
         TuiContentView::Changes if app.selected_worktree_id.is_some() => {
             items.push(action_label("[g] Refresh", HitTarget::Diff, theme.focus));
         }
@@ -1231,7 +1362,7 @@ fn add_terminal_footer_action(app: &App, items: &mut Vec<ActionItem>, theme: The
 fn footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
     let mut actions = match app.focus {
         FocusZone::Explorer => explorer_footer_actions(app, width, theme),
-        FocusZone::Main => main_footer_actions(app, theme),
+        FocusZone::Main => main_footer_actions(app, width, theme),
     };
     actions.push(action_label(
         "[/] Commands",
@@ -1306,7 +1437,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy or Active Sessions\n← →: collapse / expand or move Active Session selection\n1 / 2 / 3 / 4: Terminal / Changes / Details / Sessions\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Active navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 

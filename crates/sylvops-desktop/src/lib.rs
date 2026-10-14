@@ -2550,12 +2550,12 @@ impl DesktopApp {
             .into()
     }
 
-    fn github_detail_header(
-        &self,
-        summary: &sylvops_core::github::GitHubItemSummary,
-    ) -> Element<'_, Message> {
+    fn github_detail_header<'a>(
+        &'a self,
+        summary: &'a sylvops_core::github::GitHubItemSummary,
+    ) -> Element<'a, Message> {
         let pending = self.github_request == RequestState::Pending;
-        let mut actions = row![
+        let mut navigation_actions = row![
             button("Back to list")
                 .on_press(Message::BackToGitHubList)
                 .style(chrome_action_style),
@@ -2575,39 +2575,21 @@ impl DesktopApp {
         ]
         .spacing(6)
         .align_y(Center);
-        if summary.identity.kind == sylvops_core::github::GitHubItemKind::Issue {
-            let local_status = issue_work_status(
-                &summary.identity,
-                &self.snapshot.work_sources,
-                &self.snapshot.worktrees,
-                &self.snapshot.sessions,
-            );
-            let has_local_work = self.existing_issue_work(&summary.identity).is_some();
-            actions = actions.push(
-                button(if has_local_work {
-                    "Open Work"
-                } else {
-                    "Start Work"
-                })
-                .on_press_maybe((!pending).then_some(Message::PrepareStartWork))
-                .style(primary_action_style),
-            );
-            if has_local_work {
-                actions = actions.push(
-                    button("Start another Worktree")
-                        .on_press_maybe((!pending).then_some(Message::PrepareAnotherWorktree))
-                        .style(chrome_action_style),
-                );
-            }
-            actions = actions.push(
-                text(local_status.display_name())
-                    .size(UI_META_SIZE)
-                    .style(text::secondary),
-            );
-        }
-        if self.github_surface.detail.is_loading() {
-            actions = actions.push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
-        }
+        let actions: Element<'_, Message> =
+            if summary.identity.kind == sylvops_core::github::GitHubItemKind::Issue {
+                column![
+                    navigation_actions,
+                    self.github_issue_work_actions(summary, pending)
+                ]
+                .spacing(6)
+                .into()
+            } else {
+                if self.github_surface.detail.is_loading() {
+                    navigation_actions = navigation_actions
+                        .push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
+                }
+                navigation_actions.into()
+            };
         let mut heading = column![
             actions,
             text(format!(
@@ -2644,6 +2626,47 @@ impl DesktopApp {
             );
         }
         heading.into()
+    }
+
+    fn github_issue_work_actions<'a>(
+        &'a self,
+        summary: &'a sylvops_core::github::GitHubItemSummary,
+        pending: bool,
+    ) -> Element<'a, Message> {
+        let local_status = issue_work_status(
+            &summary.identity,
+            &self.snapshot.work_sources,
+            &self.snapshot.worktrees,
+            &self.snapshot.sessions,
+        );
+        let has_local_work = self.existing_issue_work(&summary.identity).is_some();
+        let mut actions = row![
+            button(if has_local_work {
+                "Open Work"
+            } else {
+                "Start Work"
+            })
+            .on_press_maybe((!pending).then_some(Message::PrepareStartWork))
+            .style(primary_action_style),
+        ]
+        .spacing(6)
+        .align_y(Center);
+        if has_local_work {
+            actions = actions.push(
+                button("Start another Worktree")
+                    .on_press_maybe((!pending).then_some(Message::PrepareAnotherWorktree))
+                    .style(chrome_action_style),
+            );
+        }
+        actions = actions.push(
+            text(local_status.display_name())
+                .size(UI_META_SIZE)
+                .style(text::secondary),
+        );
+        if self.github_surface.detail.is_loading() {
+            actions = actions.push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
+        }
+        actions.into()
     }
 
     fn github_comments_view<'a>(
