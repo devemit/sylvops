@@ -1,6 +1,10 @@
 //! Pure navigation reducer. Async daemon work is represented as effects.
 
-use sylvops_core::{ids::SessionId, provider::session_can_resume, ui::TuiContentView};
+use sylvops_core::{
+    ids::{ProjectId, SessionId},
+    provider::session_can_resume,
+    ui::{TuiContentView, TuiNavigatorView},
+};
 
 use crate::app::{App, ExplorerNode, Flash, FlashKind, FocusZone, Mode, Palette};
 
@@ -16,10 +20,16 @@ pub(crate) enum Action {
     SelectActiveSession(SessionId),
     OpenActiveSession(SessionId),
     StopActiveSession(SessionId),
+    SelectNavigatorView(TuiNavigatorView),
+    BeginNavigatorResize,
+    ResizeNavigator(u16),
+    EndNavigatorResize,
+    AdjustNavigatorWidth(i16),
     SelectTab(TuiContentView),
     Primary,
     Resume,
     New,
+    NewWorktree,
     Rename,
     Delete,
     Diff,
@@ -36,6 +46,7 @@ pub(crate) enum Effect {
     Attach,
     Resume(SessionId),
     OpenCreate,
+    OpenCreateWorktree(ProjectId),
     OpenRename,
     OpenDelete,
     LoadDiff,
@@ -44,6 +55,7 @@ pub(crate) enum Effect {
     Quit,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
     match action {
         Action::ToggleFocus => {
@@ -55,26 +67,21 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             app.mark_navigation_dirty();
         }
         Action::Focus(focus) => app.focus = focus,
-        Action::Move(delta) if app.focus == FocusZone::Explorer => app.move_explorer(delta),
         Action::Move(delta)
-            if app.focus == FocusZone::Main && app.main_tab == TuiContentView::Sessions =>
+            if app.focus == FocusZone::Explorer
+                && app.navigator_view == TuiNavigatorView::Active =>
         {
             app.move_active_session(delta);
         }
+        Action::Move(delta) if app.focus == FocusZone::Explorer => app.move_explorer(delta),
         Action::Move(_) => {}
         Action::MoveExplorer(delta) => {
             app.focus = FocusZone::Explorer;
-            app.move_explorer(delta);
-        }
-        Action::Expand
-            if app.focus == FocusZone::Main && app.main_tab == TuiContentView::Sessions =>
-        {
-            app.move_active_session(1);
-        }
-        Action::Collapse
-            if app.focus == FocusZone::Main && app.main_tab == TuiContentView::Sessions =>
-        {
-            app.move_active_session(-1);
+            if app.navigator_view == TuiNavigatorView::Active {
+                app.move_active_session(delta);
+            } else {
+                app.move_explorer(delta);
+            }
         }
         Action::Expand => app.expand_selected(),
         Action::Collapse => app.collapse_selected(),
@@ -83,16 +90,35 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             app.select_explorer_index(index);
         }
         Action::SelectActiveSession(session_id) => {
-            select_active_session(app, session_id, None);
+            select_active_session(app, session_id, None, false);
         }
         Action::OpenActiveSession(session_id) => {
-            return select_active_session(app, session_id, Some(Effect::Attach));
+            return select_active_session(app, session_id, Some(Effect::Attach), true);
         }
         Action::StopActiveSession(session_id) => {
-            return select_active_session(app, session_id, Some(Effect::OpenDelete));
+            return select_active_session(app, session_id, Some(Effect::OpenDelete), false);
         }
+        Action::SelectNavigatorView(view) => app.select_navigator_view(view),
+        Action::BeginNavigatorResize => app.navigator_resizing = true,
+        Action::ResizeNavigator(column) if app.navigator_resizing => {
+            app.set_navigator_width(column);
+        }
+        Action::ResizeNavigator(_) => {}
+        Action::EndNavigatorResize => app.navigator_resizing = false,
+        Action::AdjustNavigatorWidth(delta) => app.adjust_navigator_width(delta),
         Action::SelectTab(tab) => app.set_tab(tab),
         Action::Primary => {
+            if app.focus == FocusZone::Explorer
+                && app.navigator_view == TuiNavigatorView::Active
+                && let Some(session_id) = app.selected_session_id
+                && app
+                    .active_sessions()
+                    .iter()
+                    .any(|session| session.id == session_id)
+            {
+                app.set_tab(TuiContentView::Terminal);
+                return vec![Effect::Attach];
+            }
             if app.focus == FocusZone::Explorer {
                 match app
                     .explorer_rows()
@@ -103,11 +129,7 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
                     Some(_) => app.expand_selected(),
                     None => return vec![Effect::OpenCreate],
                 }
-            } else if matches!(
-                app.main_tab,
-                TuiContentView::Terminal | TuiContentView::Sessions
-            ) && app.selected_session().is_some()
-            {
+            } else if app.main_tab == TuiContentView::Terminal && app.selected_session().is_some() {
                 return vec![Effect::Attach];
             }
         }
@@ -122,6 +144,7 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             }
         }
         Action::New => return vec![Effect::OpenCreate],
+        Action::NewWorktree => return new_worktree_effect(app),
         Action::Rename => return vec![Effect::OpenRename],
         Action::Delete => return vec![Effect::OpenDelete],
         Action::Diff => {
@@ -146,13 +169,26 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
     Vec::new()
 }
 
+fn new_worktree_effect(app: &App) -> Vec<Effect> {
+    app.selected_project()
+        .map(|project| vec![Effect::OpenCreateWorktree(project.id)])
+        .unwrap_or_default()
+}
+
 fn select_active_session(
     app: &mut App,
     session_id: SessionId,
     effect: Option<Effect>,
+    focus_main: bool,
 ) -> Vec<Effect> {
-    app.focus = FocusZone::Main;
     if app.select_active_session(session_id) {
+        app.navigator_view = TuiNavigatorView::Active;
+        if focus_main {
+            app.set_tab(TuiContentView::Terminal);
+        } else {
+            app.focus = FocusZone::Explorer;
+            app.mark_navigation_dirty();
+        }
         effect.into_iter().collect()
     } else {
         app.flash = Some(Flash::transient(

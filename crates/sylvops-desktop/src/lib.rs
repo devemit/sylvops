@@ -2555,7 +2555,7 @@ impl DesktopApp {
         summary: &sylvops_core::github::GitHubItemSummary,
     ) -> Element<'_, Message> {
         let pending = self.github_request == RequestState::Pending;
-        let mut actions = row![
+        let mut navigation_actions = row![
             button("Back to list")
                 .on_press(Message::BackToGitHubList)
                 .style(chrome_action_style),
@@ -2575,39 +2575,50 @@ impl DesktopApp {
         ]
         .spacing(6)
         .align_y(Center);
-        if summary.identity.kind == sylvops_core::github::GitHubItemKind::Issue {
-            let local_status = issue_work_status(
-                &summary.identity,
-                &self.snapshot.work_sources,
-                &self.snapshot.worktrees,
-                &self.snapshot.sessions,
-            );
-            let has_local_work = self.existing_issue_work(&summary.identity).is_some();
-            actions = actions.push(
-                button(if has_local_work {
-                    "Open Work"
-                } else {
-                    "Start Work"
-                })
-                .on_press_maybe((!pending).then_some(Message::PrepareStartWork))
-                .style(primary_action_style),
-            );
-            if has_local_work {
-                actions = actions.push(
-                    button("Start another Worktree")
-                        .on_press_maybe((!pending).then_some(Message::PrepareAnotherWorktree))
-                        .style(chrome_action_style),
+        let actions: Element<'_, Message> =
+            if summary.identity.kind == sylvops_core::github::GitHubItemKind::Issue {
+                let local_status = issue_work_status(
+                    &summary.identity,
+                    &self.snapshot.work_sources,
+                    &self.snapshot.worktrees,
+                    &self.snapshot.sessions,
                 );
-            }
-            actions = actions.push(
-                text(local_status.display_name())
-                    .size(UI_META_SIZE)
-                    .style(text::secondary),
-            );
-        }
-        if self.github_surface.detail.is_loading() {
-            actions = actions.push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
-        }
+                let has_local_work = self.existing_issue_work(&summary.identity).is_some();
+                let mut work_actions = row![
+                    button(if has_local_work {
+                        "Open Work"
+                    } else {
+                        "Start Work"
+                    })
+                    .on_press_maybe((!pending).then_some(Message::PrepareStartWork))
+                    .style(primary_action_style),
+                ]
+                .spacing(6)
+                .align_y(Center);
+                if has_local_work {
+                    work_actions = work_actions.push(
+                        button("Start another Worktree")
+                            .on_press_maybe((!pending).then_some(Message::PrepareAnotherWorktree))
+                            .style(chrome_action_style),
+                    );
+                }
+                work_actions = work_actions.push(
+                    text(local_status.display_name())
+                        .size(UI_META_SIZE)
+                        .style(text::secondary),
+                );
+                if self.github_surface.detail.is_loading() {
+                    work_actions = work_actions
+                        .push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
+                }
+                column![navigation_actions, work_actions].spacing(6).into()
+            } else {
+                if self.github_surface.detail.is_loading() {
+                    navigation_actions = navigation_actions
+                        .push(text("Loading…").size(UI_META_SIZE).style(text::secondary));
+                }
+                navigation_actions.into()
+            };
         let mut heading = column![
             actions,
             text(format!(

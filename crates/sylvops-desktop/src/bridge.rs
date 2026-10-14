@@ -115,9 +115,7 @@ pub(crate) enum TerminalInputError {
 
 enum NextCommand {
     Pending(BridgeCommand),
-    PendingAfterInputFailure(BridgeCommand),
     Await,
-    InputFailed,
     Closed,
 }
 
@@ -400,7 +398,7 @@ fn run_worker(
             return;
         }
     };
-    runtime.block_on(run_worker_async(paths, commands, events, input_closed));
+    runtime.block_on(run_worker_async(paths, commands, events));
     input_closed.store(true, Ordering::Release);
 }
 
@@ -409,7 +407,6 @@ async fn run_worker_async(
     paths: RuntimePaths,
     mut commands: mpsc::Receiver<BridgeCommand>,
     events: EventSink,
-    input_closed: &AtomicBool,
 ) {
     let client = match DaemonClient::connect(&paths, "sylvops-desktop").await {
         Ok(client) => client,
@@ -473,7 +470,6 @@ async fn run_worker_async(
 
     let mut daemon_events = client.subscribe();
     let mut deferred_command = None;
-    let mut terminal_input_open = true;
     loop {
         let command = if let Some(command) = deferred_command.take() {
             Some(command)
@@ -550,30 +546,14 @@ async fn run_worker_async(
                 }
             }
             BridgeCommand::TerminalInput { session_id, bytes } => {
-                if terminal_input_open {
-                    match send_terminal_input_batch(
-                        &client,
-                        &events,
-                        &mut commands,
-                        session_id,
-                        bytes,
-                    )
+                match send_terminal_input_batch(&client, &events, &mut commands, session_id, bytes)
                     .await
-                    {
-                        NextCommand::Pending(command) => {
-                            deferred_command = Some(command);
-                        }
-                        NextCommand::PendingAfterInputFailure(command) => {
-                            deferred_command = Some(command);
-                            terminal_input_open = false;
-                        }
-                        NextCommand::Await => {}
-                        NextCommand::InputFailed => terminal_input_open = false,
-                        NextCommand::Closed => break,
+                {
+                    NextCommand::Pending(command) => {
+                        deferred_command = Some(command);
                     }
-                    if !terminal_input_open {
-                        input_closed.store(true, Ordering::Release);
-                    }
+                    NextCommand::Await => {}
+                    NextCommand::Closed => break,
                 }
             }
             BridgeCommand::FlushTerminalInput => {}
@@ -606,7 +586,7 @@ async fn send_terminal_input_batch(
                 .await
                 .is_err()
         {
-            return NextCommand::InputFailed;
+            return NextCommand::Await;
         }
         if offset < input_bytes.len() {
             continue;
@@ -621,28 +601,16 @@ async fn send_terminal_input_batch(
                 offset = 0;
             }
             Ok(Some(command)) => {
-                return if flush_terminal_input_batch(client, events, session_id, &mut batch)
-                    .await
-                    .is_ok()
-                {
-                    NextCommand::Pending(command)
-                } else {
-                    NextCommand::PendingAfterInputFailure(command)
-                };
+                let _ = flush_terminal_input_batch(client, events, session_id, &mut batch).await;
+                return NextCommand::Pending(command);
             }
             Ok(None) => {
                 let _ = flush_terminal_input_batch(client, events, session_id, &mut batch).await;
                 return NextCommand::Closed;
             }
             Err(_) => {
-                return if flush_terminal_input_batch(client, events, session_id, &mut batch)
-                    .await
-                    .is_ok()
-                {
-                    NextCommand::Await
-                } else {
-                    NextCommand::InputFailed
-                };
+                let _ = flush_terminal_input_batch(client, events, session_id, &mut batch).await;
+                return NextCommand::Await;
             }
         }
     }
@@ -663,7 +631,7 @@ async fn flush_terminal_input_batch(
         Ok(_) => {
             events.send_critical(BridgeEvent::Error {
                 operation: Some(Operation::Input(session_id)),
-                message: "the daemon returned an unexpected input acknowledgement; terminal input was stopped before any later queued bytes could be sent".into(),
+                message: "the daemon returned an unexpected input acknowledgement; the rejected input batch was not retried".into(),
             });
             Err(TerminalInputDeliveryFailed)
         }
@@ -696,9 +664,7 @@ fn bounded_input_error(message: &str) -> String {
         })
         .take(512)
         .collect();
-    format!(
-        "terminal input transport failed; terminal input was stopped before any later queued bytes could be sent: {detail}"
-    )
+    format!("terminal input transport failed; the rejected input batch was not retried: {detail}")
 }
 
 fn send_startup_error(events: &EventSink, message: String) {
@@ -850,7 +816,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(next, NextCommand::InputFailed));
+        assert!(matches!(next, NextCommand::Await));
         assert!(matches!(
             bridge.drain(1).as_slice(),
             [BridgeEvent::Error {
@@ -861,6 +827,59 @@ mod tests {
                 && !message.contains('\n')
                 && message.chars().count() <= 620
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_session_input_preserves_the_next_sessions_command() {
+        let (bridge, harness) = Bridge::harness();
+        let (commands, mut command_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let failed_session_id = SessionId::new();
+        let next_session_id = SessionId::new();
+        commands
+            .try_send(BridgeCommand::TerminalInput {
+                session_id: next_session_id,
+                bytes: vec![b'y'],
+            })
+            .expect("next Session input");
+
+        let next = send_terminal_input_batch(
+            &DisconnectedInputTransport,
+            &harness.events,
+            &mut command_rx,
+            failed_session_id,
+            vec![b'x'],
+        )
+        .await;
+
+        let NextCommand::Pending(BridgeCommand::TerminalInput { session_id, bytes }) = next else {
+            panic!("failed Session input must preserve the next Session command");
+        };
+        assert_eq!(session_id, next_session_id);
+        assert_eq!(bytes, vec![b'y']);
+        assert!(matches!(
+            bridge.drain(1).as_slice(),
+            [BridgeEvent::Error {
+                operation: Some(Operation::Input(id)),
+                ..
+            }] if *id == failed_session_id
+        ));
+
+        let transport = RecordingInputTransport::default();
+        let next = send_terminal_input_batch(
+            &transport,
+            &harness.events,
+            &mut command_rx,
+            session_id,
+            bytes,
+        )
+        .await;
+
+        assert!(matches!(next, NextCommand::Await));
+        assert_eq!(
+            transport.batches.into_inner().expect("batch lock"),
+            vec![vec![b'y']]
+        );
+        assert_eq!(bridge.drain(1).len(), 0);
     }
 
     #[tokio::test]
