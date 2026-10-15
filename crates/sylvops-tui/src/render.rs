@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
@@ -773,6 +773,20 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         terminal = terminal.style(theme.text).wrap(Wrap { trim: false });
     }
     frame.render_widget(terminal, area);
+
+    if let Some(screen) = app.attached.as_ref().map(|attached| attached.parser.screen())
+        && !screen.hide_cursor()
+    {
+        let (row, column) = screen.cursor_position();
+        let inner_width = area.width.saturating_sub(2);
+        let inner_height = area.height.saturating_sub(2);
+        if column < inner_width && row < inner_height {
+            frame.set_cursor_position(Position::new(
+                area.x.saturating_add(1).saturating_add(column),
+                area.y.saturating_add(1).saturating_add(row),
+            ));
+        }
+    }
 }
 
 fn terminal_text(screen: &vt100::Screen) -> Text<'static> {
