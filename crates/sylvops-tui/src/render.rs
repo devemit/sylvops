@@ -517,6 +517,9 @@ struct ActiveSessionItem {
     last_activity_at: i64,
 }
 
+const SESSION_CARD_HEIGHT: u16 = 7;
+const SESSION_LIST_ROW_HEIGHT: u16 = 1;
+
 fn draw_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let sessions = app
         .active_sessions()
@@ -566,19 +569,19 @@ fn draw_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     }
 
     let columns = session_columns(inner.width, app.session_presentation);
+    let item_height = session_item_height(app.session_presentation);
     let gap = u16::from(columns == 2);
-    let card_width = inner
+    let item_width = inner
         .width
         .saturating_sub(gap)
         .checked_div(columns)
         .unwrap_or(inner.width);
-    let card_height = 7;
     let selected_index = app
         .selected_session_id
         .and_then(|selected| sessions.iter().position(|session| session.id == selected))
         .unwrap_or(0);
     let selected_row = selected_index / usize::from(columns);
-    let visible_rows = usize::from(inner.height / card_height).max(1);
+    let visible_rows = usize::from(inner.height / item_height).max(1);
     let first_row = selected_row.saturating_sub(visible_rows.saturating_sub(1));
     let first_index = first_row.saturating_mul(usize::from(columns));
     let visible_count = visible_rows.saturating_mul(usize::from(columns));
@@ -594,27 +597,34 @@ fn draw_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         let x = inner.x.saturating_add(
             u16::try_from(column)
                 .unwrap_or(0)
-                .saturating_mul(card_width.saturating_add(gap)),
+                .saturating_mul(item_width.saturating_add(gap)),
         );
         let y = inner.y.saturating_add(
             u16::try_from(visible_row)
                 .unwrap_or(u16::MAX)
-                .saturating_mul(card_height),
+                .saturating_mul(item_height),
         );
-        let card = Rect::new(
+        let item_area = Rect::new(
             x,
             y,
-            card_width.min(inner.x.saturating_add(inner.width).saturating_sub(x)),
-            card_height.min(inner.y.saturating_add(inner.height).saturating_sub(y)),
+            item_width.min(inner.x.saturating_add(inner.width).saturating_sub(x)),
+            item_height.min(inner.y.saturating_add(inner.height).saturating_sub(y)),
         );
         draw_active_session(
             frame,
             app,
-            card,
+            item_area,
             session,
             app.selected_session_id == Some(session.id),
             theme,
         );
+    }
+}
+
+const fn session_item_height(presentation: TuiSessionPresentation) -> u16 {
+    match presentation {
+        TuiSessionPresentation::Cards => SESSION_CARD_HEIGHT,
+        TuiSessionPresentation::List => SESSION_LIST_ROW_HEIGHT,
     }
 }
 
@@ -627,6 +637,46 @@ const fn session_columns(width: u16, presentation: TuiSessionPresentation) -> u1
 }
 
 fn draw_active_session(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    session: &ActiveSessionItem,
+    selected: bool,
+    theme: Theme,
+) {
+    match app.session_presentation {
+        TuiSessionPresentation::Cards => {
+            draw_active_session_card(frame, app, area, session, selected, theme);
+        }
+        TuiSessionPresentation::List => {
+            draw_active_session_list(frame, app, area, session, selected, theme);
+        }
+    }
+}
+
+fn draw_active_session_list(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    session: &ActiveSessionItem,
+    selected: bool,
+    theme: Theme,
+) {
+    let line = Line::from(vec![
+        Span::styled(
+            format!("{} {}", status_symbol(session.state), session.name),
+            Modifier::BOLD,
+        ),
+        Span::raw(format!(" · {}", status_label(session.state))),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(if selected { theme.selected } else { theme.text }),
+        area,
+    );
+    app.hit_map.push(area, HitTarget::ActiveSession(session.id));
+}
+
+fn draw_active_session_card(
     frame: &mut Frame<'_>,
     app: &mut App,
     area: Rect,
@@ -774,7 +824,10 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     }
     frame.render_widget(terminal, area);
 
-    if let Some(screen) = app.attached.as_ref().map(|attached| attached.parser.screen())
+    if let Some(screen) = app
+        .attached
+        .as_ref()
+        .map(|attached| attached.parser.screen())
         && !screen.hide_cursor()
     {
         let (row, column) = screen.cursor_position();
