@@ -3594,7 +3594,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_cards_and_list_render_identical_content_with_responsive_hit_targets() {
+    fn sessions_cards_are_detailed_and_list_rows_are_compact_with_responsive_hit_targets() {
         let mut snapshot = populated_snapshot();
         snapshot.captured_at = 120_000;
         snapshot.sessions[0].display_name = "running shell".into();
@@ -3660,16 +3660,21 @@ mod tests {
         }));
 
         let (list, list_hits) = render(140, TuiSessionPresentation::List);
-        let list_x = list_hits
+        let list_items = list_hits
             .0
             .iter()
             .filter_map(|region| match region.target {
-                HitTarget::ActiveSession(_) => Some(region.area.x),
+                HitTarget::ActiveSession(_) => Some(region.area),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(list_x.len(), 3);
-        assert!(list_x.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(list_items.len(), 3);
+        assert!(list_items.iter().all(|area| area.height == 1));
+        assert!(
+            list_items
+                .windows(2)
+                .all(|pair| { pair[0].x == pair[1].x && pair[0].y.saturating_add(1) == pair[1].y })
+        );
 
         let (_, narrow_hits) = render(84, TuiSessionPresentation::Cards);
         let narrow_x = narrow_hits
@@ -3685,13 +3690,19 @@ mod tests {
         for text in [&cards, &list] {
             assert!(text.contains("feedback codex"));
             assert!(text.contains("Needs feedback"));
-            assert!(text.contains("Provider: Shell"));
-            assert!(text.contains("Project: repo"));
-            assert!(text.contains("Worktree: root"));
-            assert!(text.contains("Activity: 1m ago"));
-            assert!(text.contains("Open terminal"));
-            assert!(text.contains("Stop"));
         }
+        assert!(cards.contains("Provider: Shell"));
+        assert!(cards.contains("Project: repo"));
+        assert!(cards.contains("Worktree: root"));
+        assert!(cards.contains("Activity: 1m ago"));
+        assert!(cards.contains("Open terminal"));
+        assert!(cards.contains("Stop"));
+
+        assert!(!list.contains("Provider: Shell"));
+        assert!(!list.contains("Project: repo"));
+        assert!(!list.contains("Worktree: root"));
+        assert!(!list.contains("Activity: 1m ago"));
+        assert!(!list.contains("Open terminal"));
     }
 
     #[test]
