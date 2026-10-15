@@ -3762,6 +3762,13 @@ mod tests {
             );
         }
 
+        // Compact list rows omit inline actions, so exercise mouse actions on a card render.
+        app.session_presentation = TuiSessionPresentation::Cards;
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
         let selected = app.selected_session_id.unwrap();
         let open = app
             .hit_map
