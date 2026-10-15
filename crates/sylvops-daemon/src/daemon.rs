@@ -3426,6 +3426,8 @@ async fn spawn_managed_session(
     rows: u16,
 ) -> Result<(u64, Session)> {
     let session_id = record.id;
+    let operation_lock = session_operation_lock(state, session_id).await;
+    let _operation_guard = operation_lock.lock().await;
     let provider_kind = record.provider_kind;
     let cwd = PathBuf::from(&record.cwd);
     let owned_runtime_paths = Arc::new(runtime.owned_paths);

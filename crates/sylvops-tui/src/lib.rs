@@ -3593,6 +3593,30 @@ mod tests {
         );
     }
 
+    fn render_active_sessions(
+        snapshot: &DaemonSnapshot,
+        width: u16,
+        presentation: TuiSessionPresentation,
+    ) -> (String, app::HitMap) {
+        let backend = ratatui::backend::TestBackend::new(width, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        app.select_navigator_view(TuiNavigatorView::Active);
+        app.navigator_width = 80;
+        app.session_presentation = presentation;
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        (text, app.hit_map)
+    }
+
     #[test]
     fn sessions_cards_are_detailed_and_list_rows_are_compact_with_responsive_hit_targets() {
         let mut snapshot = populated_snapshot();
@@ -3611,27 +3635,8 @@ mod tests {
             snapshot.sessions.push(session);
         }
 
-        let render = |width, presentation| {
-            let backend = ratatui::backend::TestBackend::new(width, 32);
-            let mut terminal = Terminal::new(backend).unwrap();
-            let mut app = App::new(snapshot.clone(), Vec::new(), None);
-            app.select_navigator_view(TuiNavigatorView::Active);
-            app.navigator_width = 80;
-            app.session_presentation = presentation;
-            terminal
-                .draw(|frame| render::draw(frame, &mut app))
-                .unwrap();
-            let text = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(ratatui::buffer::Cell::symbol)
-                .collect::<String>();
-            (text, app.hit_map)
-        };
-
-        let (cards, card_hits) = render(140, TuiSessionPresentation::Cards);
+        let (cards, card_hits) =
+            render_active_sessions(&snapshot, 140, TuiSessionPresentation::Cards);
         let card_items = card_hits
             .0
             .iter()
@@ -3659,7 +3664,8 @@ mod tests {
             matches!(region.target, HitTarget::ActiveSessionOpen(_)) && region.area.y == 31
         }));
 
-        let (list, list_hits) = render(140, TuiSessionPresentation::List);
+        let (list, list_hits) =
+            render_active_sessions(&snapshot, 140, TuiSessionPresentation::List);
         let list_items = list_hits
             .0
             .iter()
@@ -3676,7 +3682,7 @@ mod tests {
                 .all(|pair| { pair[0].x == pair[1].x && pair[0].y.saturating_add(1) == pair[1].y })
         );
 
-        let (_, narrow_hits) = render(84, TuiSessionPresentation::Cards);
+        let (_, narrow_hits) = render_active_sessions(&snapshot, 84, TuiSessionPresentation::Cards);
         let narrow_x = narrow_hits
             .0
             .iter()
@@ -3756,6 +3762,13 @@ mod tests {
             );
         }
 
+        // Compact list rows omit inline actions, so exercise mouse actions on a card render.
+        app.session_presentation = TuiSessionPresentation::Cards;
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
         let selected = app.selected_session_id.unwrap();
         let open = app
             .hit_map
