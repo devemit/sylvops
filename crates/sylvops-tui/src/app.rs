@@ -295,6 +295,7 @@ pub(crate) struct App {
     pub expanded_projects: HashSet<ProjectId>,
     pub expanded_worktrees: HashSet<WorktreeId>,
     pub diff: Option<String>,
+    pub diff_scroll: u16,
     pub flash: Option<Flash>,
     pub help: bool,
     pub attached: Option<AttachedTerminal>,
@@ -353,6 +354,7 @@ impl App {
             expanded_projects: HashSet::new(),
             expanded_worktrees: HashSet::new(),
             diff: None,
+            diff_scroll: 0,
             flash: None,
             help: false,
             attached: None,
@@ -1108,6 +1110,18 @@ impl App {
         };
         self.focus = FocusZone::Main;
         self.mark_navigation_dirty();
+    }
+
+    pub fn scroll_diff(&mut self, delta: isize) {
+        let maximum = self
+            .diff
+            .as_deref()
+            .map_or(0, |diff| diff.lines().count().saturating_sub(1));
+        self.diff_scroll = usize::from(self.diff_scroll)
+            .saturating_add_signed(delta)
+            .min(maximum)
+            .try_into()
+            .unwrap_or(u16::MAX);
     }
 
     pub fn select_navigator_view(&mut self, view: TuiNavigatorView) {
