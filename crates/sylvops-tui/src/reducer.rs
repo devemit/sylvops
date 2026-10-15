@@ -306,7 +306,10 @@ mod tests {
         let mut app = App::new(DaemonSnapshot::default(), Vec::new(), None);
         app.diff = Some("one\ntwo\nthree".into());
 
-        assert!(reduce(&mut app, Action::ScrollDiff(1)).is_empty());
+        assert_eq!(
+            reduce(&mut app, Action::ScrollDiff(1)),
+            Vec::<Effect>::new()
+        );
         assert_eq!(app.diff_scroll, 1);
         reduce(&mut app, Action::ScrollDiff(100));
         assert_eq!(app.diff_scroll, 2);
