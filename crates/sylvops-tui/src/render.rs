@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
@@ -306,7 +306,11 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 }
 
 fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    let (title, content, action) = if let Some(attached) = app.attached.as_ref() {
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+    let (title, content, action, cursor) = if let Some(attached) = app.attached.as_ref() {
         let role = if attached.role == sylvops_core::domain::AttachmentRole::Controller {
             "controller"
         } else {
@@ -316,6 +320,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             format!(" Terminal · attached as {role} "),
             attached.parser.screen().contents(),
             Some(("[ Detach · Ctrl+] ]", HitTarget::Detach)),
+            terminal_cursor(attached.parser.screen(), inner[0]),
         )
     } else if let Some(session) = app.selected_session() {
         (
@@ -326,24 +331,25 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
                 status_label(session.state)
             ),
             Some(("[ Attach ]", HitTarget::Attach)),
+            None,
         )
     } else {
         (
             " Terminal ".into(),
             "No session selected.\n\nPress n or click New to create a shell session.".into(),
             Some(("[ New session · n ]", HitTarget::New)),
+            None,
         )
     };
-    let inner = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
     frame.render_widget(
         Paragraph::new(content)
             .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
         inner[0],
     );
+    if let Some(cursor) = cursor {
+        frame.set_cursor_position(cursor);
+    }
     if let Some((label, target)) = action {
         frame.render_widget(
             Paragraph::new(label)
@@ -353,6 +359,27 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         );
         app.hit_map.push(inner[1], target);
     }
+}
+
+fn terminal_cursor(screen: &vt100::Screen, area: Rect) -> Option<Position> {
+    if screen.hide_cursor() {
+        return None;
+    }
+    let terminal_area = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let (row, column) = screen.cursor_position();
+    let (_, screen_width) = screen.size();
+    let column = if column == screen_width {
+        column.saturating_sub(1)
+    } else {
+        column
+    };
+    (column < terminal_area.width && row < terminal_area.height).then_some(Position::new(
+        terminal_area.x.saturating_add(column),
+        terminal_area.y.saturating_add(row),
+    ))
 }
 
 fn draw_changes(frame: &mut Frame<'_>, app: &App, area: Rect) {
