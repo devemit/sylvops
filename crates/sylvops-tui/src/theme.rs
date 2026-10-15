@@ -14,6 +14,10 @@ pub(crate) struct Theme {
     pub attention: Style,
     pub danger: Style,
     pub muted: Style,
+    pub diff_file_header: Style,
+    pub diff_hunk_header: Style,
+    pub diff_addition: Style,
+    pub diff_deletion: Style,
 }
 
 #[derive(Clone, Copy)]
@@ -45,6 +49,12 @@ impl Theme {
                     attention: Style::default().fg(Color::Yellow),
                     danger: Style::default().fg(Color::Red),
                     muted: Style::default().fg(Color::DarkGray),
+                    diff_file_header: Style::default().add_modifier(Modifier::BOLD),
+                    diff_hunk_header: Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    diff_addition: Style::default().fg(Color::Green),
+                    diff_deletion: Style::default().fg(Color::Red),
                 };
             }
             TuiTheme::Nord => Palette {
@@ -103,6 +113,10 @@ impl Theme {
                 muted: rgb(101, 123, 131),
             },
         };
+        Self::from_palette(palette)
+    }
+
+    fn from_palette(palette: Palette) -> Self {
         Self {
             background: Style::default().fg(palette.text).bg(palette.background),
             text: Style::default().fg(palette.text).bg(palette.background),
@@ -121,6 +135,24 @@ impl Theme {
                 .bg(palette.background),
             danger: Style::default().fg(palette.danger).bg(palette.background),
             muted: Style::default().fg(palette.muted).bg(palette.background),
+            diff_file_header: Style::default()
+                .fg(palette.text)
+                .bg(palette.selection)
+                .add_modifier(Modifier::BOLD),
+            diff_hunk_header: Style::default()
+                .fg(palette.focus)
+                .bg(blend(palette.background, palette.focus, 14))
+                .add_modifier(Modifier::BOLD),
+            diff_addition: Style::default().fg(palette.success).bg(blend(
+                palette.background,
+                palette.success,
+                14,
+            )),
+            diff_deletion: Style::default().fg(palette.danger).bg(blend(
+                palette.background,
+                palette.danger,
+                14,
+            )),
         }
     }
 
@@ -135,4 +167,50 @@ impl Theme {
 
 const fn rgb(red: u8, green: u8, blue: u8) -> Color {
     Color::Rgb(red, green, blue)
+}
+
+fn blend(base: Color, accent: Color, accent_percent: u16) -> Color {
+    let (Color::Rgb(base_red, base_green, base_blue), Color::Rgb(red, green, blue)) =
+        (base, accent)
+    else {
+        return accent;
+    };
+    let base_percent = 100_u16.saturating_sub(accent_percent);
+    let channel = |base: u8, accent: u8| {
+        u8::try_from((u16::from(base) * base_percent + u16::from(accent) * accent_percent) / 100)
+            .unwrap_or(u8::MAX)
+    };
+    rgb(
+        channel(base_red, red),
+        channel(base_green, green),
+        channel(base_blue, blue),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_theme_distinguishes_added_and_deleted_diff_lines() {
+        for choice in TuiTheme::ALL {
+            let theme = Theme::resolve(choice);
+            assert_ne!(theme.diff_addition, theme.diff_deletion, "{choice}");
+            assert_ne!(theme.diff_hunk_header, theme.text, "{choice}");
+            assert_ne!(theme.diff_file_header, theme.muted, "{choice}");
+        }
+    }
+
+    #[test]
+    fn named_themes_tint_added_and_deleted_row_backgrounds() {
+        for choice in TuiTheme::ALL
+            .into_iter()
+            .filter(|choice| *choice != TuiTheme::TerminalDefault)
+        {
+            let theme = Theme::resolve(choice);
+            assert_ne!(theme.diff_addition.bg, theme.background.bg, "{choice}");
+            assert_ne!(theme.diff_deletion.bg, theme.background.bg, "{choice}");
+            assert_ne!(theme.diff_addition.bg, theme.diff_deletion.bg, "{choice}");
+        }
+    }
 }

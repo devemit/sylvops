@@ -35,6 +35,7 @@ pub(crate) enum Action {
     Rename,
     Delete,
     Diff,
+    ScrollDiff(isize),
     GitHub,
     Attention,
     Settings,
@@ -153,9 +154,11 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
         Action::Rename => return vec![Effect::OpenRename],
         Action::Delete => return vec![Effect::OpenDelete],
         Action::Diff => {
+            app.diff_scroll = 0;
             app.set_tab(TuiContentView::Changes);
             return vec![Effect::LoadDiff];
         }
+        Action::ScrollDiff(delta) => app.scroll_diff(delta),
         Action::GitHub => return vec![Effect::OpenGitHub],
         Action::Attention => {
             app.flash = Some(match app.select_attention() {
@@ -296,5 +299,24 @@ mod tests {
         successor.state = SessionState::Running;
         app.snapshot.sessions.push(successor);
         assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
+    }
+
+    #[test]
+    fn diff_scrolling_is_bounded_and_refresh_resets_to_the_top() {
+        let mut app = App::new(DaemonSnapshot::default(), Vec::new(), None);
+        app.diff = Some("one\ntwo\nthree".into());
+
+        assert!(reduce(&mut app, Action::ScrollDiff(1)).is_empty());
+        assert_eq!(app.diff_scroll, 1);
+        reduce(&mut app, Action::ScrollDiff(100));
+        assert_eq!(app.diff_scroll, 2);
+        reduce(&mut app, Action::ScrollDiff(-1));
+        assert_eq!(app.diff_scroll, 1);
+        reduce(&mut app, Action::ScrollDiff(-100));
+        assert_eq!(app.diff_scroll, 0);
+
+        app.diff_scroll = 2;
+        assert_eq!(reduce(&mut app, Action::Diff), vec![Effect::LoadDiff]);
+        assert_eq!(app.diff_scroll, 0);
     }
 }

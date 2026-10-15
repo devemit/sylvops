@@ -8,6 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use sylvops_core::{
+    diff::{self, DiffLineKind},
     domain::{Session, SessionState, WorktreeStatus},
     github::{
         GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubCheckState, GitHubItemKind,
@@ -774,7 +775,10 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     }
     frame.render_widget(terminal, area);
 
-    if let Some(screen) = app.attached.as_ref().map(|attached| attached.parser.screen())
+    if let Some(screen) = app
+        .attached
+        .as_ref()
+        .map(|attached| attached.parser.screen())
         && !screen.hide_cursor()
     {
         let (row, column) = screen.cursor_position();
@@ -862,18 +866,38 @@ fn draw_changes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         .diff
         .as_deref()
         .unwrap_or("Press g to load the bounded daemon-owned diff for this worktree.");
+    let block = Block::default()
+        .title(" Changes · read-only · ↑/↓ PgUp/PgDn ")
+        .borders(Borders::ALL)
+        .border_style(theme.border);
+    let inner_width = block.inner(area).width;
     frame.render_widget(
-        Paragraph::new(content)
-            .block(
-                Block::default()
-                    .title(" Changes · read-only ")
-                    .borders(Borders::ALL)
-                    .border_style(theme.border),
-            )
+        Paragraph::new(styled_diff_lines(content, inner_width, theme))
+            .block(block)
             .style(theme.text)
+            .scroll((app.diff_scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn styled_diff_lines(content: &str, width: u16, theme: Theme) -> Vec<Line<'static>> {
+    diff::lines(content)
+        .map(|line| {
+            let mut text = line.text.to_owned();
+            let padding = width.saturating_sub(text_width(&text));
+            text.extend(std::iter::repeat_n(' ', usize::from(padding)));
+            let style = match line.kind {
+                DiffLineKind::FileHeader => theme.diff_file_header,
+                DiffLineKind::Metadata | DiffLineKind::Notice => theme.muted,
+                DiffLineKind::HunkHeader => theme.diff_hunk_header,
+                DiffLineKind::Addition => theme.diff_addition,
+                DiffLineKind::Deletion => theme.diff_deletion,
+                DiffLineKind::Context => theme.text,
+            };
+            Line::styled(text, style)
+        })
+        .collect()
 }
 
 fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -1451,7 +1475,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Active navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Active navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nChanges: ↑/↓, j/k, Page Up/Page Down, or mouse wheel to scroll\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 
@@ -3189,4 +3213,26 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_diff_lines_use_semantic_theme_styles_and_fill_short_rows() {
+        let theme = Theme::resolve(TuiTheme::Nord);
+        let lines = styled_diff_lines(
+            "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n-old\n+new\n context",
+            32,
+            theme,
+        );
+
+        assert_eq!(lines[0].style, theme.diff_file_header);
+        assert_eq!(lines[1].style, theme.diff_hunk_header);
+        assert_eq!(lines[2].style, theme.diff_deletion);
+        assert_eq!(lines[3].style, theme.diff_addition);
+        assert_eq!(lines[4].style, theme.text);
+        assert!(lines.iter().all(|line| line.width() >= 32));
+    }
 }

@@ -2952,6 +2952,7 @@ async fn execute_palette_item(
 }
 
 async fn show_diff(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
+    app.diff_scroll = 0;
     let Some(worktree_id) = app.selected_worktree_id else {
         app.flash = Some(Flash::error("Select a worktree or session first."));
         return Ok(());

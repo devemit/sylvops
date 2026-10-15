@@ -51,6 +51,7 @@ use presentation::{
     session_state_label,
 };
 use sylvops_core::{
+    diff::{self as diff_view, DiffLineKind},
     domain::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
         Worktree, WorktreeStatus, state_is_active,
@@ -2174,6 +2175,24 @@ impl DesktopApp {
         let body = self.diff.as_deref().unwrap_or(
             "Select a checkout and open Changes to load its bounded, read-only Git diff.",
         );
+        let font = terminal_font(self.desktop_state.terminal_font);
+        let font_size = u32::from(self.desktop_state.terminal_font_size);
+        let mut diff = column![].spacing(0).width(Fill);
+        for line in diff_view::lines(body) {
+            let kind = line.kind;
+            let content = if line.text.is_empty() { " " } else { line.text };
+            diff = diff.push(
+                container(
+                    text(content)
+                        .font(font)
+                        .size(font_size)
+                        .wrapping(text::Wrapping::None),
+                )
+                .padding([2, 8])
+                .width(Fill)
+                .style(move |theme| diff_line_style(theme, kind)),
+            );
+        }
         container(column![
             container(
                 text("Read-only Git changes · running sessions continue, but terminal input is disabled in this tab")
@@ -2183,11 +2202,12 @@ impl DesktopApp {
             )
             .height(28)
             .align_y(Vertical::Center),
-            scrollable(
-                text(body)
-                    .font(terminal_font(self.desktop_state.terminal_font))
-                    .size(u32::from(self.desktop_state.terminal_font_size)),
-            )
+            scrollable(diff)
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            })
+            .width(Fill)
             .height(Fill),
         ].spacing(6))
         .padding(14)
@@ -8508,6 +8528,65 @@ fn workspace_surface(theme: &Theme) -> container::Style {
     }
 }
 
+fn diff_line_style(theme: &Theme, kind: DiffLineKind) -> container::Style {
+    let palette = theme.extended_palette();
+    let canvas = palette.background.base.color;
+    let (background, foreground) = match kind {
+        DiffLineKind::FileHeader => (
+            Some(palette.background.weaker.color),
+            contrast_safe_text(
+                palette.background.weaker.color,
+                palette.background.weaker.text,
+            ),
+        ),
+        DiffLineKind::Metadata | DiffLineKind::Notice => (
+            None,
+            contrast_safe_text(canvas, palette.secondary.base.color),
+        ),
+        DiffLineKind::HunkHeader => {
+            let background = mix_color(canvas, palette.primary.base.color, 0.14);
+            (
+                Some(background),
+                contrast_safe_text(background, palette.primary.base.color),
+            )
+        }
+        DiffLineKind::Addition => {
+            let background = mix_color(canvas, palette.success.base.color, 0.14);
+            (
+                Some(background),
+                contrast_safe_text(background, palette.success.base.color),
+            )
+        }
+        DiffLineKind::Deletion => {
+            let background = mix_color(canvas, palette.danger.base.color, 0.14);
+            (
+                Some(background),
+                contrast_safe_text(background, palette.danger.base.color),
+            )
+        }
+        DiffLineKind::Context => (
+            None,
+            contrast_safe_text(canvas, palette.background.base.text),
+        ),
+    };
+    container::Style {
+        background: background.map(Background::Color),
+        text_color: Some(foreground),
+        ..container::Style::default()
+    }
+}
+
+fn mix_color(base: Color, accent: Color, accent_weight: f32) -> Color {
+    let accent_weight = accent_weight.clamp(0.0, 1.0);
+    let base_weight = 1.0 - accent_weight;
+    Color {
+        r: base.r * base_weight + accent.r * accent_weight,
+        g: base.g * base_weight + accent.g * accent_weight,
+        b: base.b * base_weight + accent.b * accent_weight,
+        a: 1.0,
+    }
+}
+
 fn card_surface(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
@@ -11369,6 +11448,76 @@ mod tests {
             };
             assert!(background.relative_contrast(style.text_color) >= 4.5);
         }
+    }
+
+    #[test]
+    fn diff_rows_are_distinct_and_readable_in_every_theme() {
+        for choice in DesktopTheme::ALL {
+            let theme = theme::resolve(PresentationTheme::resolve(choice, SystemAppearance::Dark));
+            let canvas = theme.extended_palette().background.base.color;
+            let addition = diff_line_style(&theme, DiffLineKind::Addition);
+            let deletion = diff_line_style(&theme, DiffLineKind::Deletion);
+            let hunk = diff_line_style(&theme, DiffLineKind::HunkHeader);
+
+            let Some(Background::Color(addition_background)) = addition.background else {
+                panic!("{choice} additions need a tinted background");
+            };
+            let Some(Background::Color(deletion_background)) = deletion.background else {
+                panic!("{choice} deletions need a tinted background");
+            };
+            let Some(Background::Color(hunk_background)) = hunk.background else {
+                panic!("{choice} hunk headers need a tinted background");
+            };
+
+            assert_ne!(addition_background, deletion_background, "{choice}");
+            assert_ne!(addition_background, canvas, "{choice}");
+            assert_ne!(deletion_background, canvas, "{choice}");
+            assert_ne!(hunk_background, canvas, "{choice}");
+            for (name, style, background) in [
+                ("addition", addition, addition_background),
+                ("deletion", deletion, deletion_background),
+                ("hunk", hunk, hunk_background),
+            ] {
+                let foreground = style.text_color.expect("diff row text color");
+                assert!(
+                    background.relative_contrast(foreground) >= 4.5,
+                    "{choice} {name} text must remain readable"
+                );
+            }
+
+            for kind in [
+                DiffLineKind::FileHeader,
+                DiffLineKind::Metadata,
+                DiffLineKind::Context,
+                DiffLineKind::Notice,
+            ] {
+                let style = diff_line_style(&theme, kind);
+                let background = match style.background {
+                    Some(Background::Color(background)) => background,
+                    None => canvas,
+                    Some(_) => panic!("diff rows only use solid backgrounds"),
+                };
+                let foreground = style.text_color.expect("diff row text color");
+                assert!(
+                    background.relative_contrast(foreground) >= 4.5,
+                    "{choice} {kind:?} text must remain readable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changes_view_preserves_lines_and_scrolls_in_both_directions() {
+        let source = include_str!("lib.rs");
+        let changes_view = source
+            .split_once("    fn changes_view(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn github_view(&self)"))
+            .map(|(body, _)| body)
+            .expect("changes view source");
+
+        assert!(changes_view.contains("diff_view::lines(body)"));
+        assert!(changes_view.contains("Wrapping::None"));
+        assert!(changes_view.contains("scrollable::Direction::Both"));
     }
 
     #[test]
