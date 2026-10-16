@@ -706,12 +706,21 @@ fn draw_active_session_card(
     theme: Theme,
 ) {
     let needs_input = session.state == SessionState::NeedsFeedback;
-    let border = if selected {
+    let surface = active_session_style(session.state, selected, theme);
+    let border = if needs_input {
+        theme.attention.add_modifier(if selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        })
+    } else if selected {
         theme.focus
-    } else if needs_input {
-        theme.attention
     } else {
         theme.border
+    };
+    let border = Style {
+        bg: surface.bg,
+        ..border
     };
     let animation_frame = app.status_animation_frame();
     let lines = vec![
@@ -740,7 +749,7 @@ fn draw_active_session_card(
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).border_style(border))
-            .style(active_session_style(session.state, selected, theme))
+            .style(surface)
             .wrap(Wrap { trim: true }),
         area,
     );

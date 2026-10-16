@@ -6214,7 +6214,11 @@ mod tests {
         );
 
         let terminal_default = theme::Theme::resolve(TuiTheme::TerminalDefault);
-        assert_eq!(terminal_default.attention_surface.bg, None);
+        assert!(terminal_default.attention_surface.bg.is_some());
+        assert_ne!(
+            terminal_default.attention_surface.bg,
+            terminal_default.attention_selected_surface.bg
+        );
         assert_ne!(terminal_default.attention_surface, terminal_default.text);
     }
 
