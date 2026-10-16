@@ -27,7 +27,9 @@ use sylvops_core::session_state::{
     AttentionAcknowledgement, AttentionEvent, AttentionEventId, AttentionReason, ProviderActivity,
     SessionLifecycle,
 };
-use sylvops_core::status::{ConversationIdentityTransition, ProviderConversationId};
+use sylvops_core::status::{
+    ConversationIdentityTransition, ProviderConversationId, SessionStatusTransition,
+};
 use sylvops_core::ui::{DesktopState, TuiState};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -241,6 +243,7 @@ enum DatabaseCommand {
     FinishSession {
         id: SessionId,
         state: SessionState,
+        transition: Option<SessionStatusTransition>,
         exit_code: Option<i32>,
         failure_reason: Option<String>,
         reply: oneshot::Sender<Result<(u64, Session)>>,
@@ -251,7 +254,7 @@ enum DatabaseCommand {
     },
     UpdateSessionStatus {
         id: SessionId,
-        state: SessionState,
+        transition: SessionStatusTransition,
         conversation_identity: Option<VerifiedConversationIdentityUpdate>,
         reply: oneshot::Sender<Result<(u64, Session)>>,
     },
@@ -925,6 +928,35 @@ impl DatabaseHandle {
             DatabaseCommand::FinishSession {
                 id,
                 state,
+                transition: None,
+                exit_code,
+                failure_reason,
+                reply,
+            }
+        })
+        .await
+    }
+
+    /// Persists one daemon-derived process outcome with its expanded status atomically.
+    ///
+    /// # Errors
+    /// Returns an actor, validation, not-found, transaction, or SQLite error.
+    pub async fn finish_session_outcome(
+        &self,
+        id: SessionId,
+        transition: SessionStatusTransition,
+        exit_code: Option<i32>,
+    ) -> Result<(u64, Session)> {
+        let state = transition.state;
+        let failure_reason = transition
+            .failure_category
+            .as_ref()
+            .map(ToString::to_string);
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::FinishSession {
+                id,
+                state,
+                transition: Some(transition),
                 exit_code,
                 failure_reason,
                 reply,
@@ -953,13 +985,13 @@ impl DatabaseHandle {
     pub async fn update_session_status(
         &self,
         id: SessionId,
-        state: SessionState,
+        transition: SessionStatusTransition,
         conversation_identity: Option<VerifiedConversationIdentityUpdate>,
     ) -> Result<(u64, Session)> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::UpdateSessionStatus {
                 id,
-                state,
+                transition,
                 conversation_identity,
                 reply,
             }
@@ -1299,6 +1331,7 @@ fn database_thread(
             DatabaseCommand::FinishSession {
                 id,
                 state,
+                transition,
                 exit_code,
                 failure_reason,
                 reply,
@@ -1307,6 +1340,7 @@ fn database_thread(
                     &mut connection,
                     id,
                     state,
+                    transition.as_ref(),
                     exit_code,
                     failure_reason.as_deref(),
                 )
@@ -1327,14 +1361,14 @@ fn database_thread(
             }
             DatabaseCommand::UpdateSessionStatus {
                 id,
-                state,
+                transition,
                 conversation_identity,
                 reply,
             } => {
                 let result = update_session_status(
                     &mut connection,
                     id,
-                    state,
+                    &transition,
                     conversation_identity.as_ref(),
                 )
                 .map(|session| {
@@ -2569,6 +2603,7 @@ fn finish_session(
     connection: &mut Connection,
     id: SessionId,
     state: SessionState,
+    transition: Option<&SessionStatusTransition>,
     exit_code: Option<i32>,
     failure_reason: Option<&str>,
 ) -> Result<Session> {
@@ -2605,7 +2640,30 @@ fn finish_session(
             "session {id} does not exist"
         )));
     }
-    sync_expanded_session_status(&transaction, id)?;
+    if let Some(transition) = transition {
+        if transition.state != state {
+            return Err(DaemonError::Database(
+                "process outcome state does not match its expanded status".into(),
+            ));
+        }
+        transition
+            .status
+            .validate()
+            .map_err(|message| DaemonError::Database(message.into()))?;
+        transaction
+            .execute(
+                "UPDATE sessions SET status_json = ?2 WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    serde_json::to_string(&transition.status).map_err(|_| {
+                        DaemonError::Database("cannot encode Session status".into())
+                    })?
+                ],
+            )
+            .map_err(database_error)?;
+    } else {
+        sync_expanded_session_status(&transaction, id)?;
+    }
     let session = load_session(&transaction, id)?;
     transaction
         .execute(
@@ -2649,11 +2707,11 @@ fn mark_session_seen(connection: &mut Connection, id: SessionId) -> Result<Optio
 fn update_session_status(
     connection: &mut Connection,
     id: SessionId,
-    state: SessionState,
+    transition: &SessionStatusTransition,
     conversation_identity: Option<&VerifiedConversationIdentityUpdate>,
 ) -> Result<Session> {
     if !matches!(
-        state,
+        transition.state,
         SessionState::Running
             | SessionState::NeedsFeedback
             | SessionState::FinishedUnseen
@@ -2669,13 +2727,30 @@ fn update_session_status(
         .map_err(database_error)?;
     let external_session_id =
         conversation_identity.map(|identity| identity.external_session_id.as_str());
+    transition
+        .status
+        .validate()
+        .map_err(|message| DaemonError::Database(message.into()))?;
+    let status_json = serde_json::to_string(&transition.status)
+        .map_err(|_| DaemonError::Database("cannot encode Session status".into()))?;
+    let failure_category = transition
+        .failure_category
+        .as_ref()
+        .map(ToString::to_string);
     let changed = transaction
         .execute(
             "UPDATE sessions SET state = ?2, external_session_id = COALESCE(?3, external_session_id), \
-             last_activity_at = ?4, failure_reason = NULL \
+             last_activity_at = ?4, failure_reason = ?5, status_json = ?6 \
              WHERE id = ?1 AND process_id IS NOT NULL \
              AND state NOT IN ('failed', 'terminated', 'disconnected')",
-            params![id.to_string(), state.to_string(), external_session_id, now],
+            params![
+                id.to_string(),
+                transition.state.to_string(),
+                external_session_id,
+                now,
+                failure_category,
+                status_json
+            ],
         )
         .map_err(database_error)?;
     if changed != 1 {
@@ -2701,7 +2776,6 @@ fn update_session_status(
             .to_string(),
         )?;
     }
-    sync_expanded_session_status(&transaction, id)?;
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(session)
@@ -2891,7 +2965,9 @@ fn reconcile_sessions(connection: &mut Connection) -> Result<usize> {
             .execute(
                 "UPDATE sessions SET state = 'disconnected', process_id = NULL, \
                  process_identity = NULL, \
-                 failure_reason = 'daemon restarted; process identity was not trusted' \
+                 failure_reason = COALESCE(\
+                    failure_reason, 'daemon restarted; process identity was not trusted'\
+                 ) \
                  WHERE id = ?1",
                 [session_id],
             )
@@ -4297,7 +4373,19 @@ mod tests {
         assert_eq!(session.state, SessionState::FinishedUnseen);
         assert!(
             database
-                .update_session_status(session_id, SessionState::Running, None)
+                .update_session_status(
+                    session_id,
+                    SessionStatusTransition {
+                        state: SessionState::Running,
+                        status: sylvops_core::session_state::SessionStatus {
+                            lifecycle: SessionLifecycle::Running,
+                            activity: ProviderActivity::Working,
+                            attention: None,
+                        },
+                        failure_category: None,
+                    },
+                    None,
+                )
                 .await
                 .is_err()
         );

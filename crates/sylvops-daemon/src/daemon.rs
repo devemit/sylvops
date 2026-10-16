@@ -41,7 +41,7 @@ use sylvops_core::{
     provider::{AuthenticationRequirement, LaunchContext, ProviderRuntimeSpec, ResumeContext},
     status::{
         ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId,
-        SessionStatusMachine,
+        SessionStatusMachine, TurnFailureCategory,
     },
     upgrade::{
         ActiveUpgradeSession, InstallDisposition, MAX_UPGRADE_ACTIVE_SESSIONS,
@@ -368,7 +368,7 @@ struct DaemonState {
     runtime_paths: RuntimePaths,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct HookTracking {
     fingerprints: HashSet<String>,
     stopped_turns: HashSet<String>,
@@ -401,8 +401,10 @@ impl HookTracking {
         {
             return Some("stale");
         }
-        if matches!(event, NormalizedProviderEvent::TurnStopped { .. })
-            && let Some(turn_id) = turn_id
+        if matches!(
+            event,
+            NormalizedProviderEvent::TurnStopped { .. } | NormalizedProviderEvent::TurnInterrupted
+        ) && let Some(turn_id) = turn_id
         {
             self.close_turn(turn_id.to_owned());
         }
@@ -419,6 +421,7 @@ impl HookTracking {
                     SessionState::FinishedUnseen | SessionState::FinishedSeen
                 );
             }
+            NormalizedProviderEvent::TurnInterrupted => self.turn_closed = true,
             NormalizedProviderEvent::SessionEnded => {
                 self.turn_closed = true;
             }
@@ -3589,7 +3592,7 @@ async fn spawn_managed_session(
         .lock()
         .await
         .entry(session_id)
-        .or_insert_with(|| SessionStatusMachine::new(running.state));
+        .or_insert_with(|| status_machine_from_session(&running));
     spawn_exit_monitor(state.clone(), session_id, managed.clone(), completed_tx);
     if provider_kind == ProviderKind::Claude {
         spawn_claude_session_start_monitor(state.clone(), session_id, managed);
@@ -3751,12 +3754,20 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             }
         );
     let (disposition, session_start_missing) = {
-        // The daemon run loop awaits each delivery to completion, so classification, persistence,
-        // and recording are serialized even though the lock is not held across database awaits.
+        // Stage accepted tracking changes until persistence succeeds. The daemon run loop awaits
+        // each delivery to completion, so classification and commit remain serialized without
+        // holding this global lock across the database await.
         let mut tracking = state.hook_tracking.lock().await;
         let tracking = tracking.entry(delivery.session_id).or_default();
-        let disposition =
-            tracking.classify(delivery.fingerprint, &event, normalized.turn_id.as_deref());
+        let mut candidate = tracking.clone();
+        let disposition = candidate.classify(
+            delivery.fingerprint.clone(),
+            &event,
+            normalized.turn_id.as_deref(),
+        );
+        if disposition.is_some() {
+            *tracking = candidate;
+        }
         (disposition, tracking.session_start_missing)
     };
     if let Some(disposition) = disposition {
@@ -3806,16 +3817,24 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
     let conversation_identity = external_session_id.map(|external_session_id| {
         VerifiedConversationIdentityUpdate::new(external_session_id, identity_transition)
     });
-    let next = {
-        let mut machines = state.status_machines.lock().await;
-        let machine = machines
-            .entry(delivery.session_id)
-            .or_insert_with(|| SessionStatusMachine::new(persisted.state));
-        machine.apply(&event)
+    let (transition, next_machine) = {
+        let machines = state.status_machines.lock().await;
+        let mut machine = machines
+            .get(&delivery.session_id)
+            .cloned()
+            .unwrap_or_else(|| status_machine_from_session(&persisted));
+        let transition = machine
+            .apply(&event, status_timestamp())
+            .map_err(|message| DaemonError::Database(message.into()))?;
+        (transition, machine)
     };
     let status_update = state
         .database
-        .update_session_status(delivery.session_id, next, conversation_identity)
+        .update_session_status(
+            delivery.session_id,
+            transition.clone(),
+            conversation_identity,
+        )
         .await;
     let (revision, session) = match status_update {
         Ok(updated) => updated,
@@ -3845,23 +3864,23 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
         }
     };
     state
-        .hook_tracking
+        .status_machines
         .lock()
         .await
-        .entry(delivery.session_id)
-        .or_default()
-        .record_applied(&event, next);
+        .insert(delivery.session_id, next_machine);
+    {
+        let mut tracking = state.hook_tracking.lock().await;
+        let tracking = tracking.entry(delivery.session_id).or_default();
+        let classification =
+            tracking.classify(delivery.fingerprint, &event, normalized.turn_id.as_deref());
+        debug_assert!(classification.is_none());
+        tracking.record_applied(&event, transition.state);
+        if is_claude_session_start || recovers_claude_lifecycle {
+            tracking.session_start_missing = false;
+        }
+    }
     if let Some(managed) = get_managed_session(state, delivery.session_id).await {
         *managed.record.write().await = session.clone();
-    }
-    if is_claude_session_start || recovers_claude_lifecycle {
-        state
-            .hook_tracking
-            .lock()
-            .await
-            .entry(delivery.session_id)
-            .or_default()
-            .session_start_missing = false;
     }
     if recovers_claude_lifecycle {
         state
@@ -3938,55 +3957,92 @@ fn spawn_exit_monitor(
         let mut handle = managed.handle.clone();
         let provider_kind = managed.record.read().await.provider_kind;
         let exit = handle.wait().await;
+        let operation_lock = session_operation_lock(&state, session_id).await;
+        let _operation_guard = operation_lock.lock().await;
         revoke_session_hook_access(&state, session_id).await;
         state
             .providers
             .cleanup_runtime_paths(provider_kind, &managed.owned_runtime_paths);
-        match exit {
-            Ok(exit) => {
-                let state_value = if exit.stop_requested {
-                    SessionState::Terminated
-                } else if exit.exit_code == 0 {
-                    if exit.was_attached {
-                        SessionState::FinishedSeen
-                    } else {
-                        SessionState::FinishedUnseen
-                    }
-                } else {
-                    SessionState::Failed
-                };
-                let exit_code = i32::try_from(exit.exit_code).ok();
-                let failure = (state_value == SessionState::Failed)
-                    .then(|| format!("process exited with code {}", exit.exit_code));
-                match state
-                    .database
-                    .finish_session(session_id, state_value, exit_code, failure)
-                    .await
-                {
-                    Ok((revision, session)) => {
-                        *managed.record.write().await = session.clone();
-                        let _ = state.events.send(DaemonEvent::SessionStatusChanged {
-                            revision,
-                            session: session.clone(),
-                        });
-                        let _ = state.events.send(DaemonEvent::SessionExited {
-                            revision,
-                            session_id,
-                            state: state_value,
-                            exit_code,
-                        });
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, %session_id, "failed to persist session exit");
-                    }
-                }
-            }
+        let (exit_code, stop_requested, completion_acknowledged) = match exit {
+            Ok(exit) => (
+                i32::try_from(exit.exit_code).ok(),
+                exit.stop_requested,
+                exit.was_attached,
+            ),
             Err(error) => {
                 tracing::error!(%error, %session_id, "session actor ended without status");
+                (None, false, false)
+            }
+        };
+        let transition = {
+            let persisted = managed.record.read().await.clone();
+            let machines = state.status_machines.lock().await;
+            let mut machine = machines
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(|| status_machine_from_session(&persisted));
+            let transition = machine.apply_process_exit(
+                provider_kind == ProviderKind::Shell,
+                exit_code,
+                stop_requested,
+                completion_acknowledged,
+                status_timestamp(),
+            );
+            transition.map(|transition| (transition, machine))
+        };
+        match transition {
+            Ok((transition, next_machine)) => match state
+                .database
+                .finish_session_outcome(session_id, transition.clone(), exit_code)
+                .await
+            {
+                Ok((revision, session)) => {
+                    state
+                        .status_machines
+                        .lock()
+                        .await
+                        .insert(session_id, next_machine);
+                    *managed.record.write().await = session.clone();
+                    let _ = state.events.send(DaemonEvent::SessionStatusChanged {
+                        revision,
+                        session: session.clone(),
+                    });
+                    let _ = state.events.send(DaemonEvent::SessionExited {
+                        revision,
+                        session_id,
+                        state: transition.state,
+                        exit_code,
+                    });
+                }
+                Err(error) => {
+                    tracing::error!(%error, %session_id, "failed to persist session exit");
+                }
+            },
+            Err(error) => {
+                tracing::error!(%error, %session_id, "failed to derive session exit status");
             }
         }
         completed.send_replace(true);
     });
+}
+
+fn status_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn status_machine_from_session(session: &Session) -> SessionStatusMachine {
+    SessionStatusMachine::from_persisted(
+        session.state,
+        session.status,
+        session
+            .failure_reason
+            .as_deref()
+            .and_then(|category| TurnFailureCategory::new(category).ok()),
+    )
 }
 
 fn spawn_claude_session_start_monitor(
@@ -4847,6 +4903,25 @@ mod tests {
                 None,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn hook_tracking_closes_an_interrupted_turn_without_a_turn_id() {
+        let mut tracking = HookTracking::default();
+        let interrupted = NormalizedProviderEvent::TurnInterrupted;
+        assert_eq!(
+            tracking.classify("interrupt".into(), &interrupted, None),
+            None
+        );
+        tracking.record_applied(&interrupted, SessionState::Running);
+        assert_eq!(
+            tracking.classify(
+                "late-permission".into(),
+                &NormalizedProviderEvent::PermissionRequested,
+                None,
+            ),
+            Some("stale")
         );
     }
 

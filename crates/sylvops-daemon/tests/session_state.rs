@@ -8,6 +8,7 @@ use sylvops_core::{
     session_state::{
         AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
     },
+    status::{NormalizedProviderEvent, RemainingWork, SessionStatusMachine},
 };
 use sylvops_daemon::database::{DatabaseHandle, NewSession, RepositoryRegistration};
 
@@ -220,6 +221,7 @@ async fn legacy_feedback_preserves_input_and_recoverable_failure_as_distinct_rea
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn pending_live_provider_completion_survives_restart_without_adopting_the_process() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
@@ -253,8 +255,21 @@ async fn pending_live_provider_completion_survives_restart_without_adopting_the_
     };
     database.create_session(record.clone()).await.unwrap();
     database.mark_session_running(id, 42).await.unwrap();
+    let mut machine = SessionStatusMachine::from_persisted(
+        SessionState::Running,
+        database.session(id).await.unwrap().status,
+        None,
+    );
+    let completion = machine
+        .apply(
+            &NormalizedProviderEvent::TurnStopped {
+                remaining_work: RemainingWork::default(),
+            },
+            100,
+        )
+        .unwrap();
     let (_, completed) = database
-        .update_session_status(id, SessionState::FinishedUnseen, None)
+        .update_session_status(id, completion.clone(), None)
         .await
         .unwrap();
     assert_eq!(completed.status.lifecycle, SessionLifecycle::Running);
@@ -263,13 +278,13 @@ async fn pending_live_provider_completion_survives_restart_without_adopting_the_
     assert_eq!(pending.acknowledgement, AttentionAcknowledgement::Pending);
     record.id = SessionId::new();
     let acknowledged_id = record.id;
-    database.create_session(record).await.unwrap();
+    database.create_session(record.clone()).await.unwrap();
     database
         .mark_session_running(acknowledged_id, 43)
         .await
         .unwrap();
     database
-        .update_session_status(acknowledged_id, SessionState::FinishedUnseen, None)
+        .update_session_status(acknowledged_id, completion, None)
         .await
         .unwrap();
     let (_, acknowledged) = database
@@ -283,6 +298,28 @@ async fn pending_live_provider_completion_survives_restart_without_adopting_the_
         acknowledged.status.attention.unwrap().acknowledgement,
         AttentionAcknowledgement::Acknowledged
     );
+    record.id = SessionId::new();
+    let recoverable_id = record.id;
+    database.create_session(record).await.unwrap();
+    let (_, running) = database
+        .mark_session_running(recoverable_id, 44)
+        .await
+        .unwrap();
+    let mut machine = SessionStatusMachine::from_persisted(running.state, running.status, None);
+    let recoverable = machine
+        .apply(
+            &NormalizedProviderEvent::TurnFailed {
+                category: sylvops_core::status::TurnFailureCategory::new("rate_limit").unwrap(),
+            },
+            101,
+        )
+        .unwrap();
+    let recoverable_attention = recoverable.status.attention;
+    let (_, recoverable) = database
+        .update_session_status(recoverable_id, recoverable, None)
+        .await
+        .unwrap();
+    assert_eq!(recoverable.failure_reason.as_deref(), Some("rate_limit"));
     database.shutdown().await.unwrap();
 
     let database = DatabaseHandle::open(&path).unwrap();
@@ -301,6 +338,16 @@ async fn pending_live_provider_completion_survives_restart_without_adopting_the_
     assert_eq!(
         recovered_acknowledged.status.lifecycle,
         SessionLifecycle::Disconnected
+    );
+    let recovered_failure = database.session(recoverable_id).await.unwrap();
+    assert_eq!(
+        recovered_failure.status.lifecycle,
+        SessionLifecycle::Disconnected
+    );
+    assert_eq!(recovered_failure.status.attention, recoverable_attention);
+    assert_eq!(
+        recovered_failure.failure_reason.as_deref(),
+        Some("rate_limit")
     );
     database.shutdown().await.unwrap();
 }
