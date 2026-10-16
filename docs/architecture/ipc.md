@@ -47,4 +47,6 @@ An attach boundary newer than the daemon's latest output sequence is treated as 
 
 ## Current implementation boundary
 
+Protocol 1.22 extends `GitWorktreeState` with `blocking_paths` (at most 10 entries, each a tracked/untracked/ignored kind and at most 512 bytes of escaped relative-path display text) and `blocking_paths_truncated`. Directory paths retain their trailing slash; a single entry may represent an entire directory. These paths are informational only and must never be used for filesystem operations. Clients and daemon must upgrade together under exact protocol matching. Worktree removal still revalidates the complete raw status and refuses all tracked, untracked, or ignored content.
+
 The frame codec, authenticated listener, multiplexed client, correlated responses, event delivery, session replay, and slow-client resynchronization are implemented. Unix additionally rejects replacement of a live or foreign-owned socket and applies mode `0600`. Windows rejects remote clients and creates every pipe instance with a protected owner-only DACL in addition to the runtime token. Connected-client SID verification remains defense-in-depth release hardening.

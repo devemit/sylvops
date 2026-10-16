@@ -97,6 +97,10 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Mode::Confirmation(confirm) => {
             draw_confirmation(frame, &confirm, &mut app.hit_map, theme, app.density);
         }
+        Mode::RemovalBlocked(mut notice) => {
+            draw_removal_notice(frame, &mut notice, &mut app.hit_map, theme);
+            app.mode = Mode::RemovalBlocked(notice);
+        }
         Mode::CommandPalette(palette) => draw_palette(frame, app, &palette, theme),
         Mode::Settings(settings) => draw_settings(frame, app, settings, theme),
         Mode::GitHub(modal) => draw_github(frame, &modal, &mut app.hit_map, theme),
@@ -272,7 +276,11 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     };
     let summary = if attention > 0 {
         if full {
-            format!("{attention} attention")
+            if attention == 1 {
+                "1 needs input".to_owned()
+            } else {
+                format!("{attention} need input")
+            }
         } else {
             format!("!{attention}")
         }
@@ -321,14 +329,19 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 
 fn draw_attention(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     frame.render_widget(
-        Paragraph::new(format!(
-            " ! {} session(s) need attention · Shift+A or click to open next",
-            app.attention_count()
-        ))
-        .style(theme.attention),
+        Paragraph::new(attention_message(app.attention_count())).style(theme.attention),
         area,
     );
     app.hit_map.push(area, HitTarget::Attention);
+}
+
+pub(crate) fn attention_message(count: usize) -> String {
+    let subject = if count == 1 {
+        "1 session needs your input".to_owned()
+    } else {
+        format!("{count} sessions need your input")
+    };
+    format!(" ! {subject} · Shift+A or click to open next")
 }
 
 fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -441,7 +454,11 @@ fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
             .find(|item| item.id == id)
             .map_or(("Missing session".into(), String::new()), |item| {
                 (
-                    format!("{} {}", status_symbol(item.state), item.display_name),
+                    format!(
+                        "{} {}",
+                        status_symbol(item.state, app.status_animation_frame()),
+                        item.display_name
+                    ),
                     format!("  {}", status_label(item.state)),
                 )
             }),
@@ -663,17 +680,20 @@ fn draw_active_session_list(
     selected: bool,
     theme: Theme,
 ) {
+    let animation_frame = app.status_animation_frame();
     let line = Line::from(vec![
         Span::styled(
-            format!("{} {}", status_symbol(session.state), session.name),
+            format!(
+                "{} {}",
+                status_symbol(session.state, animation_frame),
+                session.name
+            ),
             Modifier::BOLD,
         ),
         Span::raw(format!(" · {}", status_label(session.state))),
     ]);
-    frame.render_widget(
-        Paragraph::new(line).style(if selected { theme.selected } else { theme.text }),
-        area,
-    );
+    let style = active_session_style(session.state, selected, theme);
+    frame.render_widget(Paragraph::new(line).style(style), area);
     app.hit_map.push(area, HitTarget::ActiveSession(session.id));
 }
 
@@ -685,11 +705,23 @@ fn draw_active_session_card(
     selected: bool,
     theme: Theme,
 ) {
-    let border = if selected { theme.focus } else { theme.border };
+    let needs_input = session.state == SessionState::NeedsFeedback;
+    let border = if selected {
+        theme.focus
+    } else if needs_input {
+        theme.attention
+    } else {
+        theme.border
+    };
+    let animation_frame = app.status_animation_frame();
     let lines = vec![
         Line::from(vec![
             Span::styled(
-                format!("{} {}", status_symbol(session.state), session.name),
+                format!(
+                    "{} {}",
+                    status_symbol(session.state, animation_frame),
+                    session.name
+                ),
                 Modifier::BOLD,
             ),
             Span::raw(format!(" · {}", status_label(session.state))),
@@ -708,7 +740,7 @@ fn draw_active_session_card(
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).border_style(border))
-            .style(if selected { theme.selected } else { theme.text })
+            .style(active_session_style(session.state, selected, theme))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -733,6 +765,20 @@ fn draw_active_session_card(
             ),
             HitTarget::ActiveSessionStop(session.id),
         );
+    }
+}
+
+pub(crate) fn active_session_style(state: SessionState, selected: bool, theme: Theme) -> Style {
+    if state == SessionState::NeedsFeedback {
+        if selected {
+            theme.attention_selected_surface
+        } else {
+            theme.attention_surface
+        }
+    } else if selected {
+        theme.selected
+    } else {
+        theme.text
     }
 }
 
@@ -789,10 +835,13 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         } else {
             "read-only observer"
         };
-        (
-            format!(" Terminal · attached as {role} "),
-            terminal_text(attached.parser.screen()),
-        )
+        let history = attached.parser.screen().scrollback();
+        let title = if attached.is_scrolled_back() {
+            format!(" Terminal · {role} · history {history} rows · Shift+End latest ")
+        } else {
+            format!(" Terminal · attached as {role} · wheel scrolls history ")
+        };
+        (title, terminal_text(attached.parser.screen()))
     } else if let Some(session) = app.selected_session() {
         let can_resume = session_can_resume(session, &app.snapshot.sessions, &app.providers);
         (
@@ -824,12 +873,18 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         terminal = terminal.style(theme.text).wrap(Wrap { trim: false });
     }
     frame.render_widget(terminal, area);
+    let viewport = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    app.hit_map.push(viewport, HitTarget::TerminalViewport);
 
     if let Some(screen) = app
         .attached
         .as_ref()
         .map(|attached| attached.parser.screen())
         && !screen.hide_cursor()
+        && screen.scrollback() == 0
     {
         let (row, column) = screen.cursor_position();
         let inner_width = area.width.saturating_sub(2);
@@ -1005,7 +1060,7 @@ fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<
             Span::styled("State        ", theme.muted),
             Span::raw(format!(
                 "{} {}",
-                status_symbol(session.state),
+                status_symbol(session.state, app.status_animation_frame()),
                 status_label(session.state)
             )),
         ]),
@@ -1467,6 +1522,20 @@ fn footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let version = application_version_label();
+    let (content_area, version_area) = footer_areas(area, &version);
+    draw_footer_content(frame, app, content_area, theme);
+    if let Some(version_area) = version_area {
+        frame.render_widget(
+            Paragraph::new(version)
+                .alignment(Alignment::Right)
+                .style(theme.muted),
+            version_area,
+        );
+    }
+}
+
+fn draw_footer_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     if let Some(flash) = &app.flash {
         frame.render_widget(
             Paragraph::new(truncate_text(&flash.text, area.width)).style(theme.flash(flash.kind)),
@@ -1504,6 +1573,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
                 "Directories · type filter · ↑↓ select · Enter open/select · Esc cancel"
             }
             Mode::Confirmation(_) => "Confirmation · y confirm · Esc cancel",
+            Mode::RemovalBlocked(_) => "Cannot remove Worktree · ↑↓ or wheel scroll · Esc close",
             Mode::CommandPalette(_) => {
                 "Commands · type to filter · ↑↓ select · Enter run · Esc close"
             }
@@ -1522,10 +1592,54 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     draw_action_line(frame, &mut app.hit_map, area, &actions, theme);
 }
 
+fn application_version_label() -> String {
+    format_version_label(
+        option_env!("PREVIEW_TAG"),
+        option_env!("RELEASE_TAG"),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn format_version_label(
+    preview_tag: Option<&str>,
+    release_tag: Option<&str>,
+    package_version: &str,
+) -> String {
+    let version = preview_tag.or(release_tag).unwrap_or(package_version);
+    if version.starts_with('v') {
+        version.to_owned()
+    } else {
+        format!("v{version}")
+    }
+}
+
+fn footer_areas(area: Rect, version: &str) -> (Rect, Option<Rect>) {
+    const MIN_CONTENT_WIDTH: u16 = 40;
+    const VERSION_GAP: u16 = 1;
+
+    let version_width = text_width(version);
+    let reserved = version_width.saturating_add(VERSION_GAP);
+    if version_width == 0 || area.width < MIN_CONTENT_WIDTH.saturating_add(reserved) {
+        return (area, None);
+    }
+    let content_width = area.width.saturating_sub(reserved);
+    (
+        Rect::new(area.x, area.y, content_width, area.height),
+        Some(Rect::new(
+            area.x
+                .saturating_add(content_width)
+                .saturating_add(VERSION_GAP),
+            area.y,
+            version_width,
+            area.height,
+        )),
+    )
+}
+
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Active navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nChanges: ↑/↓, j/k, Page Up/Page Down, or mouse wheel to scroll\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Active navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nChanges: ↑/↓, j/k, Page Up/Page Down, or mouse wheel to scroll\nAttached terminal: wheel or Shift+PageUp/PageDown scrolls; Shift+Home oldest; Shift+End latest\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 
@@ -2890,6 +3004,63 @@ fn directory_browser_filter(browser: &DirectoryBrowser) -> String {
     }
 }
 
+fn draw_removal_notice(
+    frame: &mut Frame<'_>,
+    notice: &mut crate::removal_notice::RemovalNotice,
+    hits: &mut HitMap,
+    theme: Theme,
+) {
+    let area = centered(frame.area(), 92, 85);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Cannot remove this Worktree ")
+        .borders(Borders::ALL)
+        .border_style(theme.attention)
+        .style(theme.text);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let body = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let mut wrapped = Vec::new();
+    for line in &notice.lines {
+        let mut row = String::new();
+        let mut width = 0_u16;
+        for character in line.chars() {
+            let character_width = text_width(&character.to_string());
+            if width.saturating_add(character_width) > body.width && !row.is_empty() {
+                wrapped.push(Line::from(std::mem::take(&mut row)));
+                width = 0;
+            }
+            row.push(character);
+            width = width.saturating_add(character_width);
+        }
+        wrapped.push(Line::from(row));
+    }
+    notice.max_scroll = u16::try_from(wrapped.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(body.height);
+    notice.scroll = notice.scroll.min(notice.max_scroll);
+    frame.render_widget(
+        Paragraph::new(wrapped)
+            .scroll((notice.scroll, 0))
+            .style(theme.text),
+        body,
+    );
+    let close = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+    frame.render_widget(
+        Paragraph::new("[ Close · Esc / Enter ]").style(theme.focus),
+        close,
+    );
+    hits.push(close, HitTarget::DismissNotice);
+}
+
 fn draw_confirmation(
     frame: &mut Frame<'_>,
     confirm: &crate::app::Confirmation,
@@ -3194,10 +3365,11 @@ fn draw_palette(frame: &mut Frame<'_>, app: &mut App, palette: &crate::app::Pale
     }
 }
 
-pub(crate) fn status_symbol(state: SessionState) -> &'static str {
+pub(crate) fn status_symbol(state: SessionState, animation_frame: usize) -> &'static str {
+    const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
     match state {
         SessionState::Fresh => "○",
-        SessionState::Starting | SessionState::Running => "◐",
+        SessionState::Starting | SessionState::Running => SPINNER[animation_frame % SPINNER.len()],
         SessionState::NeedsFeedback => "!",
         SessionState::FinishedUnseen => "◆",
         SessionState::FinishedSeen => "✓",

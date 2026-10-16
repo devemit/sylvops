@@ -5,7 +5,9 @@ mod directory_browser;
 mod forms;
 mod github_modal;
 mod input;
+mod input_pump;
 mod reducer;
+mod removal_notice;
 mod render;
 mod terminal;
 mod theme;
@@ -26,14 +28,20 @@ use crossterm::{
         MouseButton, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    style::Print,
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
 use directory_browser::{DirectoryBrowser, DirectoryBrowserEntry};
 use forms::{Form, FormKind};
+use futures_util::StreamExt as _;
 use github_modal::{
     GitHubDepth, GitHubEscape, GitHubModal, GitHubQuery, GitHubRequestTarget, StartWorkFocus,
     StartWorkRecovery,
 };
+use input_pump::InputPump;
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use reducer::{Effect, reduce};
 use sylvops_core::{
@@ -44,15 +52,19 @@ use sylvops_core::{
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
-        ClientRequest, DaemonEvent, DaemonResponse, MAX_PTY_CHUNK_SIZE, MAX_TERMINAL_COLUMNS,
-        MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal,
-        SessionDeletionRefusal, WorkspaceDeletionRefusal,
+        ClientRequest, DaemonEvent, DaemonResponse, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS,
+        MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal, SessionDeletionRefusal,
+        WorkspaceDeletionRefusal,
     },
     ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
     upgrade::UpgradeStatus,
 };
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
-use terminal::{AttachedTerminal, encode_key, is_detach_key};
+use terminal::{
+    AttachedTerminal, TERMINAL_SCROLLBACK_ROWS, TerminalWheelAction, encode_key, history_action,
+    is_detach_key,
+};
+use theme::terminal_background_rgb;
 
 const TICK: Duration = Duration::from_millis(60);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -121,15 +133,47 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
     let mut events = client.subscribe();
     let (github_results_tx, mut github_results) = tokio::sync::mpsc::channel(16);
     let mut github_tasks = GitHubTasks::default();
-    let _guard = TerminalGuard::enter()?;
+    let mut guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .map_err(|error| DaemonError::Lifecycle(format!("cannot initialize TUI: {error}")))?;
+    let mut inputs = event::EventStream::new();
+    let mut pending_event = None;
+    let mut input_pump: Option<InputPump> = None;
+    let mut input_failed = false;
+    let mut maintenance = tokio::time::interval(TICK);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut dirty = true;
+    let mut animation_frame = app.status_animation_frame();
 
     loop {
+        let controller = app
+            .attached
+            .as_ref()
+            .filter(|attached| attached.role == AttachmentRole::Controller)
+            .map(|attached| attached.session_id);
+        if input_pump.as_ref().map(|pump| pump.session_id) != controller {
+            input_pump = controller.map(|id| InputPump::new(client.clone(), id));
+            input_failed = false;
+        }
+        guard.sync_theme(app.theme);
+        let had_flash = app.flash.is_some();
         app.expire_flash();
+        dirty |= had_flash != app.flash.is_some();
+        let next_animation_frame = app.status_animation_frame();
+        dirty |= next_animation_frame != animation_frame
+            && app.snapshot.sessions.iter().any(|session| {
+                matches!(
+                    session.state,
+                    SessionState::Starting | SessionState::Running
+                )
+            });
+        animation_frame = next_animation_frame;
         for _ in 0..16 {
             match github_results.try_recv() {
-                Ok(result) => apply_github_result_async(&client, &mut app, result).await?,
+                Ok(result) => {
+                    apply_github_result_async(&client, &mut app, result).await?;
+                    dirty = true;
+                }
                 Err(
                     tokio::sync::mpsc::error::TryRecvError::Empty
                     | tokio::sync::mpsc::error::TryRecvError::Disconnected,
@@ -138,7 +182,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         }
         let mut refresh = false;
         for _ in 0..512 {
-            match events.try_recv() {
+            match pending_event.take().unwrap_or_else(|| events.try_recv()) {
                 Ok(DaemonEvent::SessionOutput {
                     session_id,
                     sequence,
@@ -151,6 +195,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                     {
                         attached.parser.process(&bytes);
                         attached.last_sequence = sequence;
+                        dirty = true;
                     }
                 }
                 Ok(DaemonEvent::ResynchronizationRequired {
@@ -163,11 +208,13 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                     if let Some(attached) = app.attached.as_mut()
                         && attached.session_id == session_id
                     {
-                        attached.parser = vt100::Parser::new(rows, columns, 0);
+                        attached.parser =
+                            vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS);
                         attached.parser.process(&terminal_snapshot);
                         attached.last_sequence = snapshot_sequence;
                         attached.columns = columns;
                         attached.rows = rows;
+                        dirty = true;
                     }
                 }
                 Ok(DaemonEvent::UpgradeProgress {
@@ -182,6 +229,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                         && let Some(status) = &mut app.github_status
                     {
                         status.association = association;
+                        dirty = true;
                     }
                 }
                 Ok(event) => refresh |= event_requires_snapshot_refresh(&event),
@@ -198,6 +246,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         }
         if refresh {
             app.replace_snapshot(snapshot(&client).await?);
+            dirty = true;
         }
         save_debounced(&client, &mut app).await?;
         if matches!(app.mode, Mode::TerminalAttached) {
@@ -219,21 +268,45 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             )
             .await?;
         }
-        terminal
-            .draw(|frame| render::draw(frame, &mut app))
-            .map_err(|error| DaemonError::Lifecycle(format!("cannot draw TUI: {error}")))?;
-        if !event::poll(TICK)
-            .map_err(|error| DaemonError::Lifecycle(format!("cannot poll input: {error}")))?
-        {
-            continue;
+        if dirty {
+            draw_synchronized(&mut terminal, |frame| render::draw(frame, &mut app))
+                .map_err(|error| DaemonError::Lifecycle(format!("cannot draw TUI: {error}")))?;
+            dirty = false;
         }
-        let input = event::read()
-            .map_err(|error| DaemonError::Lifecycle(format!("cannot read input: {error}")))?;
+        let input = tokio::select! {
+            event = inputs.next() => event.ok_or_else(|| DaemonError::Lifecycle("terminal input stream closed".into()))?
+                .map_err(|error| DaemonError::Lifecycle(error.to_string()))?,
+            event = events.recv() => {
+                pending_event = Some(event.map_err(|error| match error {
+                    tokio::sync::broadcast::error::RecvError::Lagged(count) => tokio::sync::broadcast::error::TryRecvError::Lagged(count),
+                    tokio::sync::broadcast::error::RecvError::Closed => tokio::sync::broadcast::error::TryRecvError::Closed,
+                }));
+                continue;
+            },
+            Some(result) = github_results.recv() => {
+                apply_github_result_async(&client, &mut app, result).await?;
+                dirty = true;
+                continue;
+            },
+            failure = async {
+                match input_pump.as_mut() {
+                    Some(pump) => (&mut pump.failure).await,
+                    None => std::future::pending().await,
+                }
+            }, if !input_failed => {
+                input_failed = true;
+                app.flash = Some(Flash::error(failure.unwrap_or_else(|_| "Terminal input worker stopped.".into())));
+                dirty = true;
+                continue;
+            },
+            _ = maintenance.tick() => continue,
+        };
         if let Event::Key(key) = &input
             && key.kind == KeyEventKind::Release
         {
             continue;
         }
+        dirty = true;
         let quit = match app.mode {
             Mode::Navigation => {
                 handle_navigation(
@@ -257,6 +330,10 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 handle_confirmation(&client, &mut app, input).await?;
                 false
             }
+            Mode::RemovalBlocked(_) => {
+                removal_notice::handle_input(&mut app, &input);
+                false
+            }
             Mode::CommandPalette(_) => {
                 handle_palette(&client, &mut app, input).await?;
                 false
@@ -277,7 +354,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 false
             }
             Mode::TerminalAttached => {
-                handle_terminal(&client, &mut app, input).await?;
+                handle_terminal(&client, &mut app, &mut input_pump, input).await?;
                 false
             }
         };
@@ -286,6 +363,17 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             return Ok(TuiExit::Quit);
         }
     }
+}
+
+fn draw_synchronized<W: std::io::Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    render: impl FnOnce(&mut ratatui::Frame<'_>),
+) -> std::io::Result<()> {
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let result = terminal.draw(render).map(|_| ());
+    // Close synchronization even if drawing failed, so the host never freezes the frame.
+    let end = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    result.and(end)
 }
 
 async fn handle_navigation(
@@ -1819,11 +1907,15 @@ fn apply_removal_inspection(app: &mut App, response: DaemonResponse) {
                 ));
                 return;
             }
-            let Some(token) = status.removal_confirmation_token.filter(|_| status.clean) else {
-                app.flash = Some(Flash::error(bounded_feedback(format!(
-                    "Remove Worktree refused: {} tracked, {} untracked, and {} ignored entries remain. Clean the Worktree and try again.",
-                    status.tracked_changes, status.untracked_files, status.ignored_files
-                ))));
+            if !status.clean {
+                app.flash = None;
+                app.mode = Mode::RemovalBlocked(removal_notice::RemovalNotice::new(&status));
+                return;
+            }
+            let Some(token) = status.removal_confirmation_token else {
+                app.flash = Some(Flash::error(
+                    "The daemon did not authorize removal. Inspect the Worktree again.",
+                ));
                 return;
             };
             app.mode = Mode::Confirmation(Confirmation {
@@ -3002,7 +3094,7 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
             ..
         } => {
             let restored = terminal_snapshot.is_some();
-            let mut parser = vt100::Parser::new(rows, columns, 0);
+            let mut parser = vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS);
             if let Some(snapshot) = terminal_snapshot {
                 parser.process(&snapshot);
             }
@@ -3097,6 +3189,7 @@ fn select_resumed_session(app: &mut App, session: &sylvops_core::domain::Session
 async fn handle_terminal(
     client: &DaemonClient,
     app: &mut App,
+    input_pump: &mut Option<InputPump>,
     input: Event,
 ) -> Result<(), DaemonError> {
     let Some(attached) = app.attached.as_ref() else {
@@ -3106,37 +3199,100 @@ async fn handle_terminal(
     let session_id = attached.session_id;
     let role = attached.role;
     let clicked_detach = matches!(&input, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) && matches!(app.hit_map.target_at(mouse.column, mouse.row), Some(HitTarget::Detach)));
+    let history = match &input {
+        Event::Key(key) => history_action(*key),
+        _ => None,
+    };
+    let wheel = match &input {
+        Event::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) =>
+        {
+            terminal_wheel_position(app, *mouse)
+        }
+        _ => None,
+    };
     match input {
-        Event::Key(key) if is_detach_key(key) => detach(client, app, session_id).await,
-        Event::Mouse(_) if clicked_detach => detach(client, app, session_id).await,
+        Event::Key(key) if is_detach_key(key) => {
+            input_pump.take();
+            detach(client, app, session_id).await
+        }
+        Event::Mouse(_) if clicked_detach => {
+            input_pump.take();
+            detach(client, app, session_id).await
+        }
+        Event::Mouse(_) if wheel.is_some() => {
+            let (scroll_up, row, column) = wheel.expect("wheel guard checked");
+            let action = app
+                .attached
+                .as_mut()
+                .map(|terminal| terminal.wheel_action(scroll_up, row, column));
+            if let Some(TerminalWheelAction::Application(bytes)) = action {
+                enqueue_terminal_input(app, input_pump.as_ref(), bytes);
+            }
+            Ok(())
+        }
+        Event::Key(_) if history.is_some() => {
+            if let Some(terminal) = app.attached.as_mut() {
+                terminal.apply_history_action(history.expect("history guard checked"));
+            }
+            Ok(())
+        }
         Event::Key(key) if role == AttachmentRole::Controller => {
+            if let Some(terminal) = app.attached.as_mut() {
+                terminal.scroll_to_latest();
+            }
             if let Some(bytes) = encode_key(key) {
-                let response = client
-                    .request(&ClientRequest::SessionInput { session_id, bytes })
-                    .await?;
-                if !matches!(response, DaemonResponse::Acknowledged) {
-                    app.flash = Some(Flash::error(response_message("terminal input", response)));
-                }
+                enqueue_terminal_input(app, input_pump.as_ref(), bytes);
             }
             Ok(())
         }
         Event::Paste(text) if role == AttachmentRole::Controller => {
-            for bytes in text.as_bytes().chunks(MAX_PTY_CHUNK_SIZE) {
-                let response = client
-                    .request(&ClientRequest::SessionInput {
-                        session_id,
-                        bytes: bytes.to_vec(),
-                    })
-                    .await?;
-                if !matches!(response, DaemonResponse::Acknowledged) {
-                    app.flash = Some(Flash::error(response_message("terminal paste", response)));
-                    break;
-                }
+            if let Some(terminal) = app.attached.as_mut() {
+                terminal.scroll_to_latest();
             }
+            enqueue_terminal_input(app, input_pump.as_ref(), text.into_bytes());
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+fn enqueue_terminal_input(app: &mut App, pump: Option<&InputPump>, bytes: Vec<u8>) {
+    let result = pump
+        .ok_or("Terminal input is unavailable; detach and reattach.")
+        .and_then(|pump| pump.enqueue(bytes));
+    if let Err(error) = result {
+        app.flash = Some(Flash::error(error));
+    }
+}
+
+fn terminal_wheel_position(
+    app: &App,
+    mouse: crossterm::event::MouseEvent,
+) -> Option<(bool, u16, u16)> {
+    let scroll_up = match mouse.kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return None,
+    };
+    let viewport = app
+        .hit_map
+        .0
+        .iter()
+        .rev()
+        .find(|region| region.target == HitTarget::TerminalViewport)?
+        .area;
+    if app.hit_map.target_at(mouse.column, mouse.row) != Some(HitTarget::TerminalViewport) {
+        return None;
+    }
+    Some((
+        scroll_up,
+        mouse.row.saturating_sub(viewport.y),
+        mouse.column.saturating_sub(viewport.x),
+    ))
 }
 
 async fn detach(
@@ -3210,7 +3366,8 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
         })
         .await?
     {
-        attached.parser = vt100::Parser::new(attached.rows, attached.columns, 0);
+        attached.parser =
+            vt100::Parser::new(attached.rows, attached.columns, TERMINAL_SCROLLBACK_ROWS);
         attached.parser.process(&snapshot);
         attached.last_sequence = replay_through_sequence;
     }
@@ -3303,8 +3460,34 @@ fn push_bounded(target: &mut String, input: &str) {
     target.push_str(&input[..end]);
 }
 
-#[derive(Debug)]
-struct TerminalGuard;
+const RESET_TERMINAL_BACKGROUND: &str = "\x1b]111\x1b\\";
+
+#[derive(Debug, Default)]
+struct TerminalBackgroundSync {
+    applied: Option<TuiTheme>,
+}
+
+impl TerminalBackgroundSync {
+    fn update(&mut self, theme: TuiTheme) -> Option<String> {
+        if self.applied == Some(theme) {
+            return None;
+        }
+        self.applied = Some(theme);
+        Some(terminal_background_sequence(theme))
+    }
+}
+
+fn terminal_background_sequence(theme: TuiTheme) -> String {
+    terminal_background_rgb(theme).map_or_else(
+        || RESET_TERMINAL_BACKGROUND.to_owned(),
+        |(red, green, blue)| format!("\x1b]11;rgb:{red:02x}/{green:02x}/{blue:02x}\x1b\\"),
+    )
+}
+
+#[derive(Debug, Default)]
+struct TerminalGuard {
+    background: TerminalBackgroundSync,
+}
 
 impl TerminalGuard {
     fn enter() -> Result<Self, DaemonError> {
@@ -3313,13 +3496,25 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(DaemonError::Lifecycle(error.to_string()));
         }
-        Ok(Self)
+        Ok(Self::default())
+    }
+
+    fn sync_theme(&mut self, theme: TuiTheme) {
+        if let Some(sequence) = self.background.update(theme) {
+            let _ = execute!(stdout(), Print(sequence));
+        }
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout(),
+            EndSynchronizedUpdate,
+            Print(RESET_TERMINAL_BACKGROUND),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -5169,6 +5364,8 @@ mod tests {
                 tracked_changes: 0,
                 untracked_files: 0,
                 ignored_files: 0,
+                blocking_paths: Vec::new(),
+                blocking_paths_truncated: false,
                 clean: true,
                 removal_confirmation_token: Some("clean-state-token".into()),
             }),
@@ -5276,6 +5473,8 @@ mod tests {
             tracked_changes: 0,
             untracked_files: 0,
             ignored_files: 0,
+            blocking_paths: Vec::new(),
+            blocking_paths_truncated: false,
             clean: true,
             removal_confirmation_token: Some("clean-state-token".into()),
         };
@@ -5300,6 +5499,73 @@ mod tests {
                 .is_some_and(|flash| flash.text.contains("is not active"))
         );
         assert!(matches!(app.mode, Mode::Navigation));
+    }
+
+    #[test]
+    fn blocked_worktree_dialog_names_ignored_content_and_scrolls_on_narrow_terminals() {
+        use sylvops_core::domain::{GitWorktreeState, WorktreeBlockingKind, WorktreeBlockingPath};
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.worktrees[0].is_root_checkout = false;
+        let worktree_id = snapshot.worktrees[0].id;
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.select_node(ExplorerNode::Worktree(worktree_id));
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::WorktreeStatus(GitWorktreeState {
+                worktree_id,
+                head_commit: "abc".into(),
+                branch: Some("feature".into()),
+                tracked_changes: 0,
+                untracked_files: 0,
+                ignored_files: 12,
+                blocking_paths: vec![WorktreeBlockingPath {
+                    kind: WorktreeBlockingKind::Ignored,
+                    path: "target/".into(),
+                }],
+                blocking_paths_truncated: true,
+                clean: false,
+                removal_confirmation_token: None,
+            }),
+        );
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Ignored content: target/"));
+        assert!(text.contains("Nothing was deleted."));
+        assert!(text.contains("and more entries"));
+
+        let mut narrow = Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+        narrow.draw(|frame| render::draw(frame, &mut app)).unwrap();
+        assert!(matches!(&app.mode, Mode::RemovalBlocked(notice) if notice.max_scroll > 0));
+        removal_notice::handle_input(
+            &mut app,
+            &Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE,
+            )),
+        );
+        assert!(
+            matches!(&app.mode, Mode::RemovalBlocked(notice) if notice.scroll == notice.max_scroll)
+        );
+        removal_notice::handle_input(
+            &mut app,
+            &Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )),
+        );
+        assert!(matches!(app.mode, Mode::Navigation));
+        assert_eq!(app.selected_worktree_id, Some(worktree_id));
     }
 
     #[test]
@@ -5790,16 +6056,157 @@ mod tests {
 
     #[test]
     fn status_is_not_encoded_by_color_alone() {
-        assert_eq!(render::status_symbol(SessionState::NeedsFeedback), "!");
+        assert_eq!(render::status_symbol(SessionState::NeedsFeedback, 0), "!");
         assert_eq!(
             render::status_label(SessionState::NeedsFeedback),
             "Needs feedback"
         );
-        assert_eq!(render::status_symbol(SessionState::Disconnected), "—");
+        assert_eq!(render::status_symbol(SessionState::Disconnected, 0), "—");
         assert_eq!(
             render::status_label(SessionState::Disconnected),
             "Disconnected"
         );
+    }
+
+    #[test]
+    fn synchronized_frame_encloses_text_and_final_cursor_position() {
+        let mut bytes = Vec::<u8>::new();
+        let backend = CrosstermBackend::new(&mut bytes);
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 20, 4)),
+            },
+        )
+        .unwrap();
+        draw_synchronized(&mut terminal, |frame| {
+            frame.render_widget(ratatui::widgets::Paragraph::new("echo"), frame.area());
+            frame.set_cursor_position((4, 0));
+        })
+        .unwrap();
+        drop(terminal);
+        assert!(bytes.starts_with(b"\x1b[?2026h"));
+        assert!(bytes.ends_with(b"\x1b[?2026l"));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("echo"));
+        assert!(text.contains("\x1b[1;5H"));
+    }
+
+    #[test]
+    fn terminal_background_tracks_named_theme_changes_and_resets_to_default() {
+        let mut sync = TerminalBackgroundSync::default();
+        assert_eq!(
+            sync.update(TuiTheme::Nord).as_deref(),
+            Some("\x1b]11;rgb:2e/34/40\x1b\\")
+        );
+        assert_eq!(sync.update(TuiTheme::Nord), None);
+        assert_eq!(
+            sync.update(TuiTheme::TokyoNight).as_deref(),
+            Some("\x1b]11;rgb:1a/1b/26\x1b\\")
+        );
+        assert_eq!(
+            sync.update(TuiTheme::TerminalDefault).as_deref(),
+            Some(RESET_TERMINAL_BACKGROUND)
+        );
+    }
+
+    #[test]
+    fn terminal_wheel_coordinates_are_scoped_to_the_rendered_viewport() {
+        use crossterm::event::MouseEvent;
+
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.hit_map
+            .push(Rect::new(10, 5, 40, 12), HitTarget::TerminalViewport);
+        let inside = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 13,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(terminal_wheel_position(&app, inside), Some((true, 2, 3)));
+
+        let outside = MouseEvent {
+            column: 3,
+            row: 2,
+            ..inside
+        };
+        assert_eq!(terminal_wheel_position(&app, outside), None);
+    }
+
+    #[test]
+    fn running_and_starting_statuses_use_a_spinning_ring() {
+        let frames = (0..4)
+            .map(|frame| render::status_symbol(SessionState::Running, frame))
+            .collect::<Vec<_>>();
+        assert_eq!(frames, ["◐", "◓", "◑", "◒"]);
+        assert_eq!(
+            render::status_symbol(SessionState::Starting, 5),
+            render::status_symbol(SessionState::Running, 1)
+        );
+    }
+
+    #[test]
+    fn attention_means_the_agent_is_waiting_for_user_input() {
+        let mut snapshot = populated_snapshot();
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        for state in [
+            SessionState::Starting,
+            SessionState::Running,
+            SessionState::Failed,
+            SessionState::FinishedUnseen,
+        ] {
+            snapshot.sessions[0].state = state;
+            app.replace_snapshot(snapshot.clone());
+            assert_eq!(app.attention_count(), 0, "{state:?}");
+            assert!(app.select_attention().is_none(), "{state:?}");
+        }
+
+        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        let session_id = snapshot.sessions[0].id;
+        app.replace_snapshot(snapshot);
+        assert_eq!(app.attention_count(), 1);
+        assert_eq!(
+            app.select_attention().as_deref(),
+            Some("shell: waiting for your input")
+        );
+        assert_eq!(app.selected_session_id, Some(session_id));
+    }
+
+    #[test]
+    fn attention_banner_copy_uses_correct_grammar() {
+        assert!(
+            render::attention_message(1).contains("1 session needs your input"),
+            "singular attention copy"
+        );
+        assert!(
+            render::attention_message(2).contains("2 sessions need your input"),
+            "plural attention copy"
+        );
+    }
+
+    #[test]
+    fn needs_feedback_rows_use_attention_surfaces_in_cards_and_lists() {
+        let theme = theme::Theme::resolve(TuiTheme::TokyoNight);
+        assert_eq!(
+            render::active_session_style(SessionState::NeedsFeedback, false, theme),
+            theme.attention_surface
+        );
+        assert_eq!(
+            render::active_session_style(SessionState::NeedsFeedback, true, theme),
+            theme.attention_selected_surface
+        );
+        assert_eq!(
+            render::active_session_style(SessionState::Running, false, theme),
+            theme.text
+        );
+        assert_eq!(
+            render::active_session_style(SessionState::Running, true, theme),
+            theme.selected
+        );
+
+        let terminal_default = theme::Theme::resolve(TuiTheme::TerminalDefault);
+        assert_eq!(terminal_default.attention_surface.bg, None);
+        assert_ne!(terminal_default.attention_surface, terminal_default.text);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 21;
+pub const PROTOCOL_MINOR: u16 = 22;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -957,6 +957,35 @@ fn take_uuid(bytes: &[u8], position: &mut usize) -> Result<Uuid> {
 mod tests {
     use super::*;
     use crate::domain::WorktreeStatus;
+
+    #[test]
+    fn worktree_blocking_path_samples_reject_oversized_or_control_text() {
+        use crate::domain::{WorktreeBlockingKind, WorktreeBlockingPath};
+        let entry = |path: String| WorktreeBlockingPath {
+            kind: WorktreeBlockingKind::Ignored,
+            path,
+        };
+        for paths in [
+            vec![entry("x".repeat(513))],
+            vec![entry("bad\x1b[31m".into())],
+            vec![entry("target/".into()); 11],
+        ] {
+            let response = DaemonResponse::WorktreeStatus(GitWorktreeState {
+                worktree_id: WorktreeId::new(),
+                head_commit: "abc".into(),
+                branch: None,
+                tracked_changes: 0,
+                untracked_files: 0,
+                ignored_files: 1,
+                blocking_paths: paths,
+                blocking_paths_truncated: false,
+                clean: false,
+                removal_confirmation_token: None,
+            });
+            let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
+            assert!(frame.payload_as::<DaemonResponse>().is_err());
+        }
+    }
     use crate::ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme};
     use crate::{
         provider::{AuthenticationRequirement, ProviderCapabilities, ProviderRuntimeCapabilities},
@@ -997,7 +1026,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 21);
+        assert_eq!(PROTOCOL_MINOR, 22);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1115,7 +1144,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 21);
+        assert_eq!(PROTOCOL_MINOR, 22);
     }
 
     #[test]
@@ -1155,7 +1184,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 21);
+        assert_eq!(PROTOCOL_MINOR, 22);
     }
 
     #[test]
@@ -1226,7 +1255,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 21);
+        assert_eq!(PROTOCOL_MINOR, 22);
     }
 
     #[test]
@@ -1624,9 +1653,14 @@ mod tests {
                 branch: Some("feature/removal".into()),
                 tracked_changes: 0,
                 untracked_files: 0,
-                ignored_files: 0,
-                clean: true,
-                removal_confirmation_token: Some("state-bound-token".into()),
+                ignored_files: 1,
+                blocking_paths: vec![crate::domain::WorktreeBlockingPath {
+                    kind: crate::domain::WorktreeBlockingKind::Ignored,
+                    path: "target/".into(),
+                }],
+                blocking_paths_truncated: false,
+                clean: false,
+                removal_confirmation_token: None,
             }),
             DaemonResponse::SessionDeleted {
                 revision: 20,

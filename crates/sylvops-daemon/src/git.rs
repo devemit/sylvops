@@ -404,6 +404,10 @@ pub async fn inspect_worktree(worktree: &Worktree) -> Result<GitWorktreeState> {
         )));
     }
     let (tracked_changes, untracked_files, ignored_files) = count_status_entries(&output.stdout);
+    let blocking_paths = blocking_status_paths(&output.stdout);
+    let blocking_paths_truncated =
+        u64::from(tracked_changes) + u64::from(untracked_files) + u64::from(ignored_files)
+            > blocking_paths.len() as u64;
     let clean = output.stdout.is_empty();
     let removal_confirmation_token = clean.then(|| {
         state_token(
@@ -421,6 +425,8 @@ pub async fn inspect_worktree(worktree: &Worktree) -> Result<GitWorktreeState> {
         tracked_changes,
         untracked_files,
         ignored_files,
+        blocking_paths,
+        blocking_paths_truncated,
         clean,
         removal_confirmation_token,
     })
@@ -759,6 +765,53 @@ fn count_status_entries(bytes: &[u8]) -> (u32, u32, u32) {
     (tracked, untracked, ignored)
 }
 
+fn blocking_status_paths(bytes: &[u8]) -> Vec<sylvops_core::domain::WorktreeBlockingPath> {
+    use sylvops_core::domain::{
+        MAX_WORKTREE_BLOCKING_PATH_BYTES, MAX_WORKTREE_BLOCKING_PATHS, WorktreeBlockingKind,
+        WorktreeBlockingPath,
+    };
+    let mut paths = Vec::new();
+    let mut records = bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if paths.len() == MAX_WORKTREE_BLOCKING_PATHS {
+            break;
+        }
+        let Some(raw_path) = record.get(3..) else {
+            continue;
+        };
+        let kind = if record.starts_with(b"?? ") {
+            WorktreeBlockingKind::Untracked
+        } else if record.starts_with(b"!! ") {
+            WorktreeBlockingKind::Ignored
+        } else {
+            WorktreeBlockingKind::Tracked
+        };
+        let mut path = String::new();
+        for character in String::from_utf8_lossy(raw_path).chars() {
+            let escaped = if character.is_control() {
+                character.escape_default().to_string()
+            } else {
+                character.to_string()
+            };
+            if path.len() + escaped.len() > MAX_WORKTREE_BLOCKING_PATH_BYTES - 3 {
+                path.push_str("...");
+                break;
+            }
+            path.push_str(&escaped);
+        }
+        paths.push(WorktreeBlockingPath { kind, path });
+        if record
+            .get(..2)
+            .is_some_and(|status| status.contains(&b'R') || status.contains(&b'C'))
+        {
+            records.next(); // porcelain -z puts the old rename/copy path in the next record.
+        }
+    }
+    paths
+}
+
 fn state_token(
     id: WorktreeId,
     path: &str,
@@ -1011,6 +1064,37 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn blocking_paths_label_ignored_directories_and_skip_rename_sources() {
+        use sylvops_core::domain::WorktreeBlockingKind;
+        let paths = blocking_status_paths(
+            b"!! target/\0?? notes.txt\0R  new.txt\0old.txt\0 M changed.txt\0",
+        );
+        assert_eq!(paths.len(), 4);
+        assert_eq!(paths[0].path, "target/");
+        assert_eq!(paths[0].kind, WorktreeBlockingKind::Ignored);
+        assert_eq!(paths[1].kind, WorktreeBlockingKind::Untracked);
+        assert_eq!(paths[2].path, "new.txt");
+        assert_eq!(paths[3].path, "changed.txt");
+    }
+
+    #[test]
+    fn blocking_paths_are_bounded_and_escape_terminal_controls() {
+        use sylvops_core::domain::{MAX_WORKTREE_BLOCKING_PATH_BYTES, MAX_WORKTREE_BLOCKING_PATHS};
+        let paths = blocking_status_paths(b"?? escape\x1b[31m\n.txt\0");
+        assert!(paths[0].path.contains("\\u{1b}"));
+        assert!(!paths[0].path.chars().any(char::is_control));
+        let input = format!("?? {}\0", "界".repeat(600)).repeat(12);
+        let paths = blocking_status_paths(input.as_bytes());
+        assert_eq!(paths.len(), MAX_WORKTREE_BLOCKING_PATHS);
+        assert!(
+            paths
+                .iter()
+                .all(|path| path.path.len() <= MAX_WORKTREE_BLOCKING_PATH_BYTES)
+        );
+        assert!(paths[0].path.ends_with("..."));
+    }
+
     #[tokio::test]
     async fn registers_unicode_repository_without_an_origin() {
         let directory = tempfile::tempdir().unwrap();
@@ -1178,6 +1262,18 @@ mod tests {
         assert!(!state.clean);
         assert_eq!(state.untracked_files, 1);
         assert_eq!(state.ignored_files, 1);
+        assert!(
+            state
+                .blocking_paths
+                .iter()
+                .any(|entry| entry.path == "ignored.txt")
+        );
+        assert!(
+            state
+                .blocking_paths
+                .iter()
+                .any(|entry| entry.path == "untracked.txt")
+        );
         assert!(state.removal_confirmation_token.is_none());
         assert!(
             remove_managed_worktree(&project, &worktree, &managed, "invalid")

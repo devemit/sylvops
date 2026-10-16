@@ -163,7 +163,7 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
         Action::Attention => {
             app.flash = Some(match app.select_attention() {
                 Some(reason) => Flash::transient(FlashKind::Info, format!("Attention: {reason}")),
-                None => Flash::transient(FlashKind::Info, "No sessions currently need attention."),
+                None => Flash::transient(FlashKind::Info, "No sessions currently need your input."),
             });
         }
         Action::Settings => {
