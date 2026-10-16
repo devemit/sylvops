@@ -886,12 +886,22 @@ fn validate_dimensions(columns: u16, rows: u16) -> Result<()> {
 }
 
 fn terminal_snapshot(parser: &vt100::Parser) -> Vec<u8> {
-    let formatted = parser.screen().contents_formatted();
-    if formatted.len() <= 512 * 1024 {
-        formatted
+    // Visible contents alone omit input modes and which grid is active. Clients need
+    // these modes after a replay gap to route wheel and paging input correctly.
+    let screen = parser.screen();
+    let mut snapshot = if screen.alternate_screen() {
+        b"\x1b[?1049h".to_vec()
     } else {
-        parser.screen().contents().into_bytes()
+        b"\x1b[?1049l".to_vec()
+    };
+    let formatted = screen.state_formatted();
+    if formatted.len() <= 512 * 1024 {
+        snapshot.extend_from_slice(&formatted);
+    } else {
+        snapshot.extend_from_slice(screen.contents().as_bytes());
+        snapshot.extend_from_slice(&screen.input_mode_formatted());
     }
+    snapshot
 }
 
 fn spawn_reader(mut reader: Box<dyn Read + Send>, events: mpsc::Sender<ActorEvent>) {
@@ -1023,5 +1033,23 @@ mod tests {
         let snapshot = String::from_utf8_lossy(&terminal_snapshot(&parser)).into_owned();
         assert!(snapshot.contains("main"));
         assert!(!snapshot.contains("alt"));
+    }
+
+    #[test]
+    fn parser_snapshot_restores_modes_needed_to_scroll_after_reattaching() {
+        let mut source = vt100::Parser::new(20, 80, 0);
+        source.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006hconversation");
+        let mut restored = vt100::Parser::new(20, 80, 100);
+        restored.process(&terminal_snapshot(&source));
+        assert!(restored.screen().alternate_screen());
+        assert_eq!(
+            restored.screen().mouse_protocol_mode(),
+            source.screen().mouse_protocol_mode()
+        );
+        assert_eq!(
+            restored.screen().mouse_protocol_encoding(),
+            source.screen().mouse_protocol_encoding()
+        );
+        assert_eq!(restored.screen().contents(), source.screen().contents());
     }
 }

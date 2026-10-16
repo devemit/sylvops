@@ -3201,6 +3201,12 @@ async fn handle_terminal(
     let clicked_detach = matches!(&input, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) && matches!(app.hit_map.target_at(mouse.column, mouse.row), Some(HitTarget::Detach)));
     let history = match &input {
         Event::Key(key) => history_action(*key),
+        Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+            match app.hit_map.target_at(mouse.column, mouse.row) {
+                Some(HitTarget::TerminalHistory(action)) => Some(action),
+                _ => None,
+            }
+        }
         _ => None,
     };
     let wheel = match &input {
@@ -3234,9 +3240,12 @@ async fn handle_terminal(
             }
             Ok(())
         }
-        Event::Key(_) if history.is_some() => {
-            if let Some(terminal) = app.attached.as_mut() {
-                terminal.apply_history_action(history.expect("history guard checked"));
+        _ if history.is_some() => {
+            let action = app.attached.as_mut().map(|terminal| {
+                terminal.apply_history_action(history.expect("history guard checked"))
+            });
+            if let Some(TerminalWheelAction::Application(bytes)) = action {
+                enqueue_terminal_input(app, input_pump.as_ref(), bytes);
             }
             Ok(())
         }

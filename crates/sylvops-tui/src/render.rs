@@ -1553,11 +1553,19 @@ fn draw_footer_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: 
         return;
     }
     if matches!(app.mode, Mode::TerminalAttached) {
-        let actions = vec![action_label(
-            "[Ctrl+]] Detach",
-            HitTarget::Detach,
-            theme.focus,
-        )];
+        let actions = vec![
+            action_label("[Ctrl+]] Detach", HitTarget::Detach, theme.focus),
+            action_label(
+                "[ Older ]",
+                HitTarget::TerminalHistory(crate::terminal::TerminalHistoryAction::PageUp),
+                theme.text,
+            ),
+            action_label(
+                "[ Newer ]",
+                HitTarget::TerminalHistory(crate::terminal::TerminalHistoryAction::PageDown),
+                theme.text,
+            ),
+        ];
         draw_action_line(frame, &mut app.hit_map, area, &actions, theme);
         return;
     }

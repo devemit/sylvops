@@ -194,6 +194,7 @@ pub(crate) enum HitTarget {
     FocusExplorer,
     FocusMain,
     TerminalViewport,
+    TerminalHistory(crate::terminal::TerminalHistoryAction),
     DismissNotice,
     Attach,
     Detach,
