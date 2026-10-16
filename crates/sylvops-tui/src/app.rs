@@ -192,6 +192,7 @@ pub(crate) enum HitTarget {
     NavigatorDivider,
     FocusExplorer,
     FocusMain,
+    TerminalViewport,
     Attach,
     Detach,
     Resume,

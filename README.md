@@ -272,10 +272,10 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 - `Tab` switches between Explorer and Main; arrows navigate and collapse/expand.
 - `1`, `2`, `3`, and `4` open Terminal, Changes, Details, and Active Sessions. A fresh TUI opens Active Sessions; the last view is restored after that.
 - Active Sessions shows only Starting, Running, and Needs feedback Sessions across the open Workspace. Starting and Running use an animated ring, while Sessions waiting for input use a subtle attention-colored surface in Cards and List. Only Needs feedback Sessions appear in the input-needed banner and Shift+A navigation. Cards use two columns when each card is at least 36 columns wide; List is always one column. Arrows and the wheel move selection without attaching, while `Enter` or **Open terminal** attaches explicitly.
-- `Enter` explicitly attaches a selected session; `Ctrl+]` detaches without stopping it.
+- `Enter` explicitly attaches a selected session; `Ctrl+]` detaches without stopping it. While attached, the wheel and Shift+PageUp/Shift+PageDown inspect bounded local history, Shift+Home/Shift+End move to the oldest/latest output, and typing returns to the live row. Full-screen providers that explicitly request mouse input receive bounded wheel events instead.
 - `n` and `r` create and rename in context. `d` names the selected target's action: Stop Session for a live Session, Delete Session for an inactive Session, Remove Worktree, Remove Project, or Delete Workspace. Each removal is inspected before an explicit `y` confirmation; a refusal explains which child, process, or Worktree condition blocks it. `/` searches commands and entities.
 - `s`, the header Settings target, or **Command: open settings** opens the distinct settings mode. Theme, Cards/List presentation, and Comfortable/Compact density changes preview immediately; **Apply** persists them, while `Esc` or **Cancel** restores the complete pre-open TUI settings.
-- Mouse selection, tabs, actions, forms, confirmations, and wheel navigation are supported. Terminal mouse-protocol forwarding is intentionally deferred.
+- Mouse selection, tabs, actions, forms, confirmations, and wheel navigation are supported. Attached terminal wheel events are forwarded only to full-screen providers that explicitly request mouse input; terminal click and drag forwarding remain deferred.
 
 ### Desktop essentials
 

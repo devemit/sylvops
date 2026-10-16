@@ -52,7 +52,10 @@ use sylvops_core::{
     upgrade::UpgradeStatus,
 };
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
-use terminal::{AttachedTerminal, encode_key, is_detach_key};
+use terminal::{
+    AttachedTerminal, TERMINAL_SCROLLBACK_ROWS, TerminalWheelAction, encode_key, history_action,
+    is_detach_key,
+};
 
 const TICK: Duration = Duration::from_millis(60);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -163,7 +166,8 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                     if let Some(attached) = app.attached.as_mut()
                         && attached.session_id == session_id
                     {
-                        attached.parser = vt100::Parser::new(rows, columns, 0);
+                        attached.parser =
+                            vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS);
                         attached.parser.process(&terminal_snapshot);
                         attached.last_sequence = snapshot_sequence;
                         attached.columns = columns;
@@ -3002,7 +3006,7 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
             ..
         } => {
             let restored = terminal_snapshot.is_some();
-            let mut parser = vt100::Parser::new(rows, columns, 0);
+            let mut parser = vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS);
             if let Some(snapshot) = terminal_snapshot {
                 parser.process(&snapshot);
             }
@@ -3106,10 +3110,53 @@ async fn handle_terminal(
     let session_id = attached.session_id;
     let role = attached.role;
     let clicked_detach = matches!(&input, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) && matches!(app.hit_map.target_at(mouse.column, mouse.row), Some(HitTarget::Detach)));
+    let history = match &input {
+        Event::Key(key) => history_action(*key),
+        _ => None,
+    };
+    let wheel = match &input {
+        Event::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) =>
+        {
+            terminal_wheel_position(app, mouse)
+        }
+        _ => None,
+    };
     match input {
         Event::Key(key) if is_detach_key(key) => detach(client, app, session_id).await,
         Event::Mouse(_) if clicked_detach => detach(client, app, session_id).await,
+        Event::Mouse(_) if wheel.is_some() => {
+            let (scroll_up, row, column) = wheel.expect("wheel guard checked");
+            let action = app
+                .attached
+                .as_mut()
+                .map(|terminal| terminal.wheel_action(scroll_up, row, column));
+            if let Some(TerminalWheelAction::Application(bytes)) = action {
+                let response = client
+                    .request(&ClientRequest::SessionInput { session_id, bytes })
+                    .await?;
+                if !matches!(response, DaemonResponse::Acknowledged) {
+                    app.flash = Some(Flash::error(response_message(
+                        "terminal wheel input",
+                        response,
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Event::Key(_) if history.is_some() => {
+            if let Some(terminal) = app.attached.as_mut() {
+                terminal.apply_history_action(history.expect("history guard checked"));
+            }
+            Ok(())
+        }
         Event::Key(key) if role == AttachmentRole::Controller => {
+            if let Some(terminal) = app.attached.as_mut() {
+                terminal.scroll_to_latest();
+            }
             if let Some(bytes) = encode_key(key) {
                 let response = client
                     .request(&ClientRequest::SessionInput { session_id, bytes })
@@ -3121,6 +3168,9 @@ async fn handle_terminal(
             Ok(())
         }
         Event::Paste(text) if role == AttachmentRole::Controller => {
+            if let Some(terminal) = app.attached.as_mut() {
+                terminal.scroll_to_latest();
+            }
             for bytes in text.as_bytes().chunks(MAX_PTY_CHUNK_SIZE) {
                 let response = client
                     .request(&ClientRequest::SessionInput {
@@ -3137,6 +3187,32 @@ async fn handle_terminal(
         }
         _ => Ok(()),
     }
+}
+
+fn terminal_wheel_position(
+    app: &App,
+    mouse: &crossterm::event::MouseEvent,
+) -> Option<(bool, u16, u16)> {
+    let scroll_up = match mouse.kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return None,
+    };
+    let viewport = app
+        .hit_map
+        .0
+        .iter()
+        .rev()
+        .find(|region| region.target == HitTarget::TerminalViewport)?
+        .area;
+    if app.hit_map.target_at(mouse.column, mouse.row) != Some(HitTarget::TerminalViewport) {
+        return None;
+    }
+    Some((
+        scroll_up,
+        mouse.row.saturating_sub(viewport.y),
+        mouse.column.saturating_sub(viewport.x),
+    ))
 }
 
 async fn detach(
@@ -3210,7 +3286,8 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
         })
         .await?
     {
-        attached.parser = vt100::Parser::new(attached.rows, attached.columns, 0);
+        attached.parser =
+            vt100::Parser::new(attached.rows, attached.columns, TERMINAL_SCROLLBACK_ROWS);
         attached.parser.process(&snapshot);
         attached.last_sequence = replay_through_sequence;
     }
@@ -5800,6 +5877,29 @@ mod tests {
             render::status_label(SessionState::Disconnected),
             "Disconnected"
         );
+    }
+
+    #[test]
+    fn terminal_wheel_coordinates_are_scoped_to_the_rendered_viewport() {
+        use crossterm::event::MouseEvent;
+
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.hit_map
+            .push(Rect::new(10, 5, 40, 12), HitTarget::TerminalViewport);
+        let inside = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 13,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(terminal_wheel_position(&app, &inside), Some((true, 2, 3)));
+
+        let outside = MouseEvent {
+            column: 3,
+            row: 2,
+            ..inside
+        };
+        assert_eq!(terminal_wheel_position(&app, &outside), None);
     }
 
     #[test]

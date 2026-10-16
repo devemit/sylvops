@@ -1,6 +1,23 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sylvops_core::{domain::AttachmentRole, ids::SessionId};
 
+pub(crate) const TERMINAL_SCROLLBACK_ROWS: usize = 10_000;
+const WHEEL_SCROLL_LINES: isize = 3;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum TerminalWheelAction {
+    Local,
+    Application(Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalHistoryAction {
+    PageUp,
+    PageDown,
+    Oldest,
+    Latest,
+}
+
 pub(crate) struct AttachedTerminal {
     pub session_id: SessionId,
     pub role: AttachmentRole,
@@ -8,6 +25,122 @@ pub(crate) struct AttachedTerminal {
     pub last_sequence: u64,
     pub columns: u16,
     pub rows: u16,
+}
+
+impl AttachedTerminal {
+    pub fn scroll_lines(&mut self, lines: isize) {
+        let current = self.parser.screen().scrollback();
+        let next = current.saturating_add_signed(lines);
+        self.parser.screen_mut().set_scrollback(next);
+    }
+
+    pub fn scroll_to_latest(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    pub fn scroll_page(&mut self, pages: isize) {
+        let page_rows = usize::from(self.rows.saturating_sub(1).max(1));
+        let lines =
+            isize::try_from(page_rows.saturating_mul(pages.unsigned_abs())).unwrap_or(isize::MAX);
+        self.scroll_lines(if pages.is_positive() { lines } else { -lines });
+    }
+
+    pub fn scroll_to_oldest(&mut self) {
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+    }
+
+    pub fn is_scrolled_back(&self) -> bool {
+        self.parser.screen().scrollback() > 0
+    }
+
+    pub fn apply_history_action(&mut self, action: TerminalHistoryAction) {
+        match action {
+            TerminalHistoryAction::PageUp => self.scroll_page(1),
+            TerminalHistoryAction::PageDown => self.scroll_page(-1),
+            TerminalHistoryAction::Oldest => self.scroll_to_oldest(),
+            TerminalHistoryAction::Latest => self.scroll_to_latest(),
+        }
+    }
+
+    pub fn wheel_action(&mut self, scroll_up: bool, row: u16, column: u16) -> TerminalWheelAction {
+        let (alternate_screen, mouse_mode, mouse_encoding) = {
+            let screen = self.parser.screen();
+            (
+                screen.alternate_screen(),
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            )
+        };
+        if self.role == AttachmentRole::Controller
+            && alternate_screen
+            && mouse_mode != vt100::MouseProtocolMode::None
+        {
+            let row = row.min(self.rows.saturating_sub(1));
+            let column = column.min(self.columns.saturating_sub(1));
+            return TerminalWheelAction::Application(encode_mouse_wheel_event(
+                mouse_encoding,
+                scroll_up,
+                row,
+                column,
+            ));
+        }
+        if !alternate_screen {
+            self.scroll_lines(if scroll_up {
+                WHEEL_SCROLL_LINES
+            } else {
+                -WHEEL_SCROLL_LINES
+            });
+        }
+        TerminalWheelAction::Local
+    }
+}
+
+pub(crate) fn history_action(key: KeyEvent) -> Option<TerminalHistoryAction> {
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::PageUp => Some(TerminalHistoryAction::PageUp),
+        KeyCode::PageDown => Some(TerminalHistoryAction::PageDown),
+        KeyCode::Home => Some(TerminalHistoryAction::Oldest),
+        KeyCode::End => Some(TerminalHistoryAction::Latest),
+        _ => None,
+    }
+}
+
+fn encode_mouse_wheel_event(
+    encoding: vt100::MouseProtocolEncoding,
+    scroll_up: bool,
+    row: u16,
+    column: u16,
+) -> Vec<u8> {
+    let button = if scroll_up { 64_u16 } else { 65_u16 };
+    let x = column.saturating_add(1);
+    let y = row.saturating_add(1);
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{x};{y}M").into_bytes(),
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let mut bytes = b"\x1b[M".to_vec();
+            for value in [
+                button.saturating_add(32),
+                x.saturating_add(32),
+                y.saturating_add(32),
+            ] {
+                let character = char::from_u32(u32::from(value)).unwrap_or('\u{fffd}');
+                let mut encoded = [0_u8; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            }
+            bytes
+        }
+        vt100::MouseProtocolEncoding::Default => vec![
+            0x1b,
+            b'[',
+            b'M',
+            u8::try_from(button.saturating_add(32)).unwrap_or(u8::MAX),
+            u8::try_from(x.min(223).saturating_add(32)).unwrap_or(u8::MAX),
+            u8::try_from(y.min(223).saturating_add(32)).unwrap_or(u8::MAX),
+        ],
+    }
 }
 
 pub(crate) fn is_detach_key(key: KeyEvent) -> bool {
@@ -47,6 +180,17 @@ pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn attached_terminal(role: AttachmentRole, rows: u16, columns: u16) -> AttachedTerminal {
+        AttachedTerminal {
+            session_id: SessionId::new(),
+            role,
+            parser: vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS),
+            last_sequence: 0,
+            columns,
+            rows,
+        }
+    }
+
     #[test]
     fn detach_is_reserved_but_escape_is_forwarded() {
         assert!(is_detach_key(KeyEvent::new(
@@ -57,5 +201,101 @@ mod tests {
             encode_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(vec![0x1b])
         );
+    }
+
+    #[test]
+    fn attached_terminal_scrolls_older_output_and_returns_to_latest() {
+        let mut terminal = attached_terminal(AttachmentRole::Controller, 3, 12);
+        terminal
+            .parser
+            .process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert!(terminal.parser.screen().contents().contains("five"));
+
+        terminal.scroll_lines(2);
+        assert!(terminal.is_scrolled_back());
+        assert!(terminal.parser.screen().contents().contains("two"));
+        let history_view = terminal.parser.screen().contents();
+
+        terminal.parser.process(b"\r\nsix");
+        assert_eq!(terminal.parser.screen().contents(), history_view);
+
+        terminal.scroll_to_latest();
+        assert!(!terminal.is_scrolled_back());
+        assert!(terminal.parser.screen().contents().contains("six"));
+    }
+
+    #[test]
+    fn normal_screen_wheel_scrolls_locally() {
+        let mut terminal = attached_terminal(AttachmentRole::Controller, 3, 12);
+        terminal
+            .parser
+            .process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+
+        assert_eq!(
+            terminal.wheel_action(true, 1, 1),
+            TerminalWheelAction::Local
+        );
+        assert!(terminal.is_scrolled_back());
+    }
+
+    #[test]
+    fn alternate_screen_wheel_uses_requested_mouse_encoding() {
+        let mut terminal = attached_terminal(AttachmentRole::Controller, 20, 80);
+        terminal
+            .parser
+            .process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+
+        assert_eq!(
+            terminal.wheel_action(true, 2, 3),
+            TerminalWheelAction::Application(b"\x1b[<64;4;3M".to_vec())
+        );
+        assert_eq!(
+            terminal.wheel_action(false, 2, 3),
+            TerminalWheelAction::Application(b"\x1b[<65;4;3M".to_vec())
+        );
+
+        terminal.parser.process(b"\x1b[?1006l\x1b[?1005h");
+        assert_eq!(
+            terminal.wheel_action(false, 2, 3),
+            TerminalWheelAction::Application(vec![0x1b, b'[', b'M', 97, 36, 35])
+        );
+
+        terminal.parser.process(b"\x1b[?1005l");
+        assert_eq!(
+            terminal.wheel_action(true, 2, 3),
+            TerminalWheelAction::Application(vec![0x1b, b'[', b'M', 96, 36, 35])
+        );
+    }
+
+    #[test]
+    fn observer_never_forwards_wheel_input() {
+        let mut terminal = attached_terminal(AttachmentRole::Observer, 20, 80);
+        terminal
+            .parser
+            .process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+
+        assert_eq!(
+            terminal.wheel_action(true, 2, 3),
+            TerminalWheelAction::Local
+        );
+    }
+
+    #[test]
+    fn shifted_navigation_keys_control_local_history() {
+        for (code, expected) in [
+            (KeyCode::PageUp, Some(TerminalHistoryAction::PageUp)),
+            (KeyCode::PageDown, Some(TerminalHistoryAction::PageDown)),
+            (KeyCode::Home, Some(TerminalHistoryAction::Oldest)),
+            (KeyCode::End, Some(TerminalHistoryAction::Latest)),
+        ] {
+            assert_eq!(
+                history_action(KeyEvent::new(code, KeyModifiers::SHIFT)),
+                expected
+            );
+            assert_eq!(
+                history_action(KeyEvent::new(code, KeyModifiers::NONE)),
+                None
+            );
+        }
     }
 }

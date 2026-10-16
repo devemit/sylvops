@@ -831,10 +831,13 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         } else {
             "read-only observer"
         };
-        (
-            format!(" Terminal · attached as {role} "),
-            terminal_text(attached.parser.screen()),
-        )
+        let history = attached.parser.screen().scrollback();
+        let title = if attached.is_scrolled_back() {
+            format!(" Terminal · {role} · history {history} rows · Shift+End latest ")
+        } else {
+            format!(" Terminal · attached as {role} · wheel scrolls history ")
+        };
+        (title, terminal_text(attached.parser.screen()))
     } else if let Some(session) = app.selected_session() {
         let can_resume = session_can_resume(session, &app.snapshot.sessions, &app.providers);
         (
@@ -866,12 +869,18 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         terminal = terminal.style(theme.text).wrap(Wrap { trim: false });
     }
     frame.render_widget(terminal, area);
+    let viewport = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    app.hit_map.push(viewport, HitTarget::TerminalViewport);
 
     if let Some(screen) = app
         .attached
         .as_ref()
         .map(|attached| attached.parser.screen())
         && !screen.hide_cursor()
+        && screen.scrollback() == 0
     {
         let (row, column) = screen.cursor_position();
         let inner_width = area.width.saturating_sub(2);
@@ -1567,7 +1576,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Active navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nChanges: ↑/↓, j/k, Page Up/Page Down, or mouse wheel to scroll\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Active navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nChanges: ↑/↓, j/k, Page Up/Page Down, or mouse wheel to scroll\nAttached terminal: wheel or Shift+PageUp/PageDown scrolls; Shift+Home oldest; Shift+End latest\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 
