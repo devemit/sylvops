@@ -967,6 +967,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix 1.1.4",
@@ -4703,6 +4704,7 @@ name = "sylvops-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm 0.29.0",
+ "futures-util",
  "junction",
  "ratatui",
  "sylvops-core",

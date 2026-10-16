@@ -5,6 +5,7 @@ mod directory_browser;
 mod forms;
 mod github_modal;
 mod input;
+mod input_pump;
 mod reducer;
 mod render;
 mod terminal;
@@ -27,14 +28,19 @@ use crossterm::{
     },
     execute,
     style::Print,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
 use directory_browser::{DirectoryBrowser, DirectoryBrowserEntry};
 use forms::{Form, FormKind};
+use futures_util::StreamExt as _;
 use github_modal::{
     GitHubDepth, GitHubEscape, GitHubModal, GitHubQuery, GitHubRequestTarget, StartWorkFocus,
     StartWorkRecovery,
 };
+use input_pump::InputPump;
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use reducer::{Effect, reduce};
 use sylvops_core::{
@@ -45,9 +51,9 @@ use sylvops_core::{
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
-        ClientRequest, DaemonEvent, DaemonResponse, MAX_PTY_CHUNK_SIZE, MAX_TERMINAL_COLUMNS,
-        MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal,
-        SessionDeletionRefusal, WorkspaceDeletionRefusal,
+        ClientRequest, DaemonEvent, DaemonResponse, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS,
+        MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal, SessionDeletionRefusal,
+        WorkspaceDeletionRefusal,
     },
     ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
     upgrade::UpgradeStatus,
@@ -129,13 +135,44 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
     let mut guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .map_err(|error| DaemonError::Lifecycle(format!("cannot initialize TUI: {error}")))?;
+    let mut inputs = event::EventStream::new();
+    let mut pending_event = None;
+    let mut input_pump: Option<InputPump> = None;
+    let mut input_failed = false;
+    let mut maintenance = tokio::time::interval(TICK);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut dirty = true;
+    let mut animation_frame = app.status_animation_frame();
 
     loop {
+        let controller = app
+            .attached
+            .as_ref()
+            .filter(|attached| attached.role == AttachmentRole::Controller)
+            .map(|attached| attached.session_id);
+        if input_pump.as_ref().map(|pump| pump.session_id) != controller {
+            input_pump = controller.map(|id| InputPump::new(client.clone(), id));
+            input_failed = false;
+        }
         guard.sync_theme(app.theme);
+        let had_flash = app.flash.is_some();
         app.expire_flash();
+        dirty |= had_flash != app.flash.is_some();
+        let next_animation_frame = app.status_animation_frame();
+        dirty |= next_animation_frame != animation_frame
+            && app.snapshot.sessions.iter().any(|session| {
+                matches!(
+                    session.state,
+                    SessionState::Starting | SessionState::Running
+                )
+            });
+        animation_frame = next_animation_frame;
         for _ in 0..16 {
             match github_results.try_recv() {
-                Ok(result) => apply_github_result_async(&client, &mut app, result).await?,
+                Ok(result) => {
+                    apply_github_result_async(&client, &mut app, result).await?;
+                    dirty = true;
+                }
                 Err(
                     tokio::sync::mpsc::error::TryRecvError::Empty
                     | tokio::sync::mpsc::error::TryRecvError::Disconnected,
@@ -144,7 +181,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         }
         let mut refresh = false;
         for _ in 0..512 {
-            match events.try_recv() {
+            match pending_event.take().unwrap_or_else(|| events.try_recv()) {
                 Ok(DaemonEvent::SessionOutput {
                     session_id,
                     sequence,
@@ -157,6 +194,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                     {
                         attached.parser.process(&bytes);
                         attached.last_sequence = sequence;
+                        dirty = true;
                     }
                 }
                 Ok(DaemonEvent::ResynchronizationRequired {
@@ -175,6 +213,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                         attached.last_sequence = snapshot_sequence;
                         attached.columns = columns;
                         attached.rows = rows;
+                        dirty = true;
                     }
                 }
                 Ok(DaemonEvent::UpgradeProgress {
@@ -189,6 +228,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                         && let Some(status) = &mut app.github_status
                     {
                         status.association = association;
+                        dirty = true;
                     }
                 }
                 Ok(event) => refresh |= event_requires_snapshot_refresh(&event),
@@ -205,6 +245,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         }
         if refresh {
             app.replace_snapshot(snapshot(&client).await?);
+            dirty = true;
         }
         save_debounced(&client, &mut app).await?;
         if matches!(app.mode, Mode::TerminalAttached) {
@@ -226,21 +267,45 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             )
             .await?;
         }
-        terminal
-            .draw(|frame| render::draw(frame, &mut app))
-            .map_err(|error| DaemonError::Lifecycle(format!("cannot draw TUI: {error}")))?;
-        if !event::poll(TICK)
-            .map_err(|error| DaemonError::Lifecycle(format!("cannot poll input: {error}")))?
-        {
-            continue;
+        if dirty {
+            draw_synchronized(&mut terminal, |frame| render::draw(frame, &mut app))
+                .map_err(|error| DaemonError::Lifecycle(format!("cannot draw TUI: {error}")))?;
+            dirty = false;
         }
-        let input = event::read()
-            .map_err(|error| DaemonError::Lifecycle(format!("cannot read input: {error}")))?;
+        let input = tokio::select! {
+            event = inputs.next() => event.ok_or_else(|| DaemonError::Lifecycle("terminal input stream closed".into()))?
+                .map_err(|error| DaemonError::Lifecycle(error.to_string()))?,
+            event = events.recv() => {
+                pending_event = Some(event.map_err(|error| match error {
+                    tokio::sync::broadcast::error::RecvError::Lagged(count) => tokio::sync::broadcast::error::TryRecvError::Lagged(count),
+                    tokio::sync::broadcast::error::RecvError::Closed => tokio::sync::broadcast::error::TryRecvError::Closed,
+                }));
+                continue;
+            },
+            Some(result) = github_results.recv() => {
+                apply_github_result_async(&client, &mut app, result).await?;
+                dirty = true;
+                continue;
+            },
+            failure = async {
+                match input_pump.as_mut() {
+                    Some(pump) => (&mut pump.failure).await,
+                    None => std::future::pending().await,
+                }
+            }, if !input_failed => {
+                input_failed = true;
+                app.flash = Some(Flash::error(failure.unwrap_or_else(|_| "Terminal input worker stopped.".into())));
+                dirty = true;
+                continue;
+            },
+            _ = maintenance.tick() => continue,
+        };
         if let Event::Key(key) = &input
             && key.kind == KeyEventKind::Release
         {
             continue;
         }
+        dirty = true;
         let quit = match app.mode {
             Mode::Navigation => {
                 handle_navigation(
@@ -284,7 +349,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 false
             }
             Mode::TerminalAttached => {
-                handle_terminal(&client, &mut app, input).await?;
+                handle_terminal(&client, &mut app, &mut input_pump, input).await?;
                 false
             }
         };
@@ -293,6 +358,17 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             return Ok(TuiExit::Quit);
         }
     }
+}
+
+fn draw_synchronized<W: std::io::Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    render: impl FnOnce(&mut ratatui::Frame<'_>),
+) -> std::io::Result<()> {
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let result = terminal.draw(render).map(|_| ());
+    // Close synchronization even if drawing failed, so the host never freezes the frame.
+    let end = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    result.and(end)
 }
 
 async fn handle_navigation(
@@ -3104,6 +3180,7 @@ fn select_resumed_session(app: &mut App, session: &sylvops_core::domain::Session
 async fn handle_terminal(
     client: &DaemonClient,
     app: &mut App,
+    input_pump: &mut Option<InputPump>,
     input: Event,
 ) -> Result<(), DaemonError> {
     let Some(attached) = app.attached.as_ref() else {
@@ -3129,8 +3206,14 @@ async fn handle_terminal(
         _ => None,
     };
     match input {
-        Event::Key(key) if is_detach_key(key) => detach(client, app, session_id).await,
-        Event::Mouse(_) if clicked_detach => detach(client, app, session_id).await,
+        Event::Key(key) if is_detach_key(key) => {
+            input_pump.take();
+            detach(client, app, session_id).await
+        }
+        Event::Mouse(_) if clicked_detach => {
+            input_pump.take();
+            detach(client, app, session_id).await
+        }
         Event::Mouse(_) if wheel.is_some() => {
             let (scroll_up, row, column) = wheel.expect("wheel guard checked");
             let action = app
@@ -3138,15 +3221,7 @@ async fn handle_terminal(
                 .as_mut()
                 .map(|terminal| terminal.wheel_action(scroll_up, row, column));
             if let Some(TerminalWheelAction::Application(bytes)) = action {
-                let response = client
-                    .request(&ClientRequest::SessionInput { session_id, bytes })
-                    .await?;
-                if !matches!(response, DaemonResponse::Acknowledged) {
-                    app.flash = Some(Flash::error(response_message(
-                        "terminal wheel input",
-                        response,
-                    )));
-                }
+                enqueue_terminal_input(app, input_pump.as_ref(), bytes);
             }
             Ok(())
         }
@@ -3161,12 +3236,7 @@ async fn handle_terminal(
                 terminal.scroll_to_latest();
             }
             if let Some(bytes) = encode_key(key) {
-                let response = client
-                    .request(&ClientRequest::SessionInput { session_id, bytes })
-                    .await?;
-                if !matches!(response, DaemonResponse::Acknowledged) {
-                    app.flash = Some(Flash::error(response_message("terminal input", response)));
-                }
+                enqueue_terminal_input(app, input_pump.as_ref(), bytes);
             }
             Ok(())
         }
@@ -3174,21 +3244,19 @@ async fn handle_terminal(
             if let Some(terminal) = app.attached.as_mut() {
                 terminal.scroll_to_latest();
             }
-            for bytes in text.as_bytes().chunks(MAX_PTY_CHUNK_SIZE) {
-                let response = client
-                    .request(&ClientRequest::SessionInput {
-                        session_id,
-                        bytes: bytes.to_vec(),
-                    })
-                    .await?;
-                if !matches!(response, DaemonResponse::Acknowledged) {
-                    app.flash = Some(Flash::error(response_message("terminal paste", response)));
-                    break;
-                }
-            }
+            enqueue_terminal_input(app, input_pump.as_ref(), text.into_bytes());
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn enqueue_terminal_input(app: &mut App, pump: Option<&InputPump>, bytes: Vec<u8>) {
+    let result = pump
+        .ok_or("Terminal input is unavailable; detach and reattach.")
+        .and_then(|pump| pump.enqueue(bytes));
+    if let Err(error) = result {
+        app.flash = Some(Flash::error(error));
     }
 }
 
@@ -3433,6 +3501,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = execute!(
             stdout(),
+            EndSynchronizedUpdate,
             Print(RESET_TERMINAL_BACKGROUND),
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -5917,6 +5986,30 @@ mod tests {
             render::status_label(SessionState::Disconnected),
             "Disconnected"
         );
+    }
+
+    #[test]
+    fn synchronized_frame_encloses_text_and_final_cursor_position() {
+        let mut bytes = Vec::<u8>::new();
+        let backend = CrosstermBackend::new(&mut bytes);
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 20, 4)),
+            },
+        )
+        .unwrap();
+        draw_synchronized(&mut terminal, |frame| {
+            frame.render_widget(ratatui::widgets::Paragraph::new("echo"), frame.area());
+            frame.set_cursor_position((4, 0));
+        })
+        .unwrap();
+        drop(terminal);
+        assert!(bytes.starts_with(b"\x1b[?2026h"));
+        assert!(bytes.ends_with(b"\x1b[?2026l"));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("echo"));
+        assert!(text.contains("\x1b[1;5H"));
     }
 
     #[test]

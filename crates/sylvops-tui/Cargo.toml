@@ -9,7 +9,8 @@ license.workspace = true
 [dependencies]
 sylvops-core = { path = "../sylvops-core" }
 sylvops-daemon = { path = "../sylvops-daemon" }
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
+futures-util.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 vt100.workspace = true
