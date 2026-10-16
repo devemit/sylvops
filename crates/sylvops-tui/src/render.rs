@@ -1518,6 +1518,20 @@ fn footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let version = application_version_label();
+    let (content_area, version_area) = footer_areas(area, &version);
+    draw_footer_content(frame, app, content_area, theme);
+    if let Some(version_area) = version_area {
+        frame.render_widget(
+            Paragraph::new(version)
+                .alignment(Alignment::Right)
+                .style(theme.muted),
+            version_area,
+        );
+    }
+}
+
+fn draw_footer_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     if let Some(flash) = &app.flash {
         frame.render_widget(
             Paragraph::new(truncate_text(&flash.text, area.width)).style(theme.flash(flash.kind)),
@@ -1571,6 +1585,50 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     }
     let actions = footer_actions(app, area.width, theme);
     draw_action_line(frame, &mut app.hit_map, area, &actions, theme);
+}
+
+fn application_version_label() -> String {
+    format_version_label(
+        option_env!("PREVIEW_TAG"),
+        option_env!("RELEASE_TAG"),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn format_version_label(
+    preview_tag: Option<&str>,
+    release_tag: Option<&str>,
+    package_version: &str,
+) -> String {
+    let version = preview_tag.or(release_tag).unwrap_or(package_version);
+    if version.starts_with('v') {
+        version.to_owned()
+    } else {
+        format!("v{version}")
+    }
+}
+
+fn footer_areas(area: Rect, version: &str) -> (Rect, Option<Rect>) {
+    const MIN_CONTENT_WIDTH: u16 = 32;
+    const VERSION_GAP: u16 = 1;
+
+    let version_width = text_width(version);
+    let reserved = version_width.saturating_add(VERSION_GAP);
+    if version_width == 0 || area.width < MIN_CONTENT_WIDTH.saturating_add(reserved) {
+        return (area, None);
+    }
+    let content_width = area.width.saturating_sub(reserved);
+    (
+        Rect::new(area.x, area.y, content_width, area.height),
+        Some(Rect::new(
+            area.x
+                .saturating_add(content_width)
+                .saturating_add(VERSION_GAP),
+            area.y,
+            version_width,
+            area.height,
+        )),
+    )
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {

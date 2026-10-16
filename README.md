@@ -275,6 +275,7 @@ The Windows implementation contains a Win32 ConPTY launcher that supplies both t
 - `Enter` explicitly attaches a selected session; `Ctrl+]` detaches without stopping it. While attached, the wheel and Shift+PageUp/Shift+PageDown inspect bounded local history, Shift+Home/Shift+End move to the oldest/latest output, and typing returns to the live row. Full-screen providers that explicitly request mouse input receive bounded wheel events instead.
 - `n` and `r` create and rename in context. `d` names the selected target's action: Stop Session for a live Session, Delete Session for an inactive Session, Remove Worktree, Remove Project, or Delete Workspace. Each removal is inspected before an explicit `y` confirmation; a refusal explains which child, process, or Worktree condition blocks it. `/` searches commands and entities.
 - `s`, the header Settings target, or **Command: open settings** opens the distinct settings mode. Theme, Cards/List presentation, and Comfortable/Compact density changes preview immediately; **Apply** persists them, while `Esc` or **Cancel** restores the complete pre-open TUI settings.
+- The footer shows the running build or preview version at the right edge when the terminal is wide enough, without displacing contextual actions.
 - Mouse selection, tabs, actions, forms, confirmations, and wheel navigation are supported. Attached terminal wheel events are forwarded only to full-screen providers that explicitly request mouse input; terminal click and drag forwarding remain deferred.
 
 ### Desktop essentials
