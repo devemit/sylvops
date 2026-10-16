@@ -18,7 +18,9 @@ use std::{
 };
 
 use bridge::{Bridge, BridgeEvent, GitHubDetailRequest, Operation, TerminalInputError};
-use chrono::{DateTime, Local, Locale};
+#[cfg(not(test))]
+use chrono::Local;
+use chrono::{DateTime, Locale};
 use forms::{
     Confirmation, DataRemovalConfirmation, FirstRunStepState, FormModal, Modal, StartWorkModal,
     first_run_steps,
@@ -282,6 +284,7 @@ struct DesktopApp {
     attention_alerts: Option<sylvops_core::attention::AttentionTracker>,
     attention_sound: Option<notifications::SoundNotifier>,
     status_animation_started_at: Instant,
+    status_animation_phase: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -757,6 +760,7 @@ impl DesktopApp {
             attention_alerts: None,
             attention_sound: notifications::SoundNotifier::new().ok(),
             status_animation_started_at: Instant::now(),
+            status_animation_phase: 0.0,
         }
     }
 
@@ -764,6 +768,13 @@ impl DesktopApp {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
+                self.status_animation_phase = self
+                    .status_animation_started_at
+                    .elapsed()
+                    .as_secs_f32()
+                    .rem_euclid(1.2)
+                    / 1.2
+                    * std::f32::consts::TAU;
                 self.flush_timers();
                 if self.modal_focus == ModalFocus::Pending {
                     self.modal_focus = ModalFocus::Idle;
@@ -7557,12 +7568,7 @@ impl DesktopApp {
     }
 
     fn status_animation_angle(&self) -> f32 {
-        self.status_animation_started_at
-            .elapsed()
-            .as_secs_f32()
-            .rem_euclid(1.2)
-            / 1.2
-            * std::f32::consts::TAU
+        self.status_animation_phase
     }
 
     fn observe_attention(&mut self) {
@@ -7765,9 +7771,14 @@ fn human_readable_timestamp(timestamp_millis: i64) -> Option<String> {
 
 fn human_readable_timestamp_for_locale(timestamp_millis: i64, locale: &str) -> Option<String> {
     let locale = chrono_locale(locale);
+    #[cfg(not(test))]
+    let timezone = Local;
+    // Keep visual fixtures independent of the developer machine's timezone.
+    #[cfg(test)]
+    let timezone = chrono::FixedOffset::east_opt(0).expect("UTC offset");
     DateTime::from_timestamp_millis(timestamp_millis).map(|timestamp| {
         timestamp
-            .with_timezone(&Local)
+            .with_timezone(&timezone)
             .format_localized("%x %X %Z", locale)
             .to_string()
     })
@@ -9950,72 +9961,72 @@ mod tests {
 
     #[cfg(windows)]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        2_755_497_156_379_073_812,
-        15_362_160_828_013_170_644,
+        6_056_929_286_929_254_572,
+        12_365_258_274_555_457_046,
         11_704_634_815_454_000_937,
-        3_347_152_369_182_623_665,
-        16_432_519_811_174_047_901,
-        2_211_951_704_754_922_015,
-        2_639_899_582_621_495_518,
-        16_661_503_487_281_653_449,
-        15_321_496_262_529_027_886,
-        4_137_155_324_487_175_349,
+        782_010_617_141_479_802,
+        4_395_501_193_168_974_425,
+        3_418_532_975_102_054_885,
+        6_245_462_422_357_463_579,
+        6_668_688_232_839_147_988,
+        10_103_567_952_100_179_337,
+        1_073_514_426_815_219_159,
         3_979_220_309_231_598_554,
-        17_670_355_805_035_403_630,
+        17_405_286_351_512_519_950,
         1_823_448_962_296_347_469,
-        7_134_676_789_761_793_996,
+        8_505_971_068_273_118_034,
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        2_755_497_156_379_073_812,
-        15_362_160_828_013_170_644,
+        6_056_929_286_929_254_572,
+        12_365_258_274_555_457_046,
         11_704_634_815_454_000_937,
-        3_347_152_369_182_623_665,
-        16_432_519_811_174_047_901,
-        2_211_951_704_754_922_015,
-        2_639_899_582_621_495_518,
-        16_661_503_487_281_653_449,
-        15_321_496_262_529_027_886,
-        4_137_155_324_487_175_349,
+        782_010_617_141_479_802,
+        4_395_501_193_168_974_425,
+        3_418_532_975_102_054_885,
+        6_245_462_422_357_463_579,
+        6_668_688_232_839_147_988,
+        10_103_567_952_100_179_337,
+        1_073_514_426_815_219_159,
         3_979_220_309_231_598_554,
-        17_670_355_805_035_403_630,
+        17_405_286_351_512_519_950,
         1_823_448_962_296_347_469,
-        7_134_676_789_761_793_996,
+        8_505_971_068_273_118_034,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        2_755_497_156_379_073_812,
-        15_362_160_828_013_170_644,
+        6_056_929_286_929_254_572,
+        12_365_258_274_555_457_046,
         11_704_634_815_454_000_937,
-        3_347_152_369_182_623_665,
-        16_432_519_811_174_047_901,
-        2_211_951_704_754_922_015,
-        2_639_899_582_621_495_518,
-        16_661_503_487_281_653_449,
-        15_321_496_262_529_027_886,
-        4_137_155_324_487_175_349,
+        782_010_617_141_479_802,
+        4_395_501_193_168_974_425,
+        3_418_532_975_102_054_885,
+        6_245_462_422_357_463_579,
+        6_668_688_232_839_147_988,
+        10_103_567_952_100_179_337,
+        1_073_514_426_815_219_159,
         3_979_220_309_231_598_554,
-        17_670_355_805_035_403_630,
+        17_405_286_351_512_519_950,
         1_823_448_962_296_347_469,
-        7_134_676_789_761_793_996,
+        8_505_971_068_273_118_034,
     ];
     #[cfg(windows)]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        3_939_955_920_622_178_100,
-        10_628_117_590_215_462_007,
-        13_610_258_227_980_294_238,
+        5_727_101_923_570_903_608,
+        2_672_352_987_724_431_018,
+        3_796_305_578_742_998_176,
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        367_342_573_165_280_833,
-        3_283_789_886_928_374_606,
-        13_610_258_227_980_294_238,
+        3_069_901_559_147_011_733,
+        1_640_181_822_002_110_095,
+        3_796_305_578_742_998_176,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        4_400_700_896_966_070_216,
-        4_554_049_753_600_281_039,
-        13_610_258_227_980_294_238,
+        3_475_967_396_953_333_700,
+        14_760_011_217_797_841_634,
+        3_796_305_578_742_998_176,
     ];
     const APPROVED_NAVIGATOR_EDGE_CHECKSUMS: [u64; 6] = [
         6_476_433_378_350_038_089,
@@ -10032,9 +10043,9 @@ mod tests {
         10_247_811_082_847_036_845,
         13_955_473_173_614_205_117,
         18_055_240_417_387_392_332,
-        5_541_714_875_867_841_274,
-        742_367_006_306_303_185,
-        3_570_113_917_247_912_683,
+        11_644_197_204_654_980_541,
+        6_057_500_174_720_136_036,
+        17_448_285_663_937_742_041,
         14_815_710_913_229_669_209,
         12_149_998_409_095_664_980,
         6_308_043_222_667_740_592,
@@ -11361,7 +11372,7 @@ mod tests {
                 confirmation_error.layout_nodes,
             ],
             [
-                183, 124, 90, 183, 126, 85, 209, 152, 111, 92, 19, 239, 158, 146
+                187, 126, 90, 185, 130, 87, 213, 156, 113, 94, 19, 243, 158, 150
             ]
         );
         let baselines = [
@@ -11468,7 +11479,7 @@ mod tests {
 
         assert_eq!(
             [wide.layout_nodes, compact.layout_nodes, narrow.layout_nodes],
-            [341, 284, 243],
+            [345, 288, 245],
             "Details layout changed at a representative width"
         );
         assert!(wide.distinct_colors >= 8, "{wide:?}");
@@ -11481,6 +11492,19 @@ mod tests {
                 "Details pixels changed at a representative width"
             );
         }
+    }
+
+    #[test]
+    fn running_ring_phase_changes_only_on_ui_ticks() {
+        let (bridge, _harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        app.status_animation_started_at = Instant::now()
+            .checked_sub(Duration::from_millis(300))
+            .unwrap();
+        assert!(app.status_animation_angle().abs() < f32::EPSILON);
+        let _ = app.update(Message::Tick);
+        assert!(app.status_animation_angle() > 0.0);
+        assert!(app.status_animation_angle() < std::f32::consts::TAU);
     }
 
     #[test]

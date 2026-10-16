@@ -77,7 +77,7 @@ fn play_sound() {
                 Ok(Some(status)) if status.success() => return,
                 Ok(Some(_)) => break,
                 Ok(None) if started.elapsed() < Duration::from_secs(2) => {
-                    std::thread::sleep(Duration::from_millis(25))
+                    std::thread::sleep(Duration::from_millis(25));
                 }
                 Ok(None) | Err(_) => {
                     let _ = child.kill();
