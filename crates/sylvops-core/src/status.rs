@@ -240,6 +240,29 @@ impl SessionStatusMachine {
         self.status
     }
 
+    /// Mirrors one daemon-persisted acknowledgement into the live reducer without changing
+    /// lifecycle, Provider activity, or in-flight work tracking.
+    #[must_use]
+    pub fn acknowledge_attention(
+        &mut self,
+        event_id: AttentionEventId,
+        reason: AttentionReason,
+    ) -> bool {
+        let Some(event) = self.status.attention.as_mut() else {
+            return false;
+        };
+        if event.id != event_id
+            || event.reason != reason
+            || event.acknowledgement != AttentionAcknowledgement::Pending
+            || reason == AttentionReason::InputRequested
+        {
+            return false;
+        }
+        event.acknowledgement = AttentionAcknowledgement::Acknowledged;
+        self.state = legacy_state(self.status);
+        true
+    }
+
     /// Applies one trusted Provider outcome and derives both compatibility and expanded state.
     ///
     /// # Errors

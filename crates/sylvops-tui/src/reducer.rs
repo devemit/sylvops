@@ -3,6 +3,7 @@
 use sylvops_core::{
     ids::{ProjectId, SessionId},
     provider::session_can_resume,
+    session_state::AttentionReason,
     ui::{TuiContentView, TuiNavigatorView},
 };
 
@@ -19,9 +20,10 @@ pub(crate) enum Action {
     Expand,
     Collapse,
     SelectExplorer(usize),
-    SelectActiveSession(SessionId),
-    OpenActiveSession(SessionId),
-    StopActiveSession(SessionId),
+    SelectOverviewSession(SessionId),
+    OpenOverviewSession(SessionId),
+    StopOverviewSession(SessionId),
+    DismissAttention(SessionId),
     SelectNavigatorView(TuiNavigatorView),
     BeginNavigatorResize,
     ResizeNavigator(u16),
@@ -47,6 +49,15 @@ pub(crate) enum Action {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Effect {
     Attach,
+    OpenAttention {
+        session_id: SessionId,
+        attention_id: sylvops_core::session_state::AttentionEventId,
+        reason: AttentionReason,
+    },
+    DismissAttention {
+        session_id: SessionId,
+        attention_id: sylvops_core::session_state::AttentionEventId,
+    },
     Resume(SessionId),
     OpenCreate,
     OpenCreateWorktree(ProjectId),
@@ -74,13 +85,13 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             if app.focus == FocusZone::Explorer
                 && app.navigator_view == TuiNavigatorView::Active =>
         {
-            app.move_active_session(delta);
+            app.move_overview_session(delta);
         }
         Action::Move(delta) if app.focus == FocusZone::Explorer => app.move_explorer(delta),
         Action::MoveExplorer(delta) => {
             app.focus = FocusZone::Explorer;
             if app.navigator_view == TuiNavigatorView::Active {
-                app.move_active_session(delta);
+                app.move_overview_session(delta);
             } else {
                 app.move_explorer(delta);
             }
@@ -91,14 +102,17 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             app.focus = FocusZone::Explorer;
             app.select_explorer_index(index);
         }
-        Action::SelectActiveSession(session_id) => {
-            select_active_session(app, session_id, None, false);
+        Action::SelectOverviewSession(session_id) => {
+            select_overview_session(app, session_id, None, false);
         }
-        Action::OpenActiveSession(session_id) => {
-            return select_active_session(app, session_id, Some(Effect::Attach), true);
+        Action::OpenOverviewSession(session_id) => {
+            return open_overview_session(app, session_id);
         }
-        Action::StopActiveSession(session_id) => {
-            return select_active_session(app, session_id, Some(Effect::OpenDelete), false);
+        Action::StopOverviewSession(session_id) => {
+            return select_overview_session(app, session_id, Some(Effect::OpenDelete), false);
+        }
+        Action::DismissAttention(session_id) => {
+            return dismiss_overview_attention(app, session_id);
         }
         Action::SelectNavigatorView(view) => app.select_navigator_view(view),
         Action::BeginNavigatorResize => {
@@ -118,12 +132,11 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
                 && app.navigator_view == TuiNavigatorView::Active
                 && let Some(session_id) = app.selected_session_id
                 && app
-                    .active_sessions()
+                    .session_overview()
                     .iter()
                     .any(|session| session.id == session_id)
             {
-                app.set_tab(TuiContentView::Terminal);
-                return vec![Effect::Attach];
+                return open_overview_session(app, session_id);
             }
             if app.focus == FocusZone::Explorer {
                 match app
@@ -163,7 +176,7 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
         Action::Attention => {
             app.flash = Some(match app.select_attention() {
                 Some(reason) => Flash::transient(FlashKind::Info, format!("Attention: {reason}")),
-                None => Flash::transient(FlashKind::Info, "No sessions currently need your input."),
+                None => Flash::transient(FlashKind::Info, "No Sessions currently need attention."),
             });
         }
         Action::Settings => {
@@ -177,19 +190,63 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
     Vec::new()
 }
 
+fn open_overview_session(app: &mut App, session_id: SessionId) -> Vec<Effect> {
+    if !app.select_overview_session(session_id) {
+        return Vec::new();
+    }
+    app.navigator_view = TuiNavigatorView::Active;
+    app.set_tab(TuiContentView::Terminal);
+    if let Some(event) = app
+        .selected_session()
+        .and_then(|session| session.status.attention)
+        .filter(|event| {
+            event.acknowledgement == sylvops_core::session_state::AttentionAcknowledgement::Pending
+        })
+    {
+        vec![Effect::OpenAttention {
+            session_id,
+            attention_id: event.id,
+            reason: event.reason,
+        }]
+    } else {
+        vec![Effect::Attach]
+    }
+}
+
+fn dismiss_overview_attention(app: &mut App, session_id: SessionId) -> Vec<Effect> {
+    if !app.select_overview_session(session_id) {
+        return Vec::new();
+    }
+    let recoverable = app.selected_session().and_then(|session| {
+        session.status.attention.filter(|event| {
+            event.reason == AttentionReason::RecoverableFailure
+                && event.acknowledgement
+                    == sylvops_core::session_state::AttentionAcknowledgement::Pending
+        })
+    });
+    if let Some(event) = recoverable {
+        vec![Effect::DismissAttention {
+            session_id,
+            attention_id: event.id,
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
 fn new_worktree_effect(app: &App) -> Vec<Effect> {
     app.selected_project()
         .map(|project| vec![Effect::OpenCreateWorktree(project.id)])
         .unwrap_or_default()
 }
 
-fn select_active_session(
+fn select_overview_session(
     app: &mut App,
     session_id: SessionId,
     effect: Option<Effect>,
     focus_main: bool,
 ) -> Vec<Effect> {
-    if app.select_active_session(session_id) {
+    if app.select_overview_session(session_id) {
         app.navigator_view = TuiNavigatorView::Active;
         if focus_main {
             app.set_tab(TuiContentView::Terminal);
@@ -201,7 +258,7 @@ fn select_active_session(
     } else {
         app.flash = Some(Flash::transient(
             FlashKind::Info,
-            "That Active Session is no longer available.",
+            "That Session is no longer available.",
         ));
         Vec::new()
     }

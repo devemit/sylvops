@@ -288,7 +288,7 @@ async fn pending_live_provider_completion_survives_restart_without_adopting_the_
         .await
         .unwrap();
     let (_, acknowledged) = database
-        .mark_session_seen(acknowledged_id)
+        .acknowledge_opened_attention(acknowledged_id, pending.id)
         .await
         .unwrap()
         .unwrap();

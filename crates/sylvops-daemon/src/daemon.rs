@@ -2786,15 +2786,31 @@ async fn handle_request(
                 let mut completed = managed.completed.clone();
                 while !*completed.borrow() && completed.changed().await.is_ok() {}
             }
-            let seen = match state.database.mark_session_seen(session_id).await {
-                Ok(seen) => seen,
-                Err(error) => {
-                    let _ = managed.handle.detach(client_id).await;
-                    return Err(error);
+            let attention_id = managed
+                .record
+                .read()
+                .await
+                .status
+                .attention
+                .map(|event| event.id);
+            let seen = if let Some(attention_id) = attention_id {
+                match state
+                    .database
+                    .acknowledge_opened_attention(session_id, attention_id)
+                    .await
+                {
+                    Ok(seen) => seen,
+                    Err(error) => {
+                        let _ = managed.handle.detach(client_id).await;
+                        return Err(error);
+                    }
                 }
+            } else {
+                None
             };
             if let Some((revision, session)) = seen {
                 *managed.record.write().await = session.clone();
+                mirror_attention_acknowledgement(state, &session).await;
                 let _ = state
                     .events
                     .send(DaemonEvent::SessionStatusChanged { revision, session });
@@ -2869,6 +2885,73 @@ async fn handle_request(
             let _ = state
                 .events
                 .send(DaemonEvent::SessionUpdated { revision, session });
+            Ok(())
+        }
+        ClientRequest::DismissAttention {
+            session_id,
+            attention_id,
+        } => {
+            let operation_lock = session_operation_lock(state, session_id).await;
+            let _operation_guard = operation_lock.lock().await;
+            let (revision, session) = state
+                .database
+                .dismiss_recoverable_attention(session_id, attention_id)
+                .await?
+                .ok_or_else(|| {
+                    DaemonError::InvalidSession(
+                        "recoverable-failure attention is stale or cannot be dismissed".into(),
+                    )
+                })?;
+            if let Some(managed) = state.sessions.read().await.get(&session_id).cloned() {
+                *managed.record.write().await = session.clone();
+            }
+            mirror_attention_acknowledgement(state, &session).await;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::SessionAttentionDismissed {
+                    revision,
+                    session: session.clone(),
+                },
+            )
+            .await?;
+            let _ = state
+                .events
+                .send(DaemonEvent::SessionStatusChanged { revision, session });
+            Ok(())
+        }
+        ClientRequest::AcknowledgeAttention {
+            session_id,
+            attention_id,
+        } => {
+            let operation_lock = session_operation_lock(state, session_id).await;
+            let _operation_guard = operation_lock.lock().await;
+            let (revision, session) = state
+                .database
+                .acknowledge_opened_attention(session_id, attention_id)
+                .await?
+                .ok_or_else(|| {
+                    DaemonError::InvalidSession(
+                        "completion or terminal-failure attention is stale or cannot be acknowledged"
+                            .into(),
+                    )
+                })?;
+            if let Some(managed) = state.sessions.read().await.get(&session_id).cloned() {
+                *managed.record.write().await = session.clone();
+            }
+            mirror_attention_acknowledgement(state, &session).await;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::SessionAttentionAcknowledged {
+                    revision,
+                    session: session.clone(),
+                },
+            )
+            .await?;
+            let _ = state
+                .events
+                .send(DaemonEvent::SessionStatusChanged { revision, session });
             Ok(())
         }
         ClientRequest::InspectSessionDeletion { session_id } => {
@@ -3288,6 +3371,19 @@ async fn handle_request(
             state.shutdown.send_replace(true);
             Ok(())
         }
+    }
+}
+
+async fn mirror_attention_acknowledgement(state: &DaemonState, session: &Session) {
+    let Some(event) = session.status.attention else {
+        return;
+    };
+    if event.acknowledgement != sylvops_core::session_state::AttentionAcknowledgement::Acknowledged
+    {
+        return;
+    }
+    if let Some(machine) = state.status_machines.lock().await.get_mut(&session.id) {
+        let _ = machine.acknowledge_attention(event.id, event.reason);
     }
 }
 

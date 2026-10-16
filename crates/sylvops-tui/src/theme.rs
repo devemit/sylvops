@@ -1,5 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
-use sylvops_core::ui::TuiTheme;
+use sylvops_core::{session_state::AttentionReason, ui::TuiTheme};
 
 use crate::app::FlashKind;
 
@@ -12,14 +12,25 @@ pub(crate) struct Theme {
     pub selected: Style,
     pub success: Style,
     pub attention: Style,
-    pub attention_surface: Style,
-    pub attention_selected_surface: Style,
+    attention_surfaces: AttentionSurfaces,
     pub danger: Style,
     pub muted: Style,
     pub diff_file_header: Style,
     pub diff_hunk_header: Style,
     pub diff_addition: Style,
     pub diff_deletion: Style,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AttentionSurfaces {
+    input: Color,
+    input_selected: Color,
+    recoverable: Color,
+    recoverable_selected: Color,
+    terminal_failure: Color,
+    terminal_failure_selected: Color,
+    completion: Color,
+    completion_selected: Color,
 }
 
 #[derive(Clone, Copy)]
@@ -49,14 +60,16 @@ impl Theme {
                     selected: Style::default().add_modifier(Modifier::REVERSED),
                     success: Style::default().fg(Color::Green),
                     attention: Style::default().fg(Color::Yellow),
-                    attention_surface: Style::default()
-                        .fg(rgb(255, 230, 190))
-                        .bg(rgb(72, 48, 24))
-                        .add_modifier(Modifier::BOLD),
-                    attention_selected_surface: Style::default()
-                        .fg(rgb(255, 240, 215))
-                        .bg(rgb(104, 66, 24))
-                        .add_modifier(Modifier::BOLD),
+                    attention_surfaces: AttentionSurfaces {
+                        input: rgb(72, 48, 24),
+                        input_selected: rgb(104, 66, 24),
+                        recoverable: rgb(64, 58, 18),
+                        recoverable_selected: rgb(92, 82, 20),
+                        terminal_failure: rgb(68, 30, 34),
+                        terminal_failure_selected: rgb(102, 38, 43),
+                        completion: rgb(27, 58, 38),
+                        completion_selected: rgb(34, 84, 52),
+                    },
                     danger: Style::default().fg(Color::Red),
                     muted: Style::default().fg(Color::DarkGray),
                     diff_file_header: Style::default().add_modifier(Modifier::BOLD),
@@ -143,15 +156,16 @@ impl Theme {
             attention: Style::default()
                 .fg(palette.attention)
                 .bg(palette.background),
-            attention_surface: Style::default().fg(palette.text).bg(blend(
-                palette.background,
-                rgb(234, 143, 56),
-                24,
-            )),
-            attention_selected_surface: Style::default()
-                .fg(palette.text)
-                .bg(blend(palette.background, rgb(234, 143, 56), 36))
-                .add_modifier(Modifier::BOLD),
+            attention_surfaces: AttentionSurfaces {
+                input: blend(palette.background, rgb(234, 143, 56), 24),
+                input_selected: blend(palette.background, rgb(234, 143, 56), 36),
+                recoverable: blend(palette.background, palette.attention, 24),
+                recoverable_selected: blend(palette.background, palette.attention, 38),
+                terminal_failure: blend(palette.background, palette.danger, 24),
+                terminal_failure_selected: blend(palette.background, palette.danger, 38),
+                completion: blend(palette.background, palette.success, 24),
+                completion_selected: blend(palette.background, palette.success, 38),
+            },
             danger: Style::default().fg(palette.danger).bg(palette.background),
             muted: Style::default().fg(palette.muted).bg(palette.background),
             diff_file_header: Style::default()
@@ -173,6 +187,30 @@ impl Theme {
                 14,
             )),
         }
+    }
+
+    pub fn attention_surface(self, reason: AttentionReason, selected: bool) -> Style {
+        let background = match (reason, selected) {
+            (AttentionReason::InputRequested, false) => self.attention_surfaces.input,
+            (AttentionReason::InputRequested, true) => self.attention_surfaces.input_selected,
+            (AttentionReason::RecoverableFailure, false) => self.attention_surfaces.recoverable,
+            (AttentionReason::RecoverableFailure, true) => {
+                self.attention_surfaces.recoverable_selected
+            }
+            (AttentionReason::TerminalFailure, false) => self.attention_surfaces.terminal_failure,
+            (AttentionReason::TerminalFailure, true) => {
+                self.attention_surfaces.terminal_failure_selected
+            }
+            (AttentionReason::SuccessfulCompletion, false) => self.attention_surfaces.completion,
+            (AttentionReason::SuccessfulCompletion, true) => {
+                self.attention_surfaces.completion_selected
+            }
+        };
+        let mut style = self.text.bg(background);
+        if selected {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        style
     }
 
     pub fn flash(self, kind: FlashKind) -> Style {
@@ -247,11 +285,10 @@ mod tests {
             .filter(|choice| *choice != TuiTheme::TerminalDefault)
         {
             let theme = Theme::resolve(choice);
-            assert_ne!(theme.attention_surface.bg, theme.background.bg, "{choice}");
-            assert_ne!(
-                theme.attention_selected_surface.bg, theme.attention_surface.bg,
-                "{choice}"
-            );
+            let normal = theme.attention_surface(AttentionReason::InputRequested, false);
+            let selected = theme.attention_surface(AttentionReason::InputRequested, true);
+            assert_ne!(normal.bg, theme.background.bg, "{choice}");
+            assert_ne!(selected.bg, normal.bg, "{choice}");
         }
     }
 }

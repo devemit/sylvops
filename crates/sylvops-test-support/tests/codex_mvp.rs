@@ -487,6 +487,36 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
             && session.external_session_id.as_deref() == Some(external_id.as_str())
             && session.status == source_history.status
     }));
+    let persisted_failure = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id == unexpected_exit_id)
+        .expect("persisted terminal failure");
+    let persisted_failure_event = persisted_failure
+        .status
+        .attention
+        .expect("persisted terminal-failure attention");
+    assert_eq!(
+        persisted_failure_event.acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
+    let opened_failure = match restarted
+        .request(&ClientRequest::AcknowledgeAttention {
+            session_id: unexpected_exit_id,
+            attention_id: persisted_failure_event.id,
+        })
+        .await
+        .expect("persisted failure acknowledgement response")
+    {
+        DaemonResponse::SessionAttentionAcknowledged { session, .. } => session,
+        response => panic!("unexpected persisted failure response: {response:?}"),
+    };
+    assert_eq!(opened_failure.status.lifecycle, SessionLifecycle::Failed);
+    assert_eq!(opened_failure.state, SessionState::Failed);
+    assert_eq!(
+        opened_failure.status.attention.unwrap().acknowledgement,
+        AttentionAcknowledgement::Acknowledged
+    );
     match restarted
         .request(&ClientRequest::ResumeSession {
             session_id: source_session_id,

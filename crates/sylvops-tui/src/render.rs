@@ -15,6 +15,7 @@ use sylvops_core::{
         GitHubItemState, GitHubReviewState,
     },
     provider::session_can_resume,
+    session_state::AttentionReason,
     ui::{
         MAX_TUI_NAVIGATOR_WIDTH, MIN_TUI_NAVIGATOR_WIDTH, TuiContentView, TuiDensity,
         TuiNavigatorView, TuiSessionPresentation, TuiTheme,
@@ -209,7 +210,7 @@ fn draw_navigator(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(2)])
         .split(area);
-    let active_count = app.active_sessions().len();
+    let session_count = app.session_overview().len();
     let navigator_focused = app.focus == FocusZone::Explorer;
     let explorer_selected = app.navigator_view == TuiNavigatorView::Explorer;
     let active_selected = app.navigator_view == TuiNavigatorView::Active;
@@ -218,7 +219,7 @@ fn draw_navigator(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         focus_marker(navigator_focused && explorer_selected)
     );
     let active_label = format!(
-        "{}[a] Active ({active_count})",
+        "{}[a] Sessions ({session_count})",
         focus_marker(navigator_focused && active_selected)
     );
     let explorer_style = if navigator_focused && explorer_selected {
@@ -277,9 +278,9 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let summary = if attention > 0 {
         if full {
             if attention == 1 {
-                "1 needs input".to_owned()
+                "1 needs attention".to_owned()
             } else {
-                format!("{attention} need input")
+                format!("{attention} need attention")
             }
         } else {
             format!("!{attention}")
@@ -337,9 +338,9 @@ fn draw_attention(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
 
 pub(crate) fn attention_message(count: usize) -> String {
     let subject = if count == 1 {
-        "1 session needs your input".to_owned()
+        "1 session needs attention".to_owned()
     } else {
-        format!("{count} sessions need your input")
+        format!("{count} sessions need attention")
     };
     format!(" ! {subject} · Shift+A or click to open next")
 }
@@ -525,7 +526,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     }
 }
 
-struct ActiveSessionItem {
+struct SessionOverviewItem {
     id: sylvops_core::ids::SessionId,
     name: String,
     state: SessionState,
@@ -533,58 +534,124 @@ struct ActiveSessionItem {
     project: String,
     worktree: String,
     last_activity_at: i64,
+    attention: Option<AttentionReason>,
 }
 
 const SESSION_CARD_HEIGHT: u16 = 7;
 const SESSION_LIST_ROW_HEIGHT: u16 = 1;
 
 fn draw_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    let sessions = app
-        .active_sessions()
+    let attention = app
+        .needs_attention_sessions()
         .into_iter()
         .map(|session| {
-            let worktree = app
-                .snapshot
-                .worktrees
-                .iter()
-                .find(|worktree| worktree.id == session.worktree_id);
-            let project = worktree.and_then(|worktree| {
-                app.snapshot
-                    .projects
-                    .iter()
-                    .find(|project| project.id == worktree.project_id)
-            });
-            ActiveSessionItem {
-                id: session.id,
-                name: session.display_name.clone(),
-                state: session.state,
-                provider: session.provider_kind.display_name(),
-                project: project
-                    .map_or("Unknown Project", |project| project.name.as_str())
-                    .to_owned(),
-                worktree: worktree
-                    .map_or("Unknown Worktree", |worktree| worktree.name.as_str())
-                    .to_owned(),
-                last_activity_at: session.last_activity_at,
-            }
+            session_item(
+                app,
+                session,
+                session.status.attention.map(|event| event.reason),
+            )
         })
         .collect::<Vec<_>>();
-    let title = format!(
-        " Active Sessions · {} · {} ",
-        sessions.len(),
-        app.session_presentation
-    );
+    let active = app
+        .active_sessions()
+        .into_iter()
+        .map(|session| session_item(app, session, None))
+        .collect::<Vec<_>>();
+
+    if attention.is_empty() && active.is_empty() {
+        let block = Block::default()
+            .title(format!(
+                " Active Sessions · 0 · {} ",
+                app.session_presentation
+            ))
+            .borders(Borders::ALL)
+            .border_style(theme.border);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        draw_sessions_empty(frame, app, inner, theme);
+        return;
+    }
+
+    if attention.is_empty() {
+        draw_session_group(frame, app, area, "Active Sessions", &active, theme);
+    } else if active.is_empty() {
+        draw_session_group(frame, app, area, "Needs Attention", &attention, theme);
+    } else {
+        let attention_height = session_group_height(
+            attention.len(),
+            area.width.saturating_sub(2),
+            app.session_presentation,
+        )
+        .min(area.height.saturating_sub(3))
+        .max(3);
+        let groups = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(attention_height), Constraint::Min(3)])
+            .split(area);
+        draw_session_group(frame, app, groups[0], "Needs Attention", &attention, theme);
+        draw_session_group(frame, app, groups[1], "Active Sessions", &active, theme);
+    }
+}
+
+fn session_item(
+    app: &App,
+    session: &Session,
+    attention: Option<AttentionReason>,
+) -> SessionOverviewItem {
+    let worktree = app
+        .snapshot
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.id == session.worktree_id);
+    let project = worktree.and_then(|worktree| {
+        app.snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == worktree.project_id)
+    });
+    SessionOverviewItem {
+        id: session.id,
+        name: session.display_name.clone(),
+        state: session.state,
+        provider: session.provider_kind.display_name(),
+        project: project
+            .map_or("Unknown Project", |project| project.name.as_str())
+            .to_owned(),
+        worktree: worktree
+            .map_or("Unknown Worktree", |worktree| worktree.name.as_str())
+            .to_owned(),
+        last_activity_at: session.last_activity_at,
+        attention,
+    }
+}
+
+fn session_group_height(count: usize, width: u16, presentation: TuiSessionPresentation) -> u16 {
+    let columns = session_columns(width, presentation);
+    let rows = count.div_ceil(usize::from(columns));
+    u16::try_from(rows)
+        .unwrap_or(u16::MAX)
+        .saturating_mul(session_item_height(presentation))
+        .saturating_add(2)
+}
+
+fn draw_session_group(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    label: &str,
+    sessions: &[SessionOverviewItem],
+    theme: Theme,
+) {
     let block = Block::default()
-        .title(title)
+        .title(format!(
+            " {label} · {} · {} ",
+            sessions.len(),
+            app.session_presentation
+        ))
         .borders(Borders::ALL)
         .border_style(theme.border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    if sessions.is_empty() {
-        draw_sessions_empty(frame, app, inner, theme);
-        return;
-    }
 
     let columns = session_columns(inner.width, app.session_presentation);
     let item_height = session_item_height(app.session_presentation);
@@ -628,7 +695,7 @@ fn draw_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             item_width.min(inner.x.saturating_add(inner.width).saturating_sub(x)),
             item_height.min(inner.y.saturating_add(inner.height).saturating_sub(y)),
         );
-        draw_active_session(
+        draw_session_overview_item(
             frame,
             app,
             item_area,
@@ -654,61 +721,74 @@ const fn session_columns(width: u16, presentation: TuiSessionPresentation) -> u1
     }
 }
 
-fn draw_active_session(
+fn draw_session_overview_item(
     frame: &mut Frame<'_>,
     app: &mut App,
     area: Rect,
-    session: &ActiveSessionItem,
+    session: &SessionOverviewItem,
     selected: bool,
     theme: Theme,
 ) {
     match app.session_presentation {
         TuiSessionPresentation::Cards => {
-            draw_active_session_card(frame, app, area, session, selected, theme);
+            draw_session_overview_card(frame, app, area, session, selected, theme);
         }
         TuiSessionPresentation::List => {
-            draw_active_session_list(frame, app, area, session, selected, theme);
+            draw_session_overview_list(frame, app, area, session, selected, theme);
         }
     }
 }
 
-fn draw_active_session_list(
+fn draw_session_overview_list(
     frame: &mut Frame<'_>,
     app: &mut App,
     area: Rect,
-    session: &ActiveSessionItem,
+    session: &SessionOverviewItem,
     selected: bool,
     theme: Theme,
 ) {
     let animation_frame = app.status_animation_frame();
-    let line = Line::from(vec![
-        Span::styled(
-            format!(
-                "{} {}",
+    let (symbol, label) = session.attention.map_or_else(
+        || {
+            (
                 status_symbol(session.state, animation_frame),
-                session.name
-            ),
-            Modifier::BOLD,
-        ),
-        Span::raw(format!(" · {}", status_label(session.state))),
+                status_label(session.state),
+            )
+        },
+        |reason| {
+            (
+                attention_reason_icon(reason),
+                attention_reason_label(reason),
+            )
+        },
+    );
+    let line = Line::from(vec![
+        Span::styled(format!("{symbol} {}", session.name), Modifier::BOLD),
+        Span::raw(format!(" · {label}")),
     ]);
-    let style = active_session_style(session.state, selected, theme);
+    let style = session.attention.map_or_else(
+        || session_selection_style(selected, theme),
+        |reason| theme.attention_surface(reason, selected),
+    );
     frame.render_widget(Paragraph::new(line).style(style), area);
-    app.hit_map.push(area, HitTarget::ActiveSession(session.id));
+    app.hit_map
+        .push(area, HitTarget::SessionOverview(session.id));
 }
 
-fn draw_active_session_card(
+fn draw_session_overview_card(
     frame: &mut Frame<'_>,
     app: &mut App,
     area: Rect,
-    session: &ActiveSessionItem,
+    session: &SessionOverviewItem,
     selected: bool,
     theme: Theme,
 ) {
-    let needs_input = session.state == SessionState::NeedsFeedback;
-    let surface = active_session_style(session.state, selected, theme);
-    let border = if needs_input {
-        theme.attention.add_modifier(if selected {
+    let surface = session.attention.map_or_else(
+        || session_selection_style(selected, theme),
+        |reason| theme.attention_surface(reason, selected),
+    );
+    let border = if let Some(reason) = session.attention {
+        attention_reason_emphasis(reason, theme).add_modifier(if selected {
             Modifier::BOLD
         } else {
             Modifier::empty()
@@ -723,17 +803,31 @@ fn draw_active_session_card(
         ..border
     };
     let animation_frame = app.status_animation_frame();
+    let (symbol, label) = session.attention.map_or_else(
+        || {
+            (
+                status_symbol(session.state, animation_frame),
+                status_label(session.state),
+            )
+        },
+        |reason| {
+            (
+                attention_reason_icon(reason),
+                attention_reason_label(reason),
+            )
+        },
+    );
+    let actions = match session.attention {
+        Some(AttentionReason::RecoverableFailure) => "[ Open terminal · Enter ]  [ Dismiss · d ]",
+        Some(AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure) => {
+            "[ Open history · Enter ]"
+        }
+        _ => "[ Open terminal · Enter ]  [ Stop · d ]",
+    };
     let lines = vec![
         Line::from(vec![
-            Span::styled(
-                format!(
-                    "{} {}",
-                    status_symbol(session.state, animation_frame),
-                    session.name
-                ),
-                Modifier::BOLD,
-            ),
-            Span::raw(format!(" · {}", status_label(session.state))),
+            Span::styled(format!("{symbol} {}", session.name), Modifier::BOLD),
+            Span::raw(format!(" · {label}")),
         ]),
         Line::from(format!(
             "Provider: {} · Project: {}",
@@ -744,7 +838,7 @@ fn draw_active_session_card(
             "Activity: {}",
             relative_activity(app.snapshot.captured_at, session.last_activity_at)
         )),
-        Line::from("[ Open terminal · Enter ]  [ Stop · d ]"),
+        Line::from(actions),
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -753,41 +847,67 @@ fn draw_active_session_card(
             .wrap(Wrap { trim: true }),
         area,
     );
-    app.hit_map.push(area, HitTarget::ActiveSession(session.id));
+    app.hit_map
+        .push(area, HitTarget::SessionOverview(session.id));
     if area.height >= 2 {
         let actions_y = area.y.saturating_add(area.height.saturating_sub(2));
         let open_width = 25.min(area.width.saturating_sub(2));
         app.hit_map.push(
             Rect::new(area.x.saturating_add(1), actions_y, open_width, 1),
-            HitTarget::ActiveSessionOpen(session.id),
+            HitTarget::SessionOverviewOpen(session.id),
         );
         let stop_x = area
             .x
             .saturating_add(28)
             .min(area.x.saturating_add(area.width));
-        app.hit_map.push(
-            Rect::new(
-                stop_x,
-                actions_y,
-                12.min(area.x.saturating_add(area.width).saturating_sub(stop_x)),
-                1,
-            ),
-            HitTarget::ActiveSessionStop(session.id),
-        );
+        let secondary = match session.attention {
+            Some(AttentionReason::RecoverableFailure) => {
+                Some(HitTarget::AttentionDismiss(session.id))
+            }
+            Some(AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure) => None,
+            _ => Some(HitTarget::SessionOverviewStop(session.id)),
+        };
+        if let Some(target) = secondary {
+            app.hit_map.push(
+                Rect::new(
+                    stop_x,
+                    actions_y,
+                    12.min(area.x.saturating_add(area.width).saturating_sub(stop_x)),
+                    1,
+                ),
+                target,
+            );
+        }
     }
 }
 
-pub(crate) fn active_session_style(state: SessionState, selected: bool, theme: Theme) -> Style {
-    if state == SessionState::NeedsFeedback {
-        if selected {
-            theme.attention_selected_surface
-        } else {
-            theme.attention_surface
-        }
-    } else if selected {
-        theme.selected
-    } else {
-        theme.text
+fn session_selection_style(selected: bool, theme: Theme) -> Style {
+    if selected { theme.selected } else { theme.text }
+}
+
+const fn attention_reason_icon(reason: AttentionReason) -> &'static str {
+    match reason {
+        AttentionReason::InputRequested => "?",
+        AttentionReason::RecoverableFailure => "!",
+        AttentionReason::TerminalFailure => "×",
+        AttentionReason::SuccessfulCompletion => "✓",
+    }
+}
+
+const fn attention_reason_label(reason: AttentionReason) -> &'static str {
+    match reason {
+        AttentionReason::InputRequested => "Input requested",
+        AttentionReason::RecoverableFailure => "Recoverable failure",
+        AttentionReason::TerminalFailure => "Terminal failure",
+        AttentionReason::SuccessfulCompletion => "Successful Completion",
+    }
+}
+
+const fn attention_reason_emphasis(reason: AttentionReason, theme: Theme) -> Style {
+    match reason {
+        AttentionReason::InputRequested | AttentionReason::RecoverableFailure => theme.attention,
+        AttentionReason::TerminalFailure => theme.danger,
+        AttentionReason::SuccessfulCompletion => theme.success,
     }
 }
 
@@ -1407,7 +1527,7 @@ fn primary_session_action(app: &App, terse: bool, theme: Theme) -> Option<Action
 fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
     let terse = width < 60 || app.density == TuiDensity::Compact;
     let navigator_label = if app.navigator_view == TuiNavigatorView::Active {
-        "Active"
+        "Sessions"
     } else {
         "Explorer"
     };
@@ -1433,20 +1553,28 @@ fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionIte
     ));
     if app.navigator_view == TuiNavigatorView::Active {
         if let Some(session) = app.selected_session_id.and_then(|id| {
-            app.active_sessions()
+            app.session_overview()
                 .into_iter()
                 .find(|session| session.id == id)
         }) {
             items.push(action_label(
                 "[Enter] Open",
-                HitTarget::ActiveSessionOpen(session.id),
+                HitTarget::SessionOverviewOpen(session.id),
                 theme.focus,
             ));
-            items.push(action_label(
-                "[d] Stop",
-                HitTarget::ActiveSessionStop(session.id),
-                theme.danger,
-            ));
+            match session.status.attention.map(|event| event.reason) {
+                Some(AttentionReason::RecoverableFailure) => items.push(action_label(
+                    "[d] Dismiss",
+                    HitTarget::AttentionDismiss(session.id),
+                    theme.attention,
+                )),
+                Some(AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure) => {}
+                _ => items.push(action_label(
+                    "[d] Stop",
+                    HitTarget::SessionOverviewStop(session.id),
+                    theme.danger,
+                )),
+            }
         }
     } else {
         items.extend(contextual_actions(app, width, theme));
@@ -1656,7 +1784,7 @@ fn footer_areas(area: Rect, version: &str) -> (Rect, Option<Rect>) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Active navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\nChanges: ↑/↓, j/k, Page Up/Page Down, or mouse wheel to scroll\nAttached terminal: wheel or Shift+PageUp/PageDown scrolls; Shift+Home oldest; Shift+End latest\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Sessions navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: dismiss recoverable attention, stop a Session, or remove a clean Worktree\ng: bounded read-only Git diff\nChanges: ↑/↓, j/k, Page Up/Page Down, or mouse wheel to scroll\nAttached terminal: wheel or Shift+PageUp/PageDown scrolls; Shift+Home oldest; Shift+End latest\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; Sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 

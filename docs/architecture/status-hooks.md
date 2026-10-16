@@ -12,7 +12,8 @@ Deterministic transitions:
 - turn stop without remaining work → completed with one pending successful-completion event while the Provider process remains live;
 - user interruption → interrupted without successful-completion attention while the Provider process remains live;
 - recoverable turn failure → recoverable failure with its bounded category and pending attention while the Provider process remains live;
-- viewing a completed session → acknowledges its existing completion identity;
+- opening completed or terminal-failure history → acknowledges that exact event identity without changing lifecycle;
+- explicitly dismissing a recoverable failure → acknowledges that exact identity without changing Provider activity; the same effective condition stays quiet until recovery or replacement;
 - explicit Stop Session → terminated, resolving prior attention without creating completion;
 - a clean plain-shell exit → exited with successful-completion attention;
 - an unexpected Provider exit → failed with terminal-failure attention unless a trustworthy completion event already established completion;
