@@ -1,0 +1,3 @@
+# Separate Session lifecycle, Provider activity, and attention
+
+SylvOps models process lifecycle, Provider activity, and user attention as independent dimensions. A completed Provider turn may leave its Session process live for another prompt, and acknowledgement changes attention without changing either process or Provider state; therefore seen/unseen completion is not a Session lifecycle state, interruption is not successful completion, and resume is available only from an eligible terminal lifecycle state. The change advances the versioned protocol and transactionally migrates legacy finished records without trusting persisted process identities.
