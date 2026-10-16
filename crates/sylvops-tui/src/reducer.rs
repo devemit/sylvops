@@ -224,6 +224,7 @@ mod tests {
             provider_kind: ProviderKind::Claude,
             display_name: "Claude".into(),
             state,
+            status: sylvops_core::session_state::SessionStatus::default(),
             process_id: None,
             external_session_id: external_session_id.map(str::to_owned),
             command: "claude".into(),

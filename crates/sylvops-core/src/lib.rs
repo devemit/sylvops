@@ -17,6 +17,7 @@ pub mod github;
 pub mod ids;
 pub mod protocol;
 pub mod provider;
+pub mod session_state;
 pub mod status;
 pub mod ui;
 pub mod ui_forms;
