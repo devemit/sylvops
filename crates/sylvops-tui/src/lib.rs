@@ -7007,7 +7007,7 @@ mod tests {
             .collect::<String>();
         for expected in [
             "untrusted reference material",
-            "Exact local base: main @ 0123456789abcdef",
+            "Confirmed base: main @ 0123456789abcdef",
             "Session name (optional): Issue 129 TUI",
             "Additional instructions: Keep the public IPC seam.",
             "Visible validation feedback.",
