@@ -7,6 +7,66 @@ use crate::{
     provider::ProviderHealth,
 };
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorktreeBaseMode {
+    #[default]
+    LatestDefaultBranch,
+    CurrentCheckout,
+    CustomRef,
+}
+
+impl WorktreeBaseMode {
+    /// Builds an explicit selection for this mode.
+    ///
+    /// # Errors
+    /// Returns an error for an empty, oversized, option-like, or control-containing custom ref.
+    pub fn selection(
+        self,
+        reference: &str,
+    ) -> Result<crate::domain::WorktreeBaseSelection, String> {
+        use crate::domain::WorktreeBaseSelection;
+        match self {
+            Self::LatestDefaultBranch => Ok(WorktreeBaseSelection::default()),
+            Self::CurrentCheckout => Ok("HEAD".into()),
+            Self::CustomRef => {
+                let reference = reference.trim();
+                if reference.is_empty()
+                    || reference.len() > 1024
+                    || reference.starts_with('-')
+                    || reference.chars().any(char::is_control)
+                {
+                    return Err("Enter a valid custom local ref.".into());
+                }
+                Ok(reference.into())
+            }
+        }
+    }
+
+    pub fn from_selection(selection: &crate::domain::WorktreeBaseSelection) -> Self {
+        match selection {
+            crate::domain::WorktreeBaseSelection::LatestDefaultBranch { .. } => {
+                Self::LatestDefaultBranch
+            }
+            crate::domain::WorktreeBaseSelection::LocalRef { reference } if reference == "HEAD" => {
+                Self::CurrentCheckout
+            }
+            crate::domain::WorktreeBaseSelection::LocalRef { .. } => Self::CustomRef,
+        }
+    }
+    pub const ALL: [Self; 3] = [
+        Self::LatestDefaultBranch,
+        Self::CurrentCheckout,
+        Self::CustomRef,
+    ];
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LatestDefaultBranch => "Latest default branch",
+            Self::CurrentCheckout => "Current checkout",
+            Self::CustomRef => "Custom local ref",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FormKind {
     CreateWorkspace,
@@ -35,6 +95,8 @@ pub struct Form {
     pub providers: Vec<ProviderHealth>,
     pub provider_index: usize,
     pub submission_error: Option<String>,
+    pub worktree_base_mode: WorktreeBaseMode,
+    pub pending: bool,
 }
 
 impl Form {
@@ -55,15 +117,18 @@ impl Form {
     }
 
     pub fn worktree(project_id: ProjectId) -> Self {
-        Self::new(
+        let mut form = Self::new(
             "Create isolated checkout",
             FormKind::CreateWorktree(project_id),
             vec![
                 field("Branch", ""),
                 field("Display name (optional)", ""),
-                field("Base ref (optional, defaults to HEAD)", "HEAD"),
+                field("Custom local ref", "HEAD"),
+                field("Remote (optional: origin or the only remote)", ""),
             ],
-        )
+        );
+        form.select_worktree_base(WorktreeBaseMode::LatestDefaultBranch);
+        form
     }
 
     pub fn session(worktree_id: WorktreeId, providers: Vec<ProviderHealth>) -> Self {
@@ -98,11 +163,94 @@ impl Form {
             providers: Vec::new(),
             provider_index: 0,
             submission_error: None,
+            worktree_base_mode: WorktreeBaseMode::default(),
+            pending: false,
         }
     }
 
     pub fn is_session(&self) -> bool {
         matches!(self.kind, FormKind::CreateSession(_))
+    }
+
+    pub fn is_worktree(&self) -> bool {
+        matches!(self.kind, FormKind::CreateWorktree(_))
+    }
+
+    pub fn select_worktree_base(&mut self, mode: WorktreeBaseMode) {
+        if !self.is_worktree() {
+            return;
+        }
+        self.worktree_base_mode = mode;
+        self.fields[2].visible = mode == WorktreeBaseMode::CustomRef;
+        self.fields[3].visible = mode == WorktreeBaseMode::LatestDefaultBranch;
+        self.active = self
+            .active
+            .min(self.visible_field_indices().len().saturating_sub(1));
+        self.clear_errors();
+    }
+
+    pub fn next_worktree_base(&mut self, delta: isize) {
+        let index = WorktreeBaseMode::ALL
+            .iter()
+            .position(|mode| *mode == self.worktree_base_mode)
+            .unwrap_or(0);
+        self.select_worktree_base(WorktreeBaseMode::ALL[index.saturating_add_signed(delta).min(2)]);
+    }
+
+    /// Returns the selected source for a worktree form.
+    ///
+    /// # Errors
+    /// Returns an error if the form or selected remote/ref is invalid.
+    pub fn worktree_selection(&self) -> Result<crate::domain::WorktreeBaseSelection, String> {
+        use crate::domain::WorktreeBaseSelection;
+        if !self.is_worktree() || self.fields.len() < 4 {
+            return Err("Not a Worktree form.".into());
+        }
+        match self.worktree_base_mode {
+            WorktreeBaseMode::LatestDefaultBranch => {
+                let remote = self.fields[3].value.trim();
+                Ok(WorktreeBaseSelection::LatestDefaultBranch {
+                    remote: if remote.is_empty() {
+                        None
+                    } else {
+                        Some(crate::github::GitRemoteName::new(remote)?)
+                    },
+                })
+            }
+            WorktreeBaseMode::CurrentCheckout => Ok(WorktreeBaseSelection::LocalRef {
+                reference: "HEAD".into(),
+            }),
+            WorktreeBaseMode::CustomRef => {
+                let reference = self.fields[2].value.trim();
+                if reference.is_empty()
+                    || reference.len() > 1024
+                    || reference.starts_with('-')
+                    || reference.chars().any(char::is_control)
+                {
+                    return Err("Enter a valid local base ref.".into());
+                }
+                Ok(WorktreeBaseSelection::LocalRef {
+                    reference: reference.into(),
+                })
+            }
+        }
+    }
+
+    /// Builds the daemon request for a worktree form.
+    ///
+    /// # Errors
+    /// Returns an error if the form or selected remote/ref is invalid.
+    pub fn worktree_request(&self) -> Result<ClientRequest, String> {
+        let FormKind::CreateWorktree(project_id) = self.kind else {
+            return Err("Not a Worktree form.".into());
+        };
+        let name = self.fields[1].value.trim();
+        Ok(ClientRequest::CreateWorktree {
+            project_id,
+            branch: self.fields[0].value.trim().into(),
+            name: (!name.is_empty()).then(|| name.to_owned()),
+            base_ref: Some(self.worktree_selection()?),
+        })
     }
 
     pub fn repository_path(&self) -> Option<&str> {
@@ -228,6 +376,12 @@ impl Form {
                 self.submission_error = Some(error);
                 return false;
             }
+        }
+        if self.is_worktree()
+            && let Err(error) = self.worktree_selection()
+        {
+            self.submission_error = Some(error);
+            return false;
         }
         true
     }

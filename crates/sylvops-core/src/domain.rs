@@ -166,6 +166,34 @@ pub struct GitWorktreeState {
     pub removal_confirmation_token: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorktreeBaseSelection {
+    LatestDefaultBranch {
+        remote: Option<crate::github::GitRemoteName>,
+    },
+    LocalRef {
+        reference: String,
+    },
+}
+
+impl Default for WorktreeBaseSelection {
+    fn default() -> Self {
+        Self::LatestDefaultBranch { remote: None }
+    }
+}
+
+impl From<String> for WorktreeBaseSelection {
+    fn from(reference: String) -> Self {
+        Self::LocalRef { reference }
+    }
+}
+
+impl From<&str> for WorktreeBaseSelection {
+    fn from(reference: &str) -> Self {
+        reference.to_owned().into()
+    }
+}
+
 fn deserialize_worktree_blocking_paths<'de, D>(
     deserializer: D,
 ) -> Result<Vec<WorktreeBlockingPath>, D::Error>
@@ -309,6 +337,7 @@ pub const fn state_allows_resume(state: SessionState) -> bool {
         SessionState::FinishedSeen
             | SessionState::FinishedUnseen
             | SessionState::Failed
+            | SessionState::Terminated
             | SessionState::Disconnected
     )
 }
@@ -374,6 +403,7 @@ mod tests {
             SessionState::FinishedSeen,
             SessionState::FinishedUnseen,
             SessionState::Failed,
+            SessionState::Terminated,
             SessionState::Disconnected,
         ] {
             assert!(state_allows_resume(state), "{state} should allow resume");
@@ -383,7 +413,6 @@ mod tests {
             SessionState::Starting,
             SessionState::Running,
             SessionState::NeedsFeedback,
-            SessionState::Terminated,
         ] {
             assert!(
                 !state_allows_resume(state),

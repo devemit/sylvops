@@ -706,12 +706,21 @@ fn draw_active_session_card(
     theme: Theme,
 ) {
     let needs_input = session.state == SessionState::NeedsFeedback;
-    let border = if selected {
+    let surface = active_session_style(session.state, selected, theme);
+    let border = if needs_input {
+        theme.attention.add_modifier(if selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        })
+    } else if selected {
         theme.focus
-    } else if needs_input {
-        theme.attention
     } else {
         theme.border
+    };
+    let border = Style {
+        bg: surface.bg,
+        ..border
     };
     let animation_frame = app.status_animation_frame();
     let lines = vec![
@@ -740,7 +749,7 @@ fn draw_active_session_card(
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).border_style(border))
-            .style(active_session_style(session.state, selected, theme))
+            .style(surface)
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -851,7 +860,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
                 session.display_name,
                 status_label(session.state),
                 if can_resume {
-                    "Press Enter to inspect retained output, or resume to continue in a new session."
+                    "Press Enter to resume this conversation and open its terminal."
                 } else {
                     "Press Enter or click Attach to connect."
                 }
@@ -1553,11 +1562,19 @@ fn draw_footer_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: 
         return;
     }
     if matches!(app.mode, Mode::TerminalAttached) {
-        let actions = vec![action_label(
-            "[Ctrl+]] Detach",
-            HitTarget::Detach,
-            theme.focus,
-        )];
+        let actions = vec![
+            action_label("[Ctrl+]] Detach", HitTarget::Detach, theme.focus),
+            action_label(
+                "[ Older ]",
+                HitTarget::TerminalHistory(crate::terminal::TerminalHistoryAction::PageUp),
+                theme.text,
+            ),
+            action_label(
+                "[ Newer ]",
+                HitTarget::TerminalHistory(crate::terminal::TerminalHistoryAction::PageDown),
+                theme.text,
+            ),
+        ];
         draw_action_line(frame, &mut app.hit_map, area, &actions, theme);
         return;
     }
@@ -1643,6 +1660,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 
+#[allow(clippy::too_many_lines)]
 fn github_footer_actions(modal: &GitHubModal, theme: Theme) -> Vec<ActionItem> {
     if modal.filter_editing {
         return vec![
@@ -1666,6 +1684,16 @@ fn github_footer_actions(modal: &GitHubModal, theme: Theme) -> Vec<ActionItem> {
             actions.push(action_label(
                 "[PgUp/PgDn] Context",
                 HitTarget::GitHubScroll(5),
+                theme.text,
+            ));
+            actions.push(action_label(
+                "[Ctrl+B] Base",
+                HitTarget::GitHubCycleBase,
+                theme.text,
+            ));
+            actions.push(action_label(
+                "[Ctrl+R] Refresh base",
+                HitTarget::GitHubRefreshBase,
                 theme.text,
             ));
             actions.push(action_label(
@@ -1924,7 +1952,7 @@ fn draw_start_work(frame: &mut Frame<'_>, modal: &GitHubModal, area: Rect, theme
             frame,
             area,
             "Preparing Start Work…",
-            "The daemon is loading and validating the exact Issue, local base, branch, and task-capable Providers.",
+            "The daemon is fetching and validating the exact Issue, selected base, branch, and task-capable Providers.",
             theme.focus,
         );
         return;
@@ -1934,7 +1962,10 @@ fn draw_start_work(frame: &mut Frame<'_>, modal: &GitHubModal, area: Rect, theme
             frame,
             area,
             "Start Work preparation failed",
-            &failure.diagnostic,
+            &format!(
+                "{} · [r] Retry latest · [l] Use current checkout · [Esc] Back",
+                failure.diagnostic
+            ),
             theme.danger,
         );
         return;
@@ -1951,7 +1982,7 @@ fn draw_start_work(frame: &mut Frame<'_>, modal: &GitHubModal, area: Rect, theme
     };
     let split = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(18), Constraint::Min(1)])
+        .constraints([Constraint::Length(21), Constraint::Min(1)])
         .split(area);
     let mut lines = start_work_issue_lines(form, theme);
     let provider = form
@@ -1960,9 +1991,24 @@ fn draw_start_work(frame: &mut Frame<'_>, modal: &GitHubModal, area: Rect, theme
     lines.extend([
         Line::raw(""),
         Line::raw(format!(
-            "Exact local base: {} @ {}",
+            "Confirmed base: {} @ {}",
             form.preparation.base.head_ref, form.preparation.base.head_commit
         )),
+        Line::raw(format!(
+            "Base source: {} · Ctrl+B to change · Ctrl+R to refresh",
+            form.base_mode.label()
+        )),
+        start_field_line(
+            "Custom local ref",
+            &form.base_ref,
+            form.focus == StartWorkFocus::BaseRef,
+            theme,
+        ),
+        Line::raw(if form.base_ready {
+            "Base preview confirmed"
+        } else {
+            "Base changed: refresh preview before confirming"
+        }),
         start_field_line(
             "Branch",
             &form.branch,
@@ -2726,6 +2772,33 @@ fn draw_form(
     frame.render_widget(Clear, area);
     let mut lines = Vec::new();
     let mut row = area.y.saturating_add(1);
+    if form.is_worktree() {
+        lines.push(Line::from("Base · ←/→ to choose"));
+        row = row.saturating_add(1);
+        for mode in sylvops_core::ui_forms::WorktreeBaseMode::ALL {
+            lines.push(Line::styled(
+                format!(
+                    "{} {}",
+                    if form.worktree_base_mode == mode {
+                        "●"
+                    } else {
+                        "○"
+                    },
+                    mode.label()
+                ),
+                theme.focus,
+            ));
+            hits.push(
+                Rect::new(area.x + 1, row, area.width.saturating_sub(2), 1),
+                HitTarget::ModalWorktreeBase(mode),
+            );
+            row = row.saturating_add(1);
+        }
+        if form.pending {
+            lines.push(Line::from("Fetching base / creating Worktree…"));
+            row = row.saturating_add(1);
+        }
+    }
     if form.is_session() {
         lines.push(Line::from(Span::styled("Provider", Modifier::BOLD)));
         row = row.saturating_add(1);

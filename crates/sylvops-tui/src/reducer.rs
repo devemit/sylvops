@@ -286,7 +286,11 @@ mod tests {
         assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
         app.snapshot.sessions[0].external_session_id = Some("verified-id".into());
         app.snapshot.sessions[0].state = SessionState::Terminated;
-        assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
+        assert_eq!(
+            reduce(&mut app, Action::Resume),
+            vec![Effect::Resume(resumable_id)]
+        );
+        app.resume_pending = None;
 
         app.snapshot.sessions[0].state = SessionState::FinishedSeen;
         app.snapshot.sessions[0].provider_kind = ProviderKind::Shell;

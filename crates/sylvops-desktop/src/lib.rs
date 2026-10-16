@@ -4,6 +4,7 @@ mod bridge;
 mod forms;
 mod github_surface;
 mod icons;
+mod notifications;
 mod presentation;
 mod state;
 mod terminal;
@@ -40,7 +41,7 @@ use iced::{
     window,
 };
 use iced::{font, font::Weight, widget::button::Status};
-use icons::{LineIcon, delete_icon, line_icon};
+use icons::{LineIcon, delete_icon, line_icon, running_ring};
 use presentation::{
     ActiveTerminalAction, ButtonIntent, ButtonTokens, ControlState, DensityMetrics,
     DesktopPresentation, InteractionState as PresentationInteraction, NavigatorAction,
@@ -278,6 +279,9 @@ struct DesktopApp {
     install_request: RequestState,
     modal_focus: ModalFocus,
     disclosures: DisclosureState,
+    attention_alerts: Option<sylvops_core::attention::AttentionTracker>,
+    attention_sound: Option<notifications::SoundNotifier>,
+    status_animation_started_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -588,6 +592,10 @@ enum Message {
     CancelNavigatorRename,
     FormInput(usize, String),
     SelectProvider(ProviderKind),
+    SelectWorktreeBase(sylvops_core::ui_forms::WorktreeBaseMode),
+    SelectStartWorkBase(sylvops_core::ui_forms::WorktreeBaseMode),
+    StartWorkBaseRefInput(String),
+    RefreshStartWorkBase,
     ProbeProvider,
     SubmitForm,
     CancelModal,
@@ -634,6 +642,7 @@ enum Message {
     LoadMoreGitHubComments,
     OpenGitHubItemInBrowser,
     PrepareStartWork,
+    PrepareStartWorkLocal,
     PrepareAnotherWorktree,
     StartWorkBranchInput(String),
     StartWorkInstructionsInput(String),
@@ -745,6 +754,9 @@ impl DesktopApp {
             install_request: RequestState::Idle,
             modal_focus: ModalFocus::Idle,
             disclosures: DisclosureState::default(),
+            attention_alerts: None,
+            attention_sound: notifications::SoundNotifier::new().ok(),
+            status_animation_started_at: Instant::now(),
         }
     }
 
@@ -908,6 +920,37 @@ impl DesktopApp {
             }
             Message::FormInput(index, value) => self.update_form_field(index, value),
             Message::SelectProvider(kind) => self.select_provider(kind),
+            Message::SelectWorktreeBase(mode) => {
+                if let Some(Modal::Form(modal)) = &mut self.modal
+                    && !modal.pending
+                {
+                    modal.form.select_worktree_base(mode);
+                }
+            }
+            Message::SelectStartWorkBase(mode) => {
+                if let Some(Modal::StartWork(modal)) = &mut self.modal
+                    && !modal.pending
+                {
+                    modal.base_mode = mode;
+                    modal.base_ready = false;
+                }
+            }
+            Message::StartWorkBaseRefInput(value) => {
+                if value.len() <= 1024
+                    && let Some(Modal::StartWork(modal)) = &mut self.modal
+                    && !modal.pending
+                {
+                    modal.base_ref = value;
+                    modal.base_ready = false;
+                }
+            }
+            Message::RefreshStartWorkBase => {
+                let start_another = match &self.modal {
+                    Some(Modal::StartWork(modal)) => modal.start_another_worktree,
+                    _ => false,
+                };
+                self.prepare_start_work(start_another);
+            }
             Message::ProbeProvider => self.probe_selected_provider(),
             Message::SubmitForm => self.submit_form(),
             Message::CancelModal => self.modal = None,
@@ -985,6 +1028,9 @@ impl DesktopApp {
             Message::LoadMoreGitHubComments => self.load_more_github_comments(),
             Message::OpenGitHubItemInBrowser => self.open_github_item_in_browser(),
             Message::PrepareStartWork => self.prepare_start_work(false),
+            Message::PrepareStartWorkLocal => {
+                self.prepare_start_work_with_base(false, Some("HEAD".into()));
+            }
             Message::PrepareAnotherWorktree => self.prepare_start_work(true),
             Message::StartWorkBranchInput(value) => {
                 if let Some(Modal::StartWork(modal)) = &mut self.modal {
@@ -1685,6 +1731,7 @@ impl DesktopApp {
         let density = self.presentation().density;
         let is_selected = row.selected;
         let is_hovered = self.hovered_navigator_node == Some(row.id);
+        let needs_input = matches!(row.id, NavigatorNodeId::Session(id) if self.session(id).is_some_and(|session| session.state == SessionState::NeedsFeedback));
         let name = text(row.label.clone())
             .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
             .size(UI_TEXT_SIZE)
@@ -1713,23 +1760,34 @@ impl DesktopApp {
                 }
             }
             title = title.push(space::horizontal());
-            column![
-                title,
-                text(row.detail.clone())
-                    .size(UI_META_SIZE)
-                    .style(text::secondary)
-                    .wrapping(text::Wrapping::None),
-            ]
-            .spacing(1)
-            .width(Fill)
-            .into()
+            let detail = text(row.detail.clone())
+                .size(UI_META_SIZE)
+                .style(text::secondary)
+                .wrapping(text::Wrapping::None);
+            let detail: Element<'static, Message> =
+                if row.indicator == Some(presentation::SessionIndicator::Working) {
+                    row![running_ring(12, self.status_animation_angle()), detail]
+                        .spacing(5)
+                        .align_y(Center)
+                        .into()
+                } else {
+                    detail.into()
+                };
+            column![title, detail].spacing(1).width(Fill).into()
         };
         let content = container(row![labels].spacing(3).align_y(Center))
             .width(Fill)
             .height(density.control_height + 14)
             .padding([4, 6])
             .clip(true)
-            .style(move |theme| navigator_row_container_style(theme, is_selected, is_hovered));
+            .style(move |theme| {
+                let style = navigator_row_container_style(theme, is_selected, is_hovered);
+                if needs_input {
+                    attention_row_style(theme, style, is_selected || is_hovered)
+                } else {
+                    style
+                }
+            });
         let select = match row.id {
             NavigatorNodeId::Repository(id) => Message::SelectProject(id),
             NavigatorNodeId::Checkout(id) => Message::SelectWorktree(id),
@@ -1907,21 +1965,41 @@ impl DesktopApp {
             let label = session_tab_label(&session.label);
             let active = session.active;
             let session_id = session.id;
+            let state = self.session(session_id).map(|session| session.state);
+            let needs_input = state == Some(SessionState::NeedsFeedback);
+            let mut label_content = row![].spacing(5).align_y(Center);
+            if matches!(state, Some(SessionState::Running | SessionState::Starting)) {
+                label_content = label_content.push(running_ring(13, self.status_animation_angle()));
+            }
+            label_content = label_content.push(
+                centered_button_label(
+                    label,
+                    UI_TEXT_SIZE,
+                    if active { UI_SEMIBOLD } else { UI_FONT },
+                )
+                .wrapping(text::Wrapping::None),
+            );
             tabs = tabs.push(
                 container(
                     row![
-                        button(
-                            centered_button_label(
-                                label,
-                                UI_TEXT_SIZE,
-                                if active { UI_SEMIBOLD } else { UI_FONT },
-                            )
-                            .wrapping(text::Wrapping::None)
-                        )
-                        .on_press(Message::SelectOpenSession(session_id))
-                        .height(density.row_height)
-                        .padding([5, 9])
-                        .style(move |theme, status| { tab_label_style(theme, status, active) }),
+                        button(label_content)
+                            .on_press(Message::SelectOpenSession(session_id))
+                            .height(density.row_height)
+                            .padding([5, 9])
+                            .style(move |theme, status| {
+                                let mut style = tab_label_style(theme, status, active);
+                                if needs_input {
+                                    style.background = Some(Background::Color(
+                                        theme
+                                            .extended_palette()
+                                            .warning
+                                            .base
+                                            .color
+                                            .scale_alpha(if active { 0.22 } else { 0.14 }),
+                                    ));
+                                }
+                                style
+                            }),
                         button(line_icon(LineIcon::Close, 15))
                             .on_press(Message::CloseSessionTab(session_id))
                             .height(density.row_height)
@@ -1931,7 +2009,14 @@ impl DesktopApp {
                     .spacing(0)
                     .align_y(Center),
                 )
-                .style(move |theme| session_tab_group_style(theme, active)),
+                .style(move |theme| {
+                    let style = session_tab_group_style(theme, active);
+                    if needs_input {
+                        attention_row_style(theme, style, active)
+                    } else {
+                        style
+                    }
+                }),
             );
         }
         if presentation.active_session.tabs.is_empty() {
@@ -2671,6 +2756,13 @@ impl DesktopApp {
         ]
         .spacing(6)
         .align_y(Center);
+        if !has_local_work {
+            actions = actions.push(
+                button("Use current checkout")
+                    .on_press_maybe((!pending).then_some(Message::PrepareStartWorkLocal))
+                    .style(chrome_action_style),
+            );
+        }
         if has_local_work {
             actions = actions.push(
                 button("Start another Worktree")
@@ -3459,6 +3551,24 @@ impl DesktopApp {
                 modal.pending,
             ));
         }
+        if form.is_worktree() {
+            let mut choices = column![text("Start from")].spacing(6);
+            for mode in sylvops_core::ui_forms::WorktreeBaseMode::ALL {
+                choices = choices.push(
+                    button(text(format!(
+                        "{} {}",
+                        if mode == form.worktree_base_mode {
+                            "●"
+                        } else {
+                            "○"
+                        },
+                        mode.label()
+                    )))
+                    .on_press_maybe((!modal.pending).then_some(Message::SelectWorktreeBase(mode))),
+                );
+            }
+            fields = fields.push(choices);
+        }
         for (index, field) in form
             .fields
             .iter()
@@ -3783,7 +3893,34 @@ impl DesktopApp {
             .width(Fill)
             .style(workspace_surface),
             rule::horizontal(1),
-            text("Confirmed local base").font(UI_SEMIBOLD),
+            text("Confirmed base").font(UI_SEMIBOLD),
+            column(
+                sylvops_core::ui_forms::WorktreeBaseMode::ALL
+                    .into_iter()
+                    .map(|mode| button(text(format!(
+                        "{} {}",
+                        if mode == modal.base_mode {
+                            "●"
+                        } else {
+                            "○"
+                        },
+                        mode.label()
+                    )))
+                    .on_press_maybe((!modal.pending).then_some(Message::SelectStartWorkBase(mode)))
+                    .into())
+            )
+            .spacing(4),
+            text_input("Custom local ref", &modal.base_ref).on_input_maybe(
+                (!modal.pending
+                    && modal.base_mode == sylvops_core::ui_forms::WorktreeBaseMode::CustomRef)
+                    .then_some(Message::StartWorkBaseRefInput)
+            ),
+            button(if modal.pending {
+                "Fetching base…"
+            } else {
+                "Refresh base preview"
+            })
+            .on_press_maybe((!modal.pending).then_some(Message::RefreshStartWorkBase)),
             text(format!(
                 "{} @ {}",
                 modal.preparation.base.head_ref, modal.preparation.base.head_commit
@@ -3978,6 +4115,9 @@ impl DesktopApp {
                 providers,
                 desktop_state,
             } => {
+                self.attention_alerts = Some(sylvops_core::attention::AttentionTracker::new(
+                    &snapshot.sessions,
+                ));
                 self.snapshot = snapshot;
                 self.providers = providers;
                 self.connection = ConnectionState::Connected;
@@ -4047,7 +4187,10 @@ impl DesktopApp {
                     self.error = Some(contextual_error(operation, &message));
                     return;
                 }
-                if matches!(operation, Some(Operation::StartWork(..))) {
+                if matches!(
+                    operation,
+                    Some(Operation::StartWork(..) | Operation::PrepareStartWork(..))
+                ) {
                     if let Some(Modal::StartWork(modal)) = &mut self.modal {
                         modal.pending = false;
                         modal.error = Some(message);
@@ -4125,6 +4268,20 @@ impl DesktopApp {
 
     fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
+            DaemonEvent::SessionStatusChanged { session, .. } => {
+                if let Some(existing) = self
+                    .snapshot
+                    .sessions
+                    .iter_mut()
+                    .find(|existing| existing.id == session.id)
+                {
+                    *existing = session;
+                } else {
+                    self.snapshot.sessions.push(session);
+                }
+                self.observe_attention();
+                self.request_snapshot();
+            }
             DaemonEvent::ProviderHealthChanged { health } => {
                 self.update_provider_health(health);
             }
@@ -4316,6 +4473,13 @@ impl DesktopApp {
                     std::mem::take(&mut self.start_work_preparation_intent),
                     StartWorkPreparationIntent::StartAnotherWorktree
                 );
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.preparation = preparation;
+                    modal.pending = false;
+                    modal.base_ready = true;
+                    modal.error = None;
+                    return;
+                }
                 if !start_another_worktree && let Some(existing) = preparation.existing_work.first()
                 {
                     self.open_issue_work(existing.worktree_id);
@@ -4401,12 +4565,21 @@ impl DesktopApp {
             (Operation::PrepareStartWork(_, _), DaemonResponse::StartWorkFailure(failure)) => {
                 self.finish_github_request();
                 self.start_work_preparation_intent = StartWorkPreparationIntent::default();
-                self.error = Some(failure.diagnostic);
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.pending = false;
+                    modal.base_ready = false;
+                    modal.error = Some(failure.diagnostic);
+                } else {
+                    self.error = Some(failure.diagnostic);
+                }
             }
             (Operation::StartWork(_, _), DaemonResponse::StartWorkFailure(failure)) => {
                 if let Some(Modal::StartWork(modal)) = &mut self.modal {
                     modal.pending = false;
                     modal.error = Some(failure.diagnostic);
+                    if failure.kind == StartWorkFailureKind::BaseMoved {
+                        modal.base_ready = false;
+                    }
                     if failure.kind == StartWorkFailureKind::BranchConflict {
                         modal.preparation.suggested_branch_conflict = true;
                     }
@@ -4420,6 +4593,7 @@ impl DesktopApp {
             (Operation::RefreshSnapshot, DaemonResponse::Snapshot(snapshot)) => {
                 self.snapshot_pending = false;
                 self.snapshot = snapshot;
+                self.observe_attention();
                 self.restore_selection();
             }
             (
@@ -4479,6 +4653,7 @@ impl DesktopApp {
                 self.select_session(session_id);
                 self.main_tab = MainTab::Terminal;
                 self.show_success("Session resumed into a new history record.");
+                self.attach_active();
                 self.request_snapshot();
             }
             (Operation::Stop(session_id), DaemonResponse::Acknowledged) => {
@@ -4605,7 +4780,11 @@ impl DesktopApp {
                 self.selected_worktree_id = Some(worktree.id);
                 self.selected_session_id = None;
                 self.modal = None;
-                self.show_success("Checkout created.");
+                self.show_success(format!(
+                    "Checkout created from {} @ {}",
+                    worktree.base_ref,
+                    worktree.base_commit.chars().take(8).collect::<String>()
+                ));
                 self.mark_state_dirty();
                 self.request_snapshot();
             }
@@ -4920,7 +5099,10 @@ impl DesktopApp {
                     self.error = Some(contextual_error(Some(operation), &message));
                     return;
                 }
-                if matches!(operation, Operation::StartWork(..)) {
+                if matches!(
+                    operation,
+                    Operation::StartWork(..) | Operation::PrepareStartWork(..)
+                ) {
                     if let Some(Modal::StartWork(modal)) = &mut self.modal {
                         modal.pending = false;
                         modal.error = Some(message);
@@ -5552,6 +5734,14 @@ impl DesktopApp {
     }
 
     fn prepare_start_work(&mut self, start_another_worktree: bool) {
+        self.prepare_start_work_with_base(start_another_worktree, None);
+    }
+
+    fn prepare_start_work_with_base(
+        &mut self,
+        start_another_worktree: bool,
+        initial_base: Option<sylvops_core::domain::WorktreeBaseSelection>,
+    ) {
         if self.github_request == RequestState::Pending {
             return;
         }
@@ -5566,7 +5756,27 @@ impl DesktopApp {
         {
             return;
         }
-        if !start_another_worktree && let Some(worktree_id) = self.existing_issue_work(&identity) {
+        let base = if let Some(Modal::StartWork(modal)) = &mut self.modal {
+            if modal.pending {
+                return;
+            }
+            match modal.base_mode.selection(&modal.base_ref) {
+                Ok(base) => {
+                    modal.pending = true;
+                    Some(base)
+                }
+                Err(error) => {
+                    modal.error = Some(error);
+                    return;
+                }
+            }
+        } else {
+            initial_base
+        };
+        if base.is_none()
+            && !start_another_worktree
+            && let Some(worktree_id) = self.existing_issue_work(&identity)
+        {
             self.open_issue_work(worktree_id);
             return;
         }
@@ -5580,6 +5790,7 @@ impl DesktopApp {
             ClientRequest::PrepareStartWork {
                 project_id,
                 issue_number: identity.number,
+                base,
             },
         );
     }
@@ -6049,6 +6260,7 @@ impl DesktopApp {
         {
             self.select_session(session_id);
             self.narrow_main = true;
+            self.attach_active();
         }
     }
 
@@ -6420,15 +6632,11 @@ impl DesktopApp {
                     repository_path: form.fields[0].value.trim().to_owned(),
                 },
             ),
-            FormKind::CreateWorktree(project_id) => self.send_request(
-                Operation::CreateWorktree,
-                ClientRequest::CreateWorktree {
-                    project_id,
-                    branch: form.fields[0].value.trim().to_owned(),
-                    name: trimmed_option(&form.fields[1].value),
-                    base_ref: trimmed_option(&form.fields[2].value),
-                },
-            ),
+            FormKind::CreateWorktree(_) => {
+                if let Ok(request) = form.worktree_request() {
+                    self.send_request(Operation::CreateWorktree, request);
+                }
+            }
             FormKind::CreateSession(worktree_id) => {
                 let (columns, rows) = self.terminal_dimensions();
                 let Some(request) = form.session_request(columns, rows) else {
@@ -6706,6 +6914,17 @@ impl DesktopApp {
             self.error = Some("The selected session no longer exists.".into());
             return;
         };
+        if self.resume_pending.contains(&session_id) {
+            return;
+        }
+        if !state_is_active(session.state) {
+            if session_can_resume(session, &self.snapshot.sessions, &self.providers) {
+                self.resume_session(session_id);
+            } else {
+                self.error = Some("Cannot resume this conversation: it needs a verified saved conversation, an available resume-capable provider, and no newer successor. History is retained; use New session to start fresh explicitly.".into());
+            }
+            return;
+        }
         if !session_can_stop(session.state) && !session_can_replay(session.state) {
             self.error = Some(format!(
                 "Session “{}” is {}; only its metadata is retained.",
@@ -7335,6 +7554,30 @@ impl DesktopApp {
         self.selected_session_id = self.sessions_for(worktree_id).first().map(|item| item.id);
         self.diff = None;
         self.mark_state_dirty();
+    }
+
+    fn status_animation_angle(&self) -> f32 {
+        self.status_animation_started_at
+            .elapsed()
+            .as_secs_f32()
+            .rem_euclid(1.2)
+            / 1.2
+            * std::f32::consts::TAU
+    }
+
+    fn observe_attention(&mut self) {
+        let Some(alerts) = &mut self.attention_alerts else {
+            self.attention_alerts = Some(sylvops_core::attention::AttentionTracker::new(
+                &self.snapshot.sessions,
+            ));
+            return;
+        };
+        if let Some(message) = alerts.update(&self.snapshot.sessions) {
+            if let Some(sound) = &self.attention_sound {
+                sound.notify();
+            }
+            self.show_success(message);
+        }
     }
 
     fn select_session(&mut self, session_id: SessionId) {
@@ -8102,14 +8345,13 @@ fn github_join_logins(logins: &[sylvops_core::github::GitHubLogin]) -> String {
     }
 }
 
-fn trimmed_option(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
-}
-
 fn form_submit_label(form: &Form, pending: bool, selected_provider_checking: bool) -> &'static str {
     if pending {
-        return "Working…";
+        return if form.is_worktree() {
+            "Preparing base / creating checkout…"
+        } else {
+            "Working…"
+        };
     }
     if selected_provider_checking {
         return "Checking provider…";
@@ -8860,6 +9102,22 @@ fn list_item_container_style(theme: &Theme, selected: bool, hovered: bool) -> co
         border: style.border,
         ..container::Style::default()
     }
+}
+
+fn attention_row_style(
+    theme: &Theme,
+    mut style: container::Style,
+    emphasized: bool,
+) -> container::Style {
+    style.background = Some(Background::Color(
+        theme
+            .extended_palette()
+            .warning
+            .base
+            .color
+            .scale_alpha(if emphasized { 0.22 } else { 0.14 }),
+    ));
+    style
 }
 
 fn navigator_row_container_style(theme: &Theme, selected: bool, hovered: bool) -> container::Style {
@@ -12376,6 +12634,7 @@ mod tests {
                 ClientRequest::PrepareStartWork {
                     project_id,
                     issue_number: identity.number,
+                    base: None,
                 },
             )
         );
@@ -12394,7 +12653,7 @@ mod tests {
             for expected in [
                 "Start Work from Issue",
                 "untrusted reference material",
-                "Confirmed local base",
+                "Confirmed base",
                 "Additional instructions",
             ] {
                 assert!(rendered.iter().any(|line| line.contains(expected)));
@@ -12422,6 +12681,17 @@ mod tests {
         assert_eq!(modal.error.as_deref(), Some("The base moved."));
         assert!(!modal.pending);
 
+        assert!(!modal.base_ready);
+        let _ = app.update(Message::RefreshStartWorkBase);
+        let (refresh_operation, refresh_request) = harness.take_request();
+        assert!(matches!(
+            refresh_request,
+            ClientRequest::PrepareStartWork { .. }
+        ));
+        app.handle_response(
+            refresh_operation,
+            DaemonResponse::StartWorkPrepared(preparation.clone()),
+        );
         let _ = app.update(Message::SubmitStartWork);
         let (operation, _) = harness.take_request();
         let worktree = Worktree {
@@ -12576,6 +12846,7 @@ mod tests {
                 ClientRequest::PrepareStartWork {
                     project_id,
                     issue_number: identity.number,
+                    base: None,
                 },
             )
         );
@@ -13029,7 +13300,7 @@ mod tests {
             &codex_health
         ));
         let terminated = session(SessionState::Terminated, Some("verified-id"));
-        assert!(!session_can_resume(
+        assert!(session_can_resume(
             &terminated,
             std::slice::from_ref(&terminated),
             &codex_health

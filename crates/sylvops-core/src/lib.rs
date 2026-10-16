@@ -8,6 +8,7 @@ pub const LINUX_DESKTOP_ID: &str = "sylvops";
 /// Stable publisher recorded in native package and executable metadata.
 pub const APPLICATION_PUBLISHER: &str = "devemit";
 
+pub mod attention;
 pub mod config;
 pub mod diff;
 pub mod domain;

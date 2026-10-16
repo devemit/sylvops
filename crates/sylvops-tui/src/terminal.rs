@@ -53,13 +53,28 @@ impl AttachedTerminal {
         self.parser.screen().scrollback() > 0
     }
 
-    pub fn apply_history_action(&mut self, action: TerminalHistoryAction) {
+    pub fn apply_history_action(&mut self, action: TerminalHistoryAction) -> TerminalWheelAction {
+        let application_page = self.parser.screen().alternate_screen()
+            || (!self.is_scrolled_back()
+                && self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None);
+        if application_page && self.role == AttachmentRole::Controller {
+            match action {
+                TerminalHistoryAction::PageUp => {
+                    return TerminalWheelAction::Application(b"\x1b[5~".to_vec());
+                }
+                TerminalHistoryAction::PageDown => {
+                    return TerminalWheelAction::Application(b"\x1b[6~".to_vec());
+                }
+                _ => {}
+            }
+        }
         match action {
             TerminalHistoryAction::PageUp => self.scroll_page(1),
             TerminalHistoryAction::PageDown => self.scroll_page(-1),
             TerminalHistoryAction::Oldest => self.scroll_to_oldest(),
             TerminalHistoryAction::Latest => self.scroll_to_latest(),
         }
+        TerminalWheelAction::Local
     }
 
     pub fn wheel_action(&mut self, scroll_up: bool, row: u16, column: u16) -> TerminalWheelAction {
@@ -72,7 +87,7 @@ impl AttachedTerminal {
             )
         };
         if self.role == AttachmentRole::Controller
-            && alternate_screen
+            && !self.is_scrolled_back()
             && mouse_mode != vt100::MouseProtocolMode::None
         {
             let row = row.min(self.rows.saturating_sub(1));
@@ -83,6 +98,13 @@ impl AttachedTerminal {
                 row,
                 column,
             ));
+        }
+        if alternate_screen && self.role == AttachmentRole::Controller {
+            return self.apply_history_action(if scroll_up {
+                TerminalHistoryAction::PageUp
+            } else {
+                TerminalHistoryAction::PageDown
+            });
         }
         if !alternate_screen {
             self.scroll_lines(if scroll_up {
@@ -236,6 +258,32 @@ mod tests {
             TerminalWheelAction::Local
         );
         assert!(terminal.is_scrolled_back());
+    }
+
+    #[test]
+    fn normal_screen_application_requesting_mouse_receives_wheel_input() {
+        let mut terminal = attached_terminal(AttachmentRole::Controller, 20, 80);
+        terminal
+            .parser
+            .process(b"\x1b[?1000h\x1b[?1006hconversation");
+        assert_eq!(
+            terminal.wheel_action(true, 2, 3),
+            TerminalWheelAction::Application(b"\x1b[<64;4;3M".to_vec())
+        );
+    }
+
+    #[test]
+    fn full_screen_history_keys_reach_the_application_instead_of_empty_local_history() {
+        let mut terminal = attached_terminal(AttachmentRole::Controller, 20, 80);
+        terminal.parser.process(b"\x1b[?1049hconversation");
+        assert_eq!(
+            terminal.apply_history_action(TerminalHistoryAction::PageUp),
+            TerminalWheelAction::Application(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            terminal.apply_history_action(TerminalHistoryAction::PageDown),
+            TerminalWheelAction::Application(b"\x1b[6~".to_vec())
+        );
     }
 
     #[test]

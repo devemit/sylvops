@@ -50,11 +50,13 @@ impl Theme {
                     success: Style::default().fg(Color::Green),
                     attention: Style::default().fg(Color::Yellow),
                     attention_surface: Style::default()
-                        .fg(Color::Yellow)
+                        .fg(rgb(255, 230, 190))
+                        .bg(rgb(72, 48, 24))
                         .add_modifier(Modifier::BOLD),
                     attention_selected_surface: Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                        .fg(rgb(255, 240, 215))
+                        .bg(rgb(104, 66, 24))
+                        .add_modifier(Modifier::BOLD),
                     danger: Style::default().fg(Color::Red),
                     muted: Style::default().fg(Color::DarkGray),
                     diff_file_header: Style::default().add_modifier(Modifier::BOLD),
@@ -143,12 +145,12 @@ impl Theme {
                 .bg(palette.background),
             attention_surface: Style::default().fg(palette.text).bg(blend(
                 palette.background,
-                palette.attention,
-                14,
+                rgb(234, 143, 56),
+                24,
             )),
             attention_selected_surface: Style::default()
                 .fg(palette.text)
-                .bg(blend(palette.background, palette.attention, 24))
+                .bg(blend(palette.background, rgb(234, 143, 56), 36))
                 .add_modifier(Modifier::BOLD),
             danger: Style::default().fg(palette.danger).bg(palette.background),
             muted: Style::default().fg(palette.muted).bg(palette.background),

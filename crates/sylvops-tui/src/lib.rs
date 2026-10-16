@@ -6,6 +6,7 @@ mod forms;
 mod github_modal;
 mod input;
 mod input_pump;
+mod notifications;
 mod reducer;
 mod removal_notice;
 mod render;
@@ -70,7 +71,7 @@ const TICK: Duration = Duration::from_millis(60);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 pub(crate) const MAX_FORM_VALUE_BYTES: usize = 8 * 1024;
 
-struct FormOutcome {
+pub(crate) struct FormOutcome {
     message: String,
     selection: Option<ExplorerNode>,
 }
@@ -133,6 +134,9 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
     let mut events = client.subscribe();
     let (github_results_tx, mut github_results) = tokio::sync::mpsc::channel(16);
     let mut github_tasks = GitHubTasks::default();
+    let mut attention_alerts = notifications::AttentionTracker::new(&app.snapshot.sessions);
+    #[cfg(windows)]
+    let popup_notifications = notifications::platform::Notifier::new().ok();
     let mut guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .map_err(|error| DaemonError::Lifecycle(format!("cannot initialize TUI: {error}")))?;
@@ -246,6 +250,20 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         }
         if refresh {
             app.replace_snapshot(snapshot(&client).await?);
+            if let Some(message) = attention_alerts.update(&app.snapshot.sessions) {
+                let _ = execute!(terminal.backend_mut(), Print("\x07"));
+                #[cfg(windows)]
+                if !popup_notifications
+                    .as_ref()
+                    .is_some_and(|notifier| notifier.send(message.clone()))
+                {
+                    app.flash = Some(Flash::error(
+                        "Windows popup notification unavailable; check the highlighted sessions.",
+                    ));
+                }
+                #[cfg(not(windows))]
+                let _ = message;
+            }
             dirty = true;
         }
         save_debounced(&client, &mut app).await?;
@@ -285,6 +303,30 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             },
             Some(result) = github_results.recv() => {
                 apply_github_result_async(&client, &mut app, result).await?;
+                dirty = true;
+                continue;
+            },
+            result = async {
+                match app.resume_response.as_mut() {
+                    Some(result) => result.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                app.resume_response = None;
+                let result = result.unwrap_or_else(|_| Err(DaemonError::Lifecycle("Session resume request stopped.".into())));
+                finish_resume(&client, &mut app, result).await?;
+                dirty = true;
+                continue;
+            },
+            result = async {
+                match app.pending_form.as_mut() {
+                    Some(result) => result.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                app.pending_form = None;
+                let result = result.unwrap_or_else(|_| Err(DaemonError::Lifecycle("Worktree creation request stopped.".into())));
+                finish_form_submission(&client, &mut app, result).await?;
                 dirty = true;
                 continue;
             },
@@ -407,7 +449,7 @@ async fn execute_effects(
     for effect in effects {
         match effect {
             Effect::Attach => attach_selected(client, app).await?,
-            Effect::Resume(session_id) => resume_session(client, app, session_id).await?,
+            Effect::Resume(session_id) => resume_session(client, app, session_id),
             Effect::OpenCreate => open_create_form(app),
             Effect::OpenCreateWorktree(project_id) => {
                 app.mode = Mode::Modal(Form::worktree(project_id));
@@ -538,9 +580,43 @@ fn start_work_input_decision(
         _ => None,
     };
     let project_id = modal.project_id;
+    if modal.start_work_error.is_some()
+        && modal.start_work.is_none()
+        && key.is_some_and(|key| matches!(key.code, KeyCode::Char('l' | 'r')))
+        && let Some(identity) = modal.selected_identity()
+    {
+        modal.start_work_initial_base = key
+            .is_some_and(|key| key.code == KeyCode::Char('l'))
+            .then(|| "HEAD".into());
+        return GitHubDecision::PrepareStartWork {
+            issue_number: identity.number,
+            start_another_worktree: true,
+        };
+    }
     let Some(form) = &mut modal.start_work else {
         return GitHubDecision::None;
     };
+    if form.pending {
+        return GitHubDecision::None;
+    }
+    if clicked == Some(HitTarget::GitHubRefreshBase)
+        || key.is_some_and(|key| {
+            key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL)
+        })
+    {
+        return GitHubDecision::PrepareStartWork {
+            issue_number: form.preparation.issue.identity.number,
+            start_another_worktree: form.start_another_worktree,
+        };
+    }
+    if clicked == Some(HitTarget::GitHubCycleBase)
+        || key.is_some_and(|key| {
+            key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL)
+        })
+    {
+        form.cycle_base();
+        return GitHubDecision::None;
+    }
     if let Some(HitTarget::GitHubScroll(delta)) = clicked {
         form.scroll_context(delta);
         return GitHubDecision::None;
@@ -1129,12 +1205,34 @@ fn queue_prepare_start_work(
     start_another_worktree: bool,
 ) {
     let request_id = tasks.next_request_id();
+    let mut base = None;
     if let Mode::GitHub(modal) = &mut app.mode {
+        base.clone_from(&modal.start_work_initial_base);
+        if let Some(form) = &mut modal.start_work {
+            match form.base_mode.selection(&form.base_ref) {
+                Ok(selection) => {
+                    base = Some(selection);
+                    form.pending = true;
+                }
+                Err(error) => {
+                    form.error = Some(StartWorkFailure::new(
+                        StartWorkFailureKind::InvalidRequest,
+                        error,
+                    ));
+                    return;
+                }
+            }
+        }
         modal.register_start_work_request(request_id);
+        modal.start_work_error = None;
+        if modal.start_work.is_none() {
+            modal.start_work_preparing = true;
+        }
     }
     let request = ClientRequest::PrepareStartWork {
         project_id,
         issue_number,
+        base,
     };
     let handle = dispatch_github_request(client, results, request, move |response| {
         GitHubAsyncResult::PrepareStartWork {
@@ -2051,6 +2149,9 @@ async fn handle_form(
     app: &mut App,
     input: Event,
 ) -> Result<(), DaemonError> {
+    if matches!(&app.mode, Mode::Modal(form) if form.pending) {
+        return Ok(());
+    }
     let mouse_target = if let Event::Mouse(mouse) = &input
         && mouse.kind == MouseEventKind::Down(MouseButton::Left)
     {
@@ -2087,6 +2188,12 @@ async fn handle_form(
         return Ok(());
     }
     let mut submit = matches!(mouse_target, Some(HitTarget::ModalSubmit));
+    if let Some(HitTarget::ModalWorktreeBase(mode)) = mouse_target {
+        if let Mode::Modal(form) = &mut app.mode {
+            form.select_worktree_base(mode);
+        }
+        return Ok(());
+    }
     let mut probe_provider = false;
     let mut browse = false;
     match input {
@@ -2108,6 +2215,8 @@ async fn handle_form(
                 KeyCode::BackTab | KeyCode::Up => form.next_field(-1),
                 KeyCode::Left if form.is_session() => form.select_next_provider(-1),
                 KeyCode::Right if form.is_session() => form.select_next_provider(1),
+                KeyCode::Left if form.is_worktree() => form.next_worktree_base(-1),
+                KeyCode::Right if form.is_worktree() => form.next_worktree_base(1),
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     probe_provider = form.is_session();
                 }
@@ -2167,7 +2276,27 @@ async fn handle_form(
         }
         return Ok(());
     }
-    match perform_form(client, &form).await {
+    if form.is_worktree() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        app.pending_form = Some(receive);
+        if let Mode::Modal(current) = &mut app.mode {
+            current.pending = true;
+        }
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = send.send(perform_form(&client, &form).await);
+        });
+        return Ok(());
+    }
+    finish_form_submission(client, app, perform_form(client, &form).await).await
+}
+
+async fn finish_form_submission(
+    client: &DaemonClient,
+    app: &mut App,
+    result: Result<FormOutcome, DaemonError>,
+) -> Result<(), DaemonError> {
+    match result {
         Ok(outcome) => {
             app.mode = Mode::Navigation;
             app.flash = Some(Flash::transient(FlashKind::Success, outcome.message));
@@ -2212,6 +2341,7 @@ async fn handle_form(
         }
         Err(error) => {
             if let Mode::Modal(current) = &mut app.mode {
+                current.pending = false;
                 current.submission_error = Some(bounded_feedback(error.to_string()));
             }
         }
@@ -2391,13 +2521,6 @@ async fn probe_form_provider(client: &DaemonClient, app: &mut App) -> Result<(),
 
 #[allow(clippy::too_many_lines)]
 async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome, DaemonError> {
-    let optional = |index: usize| {
-        form.fields
-            .get(index)
-            .map(|field| field.value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    };
     let (message, response) = match form.kind {
         FormKind::CreateWorkspace => (
             "Workspace created",
@@ -2416,15 +2539,14 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
                 })
                 .await?,
         ),
-        FormKind::CreateWorktree(project_id) => (
+        FormKind::CreateWorktree(_) => (
             "Worktree created",
             client
-                .request(&ClientRequest::CreateWorktree {
-                    project_id,
-                    branch: form.fields[0].value.trim().into(),
-                    name: optional(1),
-                    base_ref: optional(2),
-                })
+                .request(
+                    &form
+                        .worktree_request()
+                        .map_err(DaemonError::InvalidSession)?,
+                )
                 .await?,
         ),
         FormKind::CreateSession(_) => {
@@ -2479,6 +2601,14 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
     };
     match response {
         DaemonResponse::Error(error) => Err(DaemonError::Lifecycle(error.message)),
+        DaemonResponse::WorktreeCreated { worktree, .. } => Ok(FormOutcome {
+            message: format!(
+                "Worktree created from {} @ {}",
+                worktree.base_ref,
+                worktree.base_commit.chars().take(8).collect::<String>()
+            ),
+            selection,
+        }),
         _ => Ok(FormOutcome {
             message: message.into(),
             selection,
@@ -3073,6 +3203,30 @@ async fn show_diff(client: &DaemonClient, app: &mut App) -> Result<(), DaemonErr
 }
 
 async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
+    if app.resume_pending.is_some() || app.resume_response.is_some() {
+        return Ok(());
+    }
+    if let Some(session) = app.selected_session()
+        && !sylvops_core::domain::state_is_active(session.state)
+    {
+        if sylvops_core::provider::session_can_resume(
+            session,
+            &app.snapshot.sessions,
+            &app.providers,
+        ) {
+            let session_id = session.id;
+            resume_session(client, app, session_id);
+        } else {
+            app.flash = Some(Flash::error(
+                "Cannot resume this conversation: it needs a verified saved conversation, an available resume-capable provider, and no newer successor. History is retained; use New to start a fresh session explicitly.",
+            ));
+        }
+        return Ok(());
+    }
+    attach_selected_process(client, app).await
+}
+
+async fn attach_selected_process(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
     let Some(session_id) = app.selected_session_id else {
         app.flash = Some(Flash::error("Select a session first."));
         return Ok(());
@@ -3127,23 +3281,38 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
     Ok(())
 }
 
-async fn resume_session(
+fn resume_session(client: &DaemonClient, app: &mut App, source_session_id: SessionId) {
+    if app.resume_response.is_some() {
+        return;
+    }
+    app.resume_pending = Some(source_session_id);
+    app.flash = Some(Flash::transient(FlashKind::Info, "Resuming session…"));
+    let client = client.clone();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    app.resume_response = Some(receive);
+    tokio::spawn(async move {
+        let result = client
+            .request(&ClientRequest::ResumeSession {
+                session_id: source_session_id,
+                columns: 80,
+                rows: 24,
+            })
+            .await;
+        let _ = send.send(result);
+    });
+}
+
+async fn finish_resume(
     client: &DaemonClient,
     app: &mut App,
-    source_session_id: SessionId,
+    response: Result<DaemonResponse, DaemonError>,
 ) -> Result<(), DaemonError> {
-    let response = client
-        .request(&ClientRequest::ResumeSession {
-            session_id: source_session_id,
-            columns: 80,
-            rows: 24,
-        })
-        .await;
     let response = match response {
         Ok(response) => response,
         Err(error) => {
             app.resume_pending = None;
-            return Err(error);
+            app.flash = Some(Flash::error(format!("Could not resume session: {error}")));
+            return Ok(());
         }
     };
     let Some(session) = apply_resume_response(app, response) else {
@@ -3155,7 +3324,7 @@ async fn resume_session(
         FlashKind::Success,
         "Session resumed into a new history record.",
     ));
-    Ok(())
+    attach_selected_process(client, app).await
 }
 
 fn apply_resume_response(
@@ -3201,6 +3370,12 @@ async fn handle_terminal(
     let clicked_detach = matches!(&input, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) && matches!(app.hit_map.target_at(mouse.column, mouse.row), Some(HitTarget::Detach)));
     let history = match &input {
         Event::Key(key) => history_action(*key),
+        Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+            match app.hit_map.target_at(mouse.column, mouse.row) {
+                Some(HitTarget::TerminalHistory(action)) => Some(action),
+                _ => None,
+            }
+        }
         _ => None,
     };
     let wheel = match &input {
@@ -3234,9 +3409,12 @@ async fn handle_terminal(
             }
             Ok(())
         }
-        Event::Key(_) if history.is_some() => {
-            if let Some(terminal) = app.attached.as_mut() {
-                terminal.apply_history_action(history.expect("history guard checked"));
+        _ if history.is_some() => {
+            let action = app.attached.as_mut().map(|terminal| {
+                terminal.apply_history_action(history.expect("history guard checked"))
+            });
+            if let Some(TerminalWheelAction::Application(bytes)) = action {
+                enqueue_terminal_input(app, input_pump.as_ref(), bytes);
             }
             Ok(())
         }
@@ -6185,6 +6363,42 @@ mod tests {
     }
 
     #[test]
+    fn attention_notifications_fire_once_per_transition_and_skip_startup_history() {
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        let mut tracker = notifications::AttentionTracker::new(&snapshot.sessions);
+        assert!(tracker.update(&snapshot.sessions).is_none());
+        snapshot.sessions[0].state = SessionState::Running;
+        assert!(tracker.update(&snapshot.sessions).is_none());
+        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        assert_eq!(
+            tracker.update(&snapshot.sessions).as_deref(),
+            Some("shell needs your input or approval.")
+        );
+        assert!(tracker.update(&snapshot.sessions).is_none());
+        snapshot.sessions[0].display_name = "renamed".into();
+        assert!(tracker.update(&snapshot.sessions).is_none());
+        snapshot.sessions[0].state = SessionState::FinishedUnseen;
+        assert!(tracker.update(&snapshot.sessions).is_none());
+    }
+
+    #[test]
+    fn attention_notification_batches_are_bounded_and_do_not_include_terminal_text() {
+        let mut snapshot = populated_snapshot();
+        let mut tracker = notifications::AttentionTracker::new(&snapshot.sessions);
+        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        snapshot.sessions[0].display_name = format!("\x1b{}\n", "界".repeat(1000));
+        let mut another = snapshot.sessions[0].clone();
+        another.id = SessionId::new();
+        snapshot.sessions.push(another);
+        let message = tracker.update(&snapshot.sessions).unwrap();
+        assert!(message.starts_with("2 sessions need your input or approval"));
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.chars().count() < 160);
+        assert!(tracker.update(&snapshot.sessions).is_none());
+    }
+
+    #[test]
     fn needs_feedback_rows_use_attention_surfaces_in_cards_and_lists() {
         let theme = theme::Theme::resolve(TuiTheme::TokyoNight);
         assert_eq!(
@@ -6205,7 +6419,11 @@ mod tests {
         );
 
         let terminal_default = theme::Theme::resolve(TuiTheme::TerminalDefault);
-        assert_eq!(terminal_default.attention_surface.bg, None);
+        assert!(terminal_default.attention_surface.bg.is_some());
+        assert_ne!(
+            terminal_default.attention_surface.bg,
+            terminal_default.attention_selected_surface.bg
+        );
         assert_ne!(terminal_default.attention_surface, terminal_default.text);
     }
 

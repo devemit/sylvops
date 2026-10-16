@@ -132,7 +132,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     })
     .await;
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
-    match client
+    let stopped_successor = match client
         .request(&ClientRequest::ResumeSession {
             session_id: terminated_session_id,
             columns: 80,
@@ -141,13 +141,21 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("terminated resume response")
     {
-        DaemonResponse::Error(error) => assert!(
-            error.message.contains("not eligible for resume"),
-            "terminated resume error should be actionable: {}",
-            error.message
-        ),
-        response => panic!("terminated session unexpectedly resumed: {response:?}"),
-    }
+        DaemonResponse::SessionResumed { session, .. } => session,
+        response => panic!("stopped conversation did not resume: {response:?}"),
+    };
+    assert_eq!(stopped_successor.worktree_id, worktree_id);
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: stopped_successor.id,
+        })
+        .await
+        .expect("stop resumed fixture");
+    wait_for_session(&client, stopped_successor.id, |session| {
+        session.state == SessionState::Terminated
+    })
+    .await;
+    assert_eq!(owned_hook_profile_count(&codex_home), 0);
     std::fs::write(&terminated_profile, terminated_profile_source)
         .expect("restore intact owned Codex profile");
     assert_eq!(owned_hook_profile_count(&codex_home), 1);

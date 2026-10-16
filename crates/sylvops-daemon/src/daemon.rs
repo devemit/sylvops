@@ -1374,7 +1374,10 @@ async fn handle_request(
         ClientRequest::PrepareStartWork {
             project_id,
             issue_number,
+            base,
         } => {
+            let operation_lock = project_operation_lock(state, project_id).await;
+            let _operation_guard = operation_lock.lock().await;
             let Ok(project) = state.database.project(project_id).await else {
                 return send_start_work_failure(
                     outgoing,
@@ -1420,7 +1423,10 @@ async fn handle_request(
                 )
                 .await;
             };
-            let Ok(root_state) = git::inspect_worktree(&root_worktree).await else {
+            let Ok(()) =
+                git::verify_repository_root(std::path::Path::new(&root_worktree.canonical_path))
+                    .await
+            else {
                 return send_start_work_failure(
                     outgoing,
                     request_id,
@@ -1441,8 +1447,46 @@ async fn handle_request(
                         .await;
                     }
                 };
-            let head_ref = root_state.branch.as_deref().unwrap_or("HEAD");
-            let Ok(base) = StartWorkBase::new(root_worktree.id, head_ref, root_state.head_commit)
+            let selection = match base.unwrap_or_default() {
+                sylvops_core::domain::WorktreeBaseSelection::LatestDefaultBranch { remote } => {
+                    if remote
+                        .as_ref()
+                        .is_some_and(|remote| remote != &association.remote_name)
+                    {
+                        return send_start_work_failure(
+                            outgoing,
+                            request_id,
+                            StartWorkFailureKind::AssociationChanged,
+                            "Select the remote associated with this Issue's GitHub Repository.",
+                        )
+                        .await;
+                    }
+                    sylvops_core::domain::WorktreeBaseSelection::LatestDefaultBranch {
+                        remote: Some(association.remote_name.clone()),
+                    }
+                }
+                local @ sylvops_core::domain::WorktreeBaseSelection::LocalRef { .. } => local,
+            };
+            let resolved = match git::resolve_worktree_base(
+                &project,
+                &state.managed_worktree_root,
+                &selection,
+            )
+            .await
+            {
+                Ok(base) => base,
+                Err(error) => {
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::BaseMoved,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            };
+            let Ok(mut base) =
+                StartWorkBase::new(root_worktree.id, resolved.reference, resolved.commit)
             else {
                 return send_start_work_failure(
                     outgoing,
@@ -1452,6 +1496,7 @@ async fn handle_request(
                 )
                 .await;
             };
+            base.selection = resolved.selection;
             let suggested_branch = issue_branch_suggestion(issue_number, &issue.title);
             let suggested_branch_conflict = git::branch_exists(&project, suggested_branch.as_str())
                 .await
@@ -1556,7 +1601,10 @@ async fn handle_request(
                 )
                 .await;
             };
-            let Ok(root_state) = git::inspect_worktree(&root_worktree).await else {
+            let Ok(()) =
+                git::verify_repository_root(std::path::Path::new(&root_worktree.canonical_path))
+                    .await
+            else {
                 return send_start_work_failure(
                     outgoing,
                     request_id,
@@ -1565,18 +1613,6 @@ async fn handle_request(
                 )
                 .await;
             };
-            let actual_ref = root_state.branch.as_deref().unwrap_or("HEAD");
-            if actual_ref != confirmation.base.head_ref.as_str()
-                || root_state.head_commit != confirmation.base.head_commit
-            {
-                return send_start_work_failure(
-                    outgoing,
-                    request_id,
-                    StartWorkFailureKind::BaseMoved,
-                    "The Project root Worktree HEAD moved after confirmation.",
-                )
-                .await;
-            }
             let issue = match load_start_work_issue(
                 state,
                 &association.repository,
@@ -1724,7 +1760,10 @@ async fn handle_request(
                 )
                 .await;
             };
-            let Ok(latest_root_state) = git::inspect_worktree(&latest_root).await else {
+            let Ok(()) =
+                git::verify_repository_root(std::path::Path::new(&latest_root.canonical_path))
+                    .await
+            else {
                 return send_start_work_failure(
                     outgoing,
                     request_id,
@@ -1733,15 +1772,44 @@ async fn handle_request(
                 )
                 .await;
             };
-            let latest_ref = latest_root_state.branch.as_deref().unwrap_or("HEAD");
-            if latest_ref != confirmation.base.head_ref.as_str()
-                || latest_root_state.head_commit != confirmation.base.head_commit
+            if let sylvops_core::domain::WorktreeBaseSelection::LatestDefaultBranch { remote } =
+                &confirmation.base.selection
+                && remote.as_ref() != Some(&association.remote_name)
+            {
+                return send_start_work_failure(
+                    outgoing,
+                    request_id,
+                    StartWorkFailureKind::AssociationChanged,
+                    "The confirmed base remote differs from the Issue's associated remote.",
+                )
+                .await;
+            }
+            let latest_base = match git::resolve_worktree_base(
+                &current_project,
+                &state.managed_worktree_root,
+                &confirmation.base.selection,
+            )
+            .await
+            {
+                Ok(base) => base,
+                Err(error) => {
+                    return send_start_work_failure(
+                        outgoing,
+                        request_id,
+                        StartWorkFailureKind::BaseMoved,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            };
+            if latest_base.reference != confirmation.base.head_ref.as_str()
+                || latest_base.commit != confirmation.base.head_commit
             {
                 return send_start_work_failure(
                     outgoing,
                     request_id,
                     StartWorkFailureKind::BaseMoved,
-                    "The Project root Worktree HEAD moved immediately before mutation.",
+                    "The base branch moved after preview. Refresh Start Work and confirm the new base.",
                 )
                 .await;
             }
@@ -2383,15 +2451,22 @@ async fn handle_request(
             let operation_lock = project_operation_lock(state, project_id).await;
             let _operation_guard = operation_lock.lock().await;
             let project = state.database.project(project_id).await?;
-            let record = git::create_managed_worktree(
+            let base = git::resolve_worktree_base(
+                &project,
+                &state.managed_worktree_root,
+                &base_ref.unwrap_or_default(),
+            )
+            .await?;
+            let mut record = git::create_managed_worktree(
                 &project,
                 &state.managed_worktree_root,
                 WorktreeId::new(),
                 name,
                 &branch,
-                base_ref.as_deref(),
+                Some(&base.commit),
             )
             .await?;
+            record.base_ref = base.reference;
             let external_path = record.canonical_path.clone();
             let (revision, worktree) = match state.database.add_worktree(record).await {
                 Ok(result) => result,
@@ -2587,7 +2662,7 @@ async fn handle_request(
             })?;
             if !state_allows_resume(source.state) {
                 return Err(DaemonError::Provider(format!(
-                    "session state {} is not eligible for resume; only finished, failed, or disconnected sessions may be resumed",
+                    "session state {} is not eligible for resume; only finished, failed, stopped, or disconnected sessions may be resumed",
                     source.state
                 )));
             }

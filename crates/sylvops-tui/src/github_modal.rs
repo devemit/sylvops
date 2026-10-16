@@ -30,6 +30,7 @@ pub(crate) enum StartWorkFocus {
     Provider,
     SessionName,
     Instructions,
+    BaseRef,
     Confirm,
 }
 
@@ -59,6 +60,7 @@ impl StartWorkFocus {
             Self::Provider,
             Self::SessionName,
             Self::Instructions,
+            Self::BaseRef,
             Self::Confirm,
         ];
         let current: usize = match self {
@@ -66,7 +68,8 @@ impl StartWorkFocus {
             Self::Provider => 1,
             Self::SessionName => 2,
             Self::Instructions => 3,
-            Self::Confirm => 4,
+            Self::BaseRef => 4,
+            Self::Confirm => 5,
         };
         values[current.saturating_add_signed(delta).min(values.len() - 1)]
     }
@@ -74,6 +77,9 @@ impl StartWorkFocus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StartWorkForm {
+    pub base_mode: sylvops_core::ui_forms::WorktreeBaseMode,
+    pub base_ref: String,
+    pub base_ready: bool,
     pub preparation: StartWorkPreparation,
     pub branch: String,
     pub provider_index: usize,
@@ -94,6 +100,18 @@ impl StartWorkForm {
             .suggested_branch_conflict
             .then(|| branch.clone());
         Self {
+            base_mode: sylvops_core::ui_forms::WorktreeBaseMode::from_selection(
+                &preparation.base.selection,
+            ),
+            base_ref: match &preparation.base.selection {
+                sylvops_core::domain::WorktreeBaseSelection::LocalRef { reference } => {
+                    reference.clone()
+                }
+                sylvops_core::domain::WorktreeBaseSelection::LatestDefaultBranch { .. } => {
+                    "HEAD".into()
+                }
+            },
+            base_ready: true,
             branch,
             preparation,
             provider_index: 0,
@@ -115,6 +133,16 @@ impl StartWorkForm {
             .copied()
     }
 
+    pub(crate) fn cycle_base(&mut self) {
+        use sylvops_core::ui_forms::WorktreeBaseMode;
+        let index = WorktreeBaseMode::ALL
+            .iter()
+            .position(|mode| *mode == self.base_mode)
+            .unwrap_or(0);
+        self.base_mode = WorktreeBaseMode::ALL[(index + 1) % WorktreeBaseMode::ALL.len()];
+        self.base_ready = false;
+    }
+
     pub(crate) fn move_provider(&mut self, delta: isize) {
         if !self.preparation.eligible_providers.is_empty() {
             self.provider_index = self
@@ -134,12 +162,17 @@ impl StartWorkForm {
             StartWorkFocus::Instructions => {
                 Some((&mut self.instructions, MAX_START_WORK_INSTRUCTIONS_LENGTH))
             }
+            StartWorkFocus::BaseRef => Some((&mut self.base_ref, 1024)),
             StartWorkFocus::Provider | StartWorkFocus::Confirm => None,
         };
         if let Some((value, maximum)) = target
             && value.len().saturating_add(character.len_utf8()) <= maximum
         {
             value.push(character);
+            if self.focus == StartWorkFocus::BaseRef {
+                self.base_mode = sylvops_core::ui_forms::WorktreeBaseMode::CustomRef;
+                self.base_ready = false;
+            }
             self.error = None;
             if self.focus == StartWorkFocus::Branch {
                 self.branch_conflict = None;
@@ -155,9 +188,14 @@ impl StartWorkForm {
             StartWorkFocus::Branch => self.branch.pop().is_some(),
             StartWorkFocus::SessionName => self.session_name.pop().is_some(),
             StartWorkFocus::Instructions => self.instructions.pop().is_some(),
+            StartWorkFocus::BaseRef => self.base_ref.pop().is_some(),
             StartWorkFocus::Provider | StartWorkFocus::Confirm => false,
         };
         if changed {
+            if self.focus == StartWorkFocus::BaseRef {
+                self.base_mode = sylvops_core::ui_forms::WorktreeBaseMode::CustomRef;
+                self.base_ready = false;
+            }
             self.error = None;
             if self.focus == StartWorkFocus::Branch {
                 self.branch_conflict = None;
@@ -177,6 +215,9 @@ impl StartWorkForm {
     pub(crate) fn request(&self, project_id: ProjectId) -> Result<ClientRequest, String> {
         if self.pending {
             return Err("Start Work is already in progress.".into());
+        }
+        if !self.base_ready {
+            return Err("Refresh the base preview with Ctrl+R before confirming.".into());
         }
         let branch = StartWorkBranch::new(self.branch.clone())?;
         if self.branch_conflict.as_deref() == Some(branch.as_str()) {
@@ -272,6 +313,7 @@ pub(crate) struct GitHubModal {
     pub configuration_error: Option<String>,
     pub start_work: Option<StartWorkForm>,
     pub start_work_preparing: bool,
+    pub start_work_initial_base: Option<sylvops_core::domain::WorktreeBaseSelection>,
     pub start_work_error: Option<StartWorkFailure>,
     pub recovery: Option<StartWorkRecovery>,
     issue_work: HashMap<GitHubItemIdentity, WorktreeId>,
@@ -305,6 +347,7 @@ impl GitHubModal {
             configuration_error: None,
             start_work: None,
             start_work_preparing: false,
+            start_work_initial_base: None,
             start_work_error: None,
             recovery: None,
             issue_work: HashMap::new(),
@@ -591,6 +634,7 @@ impl GitHubModal {
         self.depth = GitHubDepth::StartWork;
         self.start_work = None;
         self.start_work_preparing = true;
+        self.start_work_initial_base = None;
         self.start_work_error = None;
         Some((identity.number, start_another_worktree))
     }
@@ -604,7 +648,14 @@ impl GitHubModal {
         self.start_work_preparing = false;
         self.active_start_work_request = None;
         self.start_work_error = None;
-        self.start_work = Some(StartWorkForm::new(preparation, start_another_worktree));
+        if let Some(form) = &mut self.start_work {
+            form.preparation = preparation;
+            form.pending = false;
+            form.base_ready = true;
+            form.error = None;
+        } else {
+            self.start_work = Some(StartWorkForm::new(preparation, start_another_worktree));
+        }
     }
 
     pub(crate) fn fail_start_work(&mut self, failure: StartWorkFailure) {
@@ -612,6 +663,9 @@ impl GitHubModal {
         self.active_start_work_request = None;
         if let Some(form) = &mut self.start_work {
             form.pending = false;
+            if failure.kind == sylvops_core::github::StartWorkFailureKind::BaseMoved {
+                form.base_ready = false;
+            }
             form.error = Some(failure);
         } else {
             self.start_work_error = Some(failure);
