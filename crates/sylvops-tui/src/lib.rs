@@ -6,6 +6,7 @@ mod forms;
 mod github_modal;
 mod input;
 mod input_pump;
+mod notifications;
 mod reducer;
 mod removal_notice;
 mod render;
@@ -133,6 +134,9 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
     let mut events = client.subscribe();
     let (github_results_tx, mut github_results) = tokio::sync::mpsc::channel(16);
     let mut github_tasks = GitHubTasks::default();
+    let mut attention_alerts = notifications::AttentionTracker::new(&app.snapshot.sessions);
+    #[cfg(windows)]
+    let popup_notifications = notifications::platform::Notifier::new().ok();
     let mut guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .map_err(|error| DaemonError::Lifecycle(format!("cannot initialize TUI: {error}")))?;
@@ -246,6 +250,20 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         }
         if refresh {
             app.replace_snapshot(snapshot(&client).await?);
+            if let Some(message) = attention_alerts.update(&app.snapshot.sessions) {
+                let _ = execute!(terminal.backend_mut(), Print("\x07"));
+                #[cfg(windows)]
+                if !popup_notifications
+                    .as_ref()
+                    .is_some_and(|notifier| notifier.send(message.clone()))
+                {
+                    app.flash = Some(Flash::error(
+                        "Windows popup notification unavailable; check the highlighted sessions.",
+                    ));
+                }
+                #[cfg(not(windows))]
+                let _ = message;
+            }
             dirty = true;
         }
         save_debounced(&client, &mut app).await?;
@@ -6191,6 +6209,42 @@ mod tests {
             render::attention_message(2).contains("2 sessions need your input"),
             "plural attention copy"
         );
+    }
+
+    #[test]
+    fn attention_notifications_fire_once_per_transition_and_skip_startup_history() {
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        let mut tracker = notifications::AttentionTracker::new(&snapshot.sessions);
+        assert!(tracker.update(&snapshot.sessions).is_none());
+        snapshot.sessions[0].state = SessionState::Running;
+        assert!(tracker.update(&snapshot.sessions).is_none());
+        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        assert_eq!(
+            tracker.update(&snapshot.sessions).as_deref(),
+            Some("shell needs your input or approval.")
+        );
+        assert!(tracker.update(&snapshot.sessions).is_none());
+        snapshot.sessions[0].display_name = "renamed".into();
+        assert!(tracker.update(&snapshot.sessions).is_none());
+        snapshot.sessions[0].state = SessionState::FinishedUnseen;
+        assert!(tracker.update(&snapshot.sessions).is_none());
+    }
+
+    #[test]
+    fn attention_notification_batches_are_bounded_and_do_not_include_terminal_text() {
+        let mut snapshot = populated_snapshot();
+        let mut tracker = notifications::AttentionTracker::new(&snapshot.sessions);
+        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        snapshot.sessions[0].display_name = format!("\x1b{}\n", "界".repeat(1000));
+        let mut another = snapshot.sessions[0].clone();
+        another.id = SessionId::new();
+        snapshot.sessions.push(another);
+        let message = tracker.update(&snapshot.sessions).unwrap();
+        assert!(message.starts_with("2 sessions need your input or approval"));
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.chars().count() < 160);
+        assert!(tracker.update(&snapshot.sessions).is_none());
     }
 
     #[test]
