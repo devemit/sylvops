@@ -111,7 +111,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     let terminated_profile =
         codex_home.join(format!("sylvops-{terminated_session_id}.config.toml"));
     let terminated_profile_source =
-        std::fs::read(&terminated_profile).expect("read owned Codex profile");
+        std::fs::read_to_string(&terminated_profile).expect("read owned Codex profile");
     attach(&client, terminated_session_id).await;
     client
         .request(&ClientRequest::SessionInput {
@@ -124,6 +124,11 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         session.state == SessionState::NeedsFeedback && session.external_session_id.is_some()
     })
     .await;
+    std::fs::write(
+        &terminated_profile,
+        with_codex_trust(&terminated_profile_source, &repository),
+    )
+    .expect("Codex adds trust before process-exit cleanup");
     client
         .request(&ClientRequest::StopSession {
             session_id: terminated_session_id,
@@ -159,8 +164,11 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     })
     .await;
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
-    std::fs::write(&terminated_profile, terminated_profile_source)
-        .expect("restore intact owned Codex profile");
+    std::fs::write(
+        &terminated_profile,
+        with_codex_trust(&terminated_profile_source, &repository),
+    )
+    .expect("restore owned Codex profile with current trust metadata");
     assert_eq!(owned_hook_profile_count(&codex_home), 1);
     let authorization_token = match client
         .request(&ClientRequest::InspectSessionDeletion {
@@ -201,6 +209,13 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     })
     .await;
     let external_id = waiting.external_session_id.expect("external Codex ID");
+    let source_profile = codex_home.join(format!("sylvops-{source_session_id}.config.toml"));
+    let source_profile_text = std::fs::read_to_string(&source_profile).expect("source profile");
+    std::fs::write(
+        &source_profile,
+        with_codex_trust(&source_profile_text, &repository),
+    )
+    .expect("Codex adds trust before successful exit");
     assert_eq!(waiting.status.lifecycle, SessionLifecycle::Running);
     assert_eq!(waiting.status.activity, ProviderActivity::AwaitingInput);
     let input_event = waiting.status.attention.expect("input attention");
@@ -326,6 +341,8 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     wait_for_session(&client, resumed_id, |session| session.process_id.is_none()).await;
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
 
+    exercise_codex_cleanup_refusal(&client, worktree_id, &codex_home, &repository).await;
+
     let cleanup_session_id = create_codex_session(&client, worktree_id).await;
     wait_for_session(&client, cleanup_session_id, |session| {
         session.state == SessionState::Running && session.process_id.is_some()
@@ -344,12 +361,31 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .expect("daemon result");
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
 
+    let stale_profile = codex_home.join("sylvops-stale.config.toml");
+    std::fs::write(
+        &stale_profile,
+        with_codex_trust(&terminated_profile_source, &repository),
+    )
+    .expect("legacy v1 profile left by an affected version");
+    let unrelated = codex_home.join("config.toml");
+    let unknown_profile = codex_home.join("sylvops-user.config.toml");
+    let unrelated_source = "# user configuration\n";
+    std::fs::write(&unrelated, unrelated_source).expect("user configuration");
+    std::fs::write(&unknown_profile, unrelated_source).expect("unowned profile");
+
     let restart_paths = paths.clone();
     let mut restart_task = tokio::spawn(async move { daemon::run(restart_paths).await });
     let restarted = tokio::select! {
         result = &mut restart_task => panic!("restarted daemon exited before connection: {result:?}"),
         client = connect_eventually(&paths) => client,
     };
+    assert!(
+        !stale_profile.exists(),
+        "startup removes provably owned stale profiles"
+    );
+    for path in [&unrelated, &unknown_profile] {
+        assert_eq!(std::fs::read_to_string(path).unwrap(), unrelated_source);
+    }
     let snapshot = match restarted
         .request(&ClientRequest::GetSnapshot)
         .await
@@ -414,6 +450,72 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .expect("restart daemon task")
         .expect("restart daemon result");
     assert_no_persisted_text_contains(&paths.database, PROMPT_SENTINEL);
+}
+
+fn with_codex_trust(source: &str, project: &Path) -> String {
+    let project = serde_json::to_string(&project.to_string_lossy()).expect("quoted Project path");
+    format!("{source}\n[projects.{project}]\ntrust_level = \"trusted\"\n")
+}
+
+async fn exercise_codex_cleanup_refusal(
+    client: &DaemonClient,
+    worktree_id: WorktreeId,
+    codex_home: &Path,
+    project: &Path,
+) {
+    let session_id = create_codex_session(client, worktree_id).await;
+    attach(client, session_id).await;
+    wait_for_session(client, session_id, |session| {
+        session.external_session_id.is_some()
+    })
+    .await;
+    let profile = codex_home.join(format!("sylvops-{session_id}.config.toml"));
+    let original = std::fs::read_to_string(&profile).expect("owned profile");
+    let changed = format!("{original}\n[notice]\nprivate_unknown_edit = true\n");
+    std::fs::write(&profile, &changed).expect("unknown Codex profile edit");
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("finish"),
+        })
+        .await
+        .expect("finish despite cleanup refusal");
+    let finished =
+        wait_for_session(client, session_id, |session| session.process_id.is_none()).await;
+    assert!(matches!(
+        finished.state,
+        SessionState::FinishedSeen | SessionState::FinishedUnseen
+    ));
+    assert_eq!(std::fs::read_to_string(&profile).unwrap(), changed);
+    let authorization_token = session_deletion_token(client, session_id).await;
+    match client
+        .request(&ClientRequest::DeleteSession {
+            session_id,
+            authorization_token,
+        })
+        .await
+        .expect("unknown mutation deletion refusal")
+    {
+        DaemonResponse::Error(error) => {
+            assert!(error.message.len() < 512);
+            assert!(!error.message.contains("private_unknown_edit"));
+        }
+        other => panic!("unknown mutation must refuse deletion: {other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(&profile).unwrap(), changed);
+    std::fs::write(&profile, with_codex_trust(&original, project)).expect("repair unknown edit");
+    let authorization_token = session_deletion_token(client, session_id).await;
+    assert!(matches!(
+        client
+            .request(&ClientRequest::DeleteSession {
+                session_id,
+                authorization_token
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::SessionDeleted { .. }
+    ));
+    assert!(!profile.exists());
 }
 
 async fn exercise_session_lifecycle_stale_authorization(

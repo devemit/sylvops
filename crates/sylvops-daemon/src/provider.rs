@@ -1743,14 +1743,58 @@ fn cleanup_stale_profiles(directory: &Path) {
 }
 
 fn owned_profile_checksum_is_valid(source: &str) -> bool {
+    if source.len() > 64 * 1024 {
+        return false;
+    }
     let Some((header, body)) = source.split_once('\n') else {
         return false;
     };
     let Some(expected) = header.strip_prefix("# sylvops-managed-v1 sha256=") else {
         return false;
     };
-    let actual = format!("{:x}", Sha256::digest(body.as_bytes()));
-    expected == actual
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    // v1 hashes the original bytes, which Codex preserves when appending project trust.
+    // Find that checksummed boundary without normalizing or reserializing owned content.
+    let mut checksum = Sha256::new();
+    let mut end = 0;
+    for line in body.split_inclusive('\n') {
+        checksum.update(line.as_bytes());
+        end += line.len();
+        if format!("{:x}", checksum.clone().finalize()) == expected {
+            return end == body.len() || codex_trust_metadata_is_valid(&body[..end], body);
+        }
+    }
+    false
+}
+
+fn codex_trust_metadata_is_valid(owned: &str, body: &str) -> bool {
+    let (Ok(owned), Ok(mut document)) = (owned.parse::<toml::Table>(), body.parse::<toml::Table>())
+    else {
+        return false;
+    };
+    let Some(toml::Value::Table(projects)) = document.remove("projects") else {
+        return false;
+    };
+    // Parse the complete document so dotted keys cannot silently add fields to the
+    // final hook table, or redefine an immutable table across the checksum boundary.
+    document == owned
+        && !projects.is_empty()
+        && projects.iter().all(|(path, metadata)| {
+            Path::new(path).is_absolute()
+                && !path.chars().any(char::is_control)
+                && !Path::new(path)
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir)
+                && metadata.as_table().is_some_and(|metadata| {
+                    metadata.len() == 1
+                        && matches!(
+                            metadata.get("trust_level").and_then(toml::Value::as_str),
+                            Some("trusted" | "untrusted")
+                        )
+                })
+        })
 }
 
 fn hook_command(executable: &Path) -> sylvops_core::Result<String> {
@@ -2609,6 +2653,106 @@ mod tests {
     }
 
     #[test]
+    fn runtime_cleanup_accepts_only_project_trust_mutations() {
+        let temporary = tempfile::tempdir().expect("temporary hook directory");
+        let runtime = CodexAdapter::from_executable_with_hooks(
+            std::env::current_exe().expect("test executable"),
+            std::env::current_exe().expect("hook executable"),
+            temporary.path().to_owned(),
+        );
+        let path = temporary.path().join("sylvops-fixture.config.toml");
+        let paths = [path.clone()];
+        let source = hook_profile_source("\"/owned/sylvops\" hook emit");
+        let project = toml::Value::String(temporary.path().to_string_lossy().into_owned());
+        let other_project = toml::Value::String(
+            temporary
+                .path()
+                .join("another Project")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        for (suffix, accepted) in [
+            (
+                format!("\n[projects.{project}]\ntrust_level = \"trusted\"\n"),
+                true,
+            ),
+            (
+                format!("\n[projects]\n[projects.{project}]\ntrust_level = 'untrusted'\n"),
+                true,
+            ),
+            (
+                format!(
+                    "\n[projects.{project}]\ntrust_level = 'trusted'\n[projects.{other_project}]\ntrust_level = 'untrusted'\n"
+                ),
+                true,
+            ),
+            (
+                format!(
+                    "\n[projects.{project}]\ntrust_level = \"trusted\"\n\n[projects.{project}.ignored]\n"
+                ),
+                false,
+            ),
+            (
+                format!("\n[projects.{project}]\ntrust_level = \"trusted\"\ncommand = 'extra'\n"),
+                false,
+            ),
+            (
+                format!("\n[projects.{project}]\ntrust_level = true\n"),
+                false,
+            ),
+            (
+                format!("\n[projects.{project}]\ntrust_level = 'allow'\n"),
+                false,
+            ),
+            (
+                format!(
+                    "\n[projects.{project}]\ntrust_level = \"trusted\"\ntrust_level = \"untrusted\"\n"
+                ),
+                false,
+            ),
+            (
+                "\n[projects.relative]\ntrust_level = 'trusted'\n".into(),
+                false,
+            ),
+            ("\n[projects]\n".into(), false),
+            (
+                "\nprojects = { '/tmp' = { trust_level = 'trusted' } }\n".into(),
+                false,
+            ),
+            ("\n[features]\nhooks = false\n".into(), false),
+            (
+                "\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = 'command'\ncommand = 'extra'\n"
+                    .into(),
+                false,
+            ),
+            ("\n[notice]\nhide_warning = true\n".into(), false),
+            ("\n[projects.\"unterminated]\n".into(), false),
+        ] {
+            std::fs::write(&path, format!("{source}{suffix}")).expect("mutated profile");
+            assert_eq!(
+                runtime.cleanup_runtime_paths(&paths).is_ok(),
+                accepted,
+                "{suffix}"
+            );
+            assert_eq!(!path.exists(), accepted, "{suffix}");
+        }
+        for changed in [
+            source.replace("/owned/sylvops", "/elsewhere/sylvops"),
+            source.replace("hook emit", "hook other-command"),
+            source.replace("hooks = true", "hooks = false"),
+            source.replace("timeout = 2", "timeout = 20"),
+        ] {
+            std::fs::write(
+                &path,
+                format!("{changed}\n[projects.{project}]\ntrust_level = 'trusted'\n"),
+            )
+            .expect("edited immutable content");
+            assert!(runtime.cleanup_runtime_paths(&paths).is_err());
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
     fn runtime_cleanup_removes_only_intact_application_owned_profiles() {
         let temporary = tempfile::tempdir().expect("temporary hook directory");
         let runtime = Arc::new(CodexAdapter::from_executable_with_hooks(
@@ -2654,6 +2798,23 @@ mod tests {
         let intact_path = intact.owned_paths[0].clone();
         registry.cleanup_runtime_paths(ProviderKind::Codex, &intact.owned_paths);
         assert!(!intact_path.exists());
+
+        let trusted = configure(sylvops_core::ids::SessionId::new());
+        let trusted_path = &trusted.owned_paths[0];
+        let source = std::fs::read_to_string(trusted_path).expect("managed profile");
+        let project = toml::Value::String(temporary.path().to_string_lossy().into_owned());
+        std::fs::write(
+            trusted_path,
+            format!("{source}\n[projects.{project}]\ntrust_level = \"trusted\"\n"),
+        )
+        .expect("Codex trust mutation");
+        registry
+            .cleanup_runtime_paths_checked(ProviderKind::Codex, &trusted.owned_paths)
+            .expect("Codex trust metadata preserves ownership");
+        assert!(!trusted_path.exists());
+        registry
+            .cleanup_runtime_paths_checked(ProviderKind::Codex, &trusted.owned_paths)
+            .expect("repeated cleanup succeeds");
 
         let tampered = configure(sylvops_core::ids::SessionId::new());
         let tampered_path = tampered.owned_paths[0].clone();
