@@ -76,6 +76,17 @@ fn key_action(app: &App, key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('e') => Some(Action::SelectNavigatorView(TuiNavigatorView::Explorer)),
         KeyCode::Char('a') => Some(Action::SelectNavigatorView(TuiNavigatorView::Active)),
         KeyCode::Char('r') => Some(Action::Rename),
+        KeyCode::Char('d')
+            if app.navigator_view == TuiNavigatorView::Active
+                && let Some(session) = app.selected_session()
+                && session.status.attention.is_some_and(|event| {
+                    event.reason == sylvops_core::session_state::AttentionReason::RecoverableFailure
+                        && event.acknowledgement
+                            == sylvops_core::session_state::AttentionAcknowledgement::Pending
+                }) =>
+        {
+            Some(Action::DismissAttention(session.id))
+        }
         KeyCode::Char('d') => Some(Action::Delete),
         KeyCode::Char('G') => Some(Action::GitHub),
         KeyCode::Char('g') => Some(Action::Diff),
@@ -159,9 +170,10 @@ fn overview_target(target: Option<HitTarget>) -> bool {
         target,
         Some(
             HitTarget::FocusMain
-                | HitTarget::ActiveSession(_)
-                | HitTarget::ActiveSessionOpen(_)
-                | HitTarget::ActiveSessionStop(_)
+                | HitTarget::SessionOverview(_)
+                | HitTarget::SessionOverviewOpen(_)
+                | HitTarget::SessionOverviewStop(_)
+                | HitTarget::AttentionDismiss(_)
         )
     )
 }
@@ -169,7 +181,7 @@ fn overview_target(target: Option<HitTarget>) -> bool {
 fn explorer_target(target: Option<HitTarget>) -> bool {
     matches!(
         target,
-        Some(HitTarget::ExplorerRow(_) | HitTarget::ActiveSession(_) | HitTarget::FocusExplorer)
+        Some(HitTarget::ExplorerRow(_) | HitTarget::SessionOverview(_) | HitTarget::FocusExplorer)
     )
 }
 
@@ -177,9 +189,10 @@ fn target_action(target: HitTarget) -> Option<Action> {
     match target {
         HitTarget::ExplorerRow(index) => Some(Action::SelectExplorer(index)),
         HitTarget::Tab(tab) => Some(Action::SelectTab(tab)),
-        HitTarget::ActiveSession(session_id) => Some(Action::SelectActiveSession(session_id)),
-        HitTarget::ActiveSessionOpen(session_id) => Some(Action::OpenActiveSession(session_id)),
-        HitTarget::ActiveSessionStop(session_id) => Some(Action::StopActiveSession(session_id)),
+        HitTarget::SessionOverview(session_id) => Some(Action::SelectOverviewSession(session_id)),
+        HitTarget::SessionOverviewOpen(session_id) => Some(Action::OpenOverviewSession(session_id)),
+        HitTarget::SessionOverviewStop(session_id) => Some(Action::StopOverviewSession(session_id)),
+        HitTarget::AttentionDismiss(session_id) => Some(Action::DismissAttention(session_id)),
         HitTarget::NavigatorExplorer => {
             Some(Action::SelectNavigatorView(TuiNavigatorView::Explorer))
         }

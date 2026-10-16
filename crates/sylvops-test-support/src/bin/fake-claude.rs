@@ -155,13 +155,18 @@ fn run() -> io::Result<()> {
                 emit_stop_hook(&external_id, "scheduled", false, true)?;
                 println!("FAKE_CLAUDE_STOP_SCHEDULED");
             }
-            "stop-failure" => {
+            value if value.starts_with("stop-failure") => {
+                let category = if value == "stop-failure-new" {
+                    "provider_unavailable"
+                } else {
+                    "rate_limit"
+                };
                 emit_hook_payload(
                     json!({
                         "hook_event_name": "StopFailure",
                         "session_id": external_id,
-                        "error": "rate_limit",
-                        "error_details": "SYLVOPS_PRIVATE_CLAUDE_FAILURE_75",
+                        "error": category,
+                        "error_details": format!("SYLVOPS_PRIVATE_CLAUDE_FAILURE_75:{value}"),
                         "last_assistant_message": "private provider error text"
                     }),
                     None,

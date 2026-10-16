@@ -6,16 +6,14 @@ use std::{
 
 use ratatui::layout::Rect;
 use sylvops_core::{
-    domain::{
-        DaemonSnapshot, Project, Session, SessionState, Workspace, Worktree, WorktreeStatus,
-        active_session_priority, state_is_active,
-    },
+    domain::{DaemonSnapshot, Project, Session, Workspace, Worktree, WorktreeStatus},
     github::GitHubIntegrationStatus,
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{
         ProjectRemovalAuthorization, SessionDeletionAuthorization, WorkspaceDeletionAuthorization,
     },
     provider::ProviderHealth,
+    session_state::{AttentionAcknowledgement, AttentionReason, SessionLifecycle},
     ui::{
         MAX_TUI_NAVIGATOR_WIDTH, MIN_TUI_NAVIGATOR_WIDTH, TuiContentView, TuiDensity,
         TuiNavigatorView, TuiSessionPresentation, TuiState, TuiTheme,
@@ -32,6 +30,15 @@ pub(crate) const MAIN_VIEWS: [TuiContentView; 3] = [
     TuiContentView::Changes,
     TuiContentView::Details,
 ];
+
+const fn attention_reason_priority(reason: AttentionReason) -> u8 {
+    match reason {
+        AttentionReason::InputRequested => 0,
+        AttentionReason::RecoverableFailure => 1,
+        AttentionReason::TerminalFailure => 2,
+        AttentionReason::SuccessfulCompletion => 3,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FocusZone {
@@ -185,9 +192,10 @@ pub(crate) struct ExplorerRow {
 pub(crate) enum HitTarget {
     ExplorerRow(usize),
     Tab(TuiContentView),
-    ActiveSession(SessionId),
-    ActiveSessionOpen(SessionId),
-    ActiveSessionStop(SessionId),
+    SessionOverview(SessionId),
+    SessionOverviewOpen(SessionId),
+    SessionOverviewStop(SessionId),
+    AttentionDismiss(SessionId),
     NavigatorExplorer,
     NavigatorActive,
     NavigatorDivider,
@@ -383,7 +391,7 @@ impl App {
             status_animation_started_at: Instant::now(),
         };
         app.restore_selection();
-        app.reconcile_active_session_selection();
+        app.reconcile_overview_selection();
         app
     }
 
@@ -467,7 +475,7 @@ impl App {
         if let Some(selection) = reconciled_selection {
             self.reveal_and_select(selection);
         }
-        self.reconcile_active_session_selection();
+        self.reconcile_overview_selection();
         if self.snapshot.workspaces.is_empty() && matches!(&self.mode, Mode::Navigation) {
             self.mode = Mode::Modal(Form::workspace());
         }
@@ -542,27 +550,61 @@ impl App {
     }
 
     pub fn active_sessions(&self) -> Vec<&Session> {
-        let mut sessions: Vec<_> = self
-            .snapshot
-            .sessions
-            .iter()
-            .filter(|session| {
-                state_is_active(session.state)
-                    && self.node_exists(ExplorerNode::Session(session.id))
-            })
-            .collect();
+        let mut sessions: Vec<_> =
+            self.snapshot
+                .sessions
+                .iter()
+                .filter(|session| {
+                    matches!(
+                        session.status.lifecycle,
+                        SessionLifecycle::Starting | SessionLifecycle::Running
+                    ) && !session.status.attention.is_some_and(|event| {
+                        event.acknowledgement == AttentionAcknowledgement::Pending
+                    }) && self.node_exists(ExplorerNode::Session(session.id))
+                })
+                .collect();
         sessions.sort_by_key(|session| {
             (
-                active_session_priority(session.state),
+                u8::from(session.status.lifecycle == SessionLifecycle::Starting),
                 std::cmp::Reverse(session.last_activity_at),
             )
         });
         sessions
     }
 
-    pub fn move_active_session(&mut self, delta: isize) {
+    pub fn needs_attention_sessions(&self) -> Vec<&Session> {
+        let mut sessions: Vec<_> =
+            self.snapshot
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.status.attention.is_some_and(|event| {
+                        event.acknowledgement == AttentionAcknowledgement::Pending
+                    }) && self.node_exists(ExplorerNode::Session(session.id))
+                })
+                .collect();
+        sessions.sort_by_key(|session| {
+            let event = session
+                .status
+                .attention
+                .expect("Needs Attention Session has an Attention Event");
+            (
+                attention_reason_priority(event.reason),
+                std::cmp::Reverse(event.occurred_at),
+            )
+        });
+        sessions
+    }
+
+    pub fn session_overview(&self) -> Vec<&Session> {
+        let mut sessions = self.needs_attention_sessions();
+        sessions.extend(self.active_sessions());
+        sessions
+    }
+
+    pub fn move_overview_session(&mut self, delta: isize) {
         let ids = self
-            .active_sessions()
+            .session_overview()
             .into_iter()
             .map(|session| session.id)
             .collect::<Vec<_>>();
@@ -579,9 +621,9 @@ impl App {
         self.reveal_and_select(ExplorerNode::Session(ids[next]));
     }
 
-    pub fn select_active_session(&mut self, session_id: SessionId) -> bool {
+    pub fn select_overview_session(&mut self, session_id: SessionId) -> bool {
         if self
-            .active_sessions()
+            .session_overview()
             .iter()
             .any(|session| session.id == session_id)
         {
@@ -592,12 +634,12 @@ impl App {
         }
     }
 
-    fn reconcile_active_session_selection(&mut self) {
+    fn reconcile_overview_selection(&mut self) {
         if self.navigator_view != TuiNavigatorView::Active {
             return;
         }
         let ids = self
-            .active_sessions()
+            .session_overview()
             .into_iter()
             .map(|session| session.id)
             .collect::<Vec<_>>();
@@ -1036,13 +1078,7 @@ impl App {
     }
 
     pub fn select_attention(&mut self) -> Option<String> {
-        let target = self
-            .snapshot
-            .sessions
-            .iter()
-            .filter(|session| session.state == SessionState::NeedsFeedback)
-            .max_by_key(|session| session.last_activity_at)
-            .cloned();
+        let target = self.needs_attention_sessions().first().copied().cloned();
         let session = target?;
         if let Some(worktree) = self
             .snapshot
@@ -1054,15 +1090,12 @@ impl App {
             self.expanded_worktrees.insert(worktree.id);
         }
         self.select_node(ExplorerNode::Session(session.id));
-        Some(format!("{}: waiting for your input", session.display_name))
+        self.navigator_view = TuiNavigatorView::Active;
+        Some(format!("{}: needs attention", session.display_name))
     }
 
     pub fn attention_count(&self) -> usize {
-        self.snapshot
-            .sessions
-            .iter()
-            .filter(|session| session.state == SessionState::NeedsFeedback)
-            .count()
+        self.needs_attention_sessions().len()
     }
 
     pub fn status_animation_frame(&self) -> usize {
@@ -1144,7 +1177,7 @@ impl App {
         self.navigator_view = view;
         self.navigator_resizing = NavigatorResizeState::Idle;
         self.focus = FocusZone::Explorer;
-        self.reconcile_active_session_selection();
+        self.reconcile_overview_selection();
         self.mark_navigation_dirty();
     }
 

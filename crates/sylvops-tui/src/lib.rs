@@ -449,6 +449,15 @@ async fn execute_effects(
     for effect in effects {
         match effect {
             Effect::Attach => attach_selected(client, app).await?,
+            Effect::OpenAttention {
+                session_id,
+                attention_id,
+                reason,
+            } => open_attention(client, app, session_id, attention_id, reason).await?,
+            Effect::DismissAttention {
+                session_id,
+                attention_id,
+            } => dismiss_attention(client, app, session_id, attention_id).await?,
             Effect::Resume(session_id) => resume_session(client, app, session_id),
             Effect::OpenCreate => open_create_form(app),
             Effect::OpenCreateWorktree(project_id) => {
@@ -466,6 +475,97 @@ async fn execute_effects(
         }
     }
     Ok(false)
+}
+
+async fn dismiss_attention(
+    client: &DaemonClient,
+    app: &mut App,
+    session_id: SessionId,
+    attention_id: sylvops_core::session_state::AttentionEventId,
+) -> Result<(), DaemonError> {
+    match client
+        .request(&ClientRequest::DismissAttention {
+            session_id,
+            attention_id,
+        })
+        .await?
+    {
+        DaemonResponse::SessionAttentionDismissed { revision, session } => {
+            replace_session_snapshot(app, revision, session);
+            app.flash = Some(Flash::transient(
+                FlashKind::Success,
+                "Recoverable failure dismissed.",
+            ));
+        }
+        response => {
+            app.flash = Some(Flash::error(response_message(
+                "attention dismissal",
+                response,
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn open_attention(
+    client: &DaemonClient,
+    app: &mut App,
+    session_id: SessionId,
+    attention_id: sylvops_core::session_state::AttentionEventId,
+    reason: sylvops_core::session_state::AttentionReason,
+) -> Result<(), DaemonError> {
+    use sylvops_core::session_state::{AttentionReason, SessionLifecycle};
+
+    app.reveal_and_select(ExplorerNode::Session(session_id));
+    if matches!(
+        reason,
+        AttentionReason::InputRequested | AttentionReason::RecoverableFailure
+    ) {
+        return attach_selected_process(client, app).await;
+    }
+    let live = app
+        .selected_session()
+        .is_some_and(|session| session.status.lifecycle == SessionLifecycle::Running);
+    match client
+        .request(&ClientRequest::AcknowledgeAttention {
+            session_id,
+            attention_id,
+        })
+        .await?
+    {
+        DaemonResponse::SessionAttentionAcknowledged { revision, session } => {
+            replace_session_snapshot(app, revision, session);
+            if live {
+                attach_selected_process(client, app).await?;
+            } else {
+                app.set_tab(TuiContentView::Details);
+                app.flash = Some(Flash::transient(
+                    FlashKind::Success,
+                    "Session history opened and attention acknowledged.",
+                ));
+            }
+        }
+        response => {
+            app.flash = Some(Flash::error(response_message(
+                "attention acknowledgement",
+                response,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn replace_session_snapshot(app: &mut App, revision: u64, session: sylvops_core::domain::Session) {
+    let mut next = app.snapshot.clone();
+    next.revision = revision;
+    if let Some(existing) = next
+        .sessions
+        .iter_mut()
+        .find(|existing| existing.id == session.id)
+    {
+        *existing = session;
+    }
+    app.replace_snapshot(next);
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3713,6 +3813,10 @@ mod tests {
         WorkSource,
     };
     use sylvops_core::provider::{AuthenticationRequirement, ProviderCapabilities, ProviderHealth};
+    use sylvops_core::session_state::{
+        AttentionAcknowledgement, AttentionEvent, AttentionEventId, AttentionReason,
+        ProviderActivity, SessionLifecycle, SessionStatus,
+    };
     use sylvops_core::ui::{DEFAULT_TUI_NAVIGATOR_WIDTH, TuiNavigatorView};
 
     fn provider_health(kind: ProviderKind) -> ProviderHealth {
@@ -3785,7 +3889,11 @@ mod tests {
                 provider_kind: ProviderKind::Shell,
                 display_name: "shell".into(),
                 state: SessionState::Running,
-                status: sylvops_core::session_state::SessionStatus::default(),
+                status: SessionStatus {
+                    lifecycle: SessionLifecycle::Running,
+                    activity: ProviderActivity::None,
+                    attention: None,
+                },
                 process_id: Some(42),
                 external_session_id: None,
                 command: "/bin/sh".into(),
@@ -3802,6 +3910,48 @@ mod tests {
             work_sources: Vec::new(),
             provider_profiles: Vec::new(),
         }
+    }
+
+    fn with_pending_attention(
+        mut session: Session,
+        name: &str,
+        reason: AttentionReason,
+        event_id: u64,
+        occurred_at: i64,
+    ) -> Session {
+        session.id = SessionId::new();
+        session.display_name = name.into();
+        session.last_activity_at = occurred_at;
+        session.state = match reason {
+            AttentionReason::InputRequested | AttentionReason::RecoverableFailure => {
+                SessionState::NeedsFeedback
+            }
+            AttentionReason::SuccessfulCompletion => SessionState::FinishedUnseen,
+            AttentionReason::TerminalFailure => SessionState::Failed,
+        };
+        session.status = SessionStatus {
+            lifecycle: if reason == AttentionReason::TerminalFailure {
+                SessionLifecycle::Failed
+            } else {
+                SessionLifecycle::Running
+            },
+            activity: match reason {
+                AttentionReason::InputRequested => ProviderActivity::AwaitingInput,
+                AttentionReason::RecoverableFailure => ProviderActivity::RecoverableFailure,
+                AttentionReason::SuccessfulCompletion => ProviderActivity::Completed,
+                AttentionReason::TerminalFailure => ProviderActivity::None,
+            },
+            attention: Some(AttentionEvent {
+                id: AttentionEventId::try_from(event_id).unwrap(),
+                reason,
+                acknowledgement: AttentionAcknowledgement::Pending,
+                occurred_at,
+            }),
+        };
+        if session.status.lifecycle != SessionLifecycle::Running {
+            session.process_id = None;
+        }
+        session
     }
 
     fn github_identity(kind: GitHubItemKind, number: u64) -> GitHubItemIdentity {
@@ -3905,7 +4055,7 @@ mod tests {
     }
 
     #[test]
-    fn active_session_selection_orders_filters_and_reconciles_from_snapshots() {
+    fn session_overview_selection_orders_filters_and_reconciles_from_snapshots() {
         let mut snapshot = populated_snapshot();
         let running_id = snapshot.sessions[0].id;
         snapshot.sessions[0].display_name = "running".into();
@@ -3915,20 +4065,26 @@ mod tests {
         starting.id = SessionId::new();
         starting.display_name = "starting".into();
         starting.state = SessionState::Starting;
+        starting.status.lifecycle = SessionLifecycle::Starting;
+        starting.process_id = None;
         starting.last_activity_at = 100;
         let starting_id = starting.id;
 
-        let mut needs_feedback = snapshot.sessions[0].clone();
-        needs_feedback.id = SessionId::new();
-        needs_feedback.display_name = "needs feedback".into();
-        needs_feedback.state = SessionState::NeedsFeedback;
-        needs_feedback.last_activity_at = 20;
+        let needs_feedback = with_pending_attention(
+            snapshot.sessions[0].clone(),
+            "needs feedback",
+            AttentionReason::InputRequested,
+            1,
+            20,
+        );
         let needs_feedback_id = needs_feedback.id;
 
         let mut inactive = snapshot.sessions[0].clone();
         inactive.id = SessionId::new();
         inactive.display_name = "finished history".into();
         inactive.state = SessionState::FinishedSeen;
+        inactive.status.lifecycle = SessionLifecycle::Exited;
+        inactive.process_id = None;
         inactive.last_activity_at = 200;
         snapshot
             .sessions
@@ -3937,7 +4093,7 @@ mod tests {
         let mut app = App::new(snapshot.clone(), Vec::new(), None);
         app.select_navigator_view(TuiNavigatorView::Active);
         assert_eq!(
-            app.active_sessions()
+            app.session_overview()
                 .into_iter()
                 .map(|session| session.id)
                 .collect::<Vec<_>>(),
@@ -3945,9 +4101,16 @@ mod tests {
         );
         assert_eq!(app.selected_session_id, Some(needs_feedback_id));
 
-        app.move_active_session(2);
+        app.move_overview_session(2);
         assert_eq!(app.selected_session_id, Some(starting_id));
 
+        snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == starting_id)
+            .unwrap()
+            .status
+            .lifecycle = SessionLifecycle::Exited;
         snapshot
             .sessions
             .iter_mut()
@@ -3967,7 +4130,173 @@ mod tests {
         );
     }
 
-    fn render_active_sessions(
+    #[test]
+    fn needs_attention_is_complete_urgent_recent_and_absent_from_active_sessions() {
+        let mut snapshot = populated_snapshot();
+        let running_id = snapshot.sessions[0].id;
+        let base = snapshot.sessions[0].clone();
+        let input_old = with_pending_attention(
+            base.clone(),
+            "input old",
+            AttentionReason::InputRequested,
+            1,
+            100,
+        );
+        let input_new = with_pending_attention(
+            base.clone(),
+            "input new",
+            AttentionReason::InputRequested,
+            2,
+            200,
+        );
+        let recoverable = with_pending_attention(
+            base.clone(),
+            "recoverable",
+            AttentionReason::RecoverableFailure,
+            3,
+            400,
+        );
+        let terminal = with_pending_attention(
+            base.clone(),
+            "terminal",
+            AttentionReason::TerminalFailure,
+            4,
+            500,
+        );
+        let completion = with_pending_attention(
+            base.clone(),
+            "completion",
+            AttentionReason::SuccessfulCompletion,
+            5,
+            600,
+        );
+        let pending_ids = [
+            input_new.id,
+            input_old.id,
+            recoverable.id,
+            terminal.id,
+            completion.id,
+        ];
+        snapshot
+            .sessions
+            .extend([input_old, input_new, recoverable, terminal, completion]);
+
+        let app = App::new(snapshot, Vec::new(), None);
+        assert_eq!(
+            app.needs_attention_sessions()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            pending_ids
+        );
+        assert_eq!(
+            app.active_sessions()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![running_id]
+        );
+    }
+
+    #[test]
+    fn rendered_attention_rows_pair_distinct_icons_labels_and_semantic_surfaces() {
+        let reasons = [
+            (AttentionReason::InputRequested, "?", "Input requested"),
+            (
+                AttentionReason::RecoverableFailure,
+                "!",
+                "Recoverable failure",
+            ),
+            (AttentionReason::TerminalFailure, "×", "Terminal failure"),
+            (
+                AttentionReason::SuccessfulCompletion,
+                "✓",
+                "Successful Completion",
+            ),
+        ];
+        let mut snapshot = populated_snapshot();
+        let running_id = snapshot.sessions[0].id;
+        let base = snapshot.sessions[0].clone();
+        let attention = reasons
+            .iter()
+            .enumerate()
+            .map(|(index, (reason, _, _))| {
+                with_pending_attention(
+                    base.clone(),
+                    &format!("attention-{index}"),
+                    *reason,
+                    u64::try_from(index + 1).unwrap(),
+                    i64::try_from(index + 1).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let ids = attention
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        snapshot.sessions.extend(attention);
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.select_navigator_view(TuiNavigatorView::Active);
+        app.session_presentation = TuiSessionPresentation::List;
+        app.navigator_width = 80;
+
+        let mut normal_backgrounds = Vec::new();
+        for (index, (_, icon, label)) in reasons.iter().enumerate() {
+            app.selected_session_id = Some(running_id);
+            let backend = ratatui::backend::TestBackend::new(120, 32);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            let normal_area = app
+                .hit_map
+                .0
+                .iter()
+                .find(|region| region.target == HitTarget::SessionOverview(ids[index]))
+                .unwrap()
+                .area;
+            let normal = terminal
+                .backend()
+                .buffer()
+                .cell((normal_area.x, normal_area.y))
+                .unwrap()
+                .bg;
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(text.contains(icon));
+            assert!(text.contains(label));
+
+            app.selected_session_id = Some(ids[index]);
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            let selected_area = app
+                .hit_map
+                .0
+                .iter()
+                .find(|region| region.target == HitTarget::SessionOverview(ids[index]))
+                .unwrap()
+                .area;
+            let selected = terminal
+                .backend()
+                .buffer()
+                .cell((selected_area.x, selected_area.y))
+                .unwrap()
+                .bg;
+            assert_ne!(normal, selected, "{label}");
+            normal_backgrounds.push(normal);
+        }
+        normal_backgrounds.sort_by_key(|color| format!("{color:?}"));
+        normal_backgrounds.dedup();
+        assert_eq!(normal_backgrounds.len(), reasons.len());
+    }
+
+    fn render_session_overview(
         snapshot: &DaemonSnapshot,
         width: u16,
         presentation: TuiSessionPresentation,
@@ -4010,11 +4339,11 @@ mod tests {
         }
 
         let (cards, card_hits) =
-            render_active_sessions(&snapshot, 140, TuiSessionPresentation::Cards);
+            render_session_overview(&snapshot, 140, TuiSessionPresentation::Cards);
         let card_items = card_hits
             .0
             .iter()
-            .filter(|region| matches!(region.target, HitTarget::ActiveSession(_)))
+            .filter(|region| matches!(region.target, HitTarget::SessionOverview(_)))
             .collect::<Vec<_>>();
         assert_eq!(card_items.len(), 3);
         assert_ne!(card_items[0].area.x, card_items[1].area.x);
@@ -4022,7 +4351,7 @@ mod tests {
             card_hits
                 .0
                 .iter()
-                .filter(|region| matches!(region.target, HitTarget::ActiveSessionOpen(_)))
+                .filter(|region| matches!(region.target, HitTarget::SessionOverviewOpen(_)))
                 .count(),
             4
         );
@@ -4030,21 +4359,21 @@ mod tests {
             card_hits
                 .0
                 .iter()
-                .filter(|region| matches!(region.target, HitTarget::ActiveSessionStop(_)))
+                .filter(|region| matches!(region.target, HitTarget::SessionOverviewStop(_)))
                 .count(),
             4
         );
         assert!(card_hits.0.iter().any(|region| {
-            matches!(region.target, HitTarget::ActiveSessionOpen(_)) && region.area.y == 31
+            matches!(region.target, HitTarget::SessionOverviewOpen(_)) && region.area.y == 31
         }));
 
         let (list, list_hits) =
-            render_active_sessions(&snapshot, 140, TuiSessionPresentation::List);
+            render_session_overview(&snapshot, 140, TuiSessionPresentation::List);
         let list_items = list_hits
             .0
             .iter()
             .filter_map(|region| match region.target {
-                HitTarget::ActiveSession(_) => Some(region.area),
+                HitTarget::SessionOverview(_) => Some(region.area),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -4056,12 +4385,13 @@ mod tests {
                 .all(|pair| { pair[0].x == pair[1].x && pair[0].y.saturating_add(1) == pair[1].y })
         );
 
-        let (_, narrow_hits) = render_active_sessions(&snapshot, 84, TuiSessionPresentation::Cards);
+        let (_, narrow_hits) =
+            render_session_overview(&snapshot, 84, TuiSessionPresentation::Cards);
         let narrow_x = narrow_hits
             .0
             .iter()
             .filter_map(|region| match region.target {
-                HitTarget::ActiveSession(_) => Some(region.area.x),
+                HitTarget::SessionOverview(_) => Some(region.area.x),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -4121,7 +4451,7 @@ mod tests {
 
         for presentation in [TuiSessionPresentation::Cards, TuiSessionPresentation::List] {
             app.session_presentation = presentation;
-            app.move_active_session(1_000);
+            app.move_overview_session(1_000);
             let selected = app.selected_session_id.unwrap();
             let backend = ratatui::backend::TestBackend::new(100, 20);
             let mut terminal = Terminal::new(backend).unwrap();
@@ -4132,7 +4462,7 @@ mod tests {
                 app.hit_map
                     .0
                     .iter()
-                    .any(|region| { region.target == HitTarget::ActiveSession(selected) })
+                    .any(|region| { region.target == HitTarget::SessionOverview(selected) })
             );
         }
 
@@ -4148,7 +4478,7 @@ mod tests {
             .hit_map
             .0
             .iter()
-            .find(|region| region.target == HitTarget::ActiveSessionOpen(selected))
+            .find(|region| region.target == HitTarget::SessionOverviewOpen(selected))
             .unwrap();
         let open_click = Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -4158,27 +4488,92 @@ mod tests {
         });
         assert_eq!(
             input::navigation_action(&app, &open_click),
-            Some(reducer::Action::OpenActiveSession(selected))
+            Some(reducer::Action::OpenOverviewSession(selected))
         );
         assert_eq!(
-            reduce(&mut app, reducer::Action::OpenActiveSession(selected)),
+            reduce(&mut app, reducer::Action::OpenOverviewSession(selected)),
             vec![reducer::Effect::Attach]
         );
         assert_eq!(
-            reduce(&mut app, reducer::Action::StopActiveSession(selected)),
+            reduce(&mut app, reducer::Action::StopOverviewSession(selected)),
             vec![reducer::Effect::OpenDelete]
         );
 
         let stale = SessionId::new();
         assert_eq!(
-            reduce(&mut app, reducer::Action::OpenActiveSession(stale)),
+            reduce(&mut app, reducer::Action::OpenOverviewSession(stale)),
             []
         );
         assert_eq!(
-            reduce(&mut app, reducer::Action::StopActiveSession(stale)),
+            reduce(&mut app, reducer::Action::StopOverviewSession(stale)),
             []
         );
         assert_eq!(app.selected_session_id, Some(selected));
+    }
+
+    #[test]
+    fn attention_actions_open_history_or_input_and_only_dismiss_recoverable_failure() {
+        let mut snapshot = populated_snapshot();
+        let base = snapshot.sessions[0].clone();
+        let input =
+            with_pending_attention(base.clone(), "input", AttentionReason::InputRequested, 1, 4);
+        let recoverable = with_pending_attention(
+            base.clone(),
+            "recoverable",
+            AttentionReason::RecoverableFailure,
+            2,
+            3,
+        );
+        let completion = with_pending_attention(
+            base,
+            "completion",
+            AttentionReason::SuccessfulCompletion,
+            3,
+            2,
+        );
+        snapshot
+            .sessions
+            .extend([input.clone(), recoverable.clone(), completion.clone()]);
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.select_navigator_view(TuiNavigatorView::Active);
+
+        assert_eq!(app.selected_session_id, Some(input.id));
+        assert_eq!(
+            reduce(&mut app, reducer::Action::OpenOverviewSession(input.id)),
+            vec![reducer::Effect::OpenAttention {
+                session_id: input.id,
+                attention_id: input.status.attention.unwrap().id,
+                reason: AttentionReason::InputRequested,
+            }]
+        );
+        assert_eq!(
+            reduce(&mut app, reducer::Action::DismissAttention(recoverable.id)),
+            vec![reducer::Effect::DismissAttention {
+                session_id: recoverable.id,
+                attention_id: recoverable.status.attention.unwrap().id,
+            }]
+        );
+        assert_eq!(
+            input::navigation_action(
+                &app,
+                &Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('d'),
+                    KeyModifiers::NONE,
+                )),
+            ),
+            Some(reducer::Action::DismissAttention(recoverable.id))
+        );
+        assert_eq!(
+            reduce(
+                &mut app,
+                reducer::Action::OpenOverviewSession(completion.id)
+            ),
+            vec![reducer::Effect::OpenAttention {
+                session_id: completion.id,
+                attention_id: completion.status.attention.unwrap().id,
+                reason: AttentionReason::SuccessfulCompletion,
+            }]
+        );
     }
 
     #[test]
@@ -4253,6 +4648,8 @@ mod tests {
     fn sessions_empty_state_keeps_context_and_guides_creation_or_selection() {
         let mut snapshot = populated_snapshot();
         snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
+        snapshot.sessions[0].process_id = None;
         let mut app = App::new(snapshot, Vec::new(), None);
         app.select_navigator_view(TuiNavigatorView::Active);
         let backend = ratatui::backend::TestBackend::new(100, 24);
@@ -4523,7 +4920,7 @@ mod tests {
                     .symbol()
             })
             .collect::<String>();
-        assert!(footer.contains("Active"));
+        assert!(footer.contains("Sessions"));
         assert!(footer.contains("Open"));
         assert!(!footer.contains("Rename"));
         let footer_open = app
@@ -4531,7 +4928,7 @@ mod tests {
             .0
             .iter()
             .find(|region| {
-                matches!(region.target, HitTarget::ActiveSessionOpen(_)) && region.area.y == 23
+                matches!(region.target, HitTarget::SessionOverviewOpen(_)) && region.area.y == 23
             })
             .expect("footer open action");
         assert_eq!(
@@ -4546,9 +4943,16 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("● [a] Active"));
+        assert!(rendered.contains("● [a] Sessions"));
 
         app.snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        app.snapshot.sessions[0].status.activity = ProviderActivity::AwaitingInput;
+        app.snapshot.sessions[0].status.attention = Some(AttentionEvent {
+            id: AttentionEventId::try_from(1).unwrap(),
+            reason: AttentionReason::InputRequested,
+            acknowledgement: AttentionAcknowledgement::Pending,
+            occurred_at: 10,
+        });
         terminal
             .draw(|frame| render::draw(frame, &mut app))
             .unwrap();
@@ -5130,7 +5534,7 @@ mod tests {
             "1 Terminal",
             "2 Changes",
             "3 Details",
-            "[a] Active",
+            "[a] Sessions",
             "Running",
         ] {
             assert!(
@@ -5370,7 +5774,13 @@ mod tests {
         assert_eq!(normal.height, attention.height.saturating_add(1));
 
         let mut snapshot = populated_snapshot();
-        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        snapshot.sessions[0] = with_pending_attention(
+            snapshot.sessions[0].clone(),
+            "shell",
+            AttentionReason::InputRequested,
+            1,
+            10,
+        );
         let session_id = snapshot.sessions[0].id;
         let rows = attention.height.saturating_sub(2);
         let columns = attention.width.saturating_sub(2);
@@ -6325,7 +6735,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_means_the_agent_is_waiting_for_user_input() {
+    fn attention_navigation_uses_pending_events_instead_of_legacy_state() {
         let mut snapshot = populated_snapshot();
         let mut app = App::new(snapshot.clone(), Vec::new(), None);
         for state in [
@@ -6340,13 +6750,20 @@ mod tests {
             assert!(app.select_attention().is_none(), "{state:?}");
         }
 
-        snapshot.sessions[0].state = SessionState::NeedsFeedback;
-        let session_id = snapshot.sessions[0].id;
+        let pending = with_pending_attention(
+            snapshot.sessions[0].clone(),
+            "shell",
+            AttentionReason::InputRequested,
+            1,
+            10,
+        );
+        let session_id = pending.id;
+        snapshot.sessions[0] = pending;
         app.replace_snapshot(snapshot);
         assert_eq!(app.attention_count(), 1);
         assert_eq!(
             app.select_attention().as_deref(),
-            Some("shell: waiting for your input")
+            Some("shell: needs attention")
         );
         assert_eq!(app.selected_session_id, Some(session_id));
     }
@@ -6354,11 +6771,11 @@ mod tests {
     #[test]
     fn attention_banner_copy_uses_correct_grammar() {
         assert!(
-            render::attention_message(1).contains("1 session needs your input"),
+            render::attention_message(1).contains("1 session needs attention"),
             "singular attention copy"
         );
         assert!(
-            render::attention_message(2).contains("2 sessions need your input"),
+            render::attention_message(2).contains("2 sessions need attention"),
             "plural attention copy"
         );
     }
@@ -6400,32 +6817,20 @@ mod tests {
     }
 
     #[test]
-    fn needs_feedback_rows_use_attention_surfaces_in_cards_and_lists() {
-        let theme = theme::Theme::resolve(TuiTheme::TokyoNight);
-        assert_eq!(
-            render::active_session_style(SessionState::NeedsFeedback, false, theme),
-            theme.attention_surface
-        );
-        assert_eq!(
-            render::active_session_style(SessionState::NeedsFeedback, true, theme),
-            theme.attention_selected_surface
-        );
-        assert_eq!(
-            render::active_session_style(SessionState::Running, false, theme),
-            theme.text
-        );
-        assert_eq!(
-            render::active_session_style(SessionState::Running, true, theme),
-            theme.selected
-        );
-
+    fn terminal_default_attention_surfaces_are_visible_and_selected() {
         let terminal_default = theme::Theme::resolve(TuiTheme::TerminalDefault);
-        assert!(terminal_default.attention_surface.bg.is_some());
-        assert_ne!(
-            terminal_default.attention_surface.bg,
-            terminal_default.attention_selected_surface.bg
-        );
-        assert_ne!(terminal_default.attention_surface, terminal_default.text);
+        for reason in [
+            AttentionReason::InputRequested,
+            AttentionReason::RecoverableFailure,
+            AttentionReason::TerminalFailure,
+            AttentionReason::SuccessfulCompletion,
+        ] {
+            let normal = terminal_default.attention_surface(reason, false);
+            let selected = terminal_default.attention_surface(reason, true);
+            assert!(normal.bg.is_some());
+            assert_ne!(normal.bg, selected.bg);
+            assert_ne!(normal, terminal_default.text);
+        }
     }
 
     #[test]

@@ -18,12 +18,13 @@ use crate::{
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     provider::ProviderHealth,
+    session_state::AttentionEventId,
     status::NormalizedProviderEvent,
 };
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 25;
+pub const PROTOCOL_MINOR: u16 = 26;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -644,6 +645,14 @@ pub enum ClientRequest {
         session_id: SessionId,
         name: String,
     },
+    DismissAttention {
+        session_id: SessionId,
+        attention_id: AttentionEventId,
+    },
+    AcknowledgeAttention {
+        session_id: SessionId,
+        attention_id: AttentionEventId,
+    },
     InspectSessionDeletion {
         session_id: SessionId,
     },
@@ -756,6 +765,14 @@ pub enum DaemonResponse {
         session: Session,
     },
     SessionUpdated {
+        revision: u64,
+        session: Session,
+    },
+    SessionAttentionDismissed {
+        revision: u64,
+        session: Session,
+    },
+    SessionAttentionAcknowledged {
         revision: u64,
         session: Session,
     },
@@ -1027,7 +1044,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 25);
+        assert_eq!(PROTOCOL_MINOR, 26);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1145,7 +1162,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 25);
+        assert_eq!(PROTOCOL_MINOR, 26);
     }
 
     #[test]
@@ -1185,7 +1202,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 25);
+        assert_eq!(PROTOCOL_MINOR, 26);
     }
 
     #[test]
@@ -1257,7 +1274,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 25);
+        assert_eq!(PROTOCOL_MINOR, 26);
     }
 
     #[test]
@@ -1434,6 +1451,24 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Event, 44, &event).unwrap();
         assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
+    }
+
+    #[test]
+    fn attention_dismissal_contract_is_bound_to_the_exact_event() {
+        for request in [
+            ClientRequest::DismissAttention {
+                session_id: SessionId::new(),
+                attention_id: AttentionEventId::try_from(7).unwrap(),
+            },
+            ClientRequest::AcknowledgeAttention {
+                session_id: SessionId::new(),
+                attention_id: AttentionEventId::try_from(8).unwrap(),
+            },
+        ] {
+            let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
+            assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+        assert_eq!(PROTOCOL_MINOR, 26);
     }
 
     #[test]

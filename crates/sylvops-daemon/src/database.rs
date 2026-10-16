@@ -248,8 +248,10 @@ enum DatabaseCommand {
         failure_reason: Option<String>,
         reply: oneshot::Sender<Result<(u64, Session)>>,
     },
-    MarkSessionSeen {
+    AcknowledgeAttention {
         id: SessionId,
+        attention_id: AttentionEventId,
+        action: AttentionAcknowledgementAction,
         reply: oneshot::Sender<Result<Option<(u64, Session)>>>,
     },
     UpdateSessionStatus {
@@ -279,6 +281,12 @@ enum DatabaseCommand {
     Shutdown {
         reply: oneshot::Sender<()>,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AttentionAcknowledgementAction {
+    Opened,
+    Dismissed,
 }
 
 #[derive(Clone, Debug)]
@@ -965,14 +973,43 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Marks a completed unseen session as seen.
+    /// Acknowledges the exact completion or terminal-failure event whose history was opened.
     ///
     /// # Errors
     ///
     /// Returns an actor, not-found, or SQLite error.
-    pub async fn mark_session_seen(&self, id: SessionId) -> Result<Option<(u64, Session)>> {
+    pub async fn acknowledge_opened_attention(
+        &self,
+        id: SessionId,
+        attention_id: AttentionEventId,
+    ) -> Result<Option<(u64, Session)>> {
         request(&self.inner.commands, |reply| {
-            DatabaseCommand::MarkSessionSeen { id, reply }
+            DatabaseCommand::AcknowledgeAttention {
+                id,
+                attention_id,
+                action: AttentionAcknowledgementAction::Opened,
+                reply,
+            }
+        })
+        .await
+    }
+
+    /// Dismisses the exact pending recoverable-failure event without resolving Provider activity.
+    ///
+    /// # Errors
+    /// Returns an actor, validation, not-found, transaction, or SQLite error.
+    pub async fn dismiss_recoverable_attention(
+        &self,
+        id: SessionId,
+        attention_id: AttentionEventId,
+    ) -> Result<Option<(u64, Session)>> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::AcknowledgeAttention {
+                id,
+                attention_id,
+                action: AttentionAcknowledgementAction::Dismissed,
+                reply,
+            }
         })
         .await
     }
@@ -1350,13 +1387,20 @@ fn database_thread(
                 });
                 let _ = reply.send(result);
             }
-            DatabaseCommand::MarkSessionSeen { id, reply } => {
-                let result = mark_session_seen(&mut connection, id).map(|session| {
-                    session.map(|session| {
-                        revision = revision.saturating_add(1);
-                        (revision, session)
-                    })
-                });
+            DatabaseCommand::AcknowledgeAttention {
+                id,
+                attention_id,
+                action,
+                reply,
+            } => {
+                let result = acknowledge_attention(&mut connection, id, attention_id, action).map(
+                    |session| {
+                        session.map(|session| {
+                            revision = revision.saturating_add(1);
+                            (revision, session)
+                        })
+                    },
+                );
                 let _ = reply.send(result);
             }
             DatabaseCommand::UpdateSessionStatus {
@@ -2683,22 +2727,65 @@ fn finish_session(
     Ok(session)
 }
 
-fn mark_session_seen(connection: &mut Connection, id: SessionId) -> Result<Option<Session>> {
+fn acknowledge_attention(
+    connection: &mut Connection,
+    id: SessionId,
+    attention_id: AttentionEventId,
+    action: AttentionAcknowledgementAction,
+) -> Result<Option<Session>> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
-    let changed = transaction
-        .execute(
-            "UPDATE sessions SET state = 'finished_seen' WHERE id = ?1 AND state = 'finished_unseen'",
-            [id.to_string()],
-        )
-        .map_err(database_error)?;
-    if changed == 0 {
+    let mut session = load_session(&transaction, id)?;
+    let Some(event) = session.status.attention.as_mut() else {
+        transaction.commit().map_err(database_error)?;
+        return Ok(None);
+    };
+    let allowed = match action {
+        AttentionAcknowledgementAction::Opened => matches!(
+            event.reason,
+            AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
+        ),
+        AttentionAcknowledgementAction::Dismissed => {
+            event.reason == AttentionReason::RecoverableFailure
+        }
+    };
+    if event.id != attention_id
+        || event.acknowledgement != AttentionAcknowledgement::Pending
+        || !allowed
+    {
         transaction.commit().map_err(database_error)?;
         return Ok(None);
     }
-    insert_entity_audit(&transaction, "session_seen", "session", &id.to_string())?;
-    sync_expanded_session_status(&transaction, id)?;
+    let reason = event.reason;
+    event.acknowledgement = AttentionAcknowledgement::Acknowledged;
+    session
+        .status
+        .validate()
+        .map_err(|message| DaemonError::Database(message.into()))?;
+    if reason == AttentionReason::SuccessfulCompletion {
+        session.state = SessionState::FinishedSeen;
+    }
+    transaction
+        .execute(
+            "UPDATE sessions SET state = ?2, status_json = ?3 WHERE id = ?1",
+            params![
+                id.to_string(),
+                session.state.to_string(),
+                serde_json::to_string(&session.status)
+                    .map_err(|_| DaemonError::Database("cannot encode Session status".into()))?
+            ],
+        )
+        .map_err(database_error)?;
+    insert_entity_audit(
+        &transaction,
+        match action {
+            AttentionAcknowledgementAction::Opened => "session_attention_opened",
+            AttentionAcknowledgementAction::Dismissed => "session_attention_dismissed",
+        },
+        "session",
+        &id.to_string(),
+    )?;
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(Some(session))
@@ -4371,6 +4458,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.state, SessionState::FinishedUnseen);
+        let attention_id = session.status.attention.unwrap().id;
         assert!(
             database
                 .update_session_status(
@@ -4400,14 +4488,14 @@ mod tests {
                 .unwrap()
         );
         let (seen_revision, session) = database
-            .mark_session_seen(session_id)
+            .acknowledge_opened_attention(session_id, attention_id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(session.state, SessionState::FinishedSeen);
         assert!(
             database
-                .mark_session_seen(session_id)
+                .acknowledge_opened_attention(session_id, attention_id)
                 .await
                 .unwrap()
                 .is_none()

@@ -306,6 +306,7 @@ async fn managed_claude_session_inner() {
         .expect("detach response");
 
     let reconnected = connect_eventually(&paths).await;
+    let observer = connect_eventually(&paths).await;
     let mut replay_events = reconnected.subscribe();
     let mut lifecycle_events = reconnected.subscribe();
     attach(&reconnected, session_id, output_sequence.saturating_sub(1)).await;
@@ -322,10 +323,22 @@ async fn managed_claude_session_inner() {
             })
             .await
             .expect("attention hook input");
-        wait_for_session(&reconnected, session_id, |session| {
+        let pending_input = wait_for_session(&reconnected, session_id, |session| {
             session.state == SessionState::NeedsFeedback
         })
         .await;
+        if index == 0 {
+            let input_event = pending_input.status.attention.expect("input attention");
+            attach(&observer, session_id, 0).await;
+            let still_pending = wait_for_session(&reconnected, session_id, |session| {
+                session.status.attention == Some(input_event)
+            })
+            .await;
+            assert_eq!(
+                still_pending.status.attention.unwrap().acknowledgement,
+                AttentionAcknowledgement::Pending
+            );
+        }
         reconnected
             .request(&ClientRequest::SessionInput {
                 session_id,
@@ -442,7 +455,7 @@ async fn managed_claude_session_inner() {
     })
     .await;
     attach(&reconnected, session_id, 0).await;
-    let acknowledged = wait_for_session(&reconnected, session_id, |session| {
+    let acknowledged = wait_for_session(&observer, session_id, |session| {
         session.state == SessionState::FinishedSeen
     })
     .await;
@@ -513,6 +526,50 @@ async fn managed_claude_session_inner() {
     );
     assert!(u64::from(recoverable_event.id) > u64::from(completion_event.id));
 
+    let dismissed = match observer
+        .request(&ClientRequest::DismissAttention {
+            session_id,
+            attention_id: recoverable_event.id,
+        })
+        .await
+        .expect("recoverable failure dismissal response")
+    {
+        DaemonResponse::SessionAttentionDismissed { session, .. } => session,
+        response => panic!("unexpected dismissal response: {response:?}"),
+    };
+    assert_eq!(dismissed.status.lifecycle, SessionLifecycle::Running);
+    assert_eq!(
+        dismissed.status.activity,
+        ProviderActivity::RecoverableFailure
+    );
+    assert_eq!(dismissed.state, SessionState::NeedsFeedback);
+    assert_eq!(
+        dismissed.status.attention.unwrap().acknowledgement,
+        AttentionAcknowledgement::Acknowledged
+    );
+    let cross_client_dismissal = wait_for_session(&reconnected, session_id, |session| {
+        session.status.attention == dismissed.status.attention
+    })
+    .await;
+    assert_eq!(cross_client_dismissal, dismissed);
+
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("stop-failure-repeat"),
+        })
+        .await
+        .expect("repeat recoverable failure input");
+    wait_for_provider_event(&mut lifecycle_events, session_id, |event| {
+        matches!(event, NormalizedProviderEvent::TurnFailed { category } if category.as_str() == "rate_limit")
+    })
+    .await;
+    let same_failure = wait_for_session(&reconnected, session_id, |session| {
+        session.status.attention == dismissed.status.attention
+    })
+    .await;
+    assert_eq!(same_failure.status.attention, dismissed.status.attention);
+
     reconnected
         .request(&ClientRequest::SessionInput {
             session_id,
@@ -533,6 +590,83 @@ async fn managed_claude_session_inner() {
             .map(|event| event.acknowledgement),
         Some(AttentionAcknowledgement::Resolved)
     );
+
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("stop-failure-new"),
+        })
+        .await
+        .expect("new recoverable failure input");
+    let new_failure = wait_for_session(&reconnected, session_id, |session| {
+        session.status.attention.is_some_and(|event| {
+            event.reason == AttentionReason::RecoverableFailure
+                && event.acknowledgement == AttentionAcknowledgement::Pending
+                && event.id != recoverable_event.id
+        })
+    })
+    .await;
+    assert!(u64::from(new_failure.status.attention.unwrap().id) > u64::from(recoverable_event.id));
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line("user-prompt-after-new-failure"),
+        })
+        .await
+        .expect("second recovery input");
+    wait_for_session(&reconnected, session_id, |session| {
+        session.status.activity == ProviderActivity::Working
+    })
+    .await;
+
+    let terminal_failure_id = match reconnected
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Claude,
+            display_name: Some("terminal failure history".into()),
+            model: None,
+            effort: None,
+            initial_prompt: None,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("terminal failure Session response")
+    {
+        DaemonResponse::SessionCreated { session, .. } => session.id,
+        response => panic!("unexpected terminal failure Session response: {response:?}"),
+    };
+    wait_for_session(&reconnected, terminal_failure_id, |session| {
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.external_session_id.is_some()
+    })
+    .await;
+    attach(&reconnected, terminal_failure_id, 0).await;
+    reconnected
+        .request(&ClientRequest::SessionInput {
+            session_id: terminal_failure_id,
+            bytes: input_line("unexpected-exit"),
+        })
+        .await
+        .expect("unexpected provider exit input");
+    let terminal_failure = wait_for_session(&reconnected, terminal_failure_id, |session| {
+        session.status.attention.is_some_and(|event| {
+            event.reason == AttentionReason::TerminalFailure
+                && event.acknowledgement == AttentionAcknowledgement::Pending
+        })
+    })
+    .await;
+    let terminal_event = terminal_failure.status.attention.unwrap();
+    attach(&observer, terminal_failure_id, 0).await;
+    let opened_failure = wait_for_session(&reconnected, terminal_failure_id, |session| {
+        session.status.attention.is_some_and(|event| {
+            event.id == terminal_event.id
+                && event.acknowledgement == AttentionAcknowledgement::Acknowledged
+        })
+    })
+    .await;
+    assert_eq!(opened_failure.status.lifecycle, SessionLifecycle::Failed);
+    assert_eq!(opened_failure.state, SessionState::Failed);
 
     reconnected
         .request(&ClientRequest::SessionInput {
