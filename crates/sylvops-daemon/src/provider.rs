@@ -1665,9 +1665,10 @@ impl ProviderRuntime for CodexAdapter {
             Some("SubagentStop") => Some(NormalizedProviderEvent::SubagentStopped {
                 agent_id: bounded_payload_field(&payload, "agent_id"),
             }),
-            Some("Stop" | "Interrupt") => Some(NormalizedProviderEvent::TurnStopped {
+            Some("Stop") => Some(NormalizedProviderEvent::TurnStopped {
                 remaining_work: RemainingWork::default(),
             }),
+            Some("Interrupt") => Some(NormalizedProviderEvent::TurnInterrupted),
             Some(_) => return Err(provider_error("unknown Codex lifecycle event")),
             None => return Err(provider_error("Codex lifecycle event type is missing")),
         };
@@ -2591,6 +2592,19 @@ mod tests {
                 .as_ref()
                 .map(ProviderConversationId::as_str),
             Some("codex-session-1")
+        );
+
+        let interrupted = ProviderLifecyclePayload::new(
+            br#"{"hook_event_name":"Interrupt","session_id":"codex-session-1","turn_id":"turn-1"}"#
+                .to_vec(),
+        )
+        .expect("bounded payload");
+        assert_eq!(
+            runtime
+                .normalize_lifecycle_event(&interrupted)
+                .expect("known interruption")
+                .event,
+            Some(NormalizedProviderEvent::TurnInterrupted)
         );
 
         let unknown =

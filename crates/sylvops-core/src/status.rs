@@ -5,6 +5,10 @@ use std::{collections::HashSet, fmt};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::SessionState;
+use crate::session_state::{
+    AttentionAcknowledgement, AttentionEvent, AttentionEventId, AttentionReason, ProviderActivity,
+    SessionLifecycle, SessionStatus,
+};
 
 const MAX_PROVIDER_CONVERSATION_ID_LENGTH: usize = 200;
 const MAX_TURN_FAILURE_CATEGORY_LENGTH: usize = 64;
@@ -163,23 +167,66 @@ pub enum NormalizedProviderEvent {
     TurnFailed {
         category: TurnFailureCategory,
     },
+    /// The user interrupted the current turn; the owning process may remain live.
+    TurnInterrupted,
     SessionEnded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionStatusMachine {
     state: SessionState,
+    status: SessionStatus,
+    failure_category: Option<TurnFailureCategory>,
     active_subagents: HashSet<String>,
     subagent_capacity_exhausted: bool,
+    remaining_work: RemainingWork,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionStatusTransition {
+    pub state: SessionState,
+    pub status: SessionStatus,
+    pub failure_category: Option<TurnFailureCategory>,
 }
 
 impl SessionStatusMachine {
     #[must_use]
     pub fn new(state: SessionState) -> Self {
+        let lifecycle = match state {
+            SessionState::Fresh => SessionLifecycle::Fresh,
+            SessionState::Starting => SessionLifecycle::Starting,
+            SessionState::Running | SessionState::NeedsFeedback => SessionLifecycle::Running,
+            SessionState::FinishedUnseen | SessionState::FinishedSeen => SessionLifecycle::Exited,
+            SessionState::Failed => SessionLifecycle::Failed,
+            SessionState::Terminated => SessionLifecycle::Terminated,
+            SessionState::Disconnected => SessionLifecycle::Disconnected,
+        };
         Self {
             state,
+            status: SessionStatus {
+                lifecycle,
+                ..SessionStatus::default()
+            },
+            failure_category: None,
             active_subagents: HashSet::new(),
             subagent_capacity_exhausted: false,
+            remaining_work: RemainingWork::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_persisted(
+        state: SessionState,
+        status: SessionStatus,
+        failure_category: Option<TurnFailureCategory>,
+    ) -> Self {
+        Self {
+            state,
+            status,
+            failure_category,
+            active_subagents: HashSet::new(),
+            subagent_capacity_exhausted: false,
+            remaining_work: RemainingWork::default(),
         }
     }
 
@@ -188,22 +235,53 @@ impl SessionStatusMachine {
         self.state
     }
 
-    pub fn apply(&mut self, event: &NormalizedProviderEvent) -> SessionState {
+    #[must_use]
+    pub const fn status(&self) -> SessionStatus {
+        self.status
+    }
+
+    /// Applies one trusted Provider outcome and derives both compatibility and expanded state.
+    ///
+    /// # Errors
+    /// Returns an error if the per-Session Attention Event identity is exhausted.
+    pub fn apply(
+        &mut self,
+        event: &NormalizedProviderEvent,
+        occurred_at: i64,
+    ) -> Result<SessionStatusTransition, &'static str> {
         if matches!(
-            self.state,
-            SessionState::Failed | SessionState::Terminated | SessionState::Disconnected
+            self.status.lifecycle,
+            SessionLifecycle::Exited
+                | SessionLifecycle::Failed
+                | SessionLifecycle::Terminated
+                | SessionLifecycle::Disconnected
         ) {
-            return self.state;
+            return Ok(self.transition());
         }
+        self.status.lifecycle = SessionLifecycle::Running;
         match event {
             NormalizedProviderEvent::PromptSubmitted
             | NormalizedProviderEvent::TurnStarted { .. } => {
-                self.state = SessionState::Running;
+                self.active_subagents.clear();
+                self.subagent_capacity_exhausted = false;
+                self.remaining_work = RemainingWork::default();
+                self.set_live_condition(ProviderActivity::Working, None, occurred_at)?;
             }
             NormalizedProviderEvent::PermissionRequested
-            | NormalizedProviderEvent::UserInputRequested
-            | NormalizedProviderEvent::TurnFailed { .. } => {
-                self.state = SessionState::NeedsFeedback;
+            | NormalizedProviderEvent::UserInputRequested => {
+                self.set_live_condition(
+                    ProviderActivity::AwaitingInput,
+                    Some(AttentionReason::InputRequested),
+                    occurred_at,
+                )?;
+            }
+            NormalizedProviderEvent::TurnFailed { category } => {
+                self.failure_category = Some(category.clone());
+                self.set_live_condition(
+                    ProviderActivity::RecoverableFailure,
+                    Some(AttentionReason::RecoverableFailure),
+                    occurred_at,
+                )?;
             }
             NormalizedProviderEvent::SubagentStarted { agent_id } => {
                 if !self.active_subagents.contains(agent_id) {
@@ -213,28 +291,207 @@ impl SessionStatusMachine {
                         self.subagent_capacity_exhausted = true;
                     }
                 }
-                self.state = SessionState::Running;
+                self.set_live_condition(ProviderActivity::Working, None, occurred_at)?;
             }
             NormalizedProviderEvent::SubagentStopped { agent_id } => {
                 self.active_subagents.remove(agent_id);
             }
             NormalizedProviderEvent::TurnStopped { remaining_work } => {
-                self.state = if self.active_subagents.is_empty()
+                self.remaining_work = *remaining_work;
+                if self.active_subagents.is_empty()
                     && !self.subagent_capacity_exhausted
                     && remaining_work.is_empty()
                 {
-                    SessionState::FinishedUnseen
+                    self.set_live_condition(
+                        ProviderActivity::Completed,
+                        Some(AttentionReason::SuccessfulCompletion),
+                        occurred_at,
+                    )?;
                 } else {
-                    SessionState::Running
-                };
+                    self.set_live_condition(ProviderActivity::Working, None, occurred_at)?;
+                }
+            }
+            NormalizedProviderEvent::TurnInterrupted => {
+                self.set_live_condition(ProviderActivity::Interrupted, None, occurred_at)?;
             }
             NormalizedProviderEvent::SessionEnded => {
-                if !matches!(self.state, SessionState::Failed | SessionState::Terminated) {
-                    self.state = SessionState::FinishedUnseen;
+                if !matches!(
+                    self.status.activity,
+                    ProviderActivity::Completed
+                        | ProviderActivity::Interrupted
+                        | ProviderActivity::AwaitingInput
+                        | ProviderActivity::RecoverableFailure
+                ) && self.active_subagents.is_empty()
+                    && !self.subagent_capacity_exhausted
+                    && self.remaining_work.is_empty()
+                {
+                    self.set_live_condition(
+                        ProviderActivity::Completed,
+                        Some(AttentionReason::SuccessfulCompletion),
+                        occurred_at,
+                    )?;
                 }
             }
         }
-        self.state
+        self.state = legacy_state(self.status);
+        Ok(self.transition())
+    }
+
+    /// Applies a process outcome after Provider-event processing has quiesced for the Session.
+    ///
+    /// # Errors
+    /// Returns an error if the per-Session Attention Event identity is exhausted.
+    pub fn apply_process_exit(
+        &mut self,
+        plain_shell: bool,
+        exit_code: Option<i32>,
+        stop_requested: bool,
+        completion_acknowledged: bool,
+        occurred_at: i64,
+    ) -> Result<SessionStatusTransition, &'static str> {
+        if stop_requested {
+            self.status.lifecycle = SessionLifecycle::Terminated;
+            self.status.activity = ProviderActivity::None;
+            self.failure_category = None;
+            self.resolve_attention();
+            self.state = SessionState::Terminated;
+            self.status.validate()?;
+            return Ok(self.transition());
+        }
+
+        let has_completion = self.status.attention.is_some_and(|event| {
+            event.reason == AttentionReason::SuccessfulCompletion
+                && event.acknowledgement != AttentionAcknowledgement::Resolved
+        });
+        if (plain_shell && exit_code == Some(0)) || has_completion {
+            self.status.lifecycle = SessionLifecycle::Exited;
+            self.status.activity = ProviderActivity::None;
+            self.failure_category = None;
+            self.set_attention(AttentionReason::SuccessfulCompletion, occurred_at)?;
+            if completion_acknowledged && let Some(event) = &mut self.status.attention {
+                event.acknowledgement = AttentionAcknowledgement::Acknowledged;
+            }
+            self.state = if completion_acknowledged {
+                SessionState::FinishedSeen
+            } else {
+                SessionState::FinishedUnseen
+            };
+        } else if self.status.activity == ProviderActivity::Interrupted && exit_code == Some(0) {
+            self.status.lifecycle = SessionLifecycle::Exited;
+            self.status.activity = ProviderActivity::None;
+            self.failure_category = None;
+            self.resolve_attention();
+            self.state = SessionState::FinishedSeen;
+        } else {
+            self.status.lifecycle = SessionLifecycle::Failed;
+            self.status.activity = ProviderActivity::None;
+            let category = if exit_code.is_some_and(|code| code != 0) {
+                "process_exit_nonzero"
+            } else {
+                "process_exit_without_completion"
+            };
+            self.failure_category = Some(
+                TurnFailureCategory::new(category)
+                    .map_err(|_| "invalid daemon failure category")?,
+            );
+            self.set_attention(AttentionReason::TerminalFailure, occurred_at)?;
+            self.state = SessionState::Failed;
+        }
+        self.status.validate()?;
+        Ok(self.transition())
+    }
+
+    fn set_live_condition(
+        &mut self,
+        activity: ProviderActivity,
+        reason: Option<AttentionReason>,
+        occurred_at: i64,
+    ) -> Result<(), &'static str> {
+        self.status.activity = activity;
+        if activity != ProviderActivity::RecoverableFailure {
+            self.failure_category = None;
+        }
+        if let Some(reason) = reason {
+            self.set_attention(reason, occurred_at)?;
+        } else {
+            self.resolve_attention();
+        }
+        self.status.validate()
+    }
+
+    fn set_attention(
+        &mut self,
+        reason: AttentionReason,
+        occurred_at: i64,
+    ) -> Result<(), &'static str> {
+        if self.status.attention.is_some_and(|event| {
+            event.reason == reason && event.acknowledgement != AttentionAcknowledgement::Resolved
+        }) {
+            return Ok(());
+        }
+        let next = self
+            .status
+            .attention
+            .map_or(Some(1), |event| u64::from(event.id).checked_add(1))
+            .ok_or("attention event identity is out of range")?;
+        self.status.attention = Some(AttentionEvent {
+            id: AttentionEventId::try_from(next)?,
+            reason,
+            acknowledgement: AttentionAcknowledgement::Pending,
+            occurred_at,
+        });
+        Ok(())
+    }
+
+    fn resolve_attention(&mut self) {
+        if let Some(event) = &mut self.status.attention {
+            event.acknowledgement = AttentionAcknowledgement::Resolved;
+        }
+    }
+
+    fn transition(&self) -> SessionStatusTransition {
+        SessionStatusTransition {
+            state: self.state,
+            status: self.status,
+            failure_category: self.failure_category.clone(),
+        }
+    }
+}
+
+fn legacy_state(status: SessionStatus) -> SessionState {
+    match status.lifecycle {
+        SessionLifecycle::Fresh => SessionState::Fresh,
+        SessionLifecycle::Starting => SessionState::Starting,
+        SessionLifecycle::Running => match status.activity {
+            ProviderActivity::AwaitingInput | ProviderActivity::RecoverableFailure => {
+                SessionState::NeedsFeedback
+            }
+            ProviderActivity::Completed => {
+                if status.attention.is_some_and(|event| {
+                    event.acknowledgement == AttentionAcknowledgement::Acknowledged
+                }) {
+                    SessionState::FinishedSeen
+                } else {
+                    SessionState::FinishedUnseen
+                }
+            }
+            ProviderActivity::None | ProviderActivity::Working | ProviderActivity::Interrupted => {
+                SessionState::Running
+            }
+        },
+        SessionLifecycle::Exited => {
+            if status.attention.is_some_and(|event| {
+                event.reason == AttentionReason::SuccessfulCompletion
+                    && event.acknowledgement == AttentionAcknowledgement::Acknowledged
+            }) {
+                SessionState::FinishedSeen
+            } else {
+                SessionState::FinishedUnseen
+            }
+        }
+        SessionLifecycle::Failed => SessionState::Failed,
+        SessionLifecycle::Terminated => SessionState::Terminated,
+        SessionLifecycle::Disconnected => SessionState::Disconnected,
     }
 }
 
@@ -242,25 +499,41 @@ impl SessionStatusMachine {
 mod tests {
     use super::*;
 
+    fn apply(machine: &mut SessionStatusMachine, event: &NormalizedProviderEvent) -> SessionState {
+        machine.apply(event, 0).unwrap().state
+    }
+
     #[test]
     fn active_subagent_keeps_a_stopped_turn_running() {
         let mut machine = SessionStatusMachine::new(SessionState::Fresh);
-        machine.apply(&NormalizedProviderEvent::SubagentStarted {
-            agent_id: "a".into(),
-        });
+        apply(
+            &mut machine,
+            &NormalizedProviderEvent::SubagentStarted {
+                agent_id: "a".into(),
+            },
+        );
         assert_eq!(
-            machine.apply(&NormalizedProviderEvent::TurnStopped {
-                remaining_work: RemainingWork::default(),
-            }),
+            apply(
+                &mut machine,
+                &NormalizedProviderEvent::TurnStopped {
+                    remaining_work: RemainingWork::default(),
+                }
+            ),
             SessionState::Running
         );
-        machine.apply(&NormalizedProviderEvent::SubagentStopped {
-            agent_id: "a".into(),
-        });
+        apply(
+            &mut machine,
+            &NormalizedProviderEvent::SubagentStopped {
+                agent_id: "a".into(),
+            },
+        );
         assert_eq!(
-            machine.apply(&NormalizedProviderEvent::TurnStopped {
-                remaining_work: RemainingWork::default(),
-            }),
+            apply(
+                &mut machine,
+                &NormalizedProviderEvent::TurnStopped {
+                    remaining_work: RemainingWork::default(),
+                }
+            ),
             SessionState::FinishedUnseen
         );
     }
@@ -269,7 +542,7 @@ mod tests {
     fn permission_requests_need_feedback() {
         let mut machine = SessionStatusMachine::new(SessionState::Running);
         assert_eq!(
-            machine.apply(&NormalizedProviderEvent::PermissionRequested),
+            apply(&mut machine, &NormalizedProviderEvent::PermissionRequested),
             SessionState::NeedsFeedback
         );
     }
@@ -280,15 +553,21 @@ mod tests {
         let started = NormalizedProviderEvent::SubagentStarted {
             agent_id: "agent-1".into(),
         };
-        machine.apply(&started);
-        machine.apply(&started);
-        machine.apply(&NormalizedProviderEvent::SubagentStopped {
-            agent_id: "agent-1".into(),
-        });
+        apply(&mut machine, &started);
+        apply(&mut machine, &started);
+        apply(
+            &mut machine,
+            &NormalizedProviderEvent::SubagentStopped {
+                agent_id: "agent-1".into(),
+            },
+        );
         assert_eq!(
-            machine.apply(&NormalizedProviderEvent::TurnStopped {
-                remaining_work: RemainingWork::default(),
-            }),
+            apply(
+                &mut machine,
+                &NormalizedProviderEvent::TurnStopped {
+                    remaining_work: RemainingWork::default(),
+                }
+            ),
             SessionState::FinishedUnseen
         );
     }
@@ -297,21 +576,30 @@ mod tests {
     fn subagent_tracking_is_bounded_and_fails_closed_after_capacity() {
         let mut machine = SessionStatusMachine::new(SessionState::Running);
         for index in 0..=MAX_TRACKED_ACTIVE_SUBAGENTS {
-            machine.apply(&NormalizedProviderEvent::SubagentStarted {
-                agent_id: format!("agent-{index}"),
-            });
+            apply(
+                &mut machine,
+                &NormalizedProviderEvent::SubagentStarted {
+                    agent_id: format!("agent-{index}"),
+                },
+            );
         }
         assert_eq!(machine.active_subagents.len(), MAX_TRACKED_ACTIVE_SUBAGENTS);
         assert!(machine.subagent_capacity_exhausted);
         for index in 0..MAX_TRACKED_ACTIVE_SUBAGENTS {
-            machine.apply(&NormalizedProviderEvent::SubagentStopped {
-                agent_id: format!("agent-{index}"),
-            });
+            apply(
+                &mut machine,
+                &NormalizedProviderEvent::SubagentStopped {
+                    agent_id: format!("agent-{index}"),
+                },
+            );
         }
         assert_eq!(
-            machine.apply(&NormalizedProviderEvent::TurnStopped {
-                remaining_work: RemainingWork::default(),
-            }),
+            apply(
+                &mut machine,
+                &NormalizedProviderEvent::TurnStopped {
+                    remaining_work: RemainingWork::default(),
+                }
+            ),
             SessionState::Running
         );
     }
@@ -320,12 +608,15 @@ mod tests {
     fn remaining_background_work_keeps_a_stopped_turn_running() {
         let mut machine = SessionStatusMachine::new(SessionState::Running);
         assert_eq!(
-            machine.apply(&NormalizedProviderEvent::TurnStopped {
-                remaining_work: RemainingWork {
-                    background_tasks: true,
-                    ..RemainingWork::default()
-                },
-            }),
+            apply(
+                &mut machine,
+                &NormalizedProviderEvent::TurnStopped {
+                    remaining_work: RemainingWork {
+                        background_tasks: true,
+                        ..RemainingWork::default()
+                    },
+                }
+            ),
             SessionState::Running
         );
     }
@@ -334,11 +625,116 @@ mod tests {
     fn recoverable_turn_failure_needs_feedback_without_ending_the_session() {
         let mut machine = SessionStatusMachine::new(SessionState::Running);
         assert_eq!(
-            machine.apply(&NormalizedProviderEvent::TurnFailed {
-                category: TurnFailureCategory::new("provider_unavailable").unwrap(),
-            }),
+            apply(
+                &mut machine,
+                &NormalizedProviderEvent::TurnFailed {
+                    category: TurnFailureCategory::new("provider_unavailable").unwrap(),
+                }
+            ),
             SessionState::NeedsFeedback
         );
+    }
+
+    #[test]
+    fn interruption_is_not_completion_even_when_the_process_exits_cleanly() {
+        let mut machine = SessionStatusMachine::new(SessionState::Running);
+        let input = machine
+            .apply(&NormalizedProviderEvent::UserInputRequested, 10)
+            .unwrap();
+        let input_id = input.status.attention.unwrap().id;
+        let interrupted = machine
+            .apply(&NormalizedProviderEvent::TurnInterrupted, 11)
+            .unwrap();
+        assert_eq!(interrupted.status.activity, ProviderActivity::Interrupted);
+        assert_eq!(interrupted.state, SessionState::Running);
+        assert_eq!(
+            interrupted.status.attention.unwrap().acknowledgement,
+            AttentionAcknowledgement::Resolved
+        );
+
+        let ended = machine
+            .apply(&NormalizedProviderEvent::SessionEnded, 12)
+            .unwrap();
+        assert_eq!(ended.status.activity, ProviderActivity::Interrupted);
+        let exited = machine
+            .apply_process_exit(false, Some(0), false, false, 13)
+            .unwrap();
+        assert_eq!(exited.status.lifecycle, SessionLifecycle::Exited);
+        assert_eq!(exited.status.activity, ProviderActivity::None);
+        assert_eq!(exited.status.attention.unwrap().id, input_id);
+        assert_ne!(
+            exited.status.attention.unwrap().reason,
+            AttentionReason::SuccessfulCompletion
+        );
+    }
+
+    #[test]
+    fn completion_identity_is_reused_by_session_end_and_process_exit() {
+        let mut machine = SessionStatusMachine::new(SessionState::Running);
+        let completed = machine
+            .apply(
+                &NormalizedProviderEvent::TurnStopped {
+                    remaining_work: RemainingWork::default(),
+                },
+                10,
+            )
+            .unwrap();
+        let completion = completed.status.attention.unwrap();
+        let ended = machine
+            .apply(&NormalizedProviderEvent::SessionEnded, 11)
+            .unwrap();
+        assert_eq!(ended.status.attention, Some(completion));
+        let exited = machine
+            .apply_process_exit(false, Some(0), false, false, 12)
+            .unwrap();
+        assert_eq!(exited.status.attention, Some(completion));
+    }
+
+    #[test]
+    fn terminal_failure_replaces_recoverable_failure_with_a_new_identity() {
+        let mut machine = SessionStatusMachine::new(SessionState::Running);
+        let recoverable = machine
+            .apply(
+                &NormalizedProviderEvent::TurnFailed {
+                    category: TurnFailureCategory::new("rate_limit").unwrap(),
+                },
+                10,
+            )
+            .unwrap();
+        let recoverable_id = recoverable.status.attention.unwrap().id;
+        assert_eq!(recoverable.failure_category.unwrap().as_str(), "rate_limit");
+
+        let failed = machine
+            .apply_process_exit(false, Some(17), false, false, 11)
+            .unwrap();
+        let terminal = failed.status.attention.unwrap();
+        assert_eq!(terminal.reason, AttentionReason::TerminalFailure);
+        assert!(u64::from(terminal.id) > u64::from(recoverable_id));
+        assert_eq!(
+            failed.failure_category.unwrap().as_str(),
+            "process_exit_nonzero"
+        );
+    }
+
+    #[test]
+    fn session_end_does_not_complete_known_remaining_work() {
+        let mut machine = SessionStatusMachine::new(SessionState::Running);
+        machine
+            .apply(
+                &NormalizedProviderEvent::TurnStopped {
+                    remaining_work: RemainingWork {
+                        background_tasks: true,
+                        ..RemainingWork::default()
+                    },
+                },
+                10,
+            )
+            .unwrap();
+        let ended = machine
+            .apply(&NormalizedProviderEvent::SessionEnded, 11)
+            .unwrap();
+        assert_eq!(ended.status.activity, ProviderActivity::Working);
+        assert!(ended.status.attention.is_none());
     }
 
     #[test]
@@ -356,7 +752,10 @@ mod tests {
     fn late_hook_cannot_resurrect_a_terminal_session() {
         let mut machine = SessionStatusMachine::new(SessionState::Terminated);
         assert_eq!(
-            machine.apply(&NormalizedProviderEvent::TurnStarted { conversation: None }),
+            apply(
+                &mut machine,
+                &NormalizedProviderEvent::TurnStarted { conversation: None },
+            ),
             SessionState::Terminated
         );
     }

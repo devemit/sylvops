@@ -99,12 +99,24 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         ),
         response => panic!("session without resume ID unexpectedly resumed: {response:?}"),
     }
+    attach(&client, shell_session_id).await;
     client
-        .request(&ClientRequest::StopSession {
+        .request(&ClientRequest::SessionInput {
             session_id: shell_session_id,
+            bytes: input_line("exit"),
         })
         .await
-        .expect("stop shell response");
+        .expect("clean shell exit input");
+    let exited_shell = wait_for_session(&client, shell_session_id, |session| {
+        session.process_id.is_none()
+    })
+    .await;
+    assert_eq!(exited_shell.status.lifecycle, SessionLifecycle::Exited);
+    assert_eq!(exited_shell.status.activity, ProviderActivity::None);
+    assert_eq!(
+        exited_shell.status.attention.map(|event| event.reason),
+        Some(AttentionReason::SuccessfulCompletion)
+    );
 
     let terminated_session_id = create_codex_session(&client, worktree_id).await;
     assert_eq!(owned_hook_profile_count(&codex_home), 1);
@@ -135,10 +147,16 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         })
         .await
         .expect("terminate response");
-    wait_for_session(&client, terminated_session_id, |session| {
+    let terminated = wait_for_session(&client, terminated_session_id, |session| {
         session.state == SessionState::Terminated
     })
     .await;
+    assert_eq!(terminated.status.lifecycle, SessionLifecycle::Terminated);
+    assert_eq!(terminated.status.activity, ProviderActivity::None);
+    assert_ne!(
+        terminated.status.attention.map(|event| event.reason),
+        Some(AttentionReason::SuccessfulCompletion)
+    );
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
     let stopped_successor = match client
         .request(&ClientRequest::ResumeSession {
@@ -195,6 +213,34 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     ));
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
 
+    let unexpected_exit_id = create_codex_session(&client, worktree_id).await;
+    wait_for_session(&client, unexpected_exit_id, |session| {
+        session.external_session_id.is_some()
+    })
+    .await;
+    attach(&client, unexpected_exit_id).await;
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id: unexpected_exit_id,
+            bytes: input_line("clean-exit"),
+        })
+        .await
+        .expect("unexpected clean provider exit input");
+    let unexpected_exit = wait_for_session(&client, unexpected_exit_id, |session| {
+        session.process_id.is_none()
+    })
+    .await;
+    assert_eq!(unexpected_exit.status.lifecycle, SessionLifecycle::Failed);
+    assert_eq!(unexpected_exit.state, SessionState::Failed);
+    assert_eq!(
+        unexpected_exit.status.attention.map(|event| event.reason),
+        Some(AttentionReason::TerminalFailure)
+    );
+    assert_eq!(
+        unexpected_exit.failure_reason.as_deref(),
+        Some("process_exit_without_completion")
+    );
+
     let source_session_id = create_codex_session(&client, worktree_id).await;
     attach(&client, source_session_id).await;
     client
@@ -228,10 +274,51 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     client
         .request(&ClientRequest::SessionInput {
             session_id: source_session_id,
-            bytes: input_line("finish"),
+            bytes: input_line("interrupt"),
         })
         .await
-        .expect("finish input");
+        .expect("interrupt input");
+    let interrupted = wait_for_session(&client, source_session_id, |session| {
+        session.status.activity == ProviderActivity::Interrupted
+    })
+    .await;
+    assert_eq!(interrupted.status.lifecycle, SessionLifecycle::Running);
+    assert!(interrupted.process_id.is_some());
+    assert_eq!(interrupted.state, SessionState::Running);
+    assert_eq!(
+        interrupted
+            .status
+            .attention
+            .map(|event| event.acknowledgement),
+        Some(AttentionAcknowledgement::Resolved)
+    );
+
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id: source_session_id,
+            bytes: input_line("complete-live"),
+        })
+        .await
+        .expect("live completion input");
+    let live_completion = wait_for_session(&client, source_session_id, |session| {
+        session.status.activity == ProviderActivity::Completed && session.process_id.is_some()
+    })
+    .await;
+    let live_completion_event = live_completion
+        .status
+        .attention
+        .expect("live completion attention");
+    assert_eq!(
+        live_completion_event.reason,
+        AttentionReason::SuccessfulCompletion
+    );
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id: source_session_id,
+            bytes: input_line("end-session"),
+        })
+        .await
+        .expect("SessionEnd input");
     wait_for_session(&client, source_session_id, |session| {
         session.process_id.is_none()
             && matches!(
@@ -315,6 +402,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         completion_event.reason,
         AttentionReason::SuccessfulCompletion
     );
+    assert_eq!(completion_event.id, live_completion_event.id);
     assert!(u64::from(completion_event.id) > u64::from(input_event.id));
     assert!(matches!(
         source_history.state,

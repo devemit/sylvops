@@ -494,7 +494,24 @@ async fn managed_claude_session_inner() {
         session.state == SessionState::NeedsFeedback
     })
     .await;
-    assert!(recoverable.failure_reason.is_none());
+    assert_eq!(recoverable.failure_reason.as_deref(), Some("rate_limit"));
+    assert_eq!(
+        recoverable.status.activity,
+        ProviderActivity::RecoverableFailure
+    );
+    let recoverable_event = recoverable
+        .status
+        .attention
+        .expect("recoverable failure attention");
+    assert_eq!(
+        recoverable_event.reason,
+        AttentionReason::RecoverableFailure
+    );
+    assert_eq!(
+        recoverable_event.acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
+    assert!(u64::from(recoverable_event.id) > u64::from(completion_event.id));
 
     reconnected
         .request(&ClientRequest::SessionInput {
@@ -503,10 +520,19 @@ async fn managed_claude_session_inner() {
         })
         .await
         .expect("output flood input");
-    wait_for_session(&reconnected, session_id, |session| {
+    let recovered_work = wait_for_session(&reconnected, session_id, |session| {
         session.state == SessionState::Running
     })
     .await;
+    assert!(recovered_work.failure_reason.is_none());
+    assert_eq!(recovered_work.status.activity, ProviderActivity::Working);
+    assert_eq!(
+        recovered_work
+            .status
+            .attention
+            .map(|event| event.acknowledgement),
+        Some(AttentionAcknowledgement::Resolved)
+    );
 
     reconnected
         .request(&ClientRequest::SessionInput {
@@ -731,7 +757,13 @@ async fn late_session_start_recovers_after_warning() {
     assert_eq!(failed.exit_code, Some(17));
     assert_eq!(
         failed.failure_reason.as_deref(),
-        Some("process exited with code 17")
+        Some("process_exit_nonzero")
+    );
+    assert_eq!(failed.status.lifecycle, SessionLifecycle::Failed);
+    assert_eq!(failed.status.activity, ProviderActivity::None);
+    assert_eq!(
+        failed.status.attention.map(|event| event.reason),
+        Some(AttentionReason::TerminalFailure)
     );
     let external_id = failed
         .external_session_id

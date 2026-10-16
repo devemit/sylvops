@@ -86,6 +86,30 @@ fn run() -> io::Result<()> {
                 )?;
                 println!("FAKE_CODEX_PERMISSION");
             }
+            "interrupt" => {
+                emit_hook(
+                    "Interrupt",
+                    &external_id,
+                    Some(json!({"turn_id": "turn-1"})),
+                )?;
+                println!("FAKE_CODEX_INTERRUPTED");
+            }
+            "complete-live" => {
+                emit_hook(
+                    "UserPromptSubmit",
+                    &external_id,
+                    Some(json!({"turn_id": "turn-2"})),
+                )?;
+                emit_hook("Stop", &external_id, Some(json!({"turn_id": "turn-2"})))?;
+                println!("FAKE_CODEX_COMPLETED_LIVE");
+            }
+            "end-session" => {
+                emit_hook("SessionEnd", &external_id, None)?;
+                println!("FAKE_CODEX_SESSION_ENDED");
+                io::stdout().flush()?;
+                return Ok(());
+            }
+            "clean-exit" => return Ok(()),
             "finish" => {
                 emit_hook("Stop", &external_id, Some(json!({"turn_id": "turn-1"})))?;
                 emit_hook("SessionEnd", &external_id, None)?;
