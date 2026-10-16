@@ -272,7 +272,11 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     };
     let summary = if attention > 0 {
         if full {
-            format!("{attention} attention")
+            if attention == 1 {
+                "1 needs input".to_owned()
+            } else {
+                format!("{attention} need input")
+            }
         } else {
             format!("!{attention}")
         }
@@ -321,14 +325,19 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 
 fn draw_attention(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     frame.render_widget(
-        Paragraph::new(format!(
-            " ! {} session(s) need attention · Shift+A or click to open next",
-            app.attention_count()
-        ))
-        .style(theme.attention),
+        Paragraph::new(attention_message(app.attention_count())).style(theme.attention),
         area,
     );
     app.hit_map.push(area, HitTarget::Attention);
+}
+
+pub(crate) fn attention_message(count: usize) -> String {
+    let subject = if count == 1 {
+        "1 session needs your input".to_owned()
+    } else {
+        format!("{count} sessions need your input")
+    };
+    format!(" ! {subject} · Shift+A or click to open next")
 }
 
 fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -441,7 +450,11 @@ fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
             .find(|item| item.id == id)
             .map_or(("Missing session".into(), String::new()), |item| {
                 (
-                    format!("{} {}", status_symbol(item.state), item.display_name),
+                    format!(
+                        "{} {}",
+                        status_symbol(item.state, app.status_animation_frame()),
+                        item.display_name
+                    ),
                     format!("  {}", status_label(item.state)),
                 )
             }),
@@ -663,17 +676,20 @@ fn draw_active_session_list(
     selected: bool,
     theme: Theme,
 ) {
+    let animation_frame = app.status_animation_frame();
     let line = Line::from(vec![
         Span::styled(
-            format!("{} {}", status_symbol(session.state), session.name),
+            format!(
+                "{} {}",
+                status_symbol(session.state, animation_frame),
+                session.name
+            ),
             Modifier::BOLD,
         ),
         Span::raw(format!(" · {}", status_label(session.state))),
     ]);
-    frame.render_widget(
-        Paragraph::new(line).style(if selected { theme.selected } else { theme.text }),
-        area,
-    );
+    let style = active_session_style(session.state, selected, theme);
+    frame.render_widget(Paragraph::new(line).style(style), area);
     app.hit_map.push(area, HitTarget::ActiveSession(session.id));
 }
 
@@ -685,11 +701,23 @@ fn draw_active_session_card(
     selected: bool,
     theme: Theme,
 ) {
-    let border = if selected { theme.focus } else { theme.border };
+    let needs_input = session.state == SessionState::NeedsFeedback;
+    let border = if selected {
+        theme.focus
+    } else if needs_input {
+        theme.attention
+    } else {
+        theme.border
+    };
+    let animation_frame = app.status_animation_frame();
     let lines = vec![
         Line::from(vec![
             Span::styled(
-                format!("{} {}", status_symbol(session.state), session.name),
+                format!(
+                    "{} {}",
+                    status_symbol(session.state, animation_frame),
+                    session.name
+                ),
                 Modifier::BOLD,
             ),
             Span::raw(format!(" · {}", status_label(session.state))),
@@ -708,7 +736,7 @@ fn draw_active_session_card(
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).border_style(border))
-            .style(if selected { theme.selected } else { theme.text })
+            .style(active_session_style(session.state, selected, theme))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -733,6 +761,20 @@ fn draw_active_session_card(
             ),
             HitTarget::ActiveSessionStop(session.id),
         );
+    }
+}
+
+pub(crate) fn active_session_style(state: SessionState, selected: bool, theme: Theme) -> Style {
+    if state == SessionState::NeedsFeedback {
+        if selected {
+            theme.attention_selected_surface
+        } else {
+            theme.attention_surface
+        }
+    } else if selected {
+        theme.selected
+    } else {
+        theme.text
     }
 }
 
@@ -1005,7 +1047,7 @@ fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<
             Span::styled("State        ", theme.muted),
             Span::raw(format!(
                 "{} {}",
-                status_symbol(session.state),
+                status_symbol(session.state, app.status_animation_frame()),
                 status_label(session.state)
             )),
         ]),
@@ -3194,10 +3236,11 @@ fn draw_palette(frame: &mut Frame<'_>, app: &mut App, palette: &crate::app::Pale
     }
 }
 
-pub(crate) fn status_symbol(state: SessionState) -> &'static str {
+pub(crate) fn status_symbol(state: SessionState, animation_frame: usize) -> &'static str {
+    const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
     match state {
         SessionState::Fresh => "○",
-        SessionState::Starting | SessionState::Running => "◐",
+        SessionState::Starting | SessionState::Running => SPINNER[animation_frame % SPINNER.len()],
         SessionState::NeedsFeedback => "!",
         SessionState::FinishedUnseen => "◆",
         SessionState::FinishedSeen => "✓",

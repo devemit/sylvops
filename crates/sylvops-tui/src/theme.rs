@@ -12,6 +12,8 @@ pub(crate) struct Theme {
     pub selected: Style,
     pub success: Style,
     pub attention: Style,
+    pub attention_surface: Style,
+    pub attention_selected_surface: Style,
     pub danger: Style,
     pub muted: Style,
     pub diff_file_header: Style,
@@ -47,6 +49,12 @@ impl Theme {
                     selected: Style::default().add_modifier(Modifier::REVERSED),
                     success: Style::default().fg(Color::Green),
                     attention: Style::default().fg(Color::Yellow),
+                    attention_surface: Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    attention_selected_surface: Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED),
                     danger: Style::default().fg(Color::Red),
                     muted: Style::default().fg(Color::DarkGray),
                     diff_file_header: Style::default().add_modifier(Modifier::BOLD),
@@ -133,6 +141,15 @@ impl Theme {
             attention: Style::default()
                 .fg(palette.attention)
                 .bg(palette.background),
+            attention_surface: Style::default().fg(palette.text).bg(blend(
+                palette.background,
+                palette.attention,
+                14,
+            )),
+            attention_selected_surface: Style::default()
+                .fg(palette.text)
+                .bg(blend(palette.background, palette.attention, 24))
+                .add_modifier(Modifier::BOLD),
             danger: Style::default().fg(palette.danger).bg(palette.background),
             muted: Style::default().fg(palette.muted).bg(palette.background),
             diff_file_header: Style::default()
@@ -211,6 +228,21 @@ mod tests {
             assert_ne!(theme.diff_addition.bg, theme.background.bg, "{choice}");
             assert_ne!(theme.diff_deletion.bg, theme.background.bg, "{choice}");
             assert_ne!(theme.diff_addition.bg, theme.diff_deletion.bg, "{choice}");
+        }
+    }
+
+    #[test]
+    fn named_themes_give_attention_rows_a_subtle_distinct_surface() {
+        for choice in TuiTheme::ALL
+            .into_iter()
+            .filter(|choice| *choice != TuiTheme::TerminalDefault)
+        {
+            let theme = Theme::resolve(choice);
+            assert_ne!(theme.attention_surface.bg, theme.background.bg, "{choice}");
+            assert_ne!(
+                theme.attention_selected_surface.bg, theme.attention_surface.bg,
+                "{choice}"
+            );
         }
     }
 }

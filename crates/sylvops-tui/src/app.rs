@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use sylvops_core::{
     domain::{
         DaemonSnapshot, Project, Session, SessionState, Workspace, Worktree, WorktreeStatus,
-        active_session_priority, attention_priority, state_is_active,
+        active_session_priority, state_is_active,
     },
     github::GitHubIntegrationStatus,
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
@@ -303,6 +303,7 @@ pub(crate) struct App {
     pub hit_map: HitMap,
     pub navigation_dirty_at: Option<Instant>,
     pub invocation_directory: PathBuf,
+    status_animation_started_at: Instant,
 }
 
 impl App {
@@ -362,6 +363,7 @@ impl App {
             hit_map: HitMap::default(),
             navigation_dirty_at: None,
             invocation_directory,
+            status_animation_started_at: Instant::now(),
         };
         app.restore_selection();
         app.reconcile_active_session_selection();
@@ -1021,13 +1023,8 @@ impl App {
             .snapshot
             .sessions
             .iter()
-            .filter(|session| attention_priority(session.state) < 4)
-            .min_by_key(|session| {
-                (
-                    attention_priority(session.state),
-                    std::cmp::Reverse(session.last_activity_at),
-                )
-            })
+            .filter(|session| session.state == SessionState::NeedsFeedback)
+            .max_by_key(|session| session.last_activity_at)
             .cloned();
         let session = target?;
         if let Some(worktree) = self
@@ -1040,19 +1037,21 @@ impl App {
             self.expanded_worktrees.insert(worktree.id);
         }
         self.select_node(ExplorerNode::Session(session.id));
-        Some(format!(
-            "{}: {}",
-            session.display_name,
-            attention_reason(session.state)
-        ))
+        Some(format!("{}: waiting for your input", session.display_name))
     }
 
     pub fn attention_count(&self) -> usize {
         self.snapshot
             .sessions
             .iter()
-            .filter(|session| attention_priority(session.state) < 4)
+            .filter(|session| session.state == SessionState::NeedsFeedback)
             .count()
+    }
+
+    pub fn status_animation_frame(&self) -> usize {
+        const FRAME_MILLIS: u128 = 120;
+        let elapsed_frames = self.status_animation_started_at.elapsed().as_millis() / FRAME_MILLIS;
+        usize::try_from(elapsed_frames).unwrap_or(usize::MAX)
     }
 
     pub fn persisted_state(&self) -> TuiState {
@@ -1169,14 +1168,4 @@ fn nearest_siblings(siblings: &[ExplorerNode], selected: ExplorerNode) -> Vec<Ex
         }
     }
     nearest
-}
-
-pub(crate) fn attention_reason(state: SessionState) -> &'static str {
-    match state {
-        SessionState::NeedsFeedback => "waiting for your input",
-        SessionState::Failed => "failed and needs review",
-        SessionState::FinishedUnseen => "finished since you last viewed it",
-        SessionState::Running | SessionState::Starting => "currently running",
-        _ => "does not require attention",
-    }
 }

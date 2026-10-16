@@ -5790,16 +5790,92 @@ mod tests {
 
     #[test]
     fn status_is_not_encoded_by_color_alone() {
-        assert_eq!(render::status_symbol(SessionState::NeedsFeedback), "!");
+        assert_eq!(render::status_symbol(SessionState::NeedsFeedback, 0), "!");
         assert_eq!(
             render::status_label(SessionState::NeedsFeedback),
             "Needs feedback"
         );
-        assert_eq!(render::status_symbol(SessionState::Disconnected), "—");
+        assert_eq!(render::status_symbol(SessionState::Disconnected, 0), "—");
         assert_eq!(
             render::status_label(SessionState::Disconnected),
             "Disconnected"
         );
+    }
+
+    #[test]
+    fn running_and_starting_statuses_use_a_spinning_ring() {
+        let frames = (0..4)
+            .map(|frame| render::status_symbol(SessionState::Running, frame))
+            .collect::<Vec<_>>();
+        assert_eq!(frames, ["◐", "◓", "◑", "◒"]);
+        assert_eq!(
+            render::status_symbol(SessionState::Starting, 5),
+            render::status_symbol(SessionState::Running, 1)
+        );
+    }
+
+    #[test]
+    fn attention_means_the_agent_is_waiting_for_user_input() {
+        let mut snapshot = populated_snapshot();
+        let mut app = App::new(snapshot.clone(), Vec::new(), None);
+        for state in [
+            SessionState::Starting,
+            SessionState::Running,
+            SessionState::Failed,
+            SessionState::FinishedUnseen,
+        ] {
+            snapshot.sessions[0].state = state;
+            app.replace_snapshot(snapshot.clone());
+            assert_eq!(app.attention_count(), 0, "{state:?}");
+            assert!(app.select_attention().is_none(), "{state:?}");
+        }
+
+        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        let session_id = snapshot.sessions[0].id;
+        app.replace_snapshot(snapshot);
+        assert_eq!(app.attention_count(), 1);
+        assert_eq!(
+            app.select_attention().as_deref(),
+            Some("shell: waiting for your input")
+        );
+        assert_eq!(app.selected_session_id, Some(session_id));
+    }
+
+    #[test]
+    fn attention_banner_copy_uses_correct_grammar() {
+        assert!(
+            render::attention_message(1).contains("1 session needs your input"),
+            "singular attention copy"
+        );
+        assert!(
+            render::attention_message(2).contains("2 sessions need your input"),
+            "plural attention copy"
+        );
+    }
+
+    #[test]
+    fn needs_feedback_rows_use_attention_surfaces_in_cards_and_lists() {
+        let theme = theme::Theme::resolve(TuiTheme::TokyoNight);
+        assert_eq!(
+            render::active_session_style(SessionState::NeedsFeedback, false, theme),
+            theme.attention_surface
+        );
+        assert_eq!(
+            render::active_session_style(SessionState::NeedsFeedback, true, theme),
+            theme.attention_selected_surface
+        );
+        assert_eq!(
+            render::active_session_style(SessionState::Running, false, theme),
+            theme.text
+        );
+        assert_eq!(
+            render::active_session_style(SessionState::Running, true, theme),
+            theme.selected
+        );
+
+        let terminal_default = theme::Theme::resolve(TuiTheme::TerminalDefault);
+        assert_eq!(terminal_default.attention_surface.bg, None);
+        assert_ne!(terminal_default.attention_surface, terminal_default.text);
     }
 
     #[test]
