@@ -687,6 +687,7 @@ mod tests {
             provider_kind: kind,
             display_name: kind.to_string(),
             state: SessionState::FinishedSeen,
+            status: crate::session_state::SessionStatus::default(),
             process_id: None,
             external_session_id: Some("verified-id".into()),
             command: kind.to_string(),

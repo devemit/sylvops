@@ -3785,6 +3785,7 @@ mod tests {
                 provider_kind: ProviderKind::Shell,
                 display_name: "shell".into(),
                 state: SessionState::Running,
+                status: sylvops_core::session_state::SessionStatus::default(),
                 process_id: Some(42),
                 external_session_id: None,
                 command: "/bin/sh".into(),

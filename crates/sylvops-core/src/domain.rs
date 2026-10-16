@@ -229,6 +229,8 @@ pub struct Session {
     pub provider_kind: ProviderKind,
     pub display_name: String,
     pub state: SessionState,
+    /// Expanded authoritative state; `state` remains for clients during the expand phase.
+    pub status: crate::session_state::SessionStatus,
     pub process_id: Option<u32>,
     pub external_session_id: Option<String>,
     pub command: String,

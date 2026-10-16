@@ -23,6 +23,10 @@ use sylvops_core::github::{
     GitRemoteName, MAX_GITHUB_CONNECTIONS, MAX_START_WORK_SOURCES, WorkSource,
 };
 use sylvops_core::ids::{ProjectId, ProviderProfileId, SessionId, WorkspaceId, WorktreeId};
+use sylvops_core::session_state::{
+    AttentionAcknowledgement, AttentionEvent, AttentionEventId, AttentionReason, ProviderActivity,
+    SessionLifecycle,
+};
 use sylvops_core::status::{ConversationIdentityTransition, ProviderConversationId};
 use sylvops_core::ui::{DesktopState, TuiState};
 use tokio::sync::{mpsc, oneshot};
@@ -75,6 +79,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         8,
         "work_sources",
         include_str!("../migrations/0008_work_sources.sql"),
+    ),
+    (
+        9,
+        "expanded_session_state",
+        include_str!("../migrations/0009_expanded_session_state.sql"),
     ),
 ];
 
@@ -1398,6 +1407,8 @@ fn open_connection(path: &Path) -> Result<Connection> {
         .pragma_update(None, "synchronous", "NORMAL")
         .map_err(database_error)?;
     apply_migrations(&mut connection)?;
+    // Validate every persisted combination before the daemon can accept clients.
+    load_snapshot(&connection, 0)?;
     Ok(connection)
 }
 
@@ -1450,6 +1461,9 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
         transaction.execute_batch(source).map_err(database_error)?;
+        if version == 9 {
+            load_snapshot(&transaction, 0)?;
+        }
         transaction
             .execute(
                 "INSERT INTO schema_migrations(version, name, applied_at, checksum) \
@@ -2545,6 +2559,7 @@ fn mark_session_running(
         )));
     }
     insert_entity_audit(&transaction, "session_started", "session", &id.to_string())?;
+    sync_expanded_session_status(&transaction, id)?;
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(session)
@@ -2590,6 +2605,7 @@ fn finish_session(
             "session {id} does not exist"
         )));
     }
+    sync_expanded_session_status(&transaction, id)?;
     let session = load_session(&transaction, id)?;
     transaction
         .execute(
@@ -2624,6 +2640,7 @@ fn mark_session_seen(connection: &mut Connection, id: SessionId) -> Result<Optio
         return Ok(None);
     }
     insert_entity_audit(&transaction, "session_seen", "session", &id.to_string())?;
+    sync_expanded_session_status(&transaction, id)?;
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(Some(session))
@@ -2684,6 +2701,7 @@ fn update_session_status(
             .to_string(),
         )?;
     }
+    sync_expanded_session_status(&transaction, id)?;
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(session)
@@ -2716,20 +2734,110 @@ fn mark_session_lifecycle_missing(
         "needs_feedback",
         &id.to_string(),
     )?;
+    sync_expanded_session_status(&transaction, id)?;
     let session = load_session(&transaction, id)?;
     transaction.commit().map_err(database_error)?;
     Ok(Some(session))
 }
 
+/// Temporary expand-phase bridge from existing daemon actions, never a protocol fallback.
+fn sync_expanded_session_status(connection: &Connection, id: SessionId) -> Result<()> {
+    // The legacy columns have just changed inside this transaction; cross-dimension
+    // validation happens again after both representations have been written.
+    let session = load_session_with(connection, id, session_record_from_row)?;
+    let mut status = session.status;
+    let live = session.process_id.is_some();
+    status.lifecycle = match session.state {
+        SessionState::Fresh => SessionLifecycle::Fresh,
+        SessionState::Starting => SessionLifecycle::Starting,
+        SessionState::Running | SessionState::NeedsFeedback => SessionLifecycle::Running,
+        SessionState::FinishedUnseen | SessionState::FinishedSeen if live => {
+            SessionLifecycle::Running
+        }
+        SessionState::FinishedUnseen | SessionState::FinishedSeen => SessionLifecycle::Exited,
+        SessionState::Failed => SessionLifecycle::Failed,
+        SessionState::Terminated => SessionLifecycle::Terminated,
+        SessionState::Disconnected => SessionLifecycle::Disconnected,
+    };
+    let reason = match session.state {
+        SessionState::NeedsFeedback if session.failure_reason.is_some() => {
+            Some(AttentionReason::RecoverableFailure)
+        }
+        SessionState::NeedsFeedback => Some(AttentionReason::InputRequested),
+        SessionState::FinishedUnseen | SessionState::FinishedSeen => {
+            Some(AttentionReason::SuccessfulCompletion)
+        }
+        SessionState::Failed => Some(AttentionReason::TerminalFailure),
+        _ => None,
+    };
+    status.activity = if status.lifecycle != SessionLifecycle::Running
+        || session.provider_kind == sylvops_core::domain::ProviderKind::Shell
+    {
+        ProviderActivity::None
+    } else {
+        match reason {
+            Some(AttentionReason::InputRequested) => ProviderActivity::AwaitingInput,
+            Some(AttentionReason::RecoverableFailure) => ProviderActivity::RecoverableFailure,
+            Some(AttentionReason::SuccessfulCompletion) => ProviderActivity::Completed,
+            _ => ProviderActivity::Working,
+        }
+    };
+    if let Some(reason) = reason {
+        if !status.attention.is_some_and(|event| {
+            event.reason == reason && event.acknowledgement != AttentionAcknowledgement::Resolved
+        }) {
+            let next = status.attention.map_or(1, |event| u64::from(event.id) + 1);
+            status.attention = Some(AttentionEvent {
+                id: AttentionEventId::try_from(next)
+                    .map_err(|message| DaemonError::Database(message.into()))?,
+                reason,
+                acknowledgement: AttentionAcknowledgement::Pending,
+                occurred_at: session.last_activity_at,
+            });
+        }
+        if session.state == SessionState::FinishedSeen
+            && let Some(event) = &mut status.attention
+        {
+            event.acknowledgement = AttentionAcknowledgement::Acknowledged;
+        }
+    } else if session.state != SessionState::Disconnected
+        && let Some(event) = &mut status.attention
+    {
+        event.acknowledgement = AttentionAcknowledgement::Resolved;
+    }
+    status
+        .validate()
+        .map_err(|message| DaemonError::Database(message.into()))?;
+    connection
+        .execute(
+            "UPDATE sessions SET status_json = ?2 WHERE id = ?1",
+            params![
+                id.to_string(),
+                serde_json::to_string(&status)
+                    .map_err(|_| DaemonError::Database("cannot encode Session status".into()))?
+            ],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
 fn load_session(connection: &Connection, id: SessionId) -> Result<Session> {
+    load_session_with(connection, id, session_from_row)
+}
+
+fn load_session_with(
+    connection: &Connection,
+    id: SessionId,
+    map: fn(&Row<'_>) -> rusqlite::Result<Session>,
+) -> Result<Session> {
     connection
         .query_row(
             "SELECT id, worktree_id, provider_profile_id, provider_kind, display_name, state, \
              process_id, external_session_id, command, arguments_json, cwd, created_at, \
              started_at, ended_at, last_activity_at, last_seen_output_sequence, exit_code, \
-             failure_reason FROM sessions WHERE id = ?1",
+             failure_reason, status_json FROM sessions WHERE id = ?1",
             [id.to_string()],
-            session_from_row,
+            map,
         )
         .optional()
         .map_err(database_error)?
@@ -2767,7 +2875,8 @@ fn reconcile_sessions(connection: &mut Connection) -> Result<usize> {
         let mut statement = transaction
             .prepare(
                 "SELECT id FROM sessions WHERE state IN \
-                 ('starting', 'running', 'needs_feedback')",
+                 ('starting', 'running', 'needs_feedback') OR \
+                 json_extract(status_json, '$.lifecycle') IN ('starting', 'running')",
             )
             .map_err(database_error)?;
         statement
@@ -2781,11 +2890,17 @@ fn reconcile_sessions(connection: &mut Connection) -> Result<usize> {
         transaction
             .execute(
                 "UPDATE sessions SET state = 'disconnected', process_id = NULL, \
+                 process_identity = NULL, \
                  failure_reason = 'daemon restarted; process identity was not trusted' \
                  WHERE id = ?1",
                 [session_id],
             )
             .map_err(database_error)?;
+        sync_expanded_session_status(
+            &transaction,
+            SessionId::from_str(session_id)
+                .map_err(|_| DaemonError::Database("invalid Session identity".into()))?,
+        )?;
         transaction
             .execute(
                 "INSERT INTO audit_events(\
@@ -2934,7 +3049,7 @@ fn load_snapshot(connection: &Connection, revision: u64) -> Result<DaemonSnapsho
             "SELECT id, worktree_id, provider_profile_id, provider_kind, display_name, state, \
                     process_id, external_session_id, command, arguments_json, cwd, created_at, \
                     started_at, ended_at, last_activity_at, last_seen_output_sequence, exit_code, \
-                    failure_reason FROM sessions ORDER BY last_activity_at DESC",
+                    failure_reason, status_json FROM sessions ORDER BY last_activity_at DESC",
             session_from_row,
         )?,
         work_sources: load_snapshot_work_sources(connection)?,
@@ -3067,6 +3182,19 @@ fn worktree_from_row(row: &Row<'_>) -> rusqlite::Result<Worktree> {
 }
 
 fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
+    let session = session_record_from_row(row)?;
+    let live = session.status.lifecycle == SessionLifecycle::Running;
+    if live != session.process_id.is_some()
+        || session.process_id == Some(0)
+        || (session.provider_kind == sylvops_core::domain::ProviderKind::Shell
+            && session.status.activity != ProviderActivity::None)
+    {
+        return Err(invalid_value(18, "invalid Session process state".into()));
+    }
+    Ok(session)
+}
+
+fn session_record_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: parse_text(row, 0)?,
         worktree_id: parse_text(row, 1)?,
@@ -3086,6 +3214,8 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
         last_seen_output_sequence: checked_integer(row, 15)?,
         exit_code: row.get(16)?,
         failure_reason: row.get(17)?,
+        status: serde_json::from_str(&row.get::<_, String>(18)?)
+            .map_err(|_| invalid_value(18, "invalid expanded Session state".into()))?,
     })
 }
 
