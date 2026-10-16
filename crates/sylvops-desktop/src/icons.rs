@@ -48,6 +48,20 @@ pub(crate) fn line_icon(icon: LineIcon, size: u16) -> svg::Svg<'static> {
         })
 }
 
+pub(crate) fn running_ring(size: u16, angle: f32) -> svg::Svg<'static> {
+    static HANDLE: std::sync::OnceLock<svg::Handle> = std::sync::OnceLock::new();
+    let handle = HANDLE.get_or_init(|| svg::Handle::from_memory(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9" opacity=".18"/><path d="M12 3a9 9 0 0 1 9 9"/></svg>"#
+    ));
+    svg::Svg::new(handle.clone())
+        .width(Length::Fixed(f32::from(size)))
+        .height(Length::Fixed(f32::from(size)))
+        .rotation(iced::Radians(angle))
+        .style(|theme: &Theme, _status| svg::Style {
+            color: Some(theme.extended_palette().success.base.color),
+        })
+}
+
 pub(crate) fn delete_icon(size: u16, emphasized: bool) -> svg::Svg<'static> {
     svg::Svg::new(svg::Handle::from_memory(LineIcon::Delete.source()))
         .width(Length::Fixed(f32::from(size)))

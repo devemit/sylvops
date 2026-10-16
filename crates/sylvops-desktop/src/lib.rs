@@ -4,6 +4,7 @@ mod bridge;
 mod forms;
 mod github_surface;
 mod icons;
+mod notifications;
 mod presentation;
 mod state;
 mod terminal;
@@ -40,7 +41,7 @@ use iced::{
     window,
 };
 use iced::{font, font::Weight, widget::button::Status};
-use icons::{LineIcon, delete_icon, line_icon};
+use icons::{LineIcon, delete_icon, line_icon, running_ring};
 use presentation::{
     ActiveTerminalAction, ButtonIntent, ButtonTokens, ControlState, DensityMetrics,
     DesktopPresentation, InteractionState as PresentationInteraction, NavigatorAction,
@@ -278,6 +279,9 @@ struct DesktopApp {
     install_request: RequestState,
     modal_focus: ModalFocus,
     disclosures: DisclosureState,
+    attention_alerts: Option<sylvops_core::attention::AttentionTracker>,
+    attention_sound: Option<notifications::SoundNotifier>,
+    status_animation_started_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -750,6 +754,9 @@ impl DesktopApp {
             install_request: RequestState::Idle,
             modal_focus: ModalFocus::Idle,
             disclosures: DisclosureState::default(),
+            attention_alerts: None,
+            attention_sound: notifications::SoundNotifier::new().ok(),
+            status_animation_started_at: Instant::now(),
         }
     }
 
@@ -1724,6 +1731,7 @@ impl DesktopApp {
         let density = self.presentation().density;
         let is_selected = row.selected;
         let is_hovered = self.hovered_navigator_node == Some(row.id);
+        let needs_input = matches!(row.id, NavigatorNodeId::Session(id) if self.session(id).is_some_and(|session| session.state == SessionState::NeedsFeedback));
         let name = text(row.label.clone())
             .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
             .size(UI_TEXT_SIZE)
@@ -1752,23 +1760,34 @@ impl DesktopApp {
                 }
             }
             title = title.push(space::horizontal());
-            column![
-                title,
-                text(row.detail.clone())
-                    .size(UI_META_SIZE)
-                    .style(text::secondary)
-                    .wrapping(text::Wrapping::None),
-            ]
-            .spacing(1)
-            .width(Fill)
-            .into()
+            let detail = text(row.detail.clone())
+                .size(UI_META_SIZE)
+                .style(text::secondary)
+                .wrapping(text::Wrapping::None);
+            let detail: Element<'static, Message> =
+                if row.indicator == Some(presentation::SessionIndicator::Working) {
+                    row![running_ring(12, self.status_animation_angle()), detail]
+                        .spacing(5)
+                        .align_y(Center)
+                        .into()
+                } else {
+                    detail.into()
+                };
+            column![title, detail].spacing(1).width(Fill).into()
         };
         let content = container(row![labels].spacing(3).align_y(Center))
             .width(Fill)
             .height(density.control_height + 14)
             .padding([4, 6])
             .clip(true)
-            .style(move |theme| navigator_row_container_style(theme, is_selected, is_hovered));
+            .style(move |theme| {
+                let style = navigator_row_container_style(theme, is_selected, is_hovered);
+                if needs_input {
+                    attention_row_style(theme, style, is_selected || is_hovered)
+                } else {
+                    style
+                }
+            });
         let select = match row.id {
             NavigatorNodeId::Repository(id) => Message::SelectProject(id),
             NavigatorNodeId::Checkout(id) => Message::SelectWorktree(id),
@@ -1946,21 +1965,41 @@ impl DesktopApp {
             let label = session_tab_label(&session.label);
             let active = session.active;
             let session_id = session.id;
+            let state = self.session(session_id).map(|session| session.state);
+            let needs_input = state == Some(SessionState::NeedsFeedback);
+            let mut label_content = row![].spacing(5).align_y(Center);
+            if matches!(state, Some(SessionState::Running | SessionState::Starting)) {
+                label_content = label_content.push(running_ring(13, self.status_animation_angle()));
+            }
+            label_content = label_content.push(
+                centered_button_label(
+                    label,
+                    UI_TEXT_SIZE,
+                    if active { UI_SEMIBOLD } else { UI_FONT },
+                )
+                .wrapping(text::Wrapping::None),
+            );
             tabs = tabs.push(
                 container(
                     row![
-                        button(
-                            centered_button_label(
-                                label,
-                                UI_TEXT_SIZE,
-                                if active { UI_SEMIBOLD } else { UI_FONT },
-                            )
-                            .wrapping(text::Wrapping::None)
-                        )
-                        .on_press(Message::SelectOpenSession(session_id))
-                        .height(density.row_height)
-                        .padding([5, 9])
-                        .style(move |theme, status| { tab_label_style(theme, status, active) }),
+                        button(label_content)
+                            .on_press(Message::SelectOpenSession(session_id))
+                            .height(density.row_height)
+                            .padding([5, 9])
+                            .style(move |theme, status| {
+                                let mut style = tab_label_style(theme, status, active);
+                                if needs_input {
+                                    style.background = Some(Background::Color(
+                                        theme
+                                            .extended_palette()
+                                            .warning
+                                            .base
+                                            .color
+                                            .scale_alpha(if active { 0.22 } else { 0.14 }),
+                                    ));
+                                }
+                                style
+                            }),
                         button(line_icon(LineIcon::Close, 15))
                             .on_press(Message::CloseSessionTab(session_id))
                             .height(density.row_height)
@@ -1970,7 +2009,14 @@ impl DesktopApp {
                     .spacing(0)
                     .align_y(Center),
                 )
-                .style(move |theme| session_tab_group_style(theme, active)),
+                .style(move |theme| {
+                    let style = session_tab_group_style(theme, active);
+                    if needs_input {
+                        attention_row_style(theme, style, active)
+                    } else {
+                        style
+                    }
+                }),
             );
         }
         if presentation.active_session.tabs.is_empty() {
@@ -4069,6 +4115,9 @@ impl DesktopApp {
                 providers,
                 desktop_state,
             } => {
+                self.attention_alerts = Some(sylvops_core::attention::AttentionTracker::new(
+                    &snapshot.sessions,
+                ));
                 self.snapshot = snapshot;
                 self.providers = providers;
                 self.connection = ConnectionState::Connected;
@@ -4219,6 +4268,20 @@ impl DesktopApp {
 
     fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
+            DaemonEvent::SessionStatusChanged { session, .. } => {
+                if let Some(existing) = self
+                    .snapshot
+                    .sessions
+                    .iter_mut()
+                    .find(|existing| existing.id == session.id)
+                {
+                    *existing = session;
+                } else {
+                    self.snapshot.sessions.push(session);
+                }
+                self.observe_attention();
+                self.request_snapshot();
+            }
             DaemonEvent::ProviderHealthChanged { health } => {
                 self.update_provider_health(health);
             }
@@ -4530,6 +4593,7 @@ impl DesktopApp {
             (Operation::RefreshSnapshot, DaemonResponse::Snapshot(snapshot)) => {
                 self.snapshot_pending = false;
                 self.snapshot = snapshot;
+                self.observe_attention();
                 self.restore_selection();
             }
             (
@@ -7492,6 +7556,30 @@ impl DesktopApp {
         self.mark_state_dirty();
     }
 
+    fn status_animation_angle(&self) -> f32 {
+        self.status_animation_started_at
+            .elapsed()
+            .as_secs_f32()
+            .rem_euclid(1.2)
+            / 1.2
+            * std::f32::consts::TAU
+    }
+
+    fn observe_attention(&mut self) {
+        let Some(alerts) = &mut self.attention_alerts else {
+            self.attention_alerts = Some(sylvops_core::attention::AttentionTracker::new(
+                &self.snapshot.sessions,
+            ));
+            return;
+        };
+        if let Some(message) = alerts.update(&self.snapshot.sessions) {
+            if let Some(sound) = &self.attention_sound {
+                sound.notify();
+            }
+            self.show_success(message);
+        }
+    }
+
     fn select_session(&mut self, session_id: SessionId) {
         self.unfocus_terminal();
         self.focused_delete_action = None;
@@ -9014,6 +9102,22 @@ fn list_item_container_style(theme: &Theme, selected: bool, hovered: bool) -> co
         border: style.border,
         ..container::Style::default()
     }
+}
+
+fn attention_row_style(
+    theme: &Theme,
+    mut style: container::Style,
+    emphasized: bool,
+) -> container::Style {
+    style.background = Some(Background::Color(
+        theme
+            .extended_palette()
+            .warning
+            .base
+            .color
+            .scale_alpha(if emphasized { 0.22 } else { 0.14 }),
+    ));
+    style
 }
 
 fn navigator_row_container_style(theme: &Theme, selected: bool, hovered: bool) -> container::Style {
