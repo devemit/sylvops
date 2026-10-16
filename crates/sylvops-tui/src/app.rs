@@ -307,6 +307,11 @@ pub(crate) struct App {
     pub help: bool,
     pub attached: Option<AttachedTerminal>,
     pub resume_pending: Option<SessionId>,
+    pub resume_response: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<sylvops_core::protocol::DaemonResponse, sylvops_daemon::DaemonError>,
+        >,
+    >,
     pub hit_map: HitMap,
     pub navigation_dirty_at: Option<Instant>,
     pub invocation_directory: PathBuf,
@@ -370,6 +375,7 @@ impl App {
             help: false,
             attached: None,
             resume_pending: None,
+            resume_response: None,
             hit_map: HitMap::default(),
             navigation_dirty_at: None,
             invocation_directory,

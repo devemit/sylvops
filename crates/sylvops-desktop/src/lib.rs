@@ -4589,6 +4589,7 @@ impl DesktopApp {
                 self.select_session(session_id);
                 self.main_tab = MainTab::Terminal;
                 self.show_success("Session resumed into a new history record.");
+                self.attach_active();
                 self.request_snapshot();
             }
             (Operation::Stop(session_id), DaemonResponse::Acknowledged) => {
@@ -6195,6 +6196,7 @@ impl DesktopApp {
         {
             self.select_session(session_id);
             self.narrow_main = true;
+            self.attach_active();
         }
     }
 
@@ -6848,6 +6850,17 @@ impl DesktopApp {
             self.error = Some("The selected session no longer exists.".into());
             return;
         };
+        if self.resume_pending.contains(&session_id) {
+            return;
+        }
+        if !state_is_active(session.state) {
+            if session_can_resume(session, &self.snapshot.sessions, &self.providers) {
+                self.resume_session(session_id);
+            } else {
+                self.error = Some("Cannot resume this conversation: it needs a verified saved conversation, an available resume-capable provider, and no newer successor. History is retained; use New session to start fresh explicitly.".into());
+            }
+            return;
+        }
         if !session_can_stop(session.state) && !session_can_replay(session.state) {
             self.error = Some(format!(
                 "Session “{}” is {}; only its metadata is retained.",
@@ -13183,7 +13196,7 @@ mod tests {
             &codex_health
         ));
         let terminated = session(SessionState::Terminated, Some("verified-id"));
-        assert!(!session_can_resume(
+        assert!(session_can_resume(
             &terminated,
             std::slice::from_ref(&terminated),
             &codex_health

@@ -860,7 +860,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
                 session.display_name,
                 status_label(session.state),
                 if can_resume {
-                    "Press Enter to inspect retained output, or resume to continue in a new session."
+                    "Press Enter to resume this conversation and open its terminal."
                 } else {
                     "Press Enter or click Attach to connect."
                 }

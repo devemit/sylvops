@@ -337,6 +337,7 @@ pub const fn state_allows_resume(state: SessionState) -> bool {
         SessionState::FinishedSeen
             | SessionState::FinishedUnseen
             | SessionState::Failed
+            | SessionState::Terminated
             | SessionState::Disconnected
     )
 }
@@ -402,6 +403,7 @@ mod tests {
             SessionState::FinishedSeen,
             SessionState::FinishedUnseen,
             SessionState::Failed,
+            SessionState::Terminated,
             SessionState::Disconnected,
         ] {
             assert!(state_allows_resume(state), "{state} should allow resume");
@@ -411,7 +413,6 @@ mod tests {
             SessionState::Starting,
             SessionState::Running,
             SessionState::NeedsFeedback,
-            SessionState::Terminated,
         ] {
             assert!(
                 !state_allows_resume(state),

@@ -2662,7 +2662,7 @@ async fn handle_request(
             })?;
             if !state_allows_resume(source.state) {
                 return Err(DaemonError::Provider(format!(
-                    "session state {} is not eligible for resume; only finished, failed, or disconnected sessions may be resumed",
+                    "session state {} is not eligible for resume; only finished, failed, stopped, or disconnected sessions may be resumed",
                     source.state
                 )));
             }

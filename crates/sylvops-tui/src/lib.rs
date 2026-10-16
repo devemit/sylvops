@@ -307,6 +307,18 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 continue;
             },
             result = async {
+                match app.resume_response.as_mut() {
+                    Some(result) => result.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                app.resume_response = None;
+                let result = result.unwrap_or_else(|_| Err(DaemonError::Lifecycle("Session resume request stopped.".into())));
+                finish_resume(&client, &mut app, result).await?;
+                dirty = true;
+                continue;
+            },
+            result = async {
                 match app.pending_form.as_mut() {
                     Some(result) => result.await,
                     None => std::future::pending().await,
@@ -437,7 +449,7 @@ async fn execute_effects(
     for effect in effects {
         match effect {
             Effect::Attach => attach_selected(client, app).await?,
-            Effect::Resume(session_id) => resume_session(client, app, session_id).await?,
+            Effect::Resume(session_id) => resume_session(client, app, session_id),
             Effect::OpenCreate => open_create_form(app),
             Effect::OpenCreateWorktree(project_id) => {
                 app.mode = Mode::Modal(Form::worktree(project_id));
@@ -3191,6 +3203,30 @@ async fn show_diff(client: &DaemonClient, app: &mut App) -> Result<(), DaemonErr
 }
 
 async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
+    if app.resume_pending.is_some() || app.resume_response.is_some() {
+        return Ok(());
+    }
+    if let Some(session) = app.selected_session()
+        && !sylvops_core::domain::state_is_active(session.state)
+    {
+        if sylvops_core::provider::session_can_resume(
+            session,
+            &app.snapshot.sessions,
+            &app.providers,
+        ) {
+            let session_id = session.id;
+            resume_session(client, app, session_id);
+        } else {
+            app.flash = Some(Flash::error(
+                "Cannot resume this conversation: it needs a verified saved conversation, an available resume-capable provider, and no newer successor. History is retained; use New to start a fresh session explicitly.",
+            ));
+        }
+        return Ok(());
+    }
+    attach_selected_process(client, app).await
+}
+
+async fn attach_selected_process(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
     let Some(session_id) = app.selected_session_id else {
         app.flash = Some(Flash::error("Select a session first."));
         return Ok(());
@@ -3245,23 +3281,38 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
     Ok(())
 }
 
-async fn resume_session(
+fn resume_session(client: &DaemonClient, app: &mut App, source_session_id: SessionId) {
+    if app.resume_response.is_some() {
+        return;
+    }
+    app.resume_pending = Some(source_session_id);
+    app.flash = Some(Flash::transient(FlashKind::Info, "Resuming session…"));
+    let client = client.clone();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    app.resume_response = Some(receive);
+    tokio::spawn(async move {
+        let result = client
+            .request(&ClientRequest::ResumeSession {
+                session_id: source_session_id,
+                columns: 80,
+                rows: 24,
+            })
+            .await;
+        let _ = send.send(result);
+    });
+}
+
+async fn finish_resume(
     client: &DaemonClient,
     app: &mut App,
-    source_session_id: SessionId,
+    response: Result<DaemonResponse, DaemonError>,
 ) -> Result<(), DaemonError> {
-    let response = client
-        .request(&ClientRequest::ResumeSession {
-            session_id: source_session_id,
-            columns: 80,
-            rows: 24,
-        })
-        .await;
     let response = match response {
         Ok(response) => response,
         Err(error) => {
             app.resume_pending = None;
-            return Err(error);
+            app.flash = Some(Flash::error(format!("Could not resume session: {error}")));
+            return Ok(());
         }
     };
     let Some(session) = apply_resume_response(app, response) else {
@@ -3273,7 +3324,7 @@ async fn resume_session(
         FlashKind::Success,
         "Session resumed into a new history record.",
     ));
-    Ok(())
+    attach_selected_process(client, app).await
 }
 
 fn apply_resume_response(
