@@ -1609,7 +1609,7 @@ fn format_version_label(
 }
 
 fn footer_areas(area: Rect, version: &str) -> (Rect, Option<Rect>) {
-    const MIN_CONTENT_WIDTH: u16 = 32;
+    const MIN_CONTENT_WIDTH: u16 = 40;
     const VERSION_GAP: u16 = 1;
 
     let version_width = text_width(version);

@@ -26,6 +26,7 @@ use crossterm::{
         MouseButton, MouseEventKind,
     },
     execute,
+    style::Print,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use directory_browser::{DirectoryBrowser, DirectoryBrowserEntry};
@@ -56,6 +57,7 @@ use terminal::{
     AttachedTerminal, TERMINAL_SCROLLBACK_ROWS, TerminalWheelAction, encode_key, history_action,
     is_detach_key,
 };
+use theme::terminal_background_rgb;
 
 const TICK: Duration = Duration::from_millis(60);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -124,11 +126,12 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
     let mut events = client.subscribe();
     let (github_results_tx, mut github_results) = tokio::sync::mpsc::channel(16);
     let mut github_tasks = GitHubTasks::default();
-    let _guard = TerminalGuard::enter()?;
+    let mut guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .map_err(|error| DaemonError::Lifecycle(format!("cannot initialize TUI: {error}")))?;
 
     loop {
+        guard.sync_theme(app.theme);
         app.expire_flash();
         for _ in 0..16 {
             match github_results.try_recv() {
@@ -3121,7 +3124,7 @@ async fn handle_terminal(
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             ) =>
         {
-            terminal_wheel_position(app, mouse)
+            terminal_wheel_position(app, *mouse)
         }
         _ => None,
     };
@@ -3191,7 +3194,7 @@ async fn handle_terminal(
 
 fn terminal_wheel_position(
     app: &App,
-    mouse: &crossterm::event::MouseEvent,
+    mouse: crossterm::event::MouseEvent,
 ) -> Option<(bool, u16, u16)> {
     let scroll_up = match mouse.kind {
         MouseEventKind::ScrollUp => true,
@@ -3380,8 +3383,34 @@ fn push_bounded(target: &mut String, input: &str) {
     target.push_str(&input[..end]);
 }
 
-#[derive(Debug)]
-struct TerminalGuard;
+const RESET_TERMINAL_BACKGROUND: &str = "\x1b]111\x1b\\";
+
+#[derive(Debug, Default)]
+struct TerminalBackgroundSync {
+    applied: Option<TuiTheme>,
+}
+
+impl TerminalBackgroundSync {
+    fn update(&mut self, theme: TuiTheme) -> Option<String> {
+        if self.applied == Some(theme) {
+            return None;
+        }
+        self.applied = Some(theme);
+        Some(terminal_background_sequence(theme))
+    }
+}
+
+fn terminal_background_sequence(theme: TuiTheme) -> String {
+    terminal_background_rgb(theme).map_or_else(
+        || RESET_TERMINAL_BACKGROUND.to_owned(),
+        |(red, green, blue)| format!("\x1b]11;rgb:{red:02x}/{green:02x}/{blue:02x}\x1b\\"),
+    )
+}
+
+#[derive(Debug, Default)]
+struct TerminalGuard {
+    background: TerminalBackgroundSync,
+}
 
 impl TerminalGuard {
     fn enter() -> Result<Self, DaemonError> {
@@ -3390,13 +3419,24 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(DaemonError::Lifecycle(error.to_string()));
         }
-        Ok(Self)
+        Ok(Self::default())
+    }
+
+    fn sync_theme(&mut self, theme: TuiTheme) {
+        if let Some(sequence) = self.background.update(theme) {
+            let _ = execute!(stdout(), Print(sequence));
+        }
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout(),
+            Print(RESET_TERMINAL_BACKGROUND),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -5880,6 +5920,24 @@ mod tests {
     }
 
     #[test]
+    fn terminal_background_tracks_named_theme_changes_and_resets_to_default() {
+        let mut sync = TerminalBackgroundSync::default();
+        assert_eq!(
+            sync.update(TuiTheme::Nord).as_deref(),
+            Some("\x1b]11;rgb:2e/34/40\x1b\\")
+        );
+        assert_eq!(sync.update(TuiTheme::Nord), None);
+        assert_eq!(
+            sync.update(TuiTheme::TokyoNight).as_deref(),
+            Some("\x1b]11;rgb:1a/1b/26\x1b\\")
+        );
+        assert_eq!(
+            sync.update(TuiTheme::TerminalDefault).as_deref(),
+            Some(RESET_TERMINAL_BACKGROUND)
+        );
+    }
+
+    #[test]
     fn terminal_wheel_coordinates_are_scoped_to_the_rendered_viewport() {
         use crossterm::event::MouseEvent;
 
@@ -5892,14 +5950,14 @@ mod tests {
             row: 7,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(terminal_wheel_position(&app, &inside), Some((true, 2, 3)));
+        assert_eq!(terminal_wheel_position(&app, inside), Some((true, 2, 3)));
 
         let outside = MouseEvent {
             column: 3,
             row: 2,
             ..inside
         };
-        assert_eq!(terminal_wheel_position(&app, &outside), None);
+        assert_eq!(terminal_wheel_position(&app, outside), None);
     }
 
     #[test]

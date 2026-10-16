@@ -182,6 +182,13 @@ impl Theme {
     }
 }
 
+pub(crate) fn terminal_background_rgb(choice: TuiTheme) -> Option<(u8, u8, u8)> {
+    match Theme::resolve(choice).background.bg {
+        Some(Color::Rgb(red, green, blue)) => Some((red, green, blue)),
+        _ => None,
+    }
+}
+
 const fn rgb(red: u8, green: u8, blue: u8) -> Color {
     Color::Rgb(red, green, blue)
 }
