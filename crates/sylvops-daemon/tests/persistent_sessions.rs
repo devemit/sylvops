@@ -272,6 +272,19 @@ async fn exercise_persistent_session() {
     };
 
     let mut events = first.subscribe();
+    let snapshot = match first.request(&ClientRequest::GetSnapshot).await.unwrap() {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        other => panic!("unexpected snapshot response: {other:?}"),
+    };
+    let running = snapshot
+        .sessions
+        .iter()
+        .find(|value| value.id == session.id)
+        .unwrap();
+    let expanded = serde_json::to_value(running).unwrap();
+    assert_eq!(expanded["status"]["lifecycle"], "running");
+    assert_eq!(expanded["status"]["activity"], "none");
+    assert!(expanded["status"]["attention"].is_null());
     assert!(matches!(
         first
             .request(&ClientRequest::AttachSession {

@@ -1994,6 +1994,7 @@ mod tests {
             provider_kind: ProviderKind::Codex,
             display_name: "Issue #128".into(),
             state: SessionState::Running,
+            status: crate::session_state::SessionStatus::default(),
             process_id: None,
             external_session_id: None,
             command: "codex".into(),

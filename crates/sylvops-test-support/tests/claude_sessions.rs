@@ -7,6 +7,9 @@ use sylvops_core::{
     domain::{ProviderKind, Session, SessionState},
     ids::SessionId,
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+    session_state::{
+        AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
+    },
     status::NormalizedProviderEvent,
     ui_forms::Form,
 };
@@ -407,10 +410,25 @@ async fn managed_claude_session_inner() {
         })
         .await
         .expect("normal Stop input");
-    wait_for_session(&reconnected, session_id, |session| {
+    let completed = wait_for_session(&reconnected, session_id, |session| {
         session.state == SessionState::FinishedUnseen
     })
     .await;
+    assert!(completed.process_id.is_some());
+    assert_eq!(completed.status.lifecycle, SessionLifecycle::Running);
+    assert_eq!(completed.status.activity, ProviderActivity::Completed);
+    let completion_event = completed
+        .status
+        .attention
+        .expect("completed turn attention");
+    assert_eq!(
+        completion_event.reason,
+        AttentionReason::SuccessfulCompletion
+    );
+    assert_eq!(
+        completion_event.acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
     reconnected
         .request(&ClientRequest::SessionInput {
             session_id,
@@ -424,10 +442,21 @@ async fn managed_claude_session_inner() {
     })
     .await;
     attach(&reconnected, session_id, 0).await;
-    wait_for_session(&reconnected, session_id, |session| {
+    let acknowledged = wait_for_session(&reconnected, session_id, |session| {
         session.state == SessionState::FinishedSeen
     })
     .await;
+    assert_eq!(acknowledged.status.lifecycle, SessionLifecycle::Running);
+    assert_eq!(acknowledged.status.activity, ProviderActivity::Completed);
+    let acknowledged_event = acknowledged
+        .status
+        .attention
+        .expect("acknowledged attention");
+    assert_eq!(acknowledged_event.id, completion_event.id);
+    assert_eq!(
+        acknowledged_event.acknowledgement,
+        AttentionAcknowledgement::Acknowledged
+    );
 
     reconnected
         .request(&ClientRequest::SessionInput {
@@ -436,10 +465,16 @@ async fn managed_claude_session_inner() {
         })
         .await
         .expect("prompt after completed turn");
-    wait_for_session(&reconnected, session_id, |session| {
+    let working = wait_for_session(&reconnected, session_id, |session| {
         session.state == SessionState::Running
     })
     .await;
+    assert_eq!(working.status.lifecycle, SessionLifecycle::Running);
+    assert_eq!(working.status.activity, ProviderActivity::Working);
+    assert_eq!(
+        working.status.attention.unwrap().acknowledgement,
+        AttentionAcknowledgement::Resolved
+    );
     reconnected
         .request(&ClientRequest::SessionInput {
             session_id,

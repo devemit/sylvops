@@ -7,6 +7,9 @@ use sylvops_core::{
     domain::{ProviderKind, Session, SessionState},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonResponse},
+    session_state::{
+        AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
+    },
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 
@@ -198,6 +201,14 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     })
     .await;
     let external_id = waiting.external_session_id.expect("external Codex ID");
+    assert_eq!(waiting.status.lifecycle, SessionLifecycle::Running);
+    assert_eq!(waiting.status.activity, ProviderActivity::AwaitingInput);
+    let input_event = waiting.status.attention.expect("input attention");
+    assert_eq!(input_event.reason, AttentionReason::InputRequested);
+    assert_eq!(
+        input_event.acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
 
     client
         .request(&ClientRequest::SessionInput {
@@ -279,6 +290,17 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .iter()
         .find(|session| session.id == source_session_id)
         .expect("historical source session");
+    assert_eq!(source_history.status.lifecycle, SessionLifecycle::Exited);
+    assert_eq!(source_history.status.activity, ProviderActivity::None);
+    let completion_event = source_history
+        .status
+        .attention
+        .expect("completion attention");
+    assert_eq!(
+        completion_event.reason,
+        AttentionReason::SuccessfulCompletion
+    );
+    assert!(u64::from(completion_event.id) > u64::from(input_event.id));
     assert!(matches!(
         source_history.state,
         SessionState::FinishedUnseen | SessionState::FinishedSeen
@@ -339,6 +361,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     assert!(snapshot.sessions.iter().any(|session| {
         session.id == source_session_id
             && session.external_session_id.as_deref() == Some(external_id.as_str())
+            && session.status == source_history.status
     }));
     match restarted
         .request(&ClientRequest::ResumeSession {
