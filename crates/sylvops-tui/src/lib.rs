@@ -7,6 +7,7 @@ mod github_modal;
 mod input;
 mod input_pump;
 mod reducer;
+mod removal_notice;
 mod render;
 mod terminal;
 mod theme;
@@ -327,6 +328,10 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             }
             Mode::Confirmation(_) => {
                 handle_confirmation(&client, &mut app, input).await?;
+                false
+            }
+            Mode::RemovalBlocked(_) => {
+                removal_notice::handle_input(&mut app, &input);
                 false
             }
             Mode::CommandPalette(_) => {
@@ -1902,11 +1907,15 @@ fn apply_removal_inspection(app: &mut App, response: DaemonResponse) {
                 ));
                 return;
             }
-            let Some(token) = status.removal_confirmation_token.filter(|_| status.clean) else {
-                app.flash = Some(Flash::error(bounded_feedback(format!(
-                    "Remove Worktree refused: {} tracked, {} untracked, and {} ignored entries remain. Clean the Worktree and try again.",
-                    status.tracked_changes, status.untracked_files, status.ignored_files
-                ))));
+            if !status.clean {
+                app.flash = None;
+                app.mode = Mode::RemovalBlocked(removal_notice::RemovalNotice::new(&status));
+                return;
+            }
+            let Some(token) = status.removal_confirmation_token else {
+                app.flash = Some(Flash::error(
+                    "The daemon did not authorize removal. Inspect the Worktree again.",
+                ));
                 return;
             };
             app.mode = Mode::Confirmation(Confirmation {
@@ -5355,6 +5364,8 @@ mod tests {
                 tracked_changes: 0,
                 untracked_files: 0,
                 ignored_files: 0,
+                blocking_paths: Vec::new(),
+                blocking_paths_truncated: false,
                 clean: true,
                 removal_confirmation_token: Some("clean-state-token".into()),
             }),
@@ -5462,6 +5473,8 @@ mod tests {
             tracked_changes: 0,
             untracked_files: 0,
             ignored_files: 0,
+            blocking_paths: Vec::new(),
+            blocking_paths_truncated: false,
             clean: true,
             removal_confirmation_token: Some("clean-state-token".into()),
         };
@@ -5486,6 +5499,73 @@ mod tests {
                 .is_some_and(|flash| flash.text.contains("is not active"))
         );
         assert!(matches!(app.mode, Mode::Navigation));
+    }
+
+    #[test]
+    fn blocked_worktree_dialog_names_ignored_content_and_scrolls_on_narrow_terminals() {
+        use sylvops_core::domain::{GitWorktreeState, WorktreeBlockingKind, WorktreeBlockingPath};
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.worktrees[0].is_root_checkout = false;
+        let worktree_id = snapshot.worktrees[0].id;
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.select_node(ExplorerNode::Worktree(worktree_id));
+        apply_removal_inspection(
+            &mut app,
+            DaemonResponse::WorktreeStatus(GitWorktreeState {
+                worktree_id,
+                head_commit: "abc".into(),
+                branch: Some("feature".into()),
+                tracked_changes: 0,
+                untracked_files: 0,
+                ignored_files: 12,
+                blocking_paths: vec![WorktreeBlockingPath {
+                    kind: WorktreeBlockingKind::Ignored,
+                    path: "target/".into(),
+                }],
+                blocking_paths_truncated: true,
+                clean: false,
+                removal_confirmation_token: None,
+            }),
+        );
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Ignored content: target/"));
+        assert!(text.contains("Nothing was deleted."));
+        assert!(text.contains("and more entries"));
+
+        let mut narrow = Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+        narrow.draw(|frame| render::draw(frame, &mut app)).unwrap();
+        assert!(matches!(&app.mode, Mode::RemovalBlocked(notice) if notice.max_scroll > 0));
+        removal_notice::handle_input(
+            &mut app,
+            &Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE,
+            )),
+        );
+        assert!(
+            matches!(&app.mode, Mode::RemovalBlocked(notice) if notice.scroll == notice.max_scroll)
+        );
+        removal_notice::handle_input(
+            &mut app,
+            &Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )),
+        );
+        assert!(matches!(app.mode, Mode::Navigation));
+        assert_eq!(app.selected_worktree_id, Some(worktree_id));
     }
 
     #[test]

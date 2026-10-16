@@ -97,6 +97,10 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Mode::Confirmation(confirm) => {
             draw_confirmation(frame, &confirm, &mut app.hit_map, theme, app.density);
         }
+        Mode::RemovalBlocked(mut notice) => {
+            draw_removal_notice(frame, &mut notice, &mut app.hit_map, theme);
+            app.mode = Mode::RemovalBlocked(notice);
+        }
         Mode::CommandPalette(palette) => draw_palette(frame, app, &palette, theme),
         Mode::Settings(settings) => draw_settings(frame, app, settings, theme),
         Mode::GitHub(modal) => draw_github(frame, &modal, &mut app.hit_map, theme),
@@ -1569,6 +1573,7 @@ fn draw_footer_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: 
                 "Directories · type filter · ↑↓ select · Enter open/select · Esc cancel"
             }
             Mode::Confirmation(_) => "Confirmation · y confirm · Esc cancel",
+            Mode::RemovalBlocked(_) => "Cannot remove Worktree · ↑↓ or wheel scroll · Esc close",
             Mode::CommandPalette(_) => {
                 "Commands · type to filter · ↑↓ select · Enter run · Esc close"
             }
@@ -2997,6 +3002,63 @@ fn directory_browser_filter(browser: &DirectoryBrowser) -> String {
     } else {
         format!("Filter: {} · hidden: {hidden}", browser.filter)
     }
+}
+
+fn draw_removal_notice(
+    frame: &mut Frame<'_>,
+    notice: &mut crate::removal_notice::RemovalNotice,
+    hits: &mut HitMap,
+    theme: Theme,
+) {
+    let area = centered(frame.area(), 92, 85);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Cannot remove this Worktree ")
+        .borders(Borders::ALL)
+        .border_style(theme.attention)
+        .style(theme.text);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let body = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let mut wrapped = Vec::new();
+    for line in &notice.lines {
+        let mut row = String::new();
+        let mut width = 0_u16;
+        for character in line.chars() {
+            let character_width = text_width(&character.to_string());
+            if width.saturating_add(character_width) > body.width && !row.is_empty() {
+                wrapped.push(Line::from(std::mem::take(&mut row)));
+                width = 0;
+            }
+            row.push(character);
+            width = width.saturating_add(character_width);
+        }
+        wrapped.push(Line::from(row));
+    }
+    notice.max_scroll = u16::try_from(wrapped.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(body.height);
+    notice.scroll = notice.scroll.min(notice.max_scroll);
+    frame.render_widget(
+        Paragraph::new(wrapped)
+            .scroll((notice.scroll, 0))
+            .style(theme.text),
+        body,
+    );
+    let close = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+    frame.render_widget(
+        Paragraph::new("[ Close · Esc / Enter ]").style(theme.focus),
+        close,
+    );
+    hits.push(close, HitTarget::DismissNotice);
 }
 
 fn draw_confirmation(

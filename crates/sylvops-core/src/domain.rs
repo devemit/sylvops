@@ -135,6 +135,23 @@ pub struct Worktree {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorktreeBlockingKind {
+    Tracked,
+    Untracked,
+    Ignored,
+}
+
+pub const MAX_WORKTREE_BLOCKING_PATHS: usize = 10;
+pub const MAX_WORKTREE_BLOCKING_PATH_BYTES: usize = 512;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorktreeBlockingPath {
+    pub kind: WorktreeBlockingKind,
+    /// Escaped, bounded display text only; never use this value for filesystem operations.
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitWorktreeState {
     pub worktree_id: WorktreeId,
     pub head_commit: String,
@@ -142,8 +159,31 @@ pub struct GitWorktreeState {
     pub tracked_changes: u32,
     pub untracked_files: u32,
     pub ignored_files: u32,
+    #[serde(deserialize_with = "deserialize_worktree_blocking_paths")]
+    pub blocking_paths: Vec<WorktreeBlockingPath>,
+    pub blocking_paths_truncated: bool,
     pub clean: bool,
     pub removal_confirmation_token: Option<String>,
+}
+
+fn deserialize_worktree_blocking_paths<'de, D>(
+    deserializer: D,
+) -> Result<Vec<WorktreeBlockingPath>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let paths = Vec::<WorktreeBlockingPath>::deserialize(deserializer)?;
+    if paths.len() > MAX_WORKTREE_BLOCKING_PATHS
+        || paths.iter().any(|entry| {
+            entry.path.len() > MAX_WORKTREE_BLOCKING_PATH_BYTES
+                || entry.path.chars().any(char::is_control)
+        })
+    {
+        return Err(serde::de::Error::custom(
+            "invalid Worktree blocking path sample",
+        ));
+    }
+    Ok(paths)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
