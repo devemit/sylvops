@@ -21,13 +21,53 @@ _Avoid_: Checkout when naming the persisted domain type
 A supervised interactive agent or shell process that belongs to a Worktree.
 _Avoid_: Terminal
 
+**Session Lifecycle**:
+The existence and terminal outcome of a Session's process, independent of Provider activity and user attention.
+_Avoid_: Provider activity, Attention Event
+
+**Conversation**:
+The provider-owned interaction history that a resumable Provider may continue across a linear chain of Sessions.
+_Avoid_: Session, terminal history, thread
+
+**Resume Conversation**:
+The explicit action of opening an eligible terminal Session to create and attach to its single successor while continuing the same provider Conversation.
+_Avoid_: Restart Session, reopen process
+
+**Session Lineage**:
+The linear sequence of historical Sessions that continue one Conversation, where each Session has at most one successor.
+_Avoid_: Restarted Session, duplicate Session
+
 **Provider**:
 The selected kind of interactive program that supplies a Session, such as a plain shell, Codex, or Claude Code.
 _Avoid_: Agent when referring to the Session's launch kind
 
+**Provider Activity**:
+The current work posture within a live Provider Session, such as working, awaiting input, or waiting after a completed turn.
+_Avoid_: Session Lifecycle, Attention Event
+
+**Successful Completion**:
+The end of a Provider turn with no known remaining work, or the clean non-requested exit of a plain-shell Session.
+_Avoid_: Process exit, user interruption, Stop Session
+
 **Attachment**:
 A client's live connection to a Session's terminal.
 _Avoid_: Session, process
+
+**Attention Event**:
+A new explicit Provider lifecycle transition that requires user awareness. Each Session has at most one pending Attention Event; a newer effective condition replaces an obsolete one, and the event remains pending until acknowledged or resolved according to its Attention Reason.
+_Avoid_: Session status, notification, inactivity
+
+**Attention Reason**:
+The bounded cause of an Attention Event: input requested, successful completion, recoverable failure, or terminal failure. It is independent of the Session's lifecycle state.
+_Avoid_: Session state, notification channel, raw provider error
+
+**Needs Attention**:
+The set of Sessions with pending Attention Events, including Sessions that are no longer active.
+_Avoid_: Active Sessions, notification queue
+
+**Attention Notification**:
+The live, system-coordinated announcement of an Attention Event through native, sound, or in-client channels. It is presentation rather than durable Session state and is not replayed at client startup.
+_Avoid_: Attention Event, Session status, notification queue
 
 ### GitHub work
 

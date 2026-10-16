@@ -1,0 +1,3 @@
+# Coordinate attention across clients
+
+The daemon owns acknowledgement and grants at most one bounded delivery claim for each live Attention Event, so desktop and TUI present one system notification instead of competing client-local alerts. Pending attention remains durable and visible across clients, while notification delivery is best-effort presentation and is not replayed when clients reconnect. Daemon-backed notification and sound preferences are shared across clients; unsupported or failed presentation never changes Session state. Native notification content is limited to the user-chosen Session name and bounded Attention Reason, and quiet-time behavior is delegated to the operating system.
