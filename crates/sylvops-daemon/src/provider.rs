@@ -1798,6 +1798,10 @@ fn codex_trust_metadata_is_valid(owned: &str, body: &str) -> bool {
 }
 
 fn hook_command(executable: &Path) -> sylvops_core::Result<String> {
+    #[cfg(windows)]
+    let executable = windows_hook_executable(executable)?;
+    #[cfg(windows)]
+    let executable = executable.as_path();
     let text = executable
         .to_str()
         .ok_or_else(|| provider_error("hook relay path is not valid Unicode"))?;
@@ -1805,6 +1809,35 @@ fn hook_command(executable: &Path) -> sylvops_core::Result<String> {
         return Err(provider_error("hook relay path contains unsafe characters"));
     }
     Ok(format!("\"{text}\" hook emit"))
+}
+
+#[cfg(windows)]
+fn windows_hook_executable(executable: &Path) -> sylvops_core::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(executable)
+        .map_err(|_| provider_error("cannot canonicalize hook relay executable"))?;
+    if !canonical.is_file() {
+        return Err(provider_error("hook relay executable is not a file"));
+    }
+    let text = canonical
+        .to_str()
+        .ok_or_else(|| provider_error("hook relay path is not valid Unicode"))?;
+    if text.chars().any(char::is_control) || text.contains(['"', '%', '!']) {
+        return Err(provider_error("hook relay path contains unsafe characters"));
+    }
+    // Canonical Windows paths use the verbatim namespace, which cmd.exe cannot
+    // execute. Convert only at the hook serialization boundary, then verify
+    // that ordinary Win32 path resolution still names the validated executable.
+    let command_path = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else {
+        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))
+    };
+    if !command_path.is_absolute()
+        || std::fs::canonicalize(&command_path).ok().as_ref() != Some(&canonical)
+    {
+        return Err(provider_error("hook relay command path identity changed"));
+    }
+    Ok(command_path)
 }
 
 fn codex_home() -> sylvops_core::Result<PathBuf> {

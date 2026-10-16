@@ -4,7 +4,7 @@ use std::{
     env,
     io::{self, BufRead, Read, Write},
     net::{SocketAddr, TcpStream},
-    process::ExitCode,
+    process::{ExitCode, Stdio},
     time::Duration,
 };
 
@@ -157,6 +157,11 @@ fn emit_hook(event: &str, external_id: &str, extra: Option<Value>) -> io::Result
         target.extend(extra);
     }
     let body = serde_json::to_vec(&payload).map_err(io::Error::other)?;
+    if let Some(home) = env::var_os("CODEX_HOME").map(std::path::PathBuf::from)
+        && home.join(".fake-codex-execute-hooks").is_file()
+    {
+        return execute_hook(&home, event, &body);
+    }
     let (address, path) = parse_endpoint(&endpoint)?;
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -175,6 +180,72 @@ fn emit_hook(event: &str, external_id: &str, extra: Option<Value>) -> io::Result
         return Err(io::Error::other("hook receiver refused fake event"));
     }
     Ok(())
+}
+
+fn execute_hook(home: &std::path::Path, event: &str, body: &[u8]) -> io::Result<()> {
+    let arguments: Vec<_> = env::args().collect();
+    let profile = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--profile")
+        .map(|pair| &pair[1])
+        .ok_or_else(|| io::Error::other("missing managed hook profile"))?;
+    let source = std::fs::read_to_string(home.join(format!("{profile}.config.toml")))?;
+    let config: toml::Value = toml::from_str(&source).map_err(io::Error::other)?;
+    let key = if cfg!(windows) {
+        "command_windows"
+    } else {
+        "command"
+    };
+    let command = config["hooks"][event][0]["hooks"][0][key]
+        .as_str()
+        .ok_or_else(|| io::Error::other("missing generated hook command"))?;
+
+    // Mirror Codex's command processor contract; never parse the executable out
+    // of the generated command, as doing so would hide serialization failures.
+    #[cfg(windows)]
+    let mut child = {
+        let shell = env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+        let mut child = tokio::process::Command::new(shell);
+        child.arg("/C").raw_arg(format!(r#""{command}""#));
+        child.creation_flags(0x0800_0000);
+        child
+    };
+    #[cfg(unix)]
+    let mut child = {
+        let mut child = tokio::process::Command::new("/bin/sh");
+        child.args(["-lc", command]);
+        child
+    };
+    let body = body.to_vec();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut child = child
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| io::Error::other("hook stdin"))?;
+                stdin.write_all(&body).await?;
+                drop(stdin);
+                let status = child.wait().await?;
+                if !status.success() {
+                    return Err(io::Error::other("generated hook command failed"));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "generated hook command timed out")
+            })?
+        })
 }
 
 fn required_environment(name: &str) -> io::Result<String> {
