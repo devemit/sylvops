@@ -133,7 +133,7 @@ pub(crate) mod platform {
                             ..Default::default()
                         };
                         copy_text(&mut data.szTip, "SylvOps session alerts");
-                        if Shell_NotifyIconW(NIM_ADD, &data) == 0 {
+                        if Shell_NotifyIconW(NIM_ADD, &raw const data) == 0 {
                             DestroyWindow(window);
                             return;
                         }
@@ -145,7 +145,7 @@ pub(crate) mod platform {
                                         NIIF_INFO | NIIF_NOSOUND | NIIF_RESPECT_QUIET_TIME;
                                     copy_text(&mut data.szInfoTitle, "SylvOps · Needs your input");
                                     copy_text(&mut data.szInfo, &message);
-                                    if Shell_NotifyIconW(NIM_MODIFY, &data) == 0 {
+                                    if Shell_NotifyIconW(NIM_MODIFY, &raw const data) == 0 {
                                         break;
                                     }
                                 }
@@ -153,12 +153,12 @@ pub(crate) mod platform {
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                             }
                             let mut message = MSG::default();
-                            while PeekMessageW(&mut message, window, 0, 0, PM_REMOVE) != 0 {
-                                TranslateMessage(&message);
-                                DispatchMessageW(&message);
+                            while PeekMessageW(&raw mut message, window, 0, 0, PM_REMOVE) != 0 {
+                                TranslateMessage(&raw const message);
+                                DispatchMessageW(&raw const message);
                             }
                         }
-                        Shell_NotifyIconW(NIM_DELETE, &data);
+                        Shell_NotifyIconW(NIM_DELETE, &raw const data);
                         DestroyWindow(window);
                     }
                 })?;

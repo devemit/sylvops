@@ -238,6 +238,182 @@ pub async fn verify_repository_root(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A validated base pinned to an immutable commit, with its human-readable source.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedWorktreeBase {
+    pub reference: String,
+    pub commit: String,
+    pub selection: sylvops_core::domain::WorktreeBaseSelection,
+}
+
+pub(crate) async fn resolve_worktree_base(
+    project: &Project,
+    managed_root: &Path,
+    selection: &sylvops_core::domain::WorktreeBaseSelection,
+) -> Result<ResolvedWorktreeBase> {
+    use sylvops_core::domain::WorktreeBaseSelection;
+    let repository = canonical_registered_path(&project.canonical_repository_path).await?;
+    verify_repository_root(&repository).await?;
+    match selection {
+        WorktreeBaseSelection::LocalRef { reference } => {
+            validate_base_ref(reference)?;
+            let expression = format!("{reference}^{{commit}}");
+            let commit = required_git(
+                &repository,
+                &["rev-parse", "--verify", "--end-of-options", &expression],
+                "resolve worktree base",
+            )
+            .await?;
+            let display_reference = if reference == "HEAD" {
+                optional_git(&repository, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+                    .await?
+                    .unwrap_or_else(|| "HEAD".into())
+            } else {
+                reference.clone()
+            };
+            Ok(ResolvedWorktreeBase {
+                reference: display_reference,
+                commit,
+                selection: selection.clone(),
+            })
+        }
+        WorktreeBaseSelection::LatestDefaultBranch { remote } => {
+            let remote = select_base_remote(&repository, remote.as_ref()).await?;
+            let hooks = managed_root.join(".disabled-hooks");
+            let output = run_remote_git(
+                &repository,
+                &hooks,
+                &["ls-remote", "--symref", "--", remote.as_str(), "HEAD"],
+            )
+            .await?;
+            let (branch, advertised_commit) = parse_remote_default_head(&output)?;
+            let reference = format!("{}/{}", remote.as_str(), branch);
+            let destination = format!("refs/remotes/{}/{}", remote.as_str(), branch);
+            let refspec = format!("+refs/heads/{branch}:{destination}");
+            run_remote_git(
+                &repository,
+                &hooks,
+                &[
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--no-write-fetch-head",
+                    "--",
+                    remote.as_str(),
+                    &refspec,
+                ],
+            )
+            .await?;
+            let commit = required_git(
+                &repository,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{destination}^{{commit}}"),
+                ],
+                "resolve fetched default branch",
+            )
+            .await?;
+            if commit != advertised_commit {
+                return Err(DaemonError::Git(
+                    "The remote branch moved while fetching. Retry to preview its latest commit."
+                        .into(),
+                ));
+            }
+            Ok(ResolvedWorktreeBase {
+                reference,
+                commit,
+                selection: WorktreeBaseSelection::LatestDefaultBranch {
+                    remote: Some(remote),
+                },
+            })
+        }
+    }
+}
+
+async fn select_base_remote(
+    repository: &Path,
+    requested: Option<&GitRemoteName>,
+) -> Result<GitRemoteName> {
+    let names = required_git(repository, &["remote"], "list Git remotes").await?;
+    let names = names
+        .lines()
+        .map(GitRemoteName::new)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| DaemonError::Git("Repository contains an invalid remote name.".into()))?;
+    if let Some(requested) = requested {
+        // Never allow Git to reinterpret a missing remote name as a URL/path.
+        return if names.contains(requested) {
+            Ok(requested.clone())
+        } else {
+            Err(DaemonError::Git(
+                "The selected remote no longer exists.".into(),
+            ))
+        };
+    }
+    if let Some(origin) = names.iter().find(|name| name.as_str() == "origin") {
+        Ok(origin.clone())
+    } else if names.len() == 1 {
+        Ok(names[0].clone())
+    } else if names.is_empty() {
+        Err(DaemonError::Git(
+            "No remote exists. Choose Current checkout or a custom local ref instead.".into(),
+        ))
+    } else {
+        Err(DaemonError::Git(format!(
+            "Choose a remote for Latest default branch: {}",
+            names
+                .iter()
+                .map(GitRemoteName::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+}
+
+fn parse_remote_default_head(bytes: &[u8]) -> Result<(String, String)> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| DaemonError::Git("Remote default branch response is invalid.".into()))?;
+    let branch = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("ref: refs/heads/")
+                .and_then(|line| line.strip_suffix("\tHEAD"))
+        })
+        .ok_or_else(|| {
+            DaemonError::Git(
+                "Remote has no default branch. Choose a custom local ref instead.".into(),
+            )
+        })?;
+    validate_branch_name(branch)?;
+    let commit = text
+        .lines()
+        .find_map(|line| {
+            line.strip_suffix("\tHEAD").filter(|value| {
+                matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
+        .ok_or_else(|| DaemonError::Git("Remote default branch has no valid commit.".into()))?;
+    Ok((branch.to_owned(), commit.to_ascii_lowercase()))
+}
+
+async fn run_remote_git(repository: &Path, hooks: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
+    let mut configured = vec![OsString::from("-c"), OsString::from("protocol.allow=never")];
+    for protocol in ["https", "http", "ssh", "git", "file"] {
+        configured.extend([
+            OsString::from("-c"),
+            OsString::from(format!("protocol.{protocol}.allow=always")),
+        ]);
+    }
+    configured.extend(arguments.iter().map(OsString::from));
+    let output = run_git_mutation(repository, hooks, &configured).await?;
+    if !output.success {
+        return Err(DaemonError::Git("Could not fetch the latest default branch. Check the remote, network, and Git authentication; retry or explicitly select a local base.".into()));
+    }
+    Ok(output.stdout)
+}
+
 /// Creates a new branch in an opaque, contained managed-worktree directory.
 ///
 /// # Errors
@@ -490,6 +666,8 @@ pub async fn worktree_diff(worktree: &Worktree) -> Result<GitDiff> {
             "--",
         ])
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1060,9 +1238,152 @@ fn reject_link(path: &Path) -> Result<()> {
 mod tests {
     use std::process::Command as ProcessCommand;
 
-    use sylvops_core::ids::ProjectId;
+    use sylvops_core::{domain::WorktreeBaseSelection, ids::ProjectId};
 
     use super::*;
+
+    #[tokio::test]
+    async fn latest_base_fetches_remote_default_without_touching_local_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let seed = directory.path().join("seed");
+        initialize_repository(&seed);
+        run_test_git(&seed, &["branch", "-M", "trunk"]);
+        let remote = directory.path().join("remote.git");
+        run_test_git(
+            directory.path(),
+            &[
+                "clone",
+                "--bare",
+                seed.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        let local = directory.path().join("local");
+        run_test_git(
+            directory.path(),
+            &["clone", remote.to_str().unwrap(), local.to_str().unwrap()],
+        );
+        run_test_git(&local, &["switch", "-c", "local-feature"]);
+        let original = required_git(&local, &["rev-parse", "HEAD"], "read test HEAD")
+            .await
+            .unwrap();
+        std::fs::write(local.join("README.md"), "uncommitted local content").unwrap();
+        std::fs::write(local.join("notes.txt"), "untracked local content").unwrap();
+        std::fs::write(seed.join("new.txt"), "latest remote content").unwrap();
+        run_test_git(&seed, &["add", "new.txt"]);
+        commit(&seed, "advance trunk");
+        run_test_git(&seed, &["push", remote.to_str().unwrap(), "trunk"]);
+        let latest = required_git(&seed, &["rev-parse", "HEAD"], "read latest HEAD")
+            .await
+            .unwrap();
+        let project = test_project(&std::fs::canonicalize(&local).unwrap());
+        let managed = prepare_managed_root(&directory.path().join("managed"))
+            .await
+            .unwrap();
+        let base = resolve_worktree_base(&project, &managed, &WorktreeBaseSelection::default())
+            .await
+            .unwrap();
+        assert_eq!(base.reference, "origin/trunk");
+        assert_eq!(base.commit, latest);
+        assert_ne!(base.commit, original);
+        let created = create_managed_worktree(
+            &project,
+            &managed,
+            WorktreeId::new(),
+            None,
+            "fresh-work",
+            Some(&base.commit),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&created.canonical_path).join("new.txt")).unwrap(),
+            "latest remote content"
+        );
+        assert_eq!(
+            required_git(&local, &["rev-parse", "HEAD"], "read unchanged HEAD")
+                .await
+                .unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("README.md")).unwrap(),
+            "uncommitted local content"
+        );
+        assert!(local.join("notes.txt").exists());
+
+        // Discover a changed remote default, rather than trusting origin/HEAD or a cached name.
+        run_test_git(&seed, &["branch", "next-default"]);
+        run_test_git(&seed, &["push", remote.to_str().unwrap(), "next-default"]);
+        run_test_git(
+            &remote,
+            &["symbolic-ref", "HEAD", "refs/heads/next-default"],
+        );
+        let changed = resolve_worktree_base(&project, &managed, &WorktreeBaseSelection::default())
+            .await
+            .unwrap();
+        assert_eq!(changed.reference, "origin/next-default");
+    }
+
+    #[tokio::test]
+    async fn latest_base_requires_unambiguous_remote_and_never_falls_back_offline() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        initialize_repository(&repository);
+        let project = test_project(&std::fs::canonicalize(&repository).unwrap());
+        let managed = prepare_managed_root(&directory.path().join("managed"))
+            .await
+            .unwrap();
+        assert!(
+            resolve_worktree_base(&project, &managed, &WorktreeBaseSelection::default())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("No remote")
+        );
+        for name in ["first", "second"] {
+            run_test_git(&repository, &["remote", "add", name, "../missing.git"]);
+        }
+        assert!(
+            resolve_worktree_base(&project, &managed, &WorktreeBaseSelection::default())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Choose a remote")
+        );
+        let selected = WorktreeBaseSelection::LatestDefaultBranch {
+            remote: Some(GitRemoteName::new("first").unwrap()),
+        };
+        assert!(
+            resolve_worktree_base(&project, &managed, &selected)
+                .await
+                .is_err()
+        );
+        let local = resolve_worktree_base(&project, &managed, &"HEAD".into())
+            .await
+            .unwrap();
+        assert_eq!(local.commit.len(), 40);
+    }
+
+    #[test]
+    fn remote_default_head_requires_symbolic_branch_and_commit() {
+        let sha = "a".repeat(40);
+        assert_eq!(
+            parse_remote_default_head(
+                format!("ref: refs/heads/trunk\tHEAD\n{sha}\tHEAD\n").as_bytes()
+            )
+            .unwrap(),
+            ("trunk".into(), sha)
+        );
+        for invalid in [
+            "",
+            "ref: refs/heads/trunk\tHEAD\n",
+            "ref: refs/heads/../bad\tHEAD\n",
+            "invalid\tHEAD\n",
+        ] {
+            assert!(parse_remote_default_head(invalid.as_bytes()).is_err());
+        }
+    }
 
     #[test]
     fn blocking_paths_label_ignored_directories_and_skip_rename_sources() {

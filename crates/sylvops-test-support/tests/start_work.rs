@@ -718,6 +718,7 @@ async fn prepare(
         .request(&ClientRequest::PrepareStartWork {
             project_id,
             issue_number: GitHubItemNumber::new(42).unwrap(),
+            base: Some("HEAD".into()),
         })
         .await
         .unwrap()

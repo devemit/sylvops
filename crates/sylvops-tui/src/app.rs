@@ -219,6 +219,7 @@ pub(crate) enum HitTarget {
     ModalField(usize),
     ModalProvider(usize),
     ModalProviderProbe,
+    ModalWorktreeBase(sylvops_core::ui_forms::WorktreeBaseMode),
     ModalSubmit,
     ModalCancel,
     ModalBrowse,
@@ -241,6 +242,8 @@ pub(crate) enum HitTarget {
     GitHubStartWork,
     GitHubStartAnother,
     GitHubStartSubmit,
+    GitHubRefreshBase,
+    GitHubCycleBase,
     GitHubRetrySession,
     GitHubOpenWorktree,
     GitHubRemoveWorktree,
@@ -307,6 +310,9 @@ pub(crate) struct App {
     pub hit_map: HitMap,
     pub navigation_dirty_at: Option<Instant>,
     pub invocation_directory: PathBuf,
+    pub pending_form: Option<
+        tokio::sync::oneshot::Receiver<Result<super::FormOutcome, sylvops_daemon::DaemonError>>,
+    >,
     status_animation_started_at: Instant,
 }
 
@@ -367,6 +373,7 @@ impl App {
             hit_map: HitMap::default(),
             navigation_dirty_at: None,
             invocation_directory,
+            pending_form: None,
             status_animation_started_at: Instant::now(),
         };
         app.restore_selection();

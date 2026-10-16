@@ -71,7 +71,7 @@ const TICK: Duration = Duration::from_millis(60);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 pub(crate) const MAX_FORM_VALUE_BYTES: usize = 8 * 1024;
 
-struct FormOutcome {
+pub(crate) struct FormOutcome {
     message: String,
     selection: Option<ExplorerNode>,
 }
@@ -303,6 +303,18 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             },
             Some(result) = github_results.recv() => {
                 apply_github_result_async(&client, &mut app, result).await?;
+                dirty = true;
+                continue;
+            },
+            result = async {
+                match app.pending_form.as_mut() {
+                    Some(result) => result.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                app.pending_form = None;
+                let result = result.unwrap_or_else(|_| Err(DaemonError::Lifecycle("Worktree creation request stopped.".into())));
+                finish_form_submission(&client, &mut app, result).await?;
                 dirty = true;
                 continue;
             },
@@ -556,9 +568,43 @@ fn start_work_input_decision(
         _ => None,
     };
     let project_id = modal.project_id;
+    if modal.start_work_error.is_some()
+        && modal.start_work.is_none()
+        && key.is_some_and(|key| matches!(key.code, KeyCode::Char('l' | 'r')))
+        && let Some(identity) = modal.selected_identity()
+    {
+        modal.start_work_initial_base = key
+            .is_some_and(|key| key.code == KeyCode::Char('l'))
+            .then(|| "HEAD".into());
+        return GitHubDecision::PrepareStartWork {
+            issue_number: identity.number,
+            start_another_worktree: true,
+        };
+    }
     let Some(form) = &mut modal.start_work else {
         return GitHubDecision::None;
     };
+    if form.pending {
+        return GitHubDecision::None;
+    }
+    if clicked == Some(HitTarget::GitHubRefreshBase)
+        || key.is_some_and(|key| {
+            key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL)
+        })
+    {
+        return GitHubDecision::PrepareStartWork {
+            issue_number: form.preparation.issue.identity.number,
+            start_another_worktree: form.start_another_worktree,
+        };
+    }
+    if clicked == Some(HitTarget::GitHubCycleBase)
+        || key.is_some_and(|key| {
+            key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL)
+        })
+    {
+        form.cycle_base();
+        return GitHubDecision::None;
+    }
     if let Some(HitTarget::GitHubScroll(delta)) = clicked {
         form.scroll_context(delta);
         return GitHubDecision::None;
@@ -1147,12 +1193,34 @@ fn queue_prepare_start_work(
     start_another_worktree: bool,
 ) {
     let request_id = tasks.next_request_id();
+    let mut base = None;
     if let Mode::GitHub(modal) = &mut app.mode {
+        base.clone_from(&modal.start_work_initial_base);
+        if let Some(form) = &mut modal.start_work {
+            match form.base_mode.selection(&form.base_ref) {
+                Ok(selection) => {
+                    base = Some(selection);
+                    form.pending = true;
+                }
+                Err(error) => {
+                    form.error = Some(StartWorkFailure::new(
+                        StartWorkFailureKind::InvalidRequest,
+                        error,
+                    ));
+                    return;
+                }
+            }
+        }
         modal.register_start_work_request(request_id);
+        modal.start_work_error = None;
+        if modal.start_work.is_none() {
+            modal.start_work_preparing = true;
+        }
     }
     let request = ClientRequest::PrepareStartWork {
         project_id,
         issue_number,
+        base,
     };
     let handle = dispatch_github_request(client, results, request, move |response| {
         GitHubAsyncResult::PrepareStartWork {
@@ -2069,6 +2137,9 @@ async fn handle_form(
     app: &mut App,
     input: Event,
 ) -> Result<(), DaemonError> {
+    if matches!(&app.mode, Mode::Modal(form) if form.pending) {
+        return Ok(());
+    }
     let mouse_target = if let Event::Mouse(mouse) = &input
         && mouse.kind == MouseEventKind::Down(MouseButton::Left)
     {
@@ -2105,6 +2176,12 @@ async fn handle_form(
         return Ok(());
     }
     let mut submit = matches!(mouse_target, Some(HitTarget::ModalSubmit));
+    if let Some(HitTarget::ModalWorktreeBase(mode)) = mouse_target {
+        if let Mode::Modal(form) = &mut app.mode {
+            form.select_worktree_base(mode);
+        }
+        return Ok(());
+    }
     let mut probe_provider = false;
     let mut browse = false;
     match input {
@@ -2126,6 +2203,8 @@ async fn handle_form(
                 KeyCode::BackTab | KeyCode::Up => form.next_field(-1),
                 KeyCode::Left if form.is_session() => form.select_next_provider(-1),
                 KeyCode::Right if form.is_session() => form.select_next_provider(1),
+                KeyCode::Left if form.is_worktree() => form.next_worktree_base(-1),
+                KeyCode::Right if form.is_worktree() => form.next_worktree_base(1),
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     probe_provider = form.is_session();
                 }
@@ -2185,7 +2264,27 @@ async fn handle_form(
         }
         return Ok(());
     }
-    match perform_form(client, &form).await {
+    if form.is_worktree() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        app.pending_form = Some(receive);
+        if let Mode::Modal(current) = &mut app.mode {
+            current.pending = true;
+        }
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = send.send(perform_form(&client, &form).await);
+        });
+        return Ok(());
+    }
+    finish_form_submission(client, app, perform_form(client, &form).await).await
+}
+
+async fn finish_form_submission(
+    client: &DaemonClient,
+    app: &mut App,
+    result: Result<FormOutcome, DaemonError>,
+) -> Result<(), DaemonError> {
+    match result {
         Ok(outcome) => {
             app.mode = Mode::Navigation;
             app.flash = Some(Flash::transient(FlashKind::Success, outcome.message));
@@ -2230,6 +2329,7 @@ async fn handle_form(
         }
         Err(error) => {
             if let Mode::Modal(current) = &mut app.mode {
+                current.pending = false;
                 current.submission_error = Some(bounded_feedback(error.to_string()));
             }
         }
@@ -2409,13 +2509,6 @@ async fn probe_form_provider(client: &DaemonClient, app: &mut App) -> Result<(),
 
 #[allow(clippy::too_many_lines)]
 async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome, DaemonError> {
-    let optional = |index: usize| {
-        form.fields
-            .get(index)
-            .map(|field| field.value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    };
     let (message, response) = match form.kind {
         FormKind::CreateWorkspace => (
             "Workspace created",
@@ -2434,15 +2527,14 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
                 })
                 .await?,
         ),
-        FormKind::CreateWorktree(project_id) => (
+        FormKind::CreateWorktree(_) => (
             "Worktree created",
             client
-                .request(&ClientRequest::CreateWorktree {
-                    project_id,
-                    branch: form.fields[0].value.trim().into(),
-                    name: optional(1),
-                    base_ref: optional(2),
-                })
+                .request(
+                    &form
+                        .worktree_request()
+                        .map_err(DaemonError::InvalidSession)?,
+                )
                 .await?,
         ),
         FormKind::CreateSession(_) => {
@@ -2497,6 +2589,14 @@ async fn perform_form(client: &DaemonClient, form: &Form) -> Result<FormOutcome,
     };
     match response {
         DaemonResponse::Error(error) => Err(DaemonError::Lifecycle(error.message)),
+        DaemonResponse::WorktreeCreated { worktree, .. } => Ok(FormOutcome {
+            message: format!(
+                "Worktree created from {} @ {}",
+                worktree.base_ref,
+                worktree.base_commit.chars().take(8).collect::<String>()
+            ),
+            selection,
+        }),
         _ => Ok(FormOutcome {
             message: message.into(),
             selection,

@@ -200,8 +200,12 @@ enum WorktreeCommand {
         project: ProjectId,
         #[arg(long)]
         branch: String,
+        /// Explicit local ref, such as HEAD or main; omit to fetch the latest remote default branch.
         #[arg(long)]
         base: Option<String>,
+        /// Remote to fetch for the latest default branch (defaults to origin or the only remote).
+        #[arg(long, conflicts_with = "base")]
+        remote: Option<String>,
         #[arg(long)]
         name: Option<String>,
     },
@@ -431,8 +435,9 @@ async fn run_command(
                 project,
                 branch,
                 base,
+                remote,
                 name,
-            } => create_worktree(&paths, project, branch, base, name).await?,
+            } => create_worktree(&paths, project, branch, base, remote, name).await?,
             WorktreeCommand::Status { worktree_id } => {
                 show_worktree_status(&paths, worktree_id).await?;
             }
@@ -929,6 +934,7 @@ async fn create_worktree(
     project_id: ProjectId,
     branch: String,
     base_ref: Option<String>,
+    remote: Option<String>,
     name: Option<String>,
 ) -> sylvops_daemon::Result<()> {
     let client = DaemonClient::connect(paths, "sylvops-cli").await?;
@@ -937,7 +943,16 @@ async fn create_worktree(
             project_id,
             name,
             branch,
-            base_ref,
+            base_ref: Some(if let Some(reference) = base_ref {
+                sylvops_core::domain::WorktreeBaseSelection::LocalRef { reference }
+            } else {
+                sylvops_core::domain::WorktreeBaseSelection::LatestDefaultBranch {
+                    remote: remote
+                        .map(sylvops_core::github::GitRemoteName::new)
+                        .transpose()
+                        .map_err(DaemonError::Git)?,
+                }
+            }),
         })
         .await?
     {
@@ -948,6 +963,7 @@ async fn create_worktree(
                 "Branch: {}",
                 worktree.branch.as_deref().unwrap_or("detached")
             );
+            println!("Base: {} @ {}", worktree.base_ref, worktree.base_commit);
             Ok(())
         }
         response => unexpected("worktree creation", response),

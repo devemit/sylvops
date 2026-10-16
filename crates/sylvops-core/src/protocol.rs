@@ -23,7 +23,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 22;
+pub const PROTOCOL_MINOR: u16 = 23;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -533,6 +533,7 @@ pub enum ClientRequest {
     PrepareStartWork {
         project_id: ProjectId,
         issue_number: GitHubItemNumber,
+        base: Option<crate::domain::WorktreeBaseSelection>,
     },
     StartWork {
         confirmation: StartWorkConfirmation,
@@ -590,7 +591,7 @@ pub enum ClientRequest {
         project_id: ProjectId,
         name: Option<String>,
         branch: String,
-        base_ref: Option<String>,
+        base_ref: Option<crate::domain::WorktreeBaseSelection>,
     },
     GetWorktreeStatus {
         worktree_id: WorktreeId,
@@ -1026,7 +1027,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 22);
+        assert_eq!(PROTOCOL_MINOR, 23);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1144,7 +1145,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 22);
+        assert_eq!(PROTOCOL_MINOR, 23);
     }
 
     #[test]
@@ -1184,7 +1185,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 22);
+        assert_eq!(PROTOCOL_MINOR, 23);
     }
 
     #[test]
@@ -1222,6 +1223,7 @@ mod tests {
             ClientRequest::PrepareStartWork {
                 project_id,
                 issue_number: GitHubItemNumber::new(127).unwrap(),
+                base: None,
             },
             ClientRequest::StartWork {
                 confirmation,
@@ -1255,7 +1257,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 22);
+        assert_eq!(PROTOCOL_MINOR, 23);
     }
 
     #[test]

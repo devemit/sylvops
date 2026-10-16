@@ -166,6 +166,34 @@ pub struct GitWorktreeState {
     pub removal_confirmation_token: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorktreeBaseSelection {
+    LatestDefaultBranch {
+        remote: Option<crate::github::GitRemoteName>,
+    },
+    LocalRef {
+        reference: String,
+    },
+}
+
+impl Default for WorktreeBaseSelection {
+    fn default() -> Self {
+        Self::LatestDefaultBranch { remote: None }
+    }
+}
+
+impl From<String> for WorktreeBaseSelection {
+    fn from(reference: String) -> Self {
+        Self::LocalRef { reference }
+    }
+}
+
+impl From<&str> for WorktreeBaseSelection {
+    fn from(reference: &str) -> Self {
+        reference.to_owned().into()
+    }
+}
+
 fn deserialize_worktree_blocking_paths<'de, D>(
     deserializer: D,
 ) -> Result<Vec<WorktreeBlockingPath>, D::Error>

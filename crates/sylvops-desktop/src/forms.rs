@@ -141,11 +141,26 @@ pub(crate) struct StartWorkModal {
     pub start_another_worktree: bool,
     pub pending: bool,
     pub error: Option<String>,
+    pub base_mode: sylvops_core::ui_forms::WorktreeBaseMode,
+    pub base_ref: String,
+    pub base_ready: bool,
 }
 
 impl StartWorkModal {
     pub(crate) fn new(project_id: ProjectId, preparation: StartWorkPreparation) -> Self {
         Self {
+            base_mode: sylvops_core::ui_forms::WorktreeBaseMode::from_selection(
+                &preparation.base.selection,
+            ),
+            base_ref: match &preparation.base.selection {
+                sylvops_core::domain::WorktreeBaseSelection::LocalRef { reference } => {
+                    reference.clone()
+                }
+                sylvops_core::domain::WorktreeBaseSelection::LatestDefaultBranch { .. } => {
+                    "HEAD".into()
+                }
+            },
+            base_ready: true,
             branch: preparation.suggested_branch.as_str().to_owned(),
             provider: preparation.eligible_providers.first().copied(),
             start_another_worktree: false,
@@ -179,6 +194,9 @@ impl StartWorkModal {
     }
 
     pub(crate) fn request(&self) -> Result<ClientRequest, String> {
+        if !self.base_ready {
+            return Err("Refresh the base preview before confirming.".into());
+        }
         if self.pending {
             return Err("Start Work is already in progress.".into());
         }

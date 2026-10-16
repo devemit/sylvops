@@ -588,6 +588,10 @@ enum Message {
     CancelNavigatorRename,
     FormInput(usize, String),
     SelectProvider(ProviderKind),
+    SelectWorktreeBase(sylvops_core::ui_forms::WorktreeBaseMode),
+    SelectStartWorkBase(sylvops_core::ui_forms::WorktreeBaseMode),
+    StartWorkBaseRefInput(String),
+    RefreshStartWorkBase,
     ProbeProvider,
     SubmitForm,
     CancelModal,
@@ -634,6 +638,7 @@ enum Message {
     LoadMoreGitHubComments,
     OpenGitHubItemInBrowser,
     PrepareStartWork,
+    PrepareStartWorkLocal,
     PrepareAnotherWorktree,
     StartWorkBranchInput(String),
     StartWorkInstructionsInput(String),
@@ -908,6 +913,37 @@ impl DesktopApp {
             }
             Message::FormInput(index, value) => self.update_form_field(index, value),
             Message::SelectProvider(kind) => self.select_provider(kind),
+            Message::SelectWorktreeBase(mode) => {
+                if let Some(Modal::Form(modal)) = &mut self.modal
+                    && !modal.pending
+                {
+                    modal.form.select_worktree_base(mode);
+                }
+            }
+            Message::SelectStartWorkBase(mode) => {
+                if let Some(Modal::StartWork(modal)) = &mut self.modal
+                    && !modal.pending
+                {
+                    modal.base_mode = mode;
+                    modal.base_ready = false;
+                }
+            }
+            Message::StartWorkBaseRefInput(value) => {
+                if value.len() <= 1024
+                    && let Some(Modal::StartWork(modal)) = &mut self.modal
+                    && !modal.pending
+                {
+                    modal.base_ref = value;
+                    modal.base_ready = false;
+                }
+            }
+            Message::RefreshStartWorkBase => {
+                let start_another = match &self.modal {
+                    Some(Modal::StartWork(modal)) => modal.start_another_worktree,
+                    _ => false,
+                };
+                self.prepare_start_work(start_another);
+            }
             Message::ProbeProvider => self.probe_selected_provider(),
             Message::SubmitForm => self.submit_form(),
             Message::CancelModal => self.modal = None,
@@ -985,6 +1021,9 @@ impl DesktopApp {
             Message::LoadMoreGitHubComments => self.load_more_github_comments(),
             Message::OpenGitHubItemInBrowser => self.open_github_item_in_browser(),
             Message::PrepareStartWork => self.prepare_start_work(false),
+            Message::PrepareStartWorkLocal => {
+                self.prepare_start_work_with_base(false, Some("HEAD".into()));
+            }
             Message::PrepareAnotherWorktree => self.prepare_start_work(true),
             Message::StartWorkBranchInput(value) => {
                 if let Some(Modal::StartWork(modal)) = &mut self.modal {
@@ -2671,6 +2710,13 @@ impl DesktopApp {
         ]
         .spacing(6)
         .align_y(Center);
+        if !has_local_work {
+            actions = actions.push(
+                button("Use current checkout")
+                    .on_press_maybe((!pending).then_some(Message::PrepareStartWorkLocal))
+                    .style(chrome_action_style),
+            );
+        }
         if has_local_work {
             actions = actions.push(
                 button("Start another Worktree")
@@ -3459,6 +3505,24 @@ impl DesktopApp {
                 modal.pending,
             ));
         }
+        if form.is_worktree() {
+            let mut choices = column![text("Start from")].spacing(6);
+            for mode in sylvops_core::ui_forms::WorktreeBaseMode::ALL {
+                choices = choices.push(
+                    button(text(format!(
+                        "{} {}",
+                        if mode == form.worktree_base_mode {
+                            "●"
+                        } else {
+                            "○"
+                        },
+                        mode.label()
+                    )))
+                    .on_press_maybe((!modal.pending).then_some(Message::SelectWorktreeBase(mode))),
+                );
+            }
+            fields = fields.push(choices);
+        }
         for (index, field) in form
             .fields
             .iter()
@@ -3783,7 +3847,34 @@ impl DesktopApp {
             .width(Fill)
             .style(workspace_surface),
             rule::horizontal(1),
-            text("Confirmed local base").font(UI_SEMIBOLD),
+            text("Confirmed base").font(UI_SEMIBOLD),
+            column(
+                sylvops_core::ui_forms::WorktreeBaseMode::ALL
+                    .into_iter()
+                    .map(|mode| button(text(format!(
+                        "{} {}",
+                        if mode == modal.base_mode {
+                            "●"
+                        } else {
+                            "○"
+                        },
+                        mode.label()
+                    )))
+                    .on_press_maybe((!modal.pending).then_some(Message::SelectStartWorkBase(mode)))
+                    .into())
+            )
+            .spacing(4),
+            text_input("Custom local ref", &modal.base_ref).on_input_maybe(
+                (!modal.pending
+                    && modal.base_mode == sylvops_core::ui_forms::WorktreeBaseMode::CustomRef)
+                    .then_some(Message::StartWorkBaseRefInput)
+            ),
+            button(if modal.pending {
+                "Fetching base…"
+            } else {
+                "Refresh base preview"
+            })
+            .on_press_maybe((!modal.pending).then_some(Message::RefreshStartWorkBase)),
             text(format!(
                 "{} @ {}",
                 modal.preparation.base.head_ref, modal.preparation.base.head_commit
@@ -4047,7 +4138,10 @@ impl DesktopApp {
                     self.error = Some(contextual_error(operation, &message));
                     return;
                 }
-                if matches!(operation, Some(Operation::StartWork(..))) {
+                if matches!(
+                    operation,
+                    Some(Operation::StartWork(..) | Operation::PrepareStartWork(..))
+                ) {
                     if let Some(Modal::StartWork(modal)) = &mut self.modal {
                         modal.pending = false;
                         modal.error = Some(message);
@@ -4316,6 +4410,13 @@ impl DesktopApp {
                     std::mem::take(&mut self.start_work_preparation_intent),
                     StartWorkPreparationIntent::StartAnotherWorktree
                 );
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.preparation = preparation;
+                    modal.pending = false;
+                    modal.base_ready = true;
+                    modal.error = None;
+                    return;
+                }
                 if !start_another_worktree && let Some(existing) = preparation.existing_work.first()
                 {
                     self.open_issue_work(existing.worktree_id);
@@ -4401,12 +4502,21 @@ impl DesktopApp {
             (Operation::PrepareStartWork(_, _), DaemonResponse::StartWorkFailure(failure)) => {
                 self.finish_github_request();
                 self.start_work_preparation_intent = StartWorkPreparationIntent::default();
-                self.error = Some(failure.diagnostic);
+                if let Some(Modal::StartWork(modal)) = &mut self.modal {
+                    modal.pending = false;
+                    modal.base_ready = false;
+                    modal.error = Some(failure.diagnostic);
+                } else {
+                    self.error = Some(failure.diagnostic);
+                }
             }
             (Operation::StartWork(_, _), DaemonResponse::StartWorkFailure(failure)) => {
                 if let Some(Modal::StartWork(modal)) = &mut self.modal {
                     modal.pending = false;
                     modal.error = Some(failure.diagnostic);
+                    if failure.kind == StartWorkFailureKind::BaseMoved {
+                        modal.base_ready = false;
+                    }
                     if failure.kind == StartWorkFailureKind::BranchConflict {
                         modal.preparation.suggested_branch_conflict = true;
                     }
@@ -4605,7 +4715,11 @@ impl DesktopApp {
                 self.selected_worktree_id = Some(worktree.id);
                 self.selected_session_id = None;
                 self.modal = None;
-                self.show_success("Checkout created.");
+                self.show_success(format!(
+                    "Checkout created from {} @ {}",
+                    worktree.base_ref,
+                    worktree.base_commit.chars().take(8).collect::<String>()
+                ));
                 self.mark_state_dirty();
                 self.request_snapshot();
             }
@@ -4920,7 +5034,10 @@ impl DesktopApp {
                     self.error = Some(contextual_error(Some(operation), &message));
                     return;
                 }
-                if matches!(operation, Operation::StartWork(..)) {
+                if matches!(
+                    operation,
+                    Operation::StartWork(..) | Operation::PrepareStartWork(..)
+                ) {
                     if let Some(Modal::StartWork(modal)) = &mut self.modal {
                         modal.pending = false;
                         modal.error = Some(message);
@@ -5552,6 +5669,14 @@ impl DesktopApp {
     }
 
     fn prepare_start_work(&mut self, start_another_worktree: bool) {
+        self.prepare_start_work_with_base(start_another_worktree, None);
+    }
+
+    fn prepare_start_work_with_base(
+        &mut self,
+        start_another_worktree: bool,
+        initial_base: Option<sylvops_core::domain::WorktreeBaseSelection>,
+    ) {
         if self.github_request == RequestState::Pending {
             return;
         }
@@ -5566,7 +5691,27 @@ impl DesktopApp {
         {
             return;
         }
-        if !start_another_worktree && let Some(worktree_id) = self.existing_issue_work(&identity) {
+        let base = if let Some(Modal::StartWork(modal)) = &mut self.modal {
+            if modal.pending {
+                return;
+            }
+            match modal.base_mode.selection(&modal.base_ref) {
+                Ok(base) => {
+                    modal.pending = true;
+                    Some(base)
+                }
+                Err(error) => {
+                    modal.error = Some(error);
+                    return;
+                }
+            }
+        } else {
+            initial_base
+        };
+        if base.is_none()
+            && !start_another_worktree
+            && let Some(worktree_id) = self.existing_issue_work(&identity)
+        {
             self.open_issue_work(worktree_id);
             return;
         }
@@ -5580,6 +5725,7 @@ impl DesktopApp {
             ClientRequest::PrepareStartWork {
                 project_id,
                 issue_number: identity.number,
+                base,
             },
         );
     }
@@ -6420,15 +6566,11 @@ impl DesktopApp {
                     repository_path: form.fields[0].value.trim().to_owned(),
                 },
             ),
-            FormKind::CreateWorktree(project_id) => self.send_request(
-                Operation::CreateWorktree,
-                ClientRequest::CreateWorktree {
-                    project_id,
-                    branch: form.fields[0].value.trim().to_owned(),
-                    name: trimmed_option(&form.fields[1].value),
-                    base_ref: trimmed_option(&form.fields[2].value),
-                },
-            ),
+            FormKind::CreateWorktree(_) => {
+                if let Ok(request) = form.worktree_request() {
+                    self.send_request(Operation::CreateWorktree, request);
+                }
+            }
             FormKind::CreateSession(worktree_id) => {
                 let (columns, rows) = self.terminal_dimensions();
                 let Some(request) = form.session_request(columns, rows) else {
@@ -8102,14 +8244,13 @@ fn github_join_logins(logins: &[sylvops_core::github::GitHubLogin]) -> String {
     }
 }
 
-fn trimmed_option(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
-}
-
 fn form_submit_label(form: &Form, pending: bool, selected_provider_checking: bool) -> &'static str {
     if pending {
-        return "Working…";
+        return if form.is_worktree() {
+            "Preparing base / creating checkout…"
+        } else {
+            "Working…"
+        };
     }
     if selected_provider_checking {
         return "Checking provider…";
@@ -12376,6 +12517,7 @@ mod tests {
                 ClientRequest::PrepareStartWork {
                     project_id,
                     issue_number: identity.number,
+                    base: None,
                 },
             )
         );
@@ -12394,7 +12536,7 @@ mod tests {
             for expected in [
                 "Start Work from Issue",
                 "untrusted reference material",
-                "Confirmed local base",
+                "Confirmed base",
                 "Additional instructions",
             ] {
                 assert!(rendered.iter().any(|line| line.contains(expected)));
@@ -12422,6 +12564,17 @@ mod tests {
         assert_eq!(modal.error.as_deref(), Some("The base moved."));
         assert!(!modal.pending);
 
+        assert!(!modal.base_ready);
+        let _ = app.update(Message::RefreshStartWorkBase);
+        let (refresh_operation, refresh_request) = harness.take_request();
+        assert!(matches!(
+            refresh_request,
+            ClientRequest::PrepareStartWork { .. }
+        ));
+        app.handle_response(
+            refresh_operation,
+            DaemonResponse::StartWorkPrepared(preparation.clone()),
+        );
         let _ = app.update(Message::SubmitStartWork);
         let (operation, _) = harness.take_request();
         let worktree = Worktree {
@@ -12576,6 +12729,7 @@ mod tests {
                 ClientRequest::PrepareStartWork {
                     project_id,
                     issue_number: identity.number,
+                    base: None,
                 },
             )
         );

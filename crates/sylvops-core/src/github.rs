@@ -989,10 +989,11 @@ pub struct StartWorkBase {
     pub head_ref: StartWorkBranch,
     #[serde(deserialize_with = "deserialize_start_work_commit")]
     pub head_commit: String,
+    pub selection: crate::domain::WorktreeBaseSelection,
 }
 
 impl StartWorkBase {
-    /// Creates the exact local HEAD identity shown during Start Work confirmation.
+    /// Creates the pinned base identity shown during Start Work confirmation.
     ///
     /// # Errors
     ///
@@ -1008,8 +1009,12 @@ impl StartWorkBase {
         {
             return Err("Start Work base commit is invalid".into());
         }
+        let head_ref = head_ref.into();
         Ok(Self {
             worktree_id,
+            selection: crate::domain::WorktreeBaseSelection::LocalRef {
+                reference: head_ref.clone(),
+            },
             head_ref: StartWorkBranch::new(head_ref)?,
             head_commit: head_commit.to_ascii_lowercase(),
         })
