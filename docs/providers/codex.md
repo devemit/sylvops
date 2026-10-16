@@ -8,6 +8,8 @@ For each daemon lifetime, SylvOps writes a uniquely named `$CODEX_HOME/<name>.co
 
 The receiver captures documented session IDs for guarded `codex resume <id> --cd <verified-worktree>`. Unknown, duplicate, stale, identity-mismatched, or malformed events cannot silently change state; relevant refusals are audited without persisting raw payloads.
 
+On Windows, the hook command serializes the validated relay executable as an ordinary drive or UNC path rather than a verbatim (`\\?\`) path. The daemon revalidates that this spelling resolves to the same canonical executable and refuses control characters, quotes, and environment-expansion characters (`%` and `!`). The relay arguments are always `hook emit`; model, prompt, repository, and Provider data cannot extend them. The default generated-command integration test runs fake Codex through the Windows `cmd.exe /C` contract (or the Unix shell contract), including an installation path with spaces and non-ASCII characters, then verifies Conversation identity through daemon IPC and after restart.
+
 Real-account tests are opt-in. Default tests use the fake agent.
 
 Interface assumptions are limited to the documented [Codex CLI commands](https://developers.openai.com/codex/cli/reference), [authentication behavior](https://developers.openai.com/codex/auth), and [hook contract](https://learn.chatgpt.com/docs/hooks).

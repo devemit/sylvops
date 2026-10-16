@@ -15,6 +15,10 @@ name = "fake-codex"
 path = "src/bin/fake-codex.rs"
 
 [[bin]]
+name = "hook-daemon"
+path = "src/bin/hook-daemon.rs"
+
+[[bin]]
 name = "fake-claude"
 path = "src/bin/fake-claude.rs"
 
@@ -33,8 +37,10 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sylvops-core = { path = "../sylvops-core" }
+sylvops-daemon = { path = "../sylvops-daemon" }
 tempfile = "3"
 tokio.workspace = true
+toml.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
@@ -45,7 +51,6 @@ nix = { version = "0.30", features = ["signal"] }
 [dev-dependencies]
 async-trait.workspace = true
 rusqlite.workspace = true
-sylvops-daemon = { path = "../sylvops-daemon" }
 uuid.workspace = true
 
 [lints]
