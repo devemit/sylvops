@@ -15,7 +15,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use sylvops_core::{
-    domain::{ProviderKind, SessionState},
+    domain::ProviderKind,
     github::{
         GitHubCheckFilter, GitHubCursor, GitHubItemKind, GitHubItemNumber, GitHubLabelName,
         GitHubListFilters, GitHubListQuery, GitHubListState, GitHubLogin, GitHubPageSize,
@@ -23,6 +23,7 @@ use sylvops_core::{
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+    session_state::SessionLifecycle,
     upgrade::InstallDisposition,
 };
 use sylvops_daemon::data_removal::{
@@ -1733,12 +1734,11 @@ async fn attach_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_
         0
     };
     let initially_finished = matches!(
-        session.state,
-        SessionState::FinishedUnseen
-            | SessionState::FinishedSeen
-            | SessionState::Failed
-            | SessionState::Terminated
-            | SessionState::Disconnected
+        session.status.lifecycle,
+        SessionLifecycle::Exited
+            | SessionLifecycle::Failed
+            | SessionLifecycle::Terminated
+            | SessionLifecycle::Disconnected
     );
     if initially_finished && last_sequence >= replay_through_sequence {
         return Ok(());

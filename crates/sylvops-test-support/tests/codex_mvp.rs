@@ -4,7 +4,7 @@ use std::{ffi::OsString, path::Path, process::Command, time::Duration};
 
 use rusqlite::OptionalExtension;
 use sylvops_core::{
-    domain::{ProviderKind, Session, SessionState},
+    domain::{ProviderKind, Session},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonResponse},
     session_state::{
@@ -133,7 +133,10 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("terminated-session permission input");
     wait_for_session(&client, terminated_session_id, |session| {
-        session.state == SessionState::NeedsFeedback && session.external_session_id.is_some()
+        matches!(
+            session.status.activity,
+            ProviderActivity::AwaitingInput | ProviderActivity::RecoverableFailure
+        ) && session.external_session_id.is_some()
     })
     .await;
     std::fs::write(
@@ -148,7 +151,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("terminate response");
     let terminated = wait_for_session(&client, terminated_session_id, |session| {
-        session.state == SessionState::Terminated
+        session.status.lifecycle == SessionLifecycle::Terminated
     })
     .await;
     assert_eq!(terminated.status.lifecycle, SessionLifecycle::Terminated);
@@ -178,7 +181,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("stop resumed fixture");
     wait_for_session(&client, stopped_successor.id, |session| {
-        session.state == SessionState::Terminated
+        session.status.lifecycle == SessionLifecycle::Terminated
     })
     .await;
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
@@ -231,7 +234,6 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     })
     .await;
     assert_eq!(unexpected_exit.status.lifecycle, SessionLifecycle::Failed);
-    assert_eq!(unexpected_exit.state, SessionState::Failed);
     assert_eq!(
         unexpected_exit.status.attention.map(|event| event.reason),
         Some(AttentionReason::TerminalFailure)
@@ -251,7 +253,10 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("permission input");
     let waiting = wait_for_session(&client, source_session_id, |session| {
-        session.state == SessionState::NeedsFeedback && session.external_session_id.is_some()
+        matches!(
+            session.status.activity,
+            ProviderActivity::AwaitingInput | ProviderActivity::RecoverableFailure
+        ) && session.external_session_id.is_some()
     })
     .await;
     let external_id = waiting.external_session_id.expect("external Codex ID");
@@ -284,7 +289,6 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     .await;
     assert_eq!(interrupted.status.lifecycle, SessionLifecycle::Running);
     assert!(interrupted.process_id.is_some());
-    assert_eq!(interrupted.state, SessionState::Running);
     assert_eq!(
         interrupted
             .status
@@ -320,11 +324,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("SessionEnd input");
     wait_for_session(&client, source_session_id, |session| {
-        session.process_id.is_none()
-            && matches!(
-                session.state,
-                SessionState::FinishedUnseen | SessionState::FinishedSeen
-            )
+        session.process_id.is_none() && session.status.lifecycle == SessionLifecycle::Exited
     })
     .await;
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
@@ -404,10 +404,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     );
     assert_eq!(completion_event.id, live_completion_event.id);
     assert!(u64::from(completion_event.id) > u64::from(input_event.id));
-    assert!(matches!(
-        source_history.state,
-        SessionState::FinishedUnseen | SessionState::FinishedSeen
-    ));
+    assert_eq!(source_history.status.lifecycle, SessionLifecycle::Exited);
     assert_eq!(
         source_history.external_session_id.as_deref(),
         Some(external_id.as_str())
@@ -433,7 +430,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
 
     let cleanup_session_id = create_codex_session(&client, worktree_id).await;
     wait_for_session(&client, cleanup_session_id, |session| {
-        session.state == SessionState::Running && session.process_id.is_some()
+        session.status.lifecycle == SessionLifecycle::Running && session.process_id.is_some()
     })
     .await;
     assert_eq!(owned_hook_profile_count(&codex_home), 1);
@@ -512,7 +509,6 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         response => panic!("unexpected persisted failure response: {response:?}"),
     };
     assert_eq!(opened_failure.status.lifecycle, SessionLifecycle::Failed);
-    assert_eq!(opened_failure.state, SessionState::Failed);
     assert_eq!(
         opened_failure.status.attention.unwrap().acknowledgement,
         AttentionAcknowledgement::Acknowledged
@@ -600,10 +596,7 @@ async fn exercise_codex_cleanup_refusal(
         .expect("finish despite cleanup refusal");
     let finished =
         wait_for_session(client, session_id, |session| session.process_id.is_none()).await;
-    assert!(matches!(
-        finished.state,
-        SessionState::FinishedSeen | SessionState::FinishedUnseen
-    ));
+    assert_eq!(finished.status.lifecycle, SessionLifecycle::Exited);
     assert_eq!(std::fs::read_to_string(&profile).unwrap(), changed);
     let authorization_token = session_deletion_token(client, session_id).await;
     match client
@@ -658,39 +651,27 @@ async fn exercise_session_lifecycle_stale_authorization(
         response => panic!("unexpected auto-finishing Session response: {response:?}"),
     };
     wait_for_session(client, session_id, |session| {
-        session.state == SessionState::FinishedUnseen && session.process_id.is_none()
+        session.status.lifecycle == SessionLifecycle::Exited && session.process_id.is_none()
     })
     .await;
-    let stale_token = session_deletion_token(client, session_id).await;
+    let deletion_token = session_deletion_token(client, session_id).await;
     attach(client, session_id).await;
-    wait_for_session(client, session_id, |session| {
-        session.state == SessionState::FinishedSeen
+    let attached = wait_for_session(client, session_id, |session| {
+        session.status.lifecycle == SessionLifecycle::Exited
     })
     .await;
+    assert_eq!(
+        attached.status.attention.unwrap().acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
     assert!(matches!(
         client
             .request(&ClientRequest::DeleteSession {
                 session_id,
-                authorization_token: stale_token,
+                authorization_token: deletion_token,
             })
             .await
-            .expect("stale lifecycle deletion response"),
-        DaemonResponse::Error(error) if error.code == "session_request_refused"
-    ));
-    let preserved = wait_for_session(client, session_id, |session| {
-        session.state == SessionState::FinishedSeen
-    })
-    .await;
-    assert_eq!(preserved.id, session_id);
-    let authorization_token = session_deletion_token(client, session_id).await;
-    assert!(matches!(
-        client
-            .request(&ClientRequest::DeleteSession {
-                session_id,
-                authorization_token,
-            })
-            .await
-            .expect("fresh lifecycle deletion response"),
+            .expect("attachment-independent deletion response"),
         DaemonResponse::SessionDeleted { session_id: deleted, .. } if deleted == session_id
     ));
 }
@@ -941,7 +922,7 @@ async fn wait_for_session(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "session state timeout; last observed: {last_observed:?}"
+            "Session status timeout; last observed: {last_observed:?}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

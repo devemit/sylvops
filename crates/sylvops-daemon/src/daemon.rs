@@ -17,9 +17,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use sylvops_core::{
     domain::{
-        DaemonHealth, MAX_SNAPSHOT_WORK_SOURCES, ProviderKind, ProviderProfile, Session,
-        SessionState, Worktree, WorktreeStatus, state_allows_deletion, state_allows_resume,
-        state_is_active,
+        DaemonHealth, MAX_SNAPSHOT_WORK_SOURCES, ProviderKind, ProviderProfile, Session, Worktree,
+        WorktreeStatus,
     },
     github::{
         GitHubAssociation, GitHubFailure, GitHubIntegrationStatus, GitHubItemKind,
@@ -33,12 +32,16 @@ use sylvops_core::{
         ClientRequest, DaemonEvent, DaemonResponse, Frame, GitHubAssociationChangeAuthorization,
         GitHubAssociationChangeInspection, HelloRequest, MessageClass, PROTOCOL_MAJOR,
         PROTOCOL_MINOR, ProjectRemovalAuthorization, ProjectRemovalInspection,
-        ProjectRemovalRefusal, ProtocolFailure, SessionDeletionAuthorization,
+        ProjectRemovalRefusal, ProtocolFailure, ProtocolVersion, SessionDeletionAuthorization,
         SessionDeletionInspection, SessionDeletionRefusal, WelcomeResponse,
         WorkspaceDeletionAuthorization, WorkspaceDeletionInspection, WorkspaceDeletionRefusal,
-        read_frame, validate_terminal_size, write_frame,
+        read_frame, read_handshake_frame, validate_terminal_size, write_frame,
     },
     provider::{AuthenticationRequirement, LaunchContext, ProviderRuntimeSpec, ResumeContext},
+    session_state::{
+        ProviderActivity, SessionLifecycle, lifecycle_allows_deletion, lifecycle_allows_resume,
+        lifecycle_is_active,
+    },
     status::{
         ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId,
         SessionStatusMachine, TurnFailureCategory,
@@ -411,15 +414,12 @@ impl HookTracking {
         None
     }
 
-    fn record_applied(&mut self, event: &NormalizedProviderEvent, state: SessionState) {
+    fn record_applied(&mut self, event: &NormalizedProviderEvent, activity: ProviderActivity) {
         match event {
             NormalizedProviderEvent::PromptSubmitted
             | NormalizedProviderEvent::TurnStarted { .. } => self.turn_closed = false,
             NormalizedProviderEvent::TurnStopped { .. } => {
-                self.turn_closed = matches!(
-                    state,
-                    SessionState::FinishedUnseen | SessionState::FinishedSeen
-                );
+                self.turn_closed = activity == ProviderActivity::Completed;
             }
             NormalizedProviderEvent::TurnInterrupted => self.turn_closed = true,
             NormalizedProviderEvent::SessionEnded => {
@@ -2663,10 +2663,10 @@ async fn handle_request(
             let external_session_id = source.external_session_id.clone().ok_or_else(|| {
                 DaemonError::Provider("session has no verified provider resume identifier".into())
             })?;
-            if !state_allows_resume(source.state) {
+            if !lifecycle_allows_resume(source.status.lifecycle) {
                 return Err(DaemonError::Provider(format!(
-                    "session state {} is not eligible for resume; only finished, failed, stopped, or disconnected sessions may be resumed",
-                    source.state
+                    "Session lifecycle {:?} is not eligible for resume; only exited, failed, terminated, or disconnected Sessions may be resumed",
+                    source.status.lifecycle
                 )));
             }
             if let Some(managed) = get_managed_session(state, source_session_id).await
@@ -2785,35 +2785,6 @@ async fn handle_request(
             if attachment.completion_published {
                 let mut completed = managed.completed.clone();
                 while !*completed.borrow() && completed.changed().await.is_ok() {}
-            }
-            let attention_id = managed
-                .record
-                .read()
-                .await
-                .status
-                .attention
-                .map(|event| event.id);
-            let seen = if let Some(attention_id) = attention_id {
-                match state
-                    .database
-                    .acknowledge_opened_attention(session_id, attention_id)
-                    .await
-                {
-                    Ok(seen) => seen,
-                    Err(error) => {
-                        let _ = managed.handle.detach(client_id).await;
-                        return Err(error);
-                    }
-                }
-            } else {
-                None
-            };
-            if let Some((revision, session)) = seen {
-                *managed.record.write().await = session.clone();
-                mirror_attention_acknowledgement(state, &session).await;
-                let _ = state
-                    .events
-                    .send(DaemonEvent::SessionStatusChanged { revision, session });
             }
             let result = send_attachment(
                 outgoing,
@@ -3133,7 +3104,7 @@ async fn handle_request(
             let mut active_handles = Vec::new();
             for managed in managed_sessions {
                 let record = managed.record.read().await.clone();
-                if state_is_active(record.state) {
+                if lifecycle_is_active(record.status.lifecycle) {
                     if active.len() >= MAX_UPGRADE_ACTIVE_SESSIONS {
                         return Err(DaemonError::Lifecycle(
                             "too many active sessions to coordinate an upgrade".into(),
@@ -3259,7 +3230,7 @@ async fn handle_request(
             }
             let managed_sessions: Vec<_> = state.sessions.read().await.values().cloned().collect();
             for managed in managed_sessions {
-                if state_is_active(managed.record.read().await.state) {
+                if lifecycle_is_active(managed.record.read().await.status.lifecycle) {
                     state
                         .database
                         .audit(
@@ -3632,7 +3603,7 @@ async fn spawn_managed_session(
                 .database
                 .finish_session(
                     session_id,
-                    SessionState::Failed,
+                    SessionLifecycle::Failed,
                     None,
                     Some(error.to_string()),
                 )
@@ -3661,7 +3632,7 @@ async fn spawn_managed_session(
                 .database
                 .finish_session(
                     session_id,
-                    SessionState::Failed,
+                    SessionLifecycle::Failed,
                     None,
                     Some(error.to_string()),
                 )
@@ -3783,10 +3754,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
     }
     if !state.hook_credentials.is_registered(delivery.session_id)
         || persisted.process_id.is_none()
-        || matches!(
-            persisted.state,
-            SessionState::Failed | SessionState::Terminated | SessionState::Disconnected
-        )
+        || !lifecycle_is_active(persisted.status.lifecycle)
     {
         state
             .database
@@ -3936,12 +3904,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
         Ok(updated) => updated,
         Err(error) => {
             let latest = state.database.session(delivery.session_id).await?;
-            if latest.process_id.is_none()
-                || matches!(
-                    latest.state,
-                    SessionState::Failed | SessionState::Terminated | SessionState::Disconnected
-                )
-            {
+            if latest.process_id.is_none() || !lifecycle_is_active(latest.status.lifecycle) {
                 state
                     .database
                     .audit(
@@ -3970,7 +3933,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
         let classification =
             tracking.classify(delivery.fingerprint, &event, normalized.turn_id.as_deref());
         debug_assert!(classification.is_none());
-        tracking.record_applied(&event, transition.state);
+        tracking.record_applied(&event, transition.status.activity);
         if is_claude_session_start || recovers_claude_lifecycle {
             tracking.session_start_missing = false;
         }
@@ -4059,15 +4022,11 @@ fn spawn_exit_monitor(
         state
             .providers
             .cleanup_runtime_paths(provider_kind, &managed.owned_runtime_paths);
-        let (exit_code, stop_requested, completion_acknowledged) = match exit {
-            Ok(exit) => (
-                i32::try_from(exit.exit_code).ok(),
-                exit.stop_requested,
-                exit.was_attached,
-            ),
+        let (exit_code, stop_requested) = match exit {
+            Ok(exit) => (i32::try_from(exit.exit_code).ok(), exit.stop_requested),
             Err(error) => {
                 tracing::error!(%error, %session_id, "session actor ended without status");
-                (None, false, false)
+                (None, false)
             }
         };
         let transition = {
@@ -4081,7 +4040,6 @@ fn spawn_exit_monitor(
                 provider_kind == ProviderKind::Shell,
                 exit_code,
                 stop_requested,
-                completion_acknowledged,
                 status_timestamp(),
             );
             transition.map(|transition| (transition, machine))
@@ -4106,7 +4064,7 @@ fn spawn_exit_monitor(
                     let _ = state.events.send(DaemonEvent::SessionExited {
                         revision,
                         session_id,
-                        state: transition.state,
+                        lifecycle: transition.status.lifecycle,
                         exit_code,
                     });
                 }
@@ -4132,7 +4090,6 @@ fn status_timestamp() -> i64 {
 
 fn status_machine_from_session(session: &Session) -> SessionStatusMachine {
     SessionStatusMachine::from_persisted(
-        session.state,
         session.status,
         session
             .failure_reason
@@ -4409,11 +4366,11 @@ async fn inspect_session_deletion(
     } else {
         false
     };
-    let refusal = if state_is_active(session.state) {
+    let refusal = if lifecycle_is_active(session.status.lifecycle) {
         Some(SessionDeletionRefusal::LiveState)
     } else if session.process_id.is_some() || runtime_owned {
         Some(SessionDeletionRefusal::OwnedProcess)
-    } else if !state_allows_deletion(session.state) {
+    } else if !lifecycle_allows_deletion(session.status.lifecycle) {
         Some(SessionDeletionRefusal::IneligibleState)
     } else {
         None
@@ -4429,7 +4386,7 @@ async fn inspect_session_deletion(
     SessionDeletionInspection {
         session_id: session.id,
         worktree_id: session.worktree_id,
-        state: session.state,
+        lifecycle: session.status.lifecycle,
         authorization_token,
         refusal,
     }
@@ -4449,7 +4406,8 @@ fn session_deletion_token(
         session.worktree_id.to_string(),
         session.provider_kind.to_string(),
         session.display_name.clone(),
-        session.state.to_string(),
+        serde_json::to_string(&session.status)
+            .expect("validated Session status is always serializable"),
         session
             .process_id
             .map_or_else(String::new, |id| id.to_string()),
@@ -4480,7 +4438,7 @@ fn session_deletion_refusal_message(refusal: Option<SessionDeletionRefusal>) -> 
             "session still owns a process tree and cannot be deleted".into()
         }
         Some(SessionDeletionRefusal::IneligibleState) | None => {
-            "session state is not eligible for deletion".into()
+            "Session lifecycle is not eligible for deletion".into()
         }
     }
 }
@@ -4660,9 +4618,25 @@ fn failure_code(error: &DaemonError) -> &'static str {
 }
 
 async fn complete_handshake(stream: &mut BoxStream, state: &DaemonState) -> Result<Option<u32>> {
-    let frame = timeout(HANDSHAKE_TIMEOUT, read_frame(stream))
+    let frame = timeout(HANDSHAKE_TIMEOUT, read_handshake_frame(stream))
         .await
         .map_err(|_| DaemonError::Lifecycle("client handshake timed out".into()))??;
+    if frame.version != ProtocolVersion::CURRENT {
+        let diagnostic = format!(
+            "client protocol {}.{} is incompatible with daemon protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}; update or restart the client and daemon together",
+            frame.version.major, frame.version.minor
+        );
+        send_failure_for_version(
+            stream,
+            frame.message_id,
+            frame.version,
+            "unsupported_protocol",
+            &diagnostic,
+            false,
+        )
+        .await?;
+        return Ok(None);
+    }
     let request = decode_request(&frame)?;
     let ClientRequest::Hello(hello) = request else {
         send_failure(
@@ -4687,11 +4661,15 @@ async fn complete_handshake(stream: &mut BoxStream, state: &DaemonState) -> Resu
         return Ok(None);
     }
     if hello.protocol_major != PROTOCOL_MAJOR || hello.protocol_minor != PROTOCOL_MINOR {
+        let diagnostic = format!(
+            "client protocol {}.{} is incompatible with daemon protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}; update or restart the client and daemon together",
+            hello.protocol_major, hello.protocol_minor
+        );
         send_failure(
             stream,
             frame.message_id,
             "unsupported_protocol",
-            "client protocol is not supported",
+            &diagnostic,
             false,
         )
         .await?;
@@ -4809,6 +4787,28 @@ async fn send_failure(
     .await
 }
 
+async fn send_failure_for_version(
+    stream: &mut BoxStream,
+    request_id: Uuid,
+    version: ProtocolVersion,
+    code: &str,
+    message: &str,
+    retryable: bool,
+) -> Result<()> {
+    let mut frame = Frame::response(
+        CONTROL_OPCODE,
+        request_id,
+        &DaemonResponse::Error(ProtocolFailure {
+            code: code.into(),
+            message: message.into(),
+            retryable,
+        }),
+    )?;
+    frame.version = version;
+    write_frame(stream, &frame).await?;
+    Ok(())
+}
+
 async fn send_response_queue(
     outgoing: &ClientSink,
     request_id: Uuid,
@@ -4881,9 +4881,10 @@ mod tests {
     };
     use std::sync::atomic::AtomicUsize;
     use sylvops_core::{
-        domain::{Project, SessionState},
+        domain::Project,
         ids::{ProjectId, WorkspaceId},
         protocol::{ClientRequest, Frame, MessageClass},
+        session_state::ProviderActivity,
         status::{ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId},
     };
     use tokio::sync::Semaphore;
@@ -4982,7 +4983,7 @@ mod tests {
             remaining_work: sylvops_core::status::RemainingWork::default(),
         };
         assert_eq!(tracking.classify("stop".into(), &stopped, None), None);
-        tracking.record_applied(&stopped, SessionState::FinishedUnseen);
+        tracking.record_applied(&stopped, ProviderActivity::Completed);
 
         assert_eq!(
             tracking.classify(
@@ -5010,7 +5011,7 @@ mod tests {
             tracking.classify("interrupt".into(), &interrupted, None),
             None
         );
-        tracking.record_applied(&interrupted, SessionState::Running);
+        tracking.record_applied(&interrupted, ProviderActivity::Interrupted);
         assert_eq!(
             tracking.classify(
                 "late-permission".into(),

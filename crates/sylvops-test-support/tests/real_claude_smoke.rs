@@ -2,7 +2,7 @@ use std::{path::Path, time::Duration};
 
 use rusqlite::OptionalExtension;
 use sylvops_core::{
-    domain::{ProviderKind, Session, SessionState},
+    domain::{ProviderKind, Session},
     ids::{SessionId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     status::{ConversationIdentityTransition, NormalizedProviderEvent},
@@ -395,10 +395,7 @@ async fn wait_for_session(
 
 fn session_finished(session: &Session) -> bool {
     session.process_id.is_none()
-        && matches!(
-            session.state,
-            SessionState::FinishedSeen | SessionState::FinishedUnseen
-        )
+        && session.status.lifecycle == sylvops_core::session_state::SessionLifecycle::Exited
 }
 
 async fn connect_eventually(paths: &RuntimePaths) -> DaemonClient {

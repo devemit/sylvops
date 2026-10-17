@@ -15,6 +15,37 @@ pub enum SessionLifecycle {
     Disconnected,
 }
 
+/// Whether a Session belongs in cross-client active-session supervision.
+#[must_use]
+pub const fn lifecycle_is_active(lifecycle: SessionLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        SessionLifecycle::Starting | SessionLifecycle::Running
+    )
+}
+
+/// Whether a terminal Session lifecycle is eligible for Provider-level resume.
+///
+/// A verified external Session identifier is still required by the daemon.
+#[must_use]
+pub const fn lifecycle_allows_resume(lifecycle: SessionLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        SessionLifecycle::Exited
+            | SessionLifecycle::Failed
+            | SessionLifecycle::Terminated
+            | SessionLifecycle::Disconnected
+    )
+}
+
+/// Whether a Session lifecycle is eligible for permanent metadata deletion.
+///
+/// The daemon must additionally prove that no owned process tree remains.
+#[must_use]
+pub const fn lifecycle_allows_deletion(lifecycle: SessionLifecycle) -> bool {
+    lifecycle_allows_resume(lifecycle)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderActivity {
@@ -180,5 +211,41 @@ impl SessionStatus {
             return Err("Provider condition requires an attention event");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ProviderActivity, SessionLifecycle, lifecycle_allows_deletion, lifecycle_allows_resume,
+        lifecycle_is_active,
+    };
+
+    #[test]
+    fn terminal_lifecycle_alone_controls_resume_and_deletion() {
+        for lifecycle in [
+            SessionLifecycle::Exited,
+            SessionLifecycle::Failed,
+            SessionLifecycle::Terminated,
+            SessionLifecycle::Disconnected,
+        ] {
+            assert!(lifecycle_allows_resume(lifecycle));
+            assert!(lifecycle_allows_deletion(lifecycle));
+        }
+
+        for lifecycle in [
+            SessionLifecycle::Fresh,
+            SessionLifecycle::Starting,
+            SessionLifecycle::Running,
+        ] {
+            assert!(!lifecycle_allows_resume(lifecycle));
+            assert!(!lifecycle_allows_deletion(lifecycle));
+        }
+    }
+
+    #[test]
+    fn completed_provider_turn_remains_an_active_session() {
+        assert!(lifecycle_is_active(SessionLifecycle::Running));
+        assert_eq!(ProviderActivity::Completed, ProviderActivity::Completed);
     }
 }

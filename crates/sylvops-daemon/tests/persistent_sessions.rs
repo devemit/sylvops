@@ -1,8 +1,8 @@
 use std::{path::Path, process::Command, time::Duration};
 
 use sylvops_core::{
-    domain::SessionState,
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+    session_state::SessionLifecycle,
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 
@@ -89,7 +89,7 @@ async fn exercise_session_deletion() {
         })
         .await
         .unwrap();
-    wait_for_session_state(&client, session.id, SessionState::Terminated).await;
+    wait_for_session_state(&client, session.id, SessionLifecycle::Terminated).await;
 
     let stale_token = inspection_token(&client, session.id).await;
     client
@@ -206,7 +206,7 @@ async fn inspection_token(
 async fn wait_for_session_state(
     client: &DaemonClient,
     session_id: sylvops_core::ids::SessionId,
-    state: SessionState,
+    state: SessionLifecycle,
 ) {
     loop {
         let snapshot = match client.request(&ClientRequest::GetSnapshot).await.unwrap() {
@@ -216,7 +216,7 @@ async fn wait_for_session_state(
         if snapshot
             .sessions
             .iter()
-            .any(|session| session.id == session_id && session.state == state)
+            .any(|session| session.id == session_id && session.status.lifecycle == state)
         {
             return;
         }
@@ -339,11 +339,9 @@ async fn exercise_persistent_session() {
             DaemonResponse::Snapshot(snapshot) => snapshot,
             other => panic!("unexpected snapshot response: {other:?}"),
         };
-        if snapshot
-            .sessions
-            .iter()
-            .any(|value| value.id == session.id && value.state == SessionState::Terminated)
-        {
+        if snapshot.sessions.iter().any(|value| {
+            value.id == session.id && value.status.lifecycle == SessionLifecycle::Terminated
+        }) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

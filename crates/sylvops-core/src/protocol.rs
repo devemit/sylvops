@@ -8,7 +8,7 @@ use crate::{
     CoreError, Result,
     domain::{
         AttachmentRole, DaemonHealth, DaemonSnapshot, GitDiff, GitWorktreeState, Project,
-        ProviderKind, Session, SessionState, Workspace, Worktree,
+        ProviderKind, Session, Workspace, Worktree,
     },
     github::{
         GitHubAssociation, GitHubBrowseFailure, GitHubFailure, GitHubIntegrationStatus,
@@ -18,13 +18,13 @@ use crate::{
     },
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     provider::ProviderHealth,
-    session_state::AttentionEventId,
+    session_state::{AttentionEventId, SessionLifecycle},
     status::NormalizedProviderEvent,
 };
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 26;
+pub const PROTOCOL_MINOR: u16 = 27;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -193,6 +193,14 @@ impl Frame {
     /// Returns an error for truncation, inconsistent lengths, invalid identifiers, unsupported
     /// versions, unknown message classes, or oversized frames.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::decode_with_version_validation(bytes, true)
+    }
+
+    fn decode_for_handshake(bytes: &[u8]) -> Result<Self> {
+        Self::decode_with_version_validation(bytes, false)
+    }
+
+    fn decode_with_version_validation(bytes: &[u8], validate_version: bool) -> Result<Self> {
         if bytes.len() < LENGTH_PREFIX_SIZE {
             return Err(CoreError::TruncatedFrame);
         }
@@ -220,10 +228,10 @@ impl Frame {
             return Err(CoreError::InvalidFrameLength);
         }
 
-        Self::decode_body(&bytes[LENGTH_PREFIX_SIZE..])
+        Self::decode_body(&bytes[LENGTH_PREFIX_SIZE..], validate_version)
     }
 
-    fn decode_body(body: &[u8]) -> Result<Self> {
+    fn decode_body(body: &[u8], validate_version: bool) -> Result<Self> {
         if body.len() < HEADER_SIZE {
             return Err(CoreError::TruncatedFrame);
         }
@@ -237,7 +245,9 @@ impl Frame {
             major: take_u16(body, &mut position)?,
             minor: take_u16(body, &mut position)?,
         };
-        version.validate()?;
+        if validate_version {
+            version.validate()?;
+        }
         let class = MessageClass::try_from(take_u8(body, &mut position)?)?;
         let opcode = take_u16(body, &mut position)?;
         let flags = take_u8(body, &mut position)?;
@@ -278,6 +288,26 @@ impl Frame {
 ///
 /// Returns an I/O or frame-validation error. Oversized lengths are rejected before allocation.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
+    read_frame_with_version_validation(reader, true).await
+}
+
+/// Reads the first connection frame while preserving an incompatible header version.
+///
+/// All framing bounds and invariants remain enforced. Daemons must compare the returned version
+/// before decoding the payload, send a bounded incompatibility response using that same version,
+/// and close the connection.
+///
+/// # Errors
+///
+/// Returns an I/O or frame-validation error. Oversized lengths are rejected before allocation.
+pub async fn read_handshake_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
+    read_frame_with_version_validation(reader, false).await
+}
+
+async fn read_frame_with_version_validation<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    validate_version: bool,
+) -> Result<Frame> {
     let declared_u32 = reader.read_u32().await?;
     let declared = usize::try_from(declared_u32).map_err(|_| CoreError::FrameTooLarge {
         actual: usize::MAX,
@@ -295,7 +325,11 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
     let mut bytes = vec![0_u8; LENGTH_PREFIX_SIZE + declared];
     bytes[..4].copy_from_slice(&declared_u32.to_be_bytes());
     reader.read_exact(&mut bytes[4..]).await?;
-    Frame::decode(&bytes)
+    if validate_version {
+        Frame::decode(&bytes)
+    } else {
+        Frame::decode_for_handshake(&bytes)
+    }
 }
 
 /// Encodes and writes one complete frame to an asynchronous byte stream.
@@ -418,7 +452,7 @@ pub enum SessionDeletionRefusal {
 pub struct SessionDeletionInspection {
     pub session_id: SessionId,
     pub worktree_id: WorktreeId,
-    pub state: SessionState,
+    pub lifecycle: SessionLifecycle,
     pub authorization_token: Option<SessionDeletionAuthorization>,
     pub refusal: Option<SessionDeletionRefusal>,
 }
@@ -889,7 +923,7 @@ pub enum DaemonEvent {
     SessionExited {
         revision: u64,
         session_id: SessionId,
-        state: SessionState,
+        lifecycle: SessionLifecycle,
         exit_code: Option<i32>,
     },
     StateResynchronizationRequired {
@@ -1044,7 +1078,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 26);
+        assert_eq!(PROTOCOL_MINOR, 27);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1162,7 +1196,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 26);
+        assert_eq!(PROTOCOL_MINOR, 27);
     }
 
     #[test]
@@ -1202,7 +1236,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 26);
+        assert_eq!(PROTOCOL_MINOR, 27);
     }
 
     #[test]
@@ -1274,7 +1308,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 26);
+        assert_eq!(PROTOCOL_MINOR, 27);
     }
 
     #[test]
@@ -1437,7 +1471,7 @@ mod tests {
         let inspection = DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
             session_id,
             worktree_id,
-            state: SessionState::FinishedSeen,
+            lifecycle: SessionLifecycle::Exited,
             authorization_token: Some("b".repeat(64).try_into().unwrap()),
             refusal: None,
         });
@@ -1468,7 +1502,7 @@ mod tests {
             let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
         }
-        assert_eq!(PROTOCOL_MINOR, 26);
+        assert_eq!(PROTOCOL_MINOR, 27);
     }
 
     #[test]
@@ -1646,28 +1680,28 @@ mod tests {
             DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
                 session_id,
                 worktree_id,
-                state: SessionState::Running,
+                lifecycle: SessionLifecycle::Running,
                 authorization_token: None,
                 refusal: Some(SessionDeletionRefusal::LiveState),
             }),
             DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
                 session_id,
                 worktree_id,
-                state: SessionState::Terminated,
+                lifecycle: SessionLifecycle::Terminated,
                 authorization_token: None,
                 refusal: Some(SessionDeletionRefusal::OwnedProcess),
             }),
             DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
                 session_id,
                 worktree_id,
-                state: SessionState::Fresh,
+                lifecycle: SessionLifecycle::Fresh,
                 authorization_token: None,
                 refusal: Some(SessionDeletionRefusal::IneligibleState),
             }),
             DaemonResponse::SessionDeletionInspected(SessionDeletionInspection {
                 session_id,
                 worktree_id,
-                state: SessionState::Terminated,
+                lifecycle: SessionLifecycle::Terminated,
                 authorization_token: Some("a".repeat(64).try_into().unwrap()),
                 refusal: None,
             }),

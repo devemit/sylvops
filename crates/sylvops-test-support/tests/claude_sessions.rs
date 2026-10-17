@@ -4,7 +4,7 @@ use std::{ffi::OsString, path::Path, process::Command, time::Duration};
 
 use rusqlite::OptionalExtension;
 use sylvops_core::{
-    domain::{ProviderKind, Session, SessionState},
+    domain::{ProviderKind, Session},
     ids::SessionId,
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
     session_state::{
@@ -101,7 +101,8 @@ async fn interactive_client_request_creates_claude_session() {
     assert!(!session.arguments_json.contains("--model"));
     assert!(!session.arguments_json.contains("--effort"));
     wait_for_session(&client, session.id, |session| {
-        session.state == SessionState::Running && session.external_session_id.is_some()
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.external_session_id.is_some()
     })
     .await;
 
@@ -184,7 +185,8 @@ async fn managed_claude_session_inner() {
         response => panic!("unexpected session response: {response:?}"),
     };
     let running = wait_for_session(&client, session_id, |session| {
-        session.state == SessionState::Running && session.external_session_id.is_some()
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.external_session_id.is_some()
     })
     .await;
     let mut verified_id = running
@@ -286,7 +288,7 @@ async fn managed_claude_session_inner() {
     )
     .await;
     wait_for_session(&client, session_id, |session| {
-        session.state == SessionState::Running
+        session.status.lifecycle == SessionLifecycle::Running
             && session.external_session_id.as_deref() == Some(verified_id.as_str())
     })
     .await;
@@ -324,7 +326,10 @@ async fn managed_claude_session_inner() {
             .await
             .expect("attention hook input");
         let pending_input = wait_for_session(&reconnected, session_id, |session| {
-            session.state == SessionState::NeedsFeedback
+            matches!(
+                session.status.activity,
+                ProviderActivity::AwaitingInput | ProviderActivity::RecoverableFailure
+            )
         })
         .await;
         if index == 0 {
@@ -347,7 +352,8 @@ async fn managed_claude_session_inner() {
             .await
             .expect("UserPromptSubmit input");
         wait_for_session(&reconnected, session_id, |session| {
-            session.state == SessionState::Running
+            session.status.lifecycle == SessionLifecycle::Running
+                && session.status.activity == ProviderActivity::Working
         })
         .await;
     }
@@ -375,7 +381,8 @@ async fn managed_claude_session_inner() {
     })
     .await;
     wait_for_session(&reconnected, session_id, |session| {
-        session.state == SessionState::Running
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.status.activity == ProviderActivity::Working
     })
     .await;
     reconnected
@@ -411,7 +418,8 @@ async fn managed_claude_session_inner() {
         })
         .await;
         wait_for_session(&reconnected, session_id, |session| {
-            session.state == SessionState::Running
+            session.status.lifecycle == SessionLifecycle::Running
+                && session.status.activity == ProviderActivity::Working
         })
         .await;
     }
@@ -424,7 +432,8 @@ async fn managed_claude_session_inner() {
         .await
         .expect("normal Stop input");
     let completed = wait_for_session(&reconnected, session_id, |session| {
-        session.state == SessionState::FinishedUnseen
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.status.activity == ProviderActivity::Completed
     })
     .await;
     assert!(completed.process_id.is_some());
@@ -451,14 +460,30 @@ async fn managed_claude_session_inner() {
         .expect("stale PermissionRequest input");
     wait_for_audit(&paths.database, "provider_hook_ignored", Some("stale"), 1).await;
     wait_for_session(&reconnected, session_id, |session| {
-        session.state == SessionState::FinishedUnseen
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.status.activity == ProviderActivity::Completed
     })
     .await;
     attach(&reconnected, session_id, 0).await;
-    let acknowledged = wait_for_session(&observer, session_id, |session| {
-        session.state == SessionState::FinishedSeen
+    let attached = wait_for_session(&observer, session_id, |session| {
+        session.status.activity == ProviderActivity::Completed
     })
     .await;
+    assert_eq!(
+        attached.status.attention.unwrap().acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
+    let acknowledged = match reconnected
+        .request(&ClientRequest::AcknowledgeAttention {
+            session_id,
+            attention_id: completion_event.id,
+        })
+        .await
+        .expect("completion acknowledgement response")
+    {
+        DaemonResponse::SessionAttentionAcknowledged { session, .. } => session,
+        response => panic!("unexpected completion acknowledgement response: {response:?}"),
+    };
     assert_eq!(acknowledged.status.lifecycle, SessionLifecycle::Running);
     assert_eq!(acknowledged.status.activity, ProviderActivity::Completed);
     let acknowledged_event = acknowledged
@@ -479,7 +504,8 @@ async fn managed_claude_session_inner() {
         .await
         .expect("prompt after completed turn");
     let working = wait_for_session(&reconnected, session_id, |session| {
-        session.state == SessionState::Running
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.status.activity == ProviderActivity::Working
     })
     .await;
     assert_eq!(working.status.lifecycle, SessionLifecycle::Running);
@@ -504,7 +530,7 @@ async fn managed_claude_session_inner() {
     })
     .await;
     let recoverable = wait_for_session(&reconnected, session_id, |session| {
-        session.state == SessionState::NeedsFeedback
+        session.status.activity == ProviderActivity::RecoverableFailure
     })
     .await;
     assert_eq!(recoverable.failure_reason.as_deref(), Some("rate_limit"));
@@ -542,7 +568,6 @@ async fn managed_claude_session_inner() {
         dismissed.status.activity,
         ProviderActivity::RecoverableFailure
     );
-    assert_eq!(dismissed.state, SessionState::NeedsFeedback);
     assert_eq!(
         dismissed.status.attention.unwrap().acknowledgement,
         AttentionAcknowledgement::Acknowledged
@@ -578,7 +603,8 @@ async fn managed_claude_session_inner() {
         .await
         .expect("output flood input");
     let recovered_work = wait_for_session(&reconnected, session_id, |session| {
-        session.state == SessionState::Running
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.status.activity == ProviderActivity::Working
     })
     .await;
     assert!(recovered_work.failure_reason.is_none());
@@ -658,15 +684,26 @@ async fn managed_claude_session_inner() {
     .await;
     let terminal_event = terminal_failure.status.attention.unwrap();
     attach(&observer, terminal_failure_id, 0).await;
-    let opened_failure = wait_for_session(&reconnected, terminal_failure_id, |session| {
-        session.status.attention.is_some_and(|event| {
-            event.id == terminal_event.id
-                && event.acknowledgement == AttentionAcknowledgement::Acknowledged
-        })
+    let attached_failure = wait_for_session(&reconnected, terminal_failure_id, |session| {
+        session.status.lifecycle == SessionLifecycle::Failed
     })
     .await;
+    assert_eq!(
+        attached_failure.status.attention.unwrap().acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
+    let opened_failure = match reconnected
+        .request(&ClientRequest::AcknowledgeAttention {
+            session_id: terminal_failure_id,
+            attention_id: terminal_event.id,
+        })
+        .await
+        .expect("terminal failure acknowledgement response")
+    {
+        DaemonResponse::SessionAttentionAcknowledged { session, .. } => session,
+        response => panic!("unexpected terminal failure acknowledgement: {response:?}"),
+    };
     assert_eq!(opened_failure.status.lifecycle, SessionLifecycle::Failed);
-    assert_eq!(opened_failure.state, SessionState::Failed);
 
     reconnected
         .request(&ClientRequest::SessionInput {
@@ -715,7 +752,8 @@ async fn managed_claude_session_inner() {
     )
     .await;
     wait_for_session(&reconnected, session_id, |session| {
-        session.state == SessionState::Running
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.status.activity == ProviderActivity::Working
     })
     .await;
 
@@ -727,7 +765,9 @@ async fn managed_claude_session_inner() {
         .await
         .expect("SessionEnd input");
     wait_for_session(&reconnected, session_id, |session| {
-        session.state == SessionState::FinishedUnseen && session.process_id.is_some()
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.status.activity == ProviderActivity::Completed
+            && session.process_id.is_some()
     })
     .await;
     reconnected
@@ -748,7 +788,7 @@ async fn managed_claude_session_inner() {
         .await
         .expect("stop response");
     wait_for_session(&reconnected, session_id, |session| {
-        session.state == SessionState::Terminated && session.process_id.is_none()
+        session.status.lifecycle == SessionLifecycle::Terminated && session.process_id.is_none()
     })
     .await;
 
@@ -838,7 +878,7 @@ async fn late_session_start_recovers_after_warning() {
     attach(&client, session_id, 0).await;
 
     let warning = wait_for_session_for(&client, session_id, Duration::from_secs(20), |session| {
-        session.state == SessionState::NeedsFeedback
+        session.status.activity == ProviderActivity::RecoverableFailure
             && session.process_id.is_some()
             && session.external_session_id.is_none()
     })
@@ -859,7 +899,9 @@ async fn late_session_start_recovers_after_warning() {
         .expect("input while hook warning is active");
     wait_for_output(&mut events, session_id, "FAKE_CLAUDE_ECHO=still-usable").await;
     let recovered = wait_for_session_for(&client, session_id, Duration::from_secs(10), |session| {
-        session.state == SessionState::Running && session.external_session_id.is_none()
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.status.activity == ProviderActivity::Working
+            && session.external_session_id.is_none()
     })
     .await;
     assert!(recovered.failure_reason.is_none());
@@ -872,7 +914,8 @@ async fn late_session_start_recovers_after_warning() {
         .await
         .expect("late SessionStart input");
     wait_for_session(&client, session_id, |session| {
-        session.state == SessionState::Running && session.external_session_id.is_some()
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.external_session_id.is_some()
     })
     .await;
 
@@ -885,7 +928,7 @@ async fn late_session_start_recovers_after_warning() {
         .await
         .expect("unexpected exit input");
     let failed = wait_for_session(&client, failed_session_id, |session| {
-        session.state == SessionState::Failed && session.process_id.is_none()
+        session.status.lifecycle == SessionLifecycle::Failed && session.process_id.is_none()
     })
     .await;
     assert_eq!(failed.exit_code, Some(17));
@@ -959,7 +1002,7 @@ async fn late_session_start_recovers_after_warning() {
         )
     }));
     wait_for_session(&client, resumed.id, |session| {
-        session.state == SessionState::Running
+        session.status.lifecycle == SessionLifecycle::Running
             && session.external_session_id.as_deref() == Some(external_id.as_str())
     })
     .await;
@@ -970,7 +1013,7 @@ async fn late_session_start_recovers_after_warning() {
         .await
         .expect("stop resumed Claude response");
     wait_for_session(&client, resumed.id, |session| {
-        session.state == SessionState::Terminated && session.process_id.is_none()
+        session.status.lifecycle == SessionLifecycle::Terminated && session.process_id.is_none()
     })
     .await;
     match client
@@ -1094,7 +1137,7 @@ async fn assert_claude_descendant_stops_with_session(
         .await
         .expect("stop response");
     wait_for_session(client, session_id, |session| {
-        session.state == SessionState::Terminated && session.process_id.is_none()
+        session.status.lifecycle == SessionLifecycle::Terminated && session.process_id.is_none()
     })
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1222,7 +1265,7 @@ async fn wait_for_session_for(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "session state timeout; last observed: {last_observed:?}"
+            "Session status timeout; last observed: {last_observed:?}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

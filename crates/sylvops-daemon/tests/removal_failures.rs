@@ -2,9 +2,10 @@ use std::{path::Path, time::Duration};
 
 use rusqlite::Connection;
 use sylvops_core::{
-    domain::{ProviderKind, SessionState, WorktreeStatus},
+    domain::{ProviderKind, WorktreeStatus},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonResponse},
+    session_state::SessionLifecycle,
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 use sylvops_test_support::{AbortOnDropTask, TemporaryRepository, git_branch_exists};
@@ -304,7 +305,7 @@ async fn create_stopped_session(client: &DaemonClient, worktree_id: WorktreeId) 
         })
         .await
         .unwrap();
-    wait_for_session_state(client, session.id, SessionState::Terminated).await;
+    wait_for_session_state(client, session.id, SessionLifecycle::Terminated).await;
     session.id
 }
 
@@ -416,14 +417,18 @@ async fn snapshot(client: &DaemonClient) -> sylvops_core::domain::DaemonSnapshot
     }
 }
 
-async fn wait_for_session_state(client: &DaemonClient, session_id: SessionId, state: SessionState) {
+async fn wait_for_session_state(
+    client: &DaemonClient,
+    session_id: SessionId,
+    state: SessionLifecycle,
+) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if snapshot(client)
             .await
             .sessions
             .iter()
-            .any(|item| item.id == session_id && item.state == state)
+            .any(|item| item.id == session_id && item.status.lifecycle == state)
         {
             return;
         }

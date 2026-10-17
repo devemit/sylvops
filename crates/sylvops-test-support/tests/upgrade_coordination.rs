@@ -11,12 +11,13 @@ use async_trait::async_trait;
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 use sylvops_core::{
-    domain::{ProviderKind, SessionState},
+    domain::ProviderKind,
     ids::SessionId,
     protocol::{
         ClientRequest, DaemonEvent, DaemonResponse, Frame, HelloRequest, MessageClass,
         PROTOCOL_MAJOR, PROTOCOL_MINOR, read_frame, write_frame,
     },
+    session_state::{SessionLifecycle, lifecycle_is_active},
     upgrade::{NativeUpgradeOutcome, ReleaseMetadata, SignedReleaseMetadata, UpgradeStatus},
 };
 use sylvops_daemon::{
@@ -85,7 +86,7 @@ impl UpgradeHandoffLauncher for RecordingHandoff {
             let snapshot = database.snapshot().await?;
             database.shutdown().await?;
             if !snapshot.sessions.iter().any(|session| {
-                session.id == session_id && session.state == SessionState::Terminated
+                session.id == session_id && session.status.lifecycle == SessionLifecycle::Terminated
             }) {
                 return Err(DaemonError::Lifecycle(
                     "active session was not reaped before upgrade handoff".into(),
@@ -242,7 +243,7 @@ async fn active_sessions_block_data_removal_without_stopping_them() {
                     && failure.message.contains("sessions are active")
         ));
         assert_session_state(&fixture.client, session_id, |state| {
-            state == SessionState::Running
+            state == SessionLifecycle::Running
         })
         .await;
         assert!(!reservation_pending(&paths).expect("reservation state"));
@@ -295,11 +296,7 @@ async fn exercise_missing_staged_upgrade_override() {
         other => panic!("unexpected snapshot response: {other:?}"),
     };
     assert!(snapshot.sessions.iter().any(|session| {
-        session.id == session_id
-            && matches!(
-                session.state,
-                SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
-            )
+        session.id == session_id && lifecycle_is_active(session.status.lifecycle)
     }));
 
     assert_eq!(launcher.calls(), 0);
@@ -360,13 +357,7 @@ async fn exercise_changed_session_set() {
             && active_sessions.iter().any(|session| session.id == second_session)
     ));
     for session_id in [first_session, second_session] {
-        assert_session_state(client, session_id, |state| {
-            matches!(
-                state,
-                SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
-            )
-        })
-        .await;
+        assert_session_state(client, session_id, lifecycle_is_active).await;
     }
     assert_eq!(launcher.calls(), 0);
     fixture.shutdown().await;
@@ -398,13 +389,7 @@ async fn exercise_declined_override() {
             && active_sessions[0].id == session_id
             && active_sessions[0].name == "Release work"
     ));
-    assert_session_state(client, session_id, |state| {
-        matches!(
-            state,
-            SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
-        )
-    })
-    .await;
+    assert_session_state(client, session_id, lifecycle_is_active).await;
     assert_eq!(launcher.calls(), 0);
     fixture.shutdown().await;
 }
@@ -697,14 +682,14 @@ async fn create_session_on_worktree(
 async fn assert_session_state(
     client: &DaemonClient,
     session_id: sylvops_core::ids::SessionId,
-    predicate: impl Fn(SessionState) -> bool,
+    predicate: impl Fn(SessionLifecycle) -> bool,
 ) {
     let snapshot = snapshot(client).await;
     assert!(
         snapshot
             .sessions
             .iter()
-            .any(|session| { session.id == session_id && predicate(session.state) })
+            .any(|session| { session.id == session_id && predicate(session.status.lifecycle) })
     );
 }
 

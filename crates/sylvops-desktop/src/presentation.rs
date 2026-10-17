@@ -1,8 +1,12 @@
 #![allow(clippy::unreadable_literal)] // Six-digit values intentionally mirror CSS RGB notation.
 
 use sylvops_core::{
-    domain::{DaemonSnapshot, SessionState, WorktreeStatus},
+    domain::{DaemonSnapshot, WorktreeStatus},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
+    session_state::{
+        AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
+        SessionStatus,
+    },
     ui::{DesktopDensity, DesktopPanel, DesktopState, DesktopTheme, MainTab},
 };
 
@@ -320,15 +324,23 @@ pub(crate) enum NavigatorAction {
 }
 
 impl SessionIndicator {
-    const fn for_state(state: SessionState) -> Self {
-        match state {
-            SessionState::Fresh => Self::Ready,
-            SessionState::Starting | SessionState::Running => Self::Working,
-            SessionState::NeedsFeedback => Self::NeedsFeedback,
-            SessionState::FinishedUnseen | SessionState::FinishedSeen => Self::Finished,
-            SessionState::Failed => Self::Failed,
-            SessionState::Terminated => Self::Stopped,
-            SessionState::Disconnected => Self::Disconnected,
+    const fn for_status(status: SessionStatus) -> Self {
+        match status.lifecycle {
+            SessionLifecycle::Fresh => Self::Ready,
+            SessionLifecycle::Starting => Self::Working,
+            SessionLifecycle::Running => match status.activity {
+                ProviderActivity::AwaitingInput | ProviderActivity::RecoverableFailure => {
+                    Self::NeedsFeedback
+                }
+                ProviderActivity::Completed => Self::Finished,
+                ProviderActivity::None
+                | ProviderActivity::Working
+                | ProviderActivity::Interrupted => Self::Working,
+            },
+            SessionLifecycle::Exited => Self::Finished,
+            SessionLifecycle::Failed => Self::Failed,
+            SessionLifecycle::Terminated => Self::Stopped,
+            SessionLifecycle::Disconnected => Self::Disconnected,
         }
     }
 }
@@ -714,7 +726,7 @@ fn build_repository_rows(
                         .iter()
                         .filter(move |session| session.worktree_id == worktree.id)
                 })
-                .filter_map(|session| attention_for_state(session.state))
+                .filter_map(|session| attention_for_status(session.status))
                 .max();
             NavigatorRow {
                 id: NavigatorNodeId::Repository(project.id),
@@ -775,7 +787,7 @@ fn build_checkout_rows(
                 indicator: None,
                 attention: sessions
                     .iter()
-                    .filter_map(|session| attention_for_state(session.state))
+                    .filter_map(|session| attention_for_status(session.status))
                     .max(),
                 actions: vec![NavigatorAction::DeleteCheckout(worktree.id)],
                 selected: selected_worktree_id == Some(worktree.id),
@@ -806,10 +818,10 @@ fn build_session_rows(
             id: NavigatorNodeId::Session(session.id),
             kind: NavigatorNodeKind::Session,
             label: session.display_name.clone(),
-            detail: session_state_label(session.state).to_owned(),
+            detail: session_status_label(session.status).to_owned(),
             badge: None,
-            indicator: Some(SessionIndicator::for_state(session.state)),
-            attention: attention_for_state(session.state),
+            indicator: Some(SessionIndicator::for_status(session.status)),
+            attention: attention_for_status(session.status),
             actions: vec![NavigatorAction::DeleteSession(session.id)],
             selected: selected_session_id == Some(session.id),
         })
@@ -834,7 +846,7 @@ fn build_active_session(
         .map(|session| OpenSessionPresentation {
             id: session.id,
             label: session.display_name.clone(),
-            state: session_state_label(session.state).to_owned(),
+            state: session_status_label(session.status).to_owned(),
             active: active_session_id == Some(session.id),
         })
         .collect();
@@ -857,64 +869,66 @@ fn build_active_session(
             checkout: worktree.name.clone(),
             branch: worktree.branch.as_deref().unwrap_or("detached").to_owned(),
             session: session.display_name.clone(),
-            state: session_state_label(session.state).to_owned(),
+            state: session_status_label(session.status).to_owned(),
             terminal_action: if active_session_attached {
                 Some(ActiveTerminalAction::Leave)
-            } else if session_state_can_stop(session.state) {
+            } else if session_status_can_stop(session.status) {
                 Some(ActiveTerminalAction::Open)
-            } else if session_state_can_replay(session.state) {
+            } else if session_status_can_replay(session.status) {
                 Some(ActiveTerminalAction::ViewOutput)
             } else {
                 None
             },
-            can_stop: session_state_can_stop(session.state),
+            can_stop: session_status_can_stop(session.status),
             can_resume: resumable_session_ids.contains(&session.id),
         })
     });
     ActiveSessionPresentation { tabs, context }
 }
 
-const fn attention_for_state(state: SessionState) -> Option<NavigatorAttention> {
-    match state {
-        SessionState::FinishedUnseen => Some(NavigatorAttention::Finished),
-        SessionState::NeedsFeedback => Some(NavigatorAttention::NeedsFeedback),
-        SessionState::Failed => Some(NavigatorAttention::Failed),
-        SessionState::Fresh
-        | SessionState::Starting
-        | SessionState::Running
-        | SessionState::FinishedSeen
-        | SessionState::Terminated
-        | SessionState::Disconnected => None,
+fn attention_for_status(status: SessionStatus) -> Option<NavigatorAttention> {
+    let event = status.attention?;
+    if event.acknowledgement != AttentionAcknowledgement::Pending {
+        return None;
     }
+    Some(match event.reason {
+        AttentionReason::SuccessfulCompletion => NavigatorAttention::Finished,
+        AttentionReason::InputRequested | AttentionReason::RecoverableFailure => {
+            NavigatorAttention::NeedsFeedback
+        }
+        AttentionReason::TerminalFailure => NavigatorAttention::Failed,
+    })
 }
 
-pub(crate) const fn session_state_can_stop(state: SessionState) -> bool {
+pub(crate) const fn session_status_can_stop(status: SessionStatus) -> bool {
     matches!(
-        state,
-        SessionState::Fresh
-            | SessionState::Starting
-            | SessionState::Running
-            | SessionState::NeedsFeedback
+        status.lifecycle,
+        SessionLifecycle::Fresh | SessionLifecycle::Starting | SessionLifecycle::Running
     )
 }
 
-pub(crate) const fn session_state_can_replay(state: SessionState) -> bool {
+pub(crate) const fn session_status_can_replay(status: SessionStatus) -> bool {
     matches!(
-        state,
-        SessionState::FinishedUnseen | SessionState::FinishedSeen | SessionState::Failed
+        status.lifecycle,
+        SessionLifecycle::Exited | SessionLifecycle::Failed
     )
 }
 
-pub(crate) const fn session_state_label(state: SessionState) -> &'static str {
-    match state {
-        SessionState::Fresh => "Ready",
-        SessionState::Starting => "Starting",
-        SessionState::Running => "Running",
-        SessionState::NeedsFeedback => "Needs feedback",
-        SessionState::FinishedUnseen | SessionState::FinishedSeen => "Finished",
-        SessionState::Failed => "Failed",
-        SessionState::Terminated => "Stopped",
-        SessionState::Disconnected => "Disconnected",
+pub(crate) const fn session_status_label(status: SessionStatus) -> &'static str {
+    match status.lifecycle {
+        SessionLifecycle::Fresh => "Ready",
+        SessionLifecycle::Starting => "Starting",
+        SessionLifecycle::Running => match status.activity {
+            ProviderActivity::AwaitingInput => "Needs input",
+            ProviderActivity::Completed => "Completed",
+            ProviderActivity::Interrupted => "Interrupted",
+            ProviderActivity::RecoverableFailure => "Recoverable failure",
+            ProviderActivity::None | ProviderActivity::Working => "Running",
+        },
+        SessionLifecycle::Exited => "Finished",
+        SessionLifecycle::Failed => "Failed",
+        SessionLifecycle::Terminated => "Stopped",
+        SessionLifecycle::Disconnected => "Disconnected",
     }
 }
 
@@ -1152,8 +1166,7 @@ mod tests {
     use super::*;
     use sylvops_core::{
         domain::{
-            DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace, Worktree,
-            WorktreeStatus,
+            DaemonSnapshot, Project, ProviderKind, Session, Workspace, Worktree, WorktreeStatus,
         },
         ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
         ui::{DesktopDensity, DesktopState},
@@ -1166,7 +1179,7 @@ mod tests {
         session_id: SessionId,
     }
 
-    fn hierarchy_fixture(session_state: SessionState) -> HierarchyFixture {
+    fn hierarchy_fixture(status: SessionStatus) -> HierarchyFixture {
         let workspace_id = WorkspaceId::new();
         let project_id = ProjectId::new();
         let worktree_id = WorktreeId::new();
@@ -1213,8 +1226,7 @@ mod tests {
                     provider_profile_id: None,
                     provider_kind: ProviderKind::Codex,
                     display_name: "Review issue 65".into(),
-                    state: session_state,
-                    status: sylvops_core::session_state::SessionStatus::default(),
+                    status,
                     process_id: None,
                     external_session_id: None,
                     command: "codex".into(),
@@ -1431,7 +1443,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn interaction_selection_is_validated_against_the_daemon_hierarchy() {
         use sylvops_core::domain::{
-            Project, ProviderKind, Session, SessionState, Workspace, Worktree, WorktreeStatus,
+            Project, ProviderKind, Session, Workspace, Worktree, WorktreeStatus,
         };
         use sylvops_core::ids::{ProjectId, SessionId, WorkspaceId, WorktreeId};
 
@@ -1480,8 +1492,10 @@ mod tests {
                 provider_profile_id: None,
                 provider_kind: ProviderKind::Codex,
                 display_name: "Codex".into(),
-                state: SessionState::Running,
-                status: sylvops_core::session_state::SessionStatus::default(),
+                status: SessionStatus {
+                    lifecycle: SessionLifecycle::Running,
+                    ..SessionStatus::default()
+                },
                 process_id: None,
                 external_session_id: None,
                 command: "codex".into(),
@@ -1542,7 +1556,10 @@ mod tests {
 
     #[test]
     fn details_selection_follows_the_explorer_level_and_selected_session() {
-        let mut fixture = hierarchy_fixture(SessionState::Running);
+        let mut fixture = hierarchy_fixture(SessionStatus {
+            lifecycle: SessionLifecycle::Running,
+            ..SessionStatus::default()
+        });
         let mut unrelated_session = fixture.snapshot.sessions[0].clone();
         unrelated_session.id = SessionId::new();
         unrelated_session.display_name = "Unrelated active session".into();
@@ -1678,7 +1695,10 @@ mod tests {
 
     #[test]
     fn navigator_presents_independent_selected_columns() {
-        let fixture = hierarchy_fixture(SessionState::Running);
+        let fixture = hierarchy_fixture(SessionStatus {
+            lifecycle: SessionLifecycle::Running,
+            ..SessionStatus::default()
+        });
         let preferences = DesktopState::default();
         let presentation = DesktopPresentation::build(&PresentationInput {
             daemon: &fixture.snapshot,
@@ -1712,7 +1732,10 @@ mod tests {
 
     #[test]
     fn navigator_orders_each_column_deterministically() {
-        let mut fixture = hierarchy_fixture(SessionState::Running);
+        let mut fixture = hierarchy_fixture(SessionStatus {
+            lifecycle: SessionLifecycle::Running,
+            ..SessionStatus::default()
+        });
         let mut recent_project = fixture.snapshot.projects[0].clone();
         recent_project.id = ProjectId::new();
         recent_project.name = "Recent repository".into();
@@ -1776,7 +1799,10 @@ mod tests {
 
     #[test]
     fn claude_session_resume_is_presented_from_returned_provider_capability() {
-        let mut fixture = hierarchy_fixture(SessionState::FinishedSeen);
+        let mut fixture = hierarchy_fixture(SessionStatus {
+            lifecycle: SessionLifecycle::Exited,
+            ..SessionStatus::default()
+        });
         let session = &mut fixture.snapshot.sessions[0];
         session.provider_kind = ProviderKind::Claude;
         session.external_session_id = Some("verified-claude-id".into());
@@ -1807,7 +1833,16 @@ mod tests {
 
     #[test]
     fn navigator_rolls_urgent_session_state_up_to_ancestors() {
-        let fixture = hierarchy_fixture(SessionState::NeedsFeedback);
+        let fixture = hierarchy_fixture(SessionStatus {
+            lifecycle: SessionLifecycle::Running,
+            activity: ProviderActivity::AwaitingInput,
+            attention: Some(sylvops_core::session_state::AttentionEvent {
+                id: sylvops_core::session_state::AttentionEventId::try_from(1).unwrap(),
+                reason: AttentionReason::InputRequested,
+                acknowledgement: AttentionAcknowledgement::Pending,
+                occurred_at: 1,
+            }),
+        });
         let preferences = DesktopState::default();
         let presentation = DesktopPresentation::build(&PresentationInput {
             daemon: &fixture.snapshot,
@@ -1832,7 +1867,10 @@ mod tests {
 
     #[test]
     fn navigator_rows_publish_contextual_actions_without_hover() {
-        let mut fixture = hierarchy_fixture(SessionState::Running);
+        let mut fixture = hierarchy_fixture(SessionStatus {
+            lifecycle: SessionLifecycle::Running,
+            ..SessionStatus::default()
+        });
         fixture.snapshot.worktrees[0].is_root_checkout = false;
         let preferences = DesktopState::default();
         let presentation = DesktopPresentation::build(&PresentationInput {
@@ -1863,7 +1901,10 @@ mod tests {
 
     #[test]
     fn responsive_shell_keeps_workspace_and_active_session_context_explicit() {
-        let fixture = hierarchy_fixture(SessionState::Running);
+        let fixture = hierarchy_fixture(SessionStatus {
+            lifecycle: SessionLifecycle::Running,
+            ..SessionStatus::default()
+        });
         let preferences = DesktopState::default();
         let present = |width| {
             DesktopPresentation::build(&PresentationInput {

@@ -2,13 +2,13 @@ use std::time::Duration;
 
 use sylvops_core::protocol::{
     ClientRequest, DaemonResponse, Frame, HelloRequest, MessageClass, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR, read_frame, write_frame,
+    PROTOCOL_MINOR, read_frame, read_handshake_frame, write_frame,
 };
 use sylvops_daemon::{
     client::DaemonClient,
     daemon::{self, CONTROL_OPCODE},
     ipc,
-    runtime::RuntimePaths,
+    runtime::{AuthenticationToken, RuntimePaths},
 };
 
 async fn connect_eventually(paths: &RuntimePaths) -> DaemonClient {
@@ -58,6 +58,42 @@ async fn daemon_authenticates_concurrent_clients_and_shuts_down_cleanly() {
     assert!(matches!(
         rejected.payload_as::<DaemonResponse>().expect("typed rejection"),
         DaemonResponse::Error(error) if error.code == "authentication_failed"
+    ));
+
+    let mut incompatible = ipc::connect(&paths.endpoint)
+        .await
+        .expect("raw incompatible connection");
+    let token = AuthenticationToken::read(&paths.authentication_token)
+        .expect("daemon authentication token");
+    let incompatible_hello = ClientRequest::Hello(HelloRequest {
+        client_name: "older-test-client".into(),
+        client_process_id: std::process::id(),
+        client_version: "0".into(),
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR - 1,
+        authentication_token: token.expose().into(),
+    });
+    let mut request = Frame::message(MessageClass::Request, CONTROL_OPCODE, &incompatible_hello)
+        .expect("incompatible hello frame");
+    request.version.minor = PROTOCOL_MINOR - 1;
+    write_frame(&mut incompatible, &request)
+        .await
+        .expect("write incompatible hello");
+    let rejected = read_handshake_frame(&mut incompatible)
+        .await
+        .expect("read protocol rejection");
+    assert_eq!(rejected.version, request.version);
+    assert!(matches!(
+        rejected.payload_as::<DaemonResponse>().expect("typed rejection"),
+        DaemonResponse::Error(error)
+            if error.code == "unsupported_protocol"
+                && error.message.contains(&format!(
+                    "client protocol {PROTOCOL_MAJOR}.{}",
+                    PROTOCOL_MINOR - 1
+                ))
+                && error.message.contains(&format!(
+                    "daemon protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}"
+                ))
     ));
 
     let second = connect_eventually(&paths).await;

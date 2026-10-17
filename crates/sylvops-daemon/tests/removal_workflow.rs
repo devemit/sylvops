@@ -2,9 +2,10 @@ use std::{path::Path, time::Duration};
 
 use rusqlite::Connection;
 use sylvops_core::{
-    domain::{ProviderKind, SessionState, WorktreeStatus},
+    domain::{ProviderKind, WorktreeStatus},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+    session_state::SessionLifecycle,
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 use sylvops_test_support::{AbortOnDropTask, TemporaryRepository, git_branch_exists};
@@ -83,7 +84,7 @@ async fn exercise_complete_removal_workflow() {
         })
         .await
         .unwrap();
-    wait_for_session_state(&observer, session.id, SessionState::Terminated).await;
+    wait_for_session_state(&observer, session.id, SessionLifecycle::Terminated).await;
     let stale_session_token = inspect_session(&actor, session.id)
         .await
         .authorization_token
@@ -183,7 +184,7 @@ async fn exercise_complete_removal_workflow() {
         })
         .await
         .unwrap();
-    wait_for_session_state(&observer, blocking_session.id, SessionState::Terminated).await;
+    wait_for_session_state(&observer, blocking_session.id, SessionLifecycle::Terminated).await;
     delete_session(&actor, blocking_session.id).await;
     let project_token = inspect_project(&actor, project.id)
         .await
@@ -449,14 +450,18 @@ async fn snapshot(client: &DaemonClient) -> sylvops_core::domain::DaemonSnapshot
     }
 }
 
-async fn wait_for_session_state(client: &DaemonClient, session_id: SessionId, state: SessionState) {
+async fn wait_for_session_state(
+    client: &DaemonClient,
+    session_id: SessionId,
+    state: SessionLifecycle,
+) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if snapshot(client)
             .await
             .sessions
             .iter()
-            .any(|item| item.id == session_id && item.state == state)
+            .any(|item| item.id == session_id && item.status.lifecycle == state)
         {
             return;
         }
