@@ -132,12 +132,12 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         load_tui_state(&client).await?,
         invocation_directory,
     );
+    app.notification_preferences = load_attention_notification_preferences(&client).await?;
     let mut events = client.subscribe();
     let (github_results_tx, mut github_results) = tokio::sync::mpsc::channel(16);
     let mut github_tasks = GitHubTasks::default();
-    let mut attention_alerts = notifications::AttentionTracker::new(&app.snapshot.sessions);
-    #[cfg(windows)]
-    let popup_notifications = notifications::platform::Notifier::new().ok();
+    let notification_presenter =
+        notifications::NotificationPresenter::new(notifications::SystemChannels::new());
     let mut guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .map_err(|error| DaemonError::Lifecycle(format!("cannot initialize TUI: {error}")))?;
@@ -253,20 +253,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         }
         if refresh {
             app.replace_snapshot(snapshot(&client).await?);
-            if let Some(message) = attention_alerts.update(&app.snapshot.sessions) {
-                let _ = execute!(terminal.backend_mut(), Print("\x07"));
-                #[cfg(windows)]
-                if !popup_notifications
-                    .as_ref()
-                    .is_some_and(|notifier| notifier.send(message.clone()))
-                {
-                    app.flash = Some(Flash::error(
-                        "Windows popup notification unavailable; check the highlighted sessions.",
-                    ));
-                }
-                #[cfg(not(windows))]
-                let _ = message;
-            }
+            deliver_attention_notifications(&client, &mut app, &notification_presenter).await?;
             dirty = true;
         }
         save_debounced(&client, &mut app).await?;
@@ -2877,6 +2864,18 @@ fn adjust_setting(app: &mut App, settings: SettingsFocus, delta: isize) {
         SettingsFocus::Density => {
             app.density = cycle_choice(&TuiDensity::ALL, app.density, delta);
         }
+        SettingsFocus::NativeNotifications => {
+            if delta != 0 {
+                app.notification_preferences.native_notifications_enabled =
+                    !app.notification_preferences.native_notifications_enabled;
+            }
+        }
+        SettingsFocus::Sound => {
+            if delta != 0 {
+                app.notification_preferences.sound_enabled =
+                    !app.notification_preferences.sound_enabled;
+            }
+        }
         SettingsFocus::GitHub | SettingsFocus::Apply | SettingsFocus::Cancel => {}
     }
 }
@@ -2918,6 +2917,20 @@ fn handle_settings_input(app: &mut App, input: &Event) -> SettingsDecision {
             app.session_presentation = choice;
             if let Mode::Settings(settings) = &mut app.mode {
                 settings.focus = SettingsFocus::Presentation;
+            }
+            return SettingsDecision::Continue;
+        }
+        Some(HitTarget::SettingsNativeNotifications(enabled)) => {
+            app.notification_preferences.native_notifications_enabled = enabled;
+            if let Mode::Settings(settings) = &mut app.mode {
+                settings.focus = SettingsFocus::NativeNotifications;
+            }
+            return SettingsDecision::Continue;
+        }
+        Some(HitTarget::SettingsSound(enabled)) => {
+            app.notification_preferences.sound_enabled = enabled;
+            if let Mode::Settings(settings) = &mut app.mode {
+                settings.focus = SettingsFocus::Sound;
             }
             return SettingsDecision::Continue;
         }
@@ -3001,6 +3014,7 @@ async fn handle_settings(
 ) -> Result<(), DaemonError> {
     match handle_settings_input(app, input) {
         SettingsDecision::Apply => {
+            save_attention_notification_preferences(client, app.notification_preferences).await?;
             save_tui_state(client, app).await?;
             app.navigation_dirty_at = None;
         }
@@ -3724,6 +3738,76 @@ async fn load_tui_state(client: &DaemonClient) -> Result<Option<TuiState>, Daemo
             "unexpected TUI state response: {response:?}"
         ))),
     }
+}
+
+async fn load_attention_notification_preferences(
+    client: &DaemonClient,
+) -> Result<sylvops_core::attention::AttentionNotificationPreferences, DaemonError> {
+    match client
+        .request(&ClientRequest::GetAttentionNotificationPreferences)
+        .await?
+    {
+        DaemonResponse::AttentionNotificationPreferences(preferences) => Ok(preferences),
+        DaemonResponse::Error(error) => Err(DaemonError::Lifecycle(error.message)),
+        response => Err(DaemonError::Lifecycle(format!(
+            "unexpected Attention Notification preferences response: {response:?}"
+        ))),
+    }
+}
+
+async fn save_attention_notification_preferences(
+    client: &DaemonClient,
+    preferences: sylvops_core::attention::AttentionNotificationPreferences,
+) -> Result<(), DaemonError> {
+    match client
+        .request(&ClientRequest::SaveAttentionNotificationPreferences { preferences })
+        .await?
+    {
+        DaemonResponse::AttentionNotificationPreferencesSaved => Ok(()),
+        DaemonResponse::Error(error) => Err(DaemonError::Lifecycle(error.message)),
+        response => Err(DaemonError::Lifecycle(format!(
+            "unexpected Attention Notification preferences save response: {response:?}"
+        ))),
+    }
+}
+
+async fn deliver_attention_notifications<C: notifications::NotificationChannels>(
+    client: &DaemonClient,
+    app: &mut App,
+    presenter: &notifications::NotificationPresenter<C>,
+) -> Result<(), DaemonError> {
+    for _ in 0..256 {
+        let claim = match client
+            .request(&ClientRequest::ClaimAttentionNotification)
+            .await?
+        {
+            DaemonResponse::AttentionNotificationClaim(claim) => claim,
+            DaemonResponse::Error(error) => return Err(DaemonError::Lifecycle(error.message)),
+            response => {
+                return Err(DaemonError::Lifecycle(format!(
+                    "unexpected Attention Notification claim response: {response:?}"
+                )));
+            }
+        };
+        let Some(claim) = claim else {
+            return Ok(());
+        };
+        if let Some(notification) = presenter.present(&claim) {
+            let kind = match notification.reason {
+                sylvops_core::session_state::AttentionReason::InputRequested => FlashKind::Info,
+                sylvops_core::session_state::AttentionReason::SuccessfulCompletion => {
+                    FlashKind::Success
+                }
+                sylvops_core::session_state::AttentionReason::RecoverableFailure
+                | sylvops_core::session_state::AttentionReason::TerminalFailure => FlashKind::Error,
+            };
+            app.flash = Some(Flash::transient(
+                kind,
+                format!("{} · {}", notification.title, notification.message),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn save_tui_state(client: &DaemonClient, app: &App) -> Result<(), DaemonError> {

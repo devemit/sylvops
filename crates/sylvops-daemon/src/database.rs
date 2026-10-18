@@ -14,6 +14,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, types::Type};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use sylvops_core::attention::AttentionNotificationPreferences;
 use sylvops_core::domain::{
     DaemonSnapshot, MAX_SNAPSHOT_SESSION_LINEAGE_LINKS, MAX_SNAPSHOT_WORK_SOURCES, Project,
     ProviderProfile, Session, SessionLineageLink, Workspace, Worktree, WorktreeStatus,
@@ -44,6 +45,8 @@ const MAX_TUI_STATE_BYTES: usize = 4 * 1024;
 const DESKTOP_STATE_SCOPE: &str = "desktop";
 const DESKTOP_STATE_KEY: &str = "navigation.v1";
 const MAX_DESKTOP_STATE_BYTES: usize = 16 * 1024;
+const ATTENTION_NOTIFICATION_PREFERENCES_KEY: &str = "attention_notifications.v1";
+const MAX_ATTENTION_NOTIFICATION_PREFERENCES_BYTES: usize = 1024;
 pub(crate) const MAX_REMOVAL_BLOCKER_IDS: usize = 32;
 const REMOVAL_QUERY_LIMIT: i64 = 33;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -123,6 +126,13 @@ enum DatabaseCommand {
     },
     SaveDesktopState {
         state: DesktopState,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    GetAttentionNotificationPreferences {
+        reply: oneshot::Sender<Result<AttentionNotificationPreferences>>,
+    },
+    SaveAttentionNotificationPreferences {
+        preferences: AttentionNotificationPreferences,
         reply: oneshot::Sender<Result<()>>,
     },
     AddWorkspace {
@@ -543,6 +553,37 @@ impl DatabaseHandle {
     pub async fn save_desktop_state(&self, state: DesktopState) -> Result<()> {
         request(&self.inner.commands, |reply| {
             DatabaseCommand::SaveDesktopState { state, reply }
+        })
+        .await
+    }
+
+    /// Loads shared Attention Notification channel preferences.
+    ///
+    /// Missing or invalid persisted values fail closed to the bounded defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor or SQLite error.
+    pub async fn attention_notification_preferences(
+        &self,
+    ) -> Result<AttentionNotificationPreferences> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::GetAttentionNotificationPreferences { reply }
+        })
+        .await
+    }
+
+    /// Persists shared Attention Notification channel preferences.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, serialization, size-limit, or SQLite error.
+    pub async fn save_attention_notification_preferences(
+        &self,
+        preferences: AttentionNotificationPreferences,
+    ) -> Result<()> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::SaveAttentionNotificationPreferences { preferences, reply }
         })
         .await
     }
@@ -1213,6 +1254,15 @@ fn database_thread(
             }
             DatabaseCommand::SaveDesktopState { state, reply } => {
                 let _ = reply.send(save_desktop_state(&connection, &state));
+            }
+            DatabaseCommand::GetAttentionNotificationPreferences { reply } => {
+                let _ = reply.send(load_attention_notification_preferences(&connection));
+            }
+            DatabaseCommand::SaveAttentionNotificationPreferences { preferences, reply } => {
+                let _ = reply.send(save_attention_notification_preferences(
+                    &connection,
+                    preferences,
+                ));
             }
             DatabaseCommand::AddWorkspace { name, reply } => {
                 let result = insert_workspace(&mut connection, &name).map(|workspace| {
@@ -3162,6 +3212,48 @@ fn save_desktop_state(connection: &Connection, state: &DesktopState) -> Result<(
              ON CONFLICT(client_scope, key) DO UPDATE SET value_json = excluded.value_json, \
              updated_at = excluded.updated_at",
             params![DESKTOP_STATE_SCOPE, DESKTOP_STATE_KEY, value, now_millis()],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
+fn load_attention_notification_preferences(
+    connection: &Connection,
+) -> Result<AttentionNotificationPreferences> {
+    let value = connection
+        .query_row(
+            "SELECT value_json FROM settings WHERE key = ?1",
+            [ATTENTION_NOTIFICATION_PREFERENCES_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    Ok(value
+        .filter(|value| value.len() <= MAX_ATTENTION_NOTIFICATION_PREFERENCES_BYTES)
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
+}
+
+fn save_attention_notification_preferences(
+    connection: &Connection,
+    preferences: AttentionNotificationPreferences,
+) -> Result<()> {
+    let value = serde_json::to_string(&preferences).map_err(|error| {
+        DaemonError::Database(format!(
+            "cannot serialize Attention Notification preferences: {error}"
+        ))
+    })?;
+    if value.len() > MAX_ATTENTION_NOTIFICATION_PREFERENCES_BYTES {
+        return Err(DaemonError::Database(
+            "Attention Notification preferences exceed size limit".into(),
+        ));
+    }
+    connection
+        .execute(
+            "INSERT INTO settings(key, value_json, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, \
+             updated_at = excluded.updated_at",
+            params![ATTENTION_NOTIFICATION_PREFERENCES_KEY, value, now_millis()],
         )
         .map_err(database_error)?;
     Ok(())
