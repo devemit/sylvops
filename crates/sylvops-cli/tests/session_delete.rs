@@ -1,9 +1,10 @@
 use std::{path::Path, process::Output, process::Stdio, time::Duration};
 
 use sylvops_core::{
-    domain::{ProviderKind, SessionState},
+    domain::ProviderKind,
     ids::SessionId,
     protocol::{ClientRequest, DaemonResponse},
+    session_state::SessionLifecycle,
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 use sylvops_test_support::{TemporaryRepository, bounded};
@@ -74,7 +75,7 @@ async fn exercise_cli_session_deletion() {
         })
         .await
         .unwrap();
-    wait_for_state(&client, session.id, SessionState::Terminated).await;
+    wait_for_state(&client, session.id, SessionLifecycle::Terminated).await;
 
     let deleted = run_delete(&state_directory, session.id).await;
     assert!(
@@ -125,7 +126,7 @@ async fn connect_eventually(paths: &RuntimePaths) -> DaemonClient {
     }
 }
 
-async fn wait_for_state(client: &DaemonClient, session_id: SessionId, state: SessionState) {
+async fn wait_for_state(client: &DaemonClient, session_id: SessionId, state: SessionLifecycle) {
     loop {
         let snapshot = match client.request(&ClientRequest::GetSnapshot).await.unwrap() {
             DaemonResponse::Snapshot(snapshot) => snapshot,
@@ -134,7 +135,7 @@ async fn wait_for_state(client: &DaemonClient, session_id: SessionId, state: Ses
         if snapshot
             .sessions
             .iter()
-            .any(|session| session.id == session_id && session.state == state)
+            .any(|session| session.id == session_id && session.status.lifecycle == state)
         {
             return;
         }

@@ -46,7 +46,7 @@ use input_pump::InputPump;
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use reducer::{Effect, reduce};
 use sylvops_core::{
-    domain::{AttachmentRole, DaemonSnapshot, SessionState, state_is_active},
+    domain::{AttachmentRole, DaemonSnapshot},
     github::{
         GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, StartWorkFailure,
         StartWorkFailureKind, StartWorkOutcome,
@@ -57,6 +57,7 @@ use sylvops_core::{
         MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, ProjectRemovalRefusal, SessionDeletionRefusal,
         WorkspaceDeletionRefusal,
     },
+    session_state::{ProviderActivity, SessionLifecycle, lifecycle_is_active},
     ui::{TuiContentView, TuiDensity, TuiSessionPresentation, TuiState, TuiTheme},
     upgrade::UpgradeStatus,
 };
@@ -166,10 +167,12 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         let next_animation_frame = app.status_animation_frame();
         dirty |= next_animation_frame != animation_frame
             && app.snapshot.sessions.iter().any(|session| {
-                matches!(
-                    session.state,
-                    SessionState::Starting | SessionState::Running
-                )
+                session.status.lifecycle == SessionLifecycle::Starting
+                    || (session.status.lifecycle == SessionLifecycle::Running
+                        && matches!(
+                            session.status.activity,
+                            ProviderActivity::None | ProviderActivity::Working
+                        ))
             });
         animation_frame = next_animation_frame;
         for _ in 0..16 {
@@ -1761,8 +1764,13 @@ fn open_github_worktree(app: &mut App, worktree_id: WorktreeId) -> bool {
         .sessions
         .iter()
         .filter(|session| session.worktree_id == worktree_id)
-        .max_by_key(|session| (state_is_active(session.state), session.last_activity_at))
-        .map(|session| (session.id, state_is_active(session.state)));
+        .max_by_key(|session| {
+            (
+                lifecycle_is_active(session.status.lifecycle),
+                session.last_activity_at,
+            )
+        })
+        .map(|session| (session.id, lifecycle_is_active(session.status.lifecycle)));
     app.mode = Mode::Navigation;
     if let Some((session_id, active)) = session {
         app.reveal_and_select(ExplorerNode::Session(session_id));
@@ -2091,14 +2099,7 @@ fn apply_removal_inspection(app: &mut App, response: DaemonResponse) {
                 return;
             }
             if app.snapshot.sessions.iter().any(|session| {
-                session.worktree_id == worktree.id
-                    && matches!(
-                        session.state,
-                        SessionState::Fresh
-                            | SessionState::Starting
-                            | SessionState::Running
-                            | SessionState::NeedsFeedback
-                    )
+                session.worktree_id == worktree.id && lifecycle_is_active(session.status.lifecycle)
             }) {
                 app.flash = Some(Flash::error(
                     "Remove Worktree refused: an active Session remains. Stop it and wait for exit first.",
@@ -2139,11 +2140,8 @@ fn apply_removal_inspection(app: &mut App, response: DaemonResponse) {
                 return;
             };
             if matches!(
-                inspection.state,
-                SessionState::Fresh
-                    | SessionState::Starting
-                    | SessionState::Running
-                    | SessionState::NeedsFeedback
+                inspection.lifecycle,
+                SessionLifecycle::Fresh | SessionLifecycle::Starting | SessionLifecycle::Running
             ) {
                 app.mode = Mode::Confirmation(Confirmation {
                     title: "Stop Session?".into(),
@@ -2156,7 +2154,8 @@ fn apply_removal_inspection(app: &mut App, response: DaemonResponse) {
                 return;
             }
             let Some(token) = inspection.authorization_token else {
-                let reason = session_deletion_refusal_text(inspection.refusal, inspection.state);
+                let reason =
+                    session_deletion_refusal_text(inspection.refusal, inspection.lifecycle);
                 app.flash = Some(Flash::error(bounded_feedback(format!(
                     "Delete Session refused: {reason}"
                 ))));
@@ -2219,7 +2218,7 @@ fn project_removal_refusal_text(refusal: &ProjectRemovalRefusal) -> String {
 
 fn session_deletion_refusal_text(
     refusal: Option<SessionDeletionRefusal>,
-    state: SessionState,
+    lifecycle: SessionLifecycle,
 ) -> String {
     match refusal {
         Some(SessionDeletionRefusal::LiveState) => {
@@ -2229,7 +2228,7 @@ fn session_deletion_refusal_text(
             "the Session still owns a process tree. Stop it and wait for exit first.".into()
         }
         Some(SessionDeletionRefusal::IneligibleState) | None => {
-            format!("state {state} is not eligible for deletion.")
+            format!("lifecycle {lifecycle:?} is not eligible for deletion.")
         }
     }
 }
@@ -3307,7 +3306,7 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
         return Ok(());
     }
     if let Some(session) = app.selected_session()
-        && !sylvops_core::domain::state_is_active(session.state)
+        && !lifecycle_is_active(session.status.lifecycle)
     {
         if sylvops_core::provider::session_can_resume(
             session,
@@ -3888,7 +3887,6 @@ mod tests {
                 provider_profile_id: None,
                 provider_kind: ProviderKind::Shell,
                 display_name: "shell".into(),
-                state: SessionState::Running,
                 status: SessionStatus {
                     lifecycle: SessionLifecycle::Running,
                     activity: ProviderActivity::None,
@@ -3922,13 +3920,6 @@ mod tests {
         session.id = SessionId::new();
         session.display_name = name.into();
         session.last_activity_at = occurred_at;
-        session.state = match reason {
-            AttentionReason::InputRequested | AttentionReason::RecoverableFailure => {
-                SessionState::NeedsFeedback
-            }
-            AttentionReason::SuccessfulCompletion => SessionState::FinishedUnseen,
-            AttentionReason::TerminalFailure => SessionState::Failed,
-        };
         session.status = SessionStatus {
             lifecycle: if reason == AttentionReason::TerminalFailure {
                 SessionLifecycle::Failed
@@ -4064,7 +4055,7 @@ mod tests {
         let mut starting = snapshot.sessions[0].clone();
         starting.id = SessionId::new();
         starting.display_name = "starting".into();
-        starting.state = SessionState::Starting;
+        starting.status.lifecycle = SessionLifecycle::Starting;
         starting.status.lifecycle = SessionLifecycle::Starting;
         starting.process_id = None;
         starting.last_activity_at = 100;
@@ -4082,7 +4073,7 @@ mod tests {
         let mut inactive = snapshot.sessions[0].clone();
         inactive.id = SessionId::new();
         inactive.display_name = "finished history".into();
-        inactive.state = SessionState::FinishedSeen;
+        inactive.status.lifecycle = SessionLifecycle::Exited;
         inactive.status.lifecycle = SessionLifecycle::Exited;
         inactive.process_id = None;
         inactive.last_activity_at = 200;
@@ -4116,7 +4107,8 @@ mod tests {
             .iter_mut()
             .find(|session| session.id == starting_id)
             .unwrap()
-            .state = SessionState::FinishedSeen;
+            .status
+            .lifecycle = SessionLifecycle::Exited;
         app.replace_snapshot(snapshot);
         assert_eq!(app.selected_session_id, Some(needs_feedback_id));
         assert_eq!(
@@ -4131,7 +4123,7 @@ mod tests {
     }
 
     #[test]
-    fn needs_attention_is_complete_urgent_recent_and_absent_from_active_sessions() {
+    fn needs_attention_is_complete_urgent_recent_and_independent_from_active_sessions() {
         let mut snapshot = populated_snapshot();
         let running_id = snapshot.sessions[0].id;
         let base = snapshot.sessions[0].clone();
@@ -4194,7 +4186,13 @@ mod tests {
                 .into_iter()
                 .map(|session| session.id)
                 .collect::<Vec<_>>(),
-            vec![running_id]
+            vec![
+                pending_ids[4],
+                pending_ids[2],
+                pending_ids[0],
+                pending_ids[1],
+                running_id,
+            ]
         );
     }
 
@@ -4326,14 +4324,25 @@ mod tests {
         snapshot.captured_at = 120_000;
         snapshot.sessions[0].display_name = "running shell".into();
         snapshot.sessions[0].last_activity_at = 60_000;
-        for (name, state, activity) in [
-            ("feedback codex", SessionState::NeedsFeedback, 119_000),
-            ("starting claude", SessionState::Starting, 118_000),
+        for (name, lifecycle, provider_activity, activity) in [
+            (
+                "feedback codex",
+                SessionLifecycle::Running,
+                ProviderActivity::AwaitingInput,
+                119_000,
+            ),
+            (
+                "starting claude",
+                SessionLifecycle::Starting,
+                ProviderActivity::None,
+                118_000,
+            ),
         ] {
             let mut session = snapshot.sessions[0].clone();
             session.id = SessionId::new();
             session.display_name = name.into();
-            session.state = state;
+            session.status.lifecycle = lifecycle;
+            session.status.activity = provider_activity;
             session.last_activity_at = activity;
             snapshot.sessions.push(session);
         }
@@ -4399,7 +4408,7 @@ mod tests {
 
         for text in [&cards, &list] {
             assert!(text.contains("feedback codex"));
-            assert!(text.contains("Needs feedback"));
+            assert!(text.contains("Needs input"));
         }
         assert!(cards.contains("Provider: Shell"));
         assert!(cards.contains("Project: repo"));
@@ -4647,7 +4656,7 @@ mod tests {
     #[test]
     fn sessions_empty_state_keeps_context_and_guides_creation_or_selection() {
         let mut snapshot = populated_snapshot();
-        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         snapshot.sessions[0].process_id = None;
         let mut app = App::new(snapshot, Vec::new(), None);
@@ -4700,7 +4709,7 @@ mod tests {
     fn successful_resume_selects_successor_and_preserves_source_history() {
         let mut snapshot = populated_snapshot();
         snapshot.sessions[0].provider_kind = ProviderKind::Codex;
-        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         snapshot.sessions[0].process_id = None;
         snapshot.sessions[0].external_session_id = Some("verified-id".into());
         snapshot.sessions[0].ended_at = Some(2);
@@ -4709,7 +4718,7 @@ mod tests {
         successor.id = SessionId::new();
         successor.created_at = 3;
         successor.display_name = "Codex (resumed)".into();
-        successor.state = SessionState::Running;
+        successor.status.lifecycle = SessionLifecycle::Running;
         successor.ended_at = None;
         let mut app = App::new(snapshot, Vec::new(), None);
         app.snapshot.sessions.push(successor.clone());
@@ -4872,7 +4881,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new(populated_snapshot(), Vec::new(), None);
-        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
 
         terminal
             .draw(|frame| render::draw(frame, &mut app))
@@ -4905,7 +4914,7 @@ mod tests {
             Some(HitTarget::Delete)
         );
 
-        app.snapshot.sessions[0].state = SessionState::Running;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Running;
         app.select_navigator_view(TuiNavigatorView::Active);
         terminal
             .draw(|frame| render::draw(frame, &mut app))
@@ -4945,7 +4954,7 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("● [a] Sessions"));
 
-        app.snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Running;
         app.snapshot.sessions[0].status.activity = ProviderActivity::AwaitingInput;
         app.snapshot.sessions[0].status.attention = Some(AttentionEvent {
             id: AttentionEventId::try_from(1).unwrap(),
@@ -5574,7 +5583,7 @@ mod tests {
             .collect::<String>();
         assert!(running.contains("[d] Stop Session"));
 
-        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         terminal
             .draw(|frame| render::draw(frame, &mut app))
             .unwrap();
@@ -5648,7 +5657,7 @@ mod tests {
         }
 
         app.snapshot.worktrees[0].is_root_checkout = false;
-        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         app.select_node(ExplorerNode::Worktree(worktree_id));
         terminal
             .draw(|frame| render::draw(frame, &mut app))
@@ -5942,7 +5951,7 @@ mod tests {
                 .contains("filesystem and Git content are preserved")
         );
 
-        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         app.select_node(ExplorerNode::Worktree(worktree_id));
         apply_removal_inspection(
             &mut app,
@@ -5974,7 +5983,7 @@ mod tests {
                 sylvops_core::protocol::SessionDeletionInspection {
                     session_id,
                     worktree_id,
-                    state: SessionState::Running,
+                    lifecycle: SessionLifecycle::Running,
                     authorization_token: None,
                     refusal: Some(SessionDeletionRefusal::LiveState),
                 },
@@ -5987,14 +5996,14 @@ mod tests {
         assert!(stop.detail.contains("descendant processes"));
         assert!(stop.detail.contains("filesystem content are preserved"));
 
-        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         apply_removal_inspection(
             &mut app,
             DaemonResponse::SessionDeletionInspected(
                 sylvops_core::protocol::SessionDeletionInspection {
                     session_id,
                     worktree_id,
-                    state: SessionState::FinishedSeen,
+                    lifecycle: SessionLifecycle::Exited,
                     authorization_token: Some("c".repeat(64).try_into().unwrap()),
                     refusal: None,
                 },
@@ -6079,7 +6088,7 @@ mod tests {
         );
         assert!(matches!(app.mode, Mode::Navigation));
 
-        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         app.snapshot.worktrees[0].status = WorktreeStatus::Missing;
         apply_removal_inspection(&mut app, DaemonResponse::WorktreeStatus(clean_status));
         assert!(
@@ -6094,7 +6103,7 @@ mod tests {
     fn blocked_worktree_dialog_names_ignored_content_and_scrolls_on_narrow_terminals() {
         use sylvops_core::domain::{GitWorktreeState, WorktreeBlockingKind, WorktreeBlockingPath};
         let mut snapshot = populated_snapshot();
-        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         snapshot.worktrees[0].is_root_checkout = false;
         let worktree_id = snapshot.worktrees[0].id;
         let mut app = App::new(snapshot, Vec::new(), None);
@@ -6189,7 +6198,7 @@ mod tests {
                 .is_some_and(|flash| flash.text.contains("Remove every Project first"))
         );
 
-        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         snapshot.sessions[0].process_id = Some(42);
         app.replace_snapshot(snapshot);
         app.select_node(ExplorerNode::Session(session_id));
@@ -6199,7 +6208,7 @@ mod tests {
                 sylvops_core::protocol::SessionDeletionInspection {
                     session_id,
                     worktree_id,
-                    state: SessionState::FinishedSeen,
+                    lifecycle: SessionLifecycle::Exited,
                     authorization_token: None,
                     refusal: Some(SessionDeletionRefusal::OwnedProcess),
                 },
@@ -6496,7 +6505,7 @@ mod tests {
     fn removed_worktree_closes_attachment_even_when_session_history_remains() {
         let mut snapshot = populated_snapshot();
         let session_id = snapshot.sessions[0].id;
-        snapshot.sessions[0].state = SessionState::FinishedSeen;
+        snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         snapshot.sessions[0].process_id = None;
         let mut app = App::new(snapshot.clone(), Vec::new(), None);
         app.attached = Some(AttachedTerminal {
@@ -6645,16 +6654,19 @@ mod tests {
 
     #[test]
     fn status_is_not_encoded_by_color_alone() {
-        assert_eq!(render::status_symbol(SessionState::NeedsFeedback, 0), "!");
-        assert_eq!(
-            render::status_label(SessionState::NeedsFeedback),
-            "Needs feedback"
-        );
-        assert_eq!(render::status_symbol(SessionState::Disconnected, 0), "—");
-        assert_eq!(
-            render::status_label(SessionState::Disconnected),
-            "Disconnected"
-        );
+        let needs_input = SessionStatus {
+            lifecycle: SessionLifecycle::Running,
+            activity: ProviderActivity::AwaitingInput,
+            attention: None,
+        };
+        assert_eq!(render::status_symbol(needs_input, 0), "!");
+        assert_eq!(render::status_label(needs_input), "Needs input");
+        let disconnected = SessionStatus {
+            lifecycle: SessionLifecycle::Disconnected,
+            ..SessionStatus::default()
+        };
+        assert_eq!(render::status_symbol(disconnected, 0), "—");
+        assert_eq!(render::status_label(disconnected), "Disconnected");
     }
 
     #[test]
@@ -6724,13 +6736,22 @@ mod tests {
 
     #[test]
     fn running_and_starting_statuses_use_a_spinning_ring() {
+        let running = SessionStatus {
+            lifecycle: SessionLifecycle::Running,
+            activity: ProviderActivity::Working,
+            attention: None,
+        };
         let frames = (0..4)
-            .map(|frame| render::status_symbol(SessionState::Running, frame))
+            .map(|frame| render::status_symbol(running, frame))
             .collect::<Vec<_>>();
         assert_eq!(frames, ["◐", "◓", "◑", "◒"]);
+        let starting = SessionStatus {
+            lifecycle: SessionLifecycle::Starting,
+            ..SessionStatus::default()
+        };
         assert_eq!(
-            render::status_symbol(SessionState::Starting, 5),
-            render::status_symbol(SessionState::Running, 1)
+            render::status_symbol(starting, 5),
+            render::status_symbol(running, 1)
         );
     }
 
@@ -6738,16 +6759,18 @@ mod tests {
     fn attention_navigation_uses_pending_events_instead_of_legacy_state() {
         let mut snapshot = populated_snapshot();
         let mut app = App::new(snapshot.clone(), Vec::new(), None);
-        for state in [
-            SessionState::Starting,
-            SessionState::Running,
-            SessionState::Failed,
-            SessionState::FinishedUnseen,
+        for lifecycle in [
+            SessionLifecycle::Starting,
+            SessionLifecycle::Running,
+            SessionLifecycle::Failed,
+            SessionLifecycle::Exited,
         ] {
-            snapshot.sessions[0].state = state;
+            snapshot.sessions[0].status.lifecycle = lifecycle;
+            snapshot.sessions[0].status.activity = ProviderActivity::None;
+            snapshot.sessions[0].status.attention = None;
             app.replace_snapshot(snapshot.clone());
-            assert_eq!(app.attention_count(), 0, "{state:?}");
-            assert!(app.select_attention().is_none(), "{state:?}");
+            assert_eq!(app.attention_count(), 0, "{lifecycle:?}");
+            assert!(app.select_attention().is_none(), "{lifecycle:?}");
         }
 
         let pending = with_pending_attention(
@@ -6783,12 +6806,25 @@ mod tests {
     #[test]
     fn attention_notifications_fire_once_per_transition_and_skip_startup_history() {
         let mut snapshot = populated_snapshot();
-        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        snapshot.sessions[0] = with_pending_attention(
+            snapshot.sessions[0].clone(),
+            "shell",
+            AttentionReason::InputRequested,
+            1,
+            10,
+        );
         let mut tracker = notifications::AttentionTracker::new(&snapshot.sessions);
         assert!(tracker.update(&snapshot.sessions).is_none());
-        snapshot.sessions[0].state = SessionState::Running;
+        snapshot.sessions[0].status.activity = ProviderActivity::Working;
+        snapshot.sessions[0].status.attention = None;
         assert!(tracker.update(&snapshot.sessions).is_none());
-        snapshot.sessions[0].state = SessionState::NeedsFeedback;
+        snapshot.sessions[0] = with_pending_attention(
+            snapshot.sessions[0].clone(),
+            "shell",
+            AttentionReason::InputRequested,
+            2,
+            11,
+        );
         assert_eq!(
             tracker.update(&snapshot.sessions).as_deref(),
             Some("shell needs your input or approval.")
@@ -6796,7 +6832,9 @@ mod tests {
         assert!(tracker.update(&snapshot.sessions).is_none());
         snapshot.sessions[0].display_name = "renamed".into();
         assert!(tracker.update(&snapshot.sessions).is_none());
-        snapshot.sessions[0].state = SessionState::FinishedUnseen;
+        snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
+        snapshot.sessions[0].status.activity = ProviderActivity::None;
+        snapshot.sessions[0].status.attention = None;
         assert!(tracker.update(&snapshot.sessions).is_none());
     }
 
@@ -6804,8 +6842,13 @@ mod tests {
     fn attention_notification_batches_are_bounded_and_do_not_include_terminal_text() {
         let mut snapshot = populated_snapshot();
         let mut tracker = notifications::AttentionTracker::new(&snapshot.sessions);
-        snapshot.sessions[0].state = SessionState::NeedsFeedback;
-        snapshot.sessions[0].display_name = format!("\x1b{}\n", "界".repeat(1000));
+        snapshot.sessions[0] = with_pending_attention(
+            snapshot.sessions[0].clone(),
+            &format!("\x1b{}\n", "界".repeat(1000)),
+            AttentionReason::InputRequested,
+            1,
+            10,
+        );
         let mut another = snapshot.sessions[0].clone();
         another.id = SessionId::new();
         snapshot.sessions.push(another);
@@ -7512,7 +7555,7 @@ mod tests {
         );
         modal.escape();
         let sourced_session = snapshot.sessions.len() - 1;
-        snapshot.sessions[sourced_session].state = SessionState::FinishedSeen;
+        snapshot.sessions[sourced_session].status.lifecycle = SessionLifecycle::Exited;
         snapshot.sessions[sourced_session].ended_at = Some(3);
         modal.sync_local_work(&snapshot);
         assert_eq!(

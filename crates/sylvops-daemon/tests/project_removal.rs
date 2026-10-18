@@ -1,9 +1,10 @@
 use std::{path::Path, time::Duration};
 
 use sylvops_core::{
-    domain::{ProviderKind, SessionState},
+    domain::ProviderKind,
     ids::{ProjectId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse, ProjectRemovalRefusal},
+    session_state::SessionLifecycle,
 };
 use sylvops_daemon::{
     client::DaemonClient, daemon, database::DatabaseHandle, git, runtime::RuntimePaths,
@@ -194,7 +195,7 @@ async fn exercise_project_removal() {
         })
         .await
         .unwrap();
-    wait_for_session_state(&client, session.id, SessionState::Terminated).await;
+    wait_for_session_state(&client, session.id, SessionLifecycle::Terminated).await;
     let deletion_token = match client
         .request(&ClientRequest::InspectSessionDeletion {
             session_id: session.id,
@@ -399,14 +400,14 @@ async fn snapshot(client: &DaemonClient) -> sylvops_core::domain::DaemonSnapshot
 async fn wait_for_session_state(
     client: &DaemonClient,
     session_id: sylvops_core::ids::SessionId,
-    state: SessionState,
+    state: SessionLifecycle,
 ) {
     loop {
         if snapshot(client)
             .await
             .sessions
             .iter()
-            .any(|session| session.id == session_id && session.state == state)
+            .any(|session| session.id == session_id && session.status.lifecycle == state)
         {
             return;
         }

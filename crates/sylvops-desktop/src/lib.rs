@@ -50,14 +50,14 @@ use presentation::{
     NavigatorAttention, NavigatorMode, NavigatorNodeId, NavigatorRow, PresentationInput,
     PresentationLayout, PresentationTheme, SystemAppearance, TerminalPalette, Viewport,
     WorkspaceNavigation, button_visual, human_readable_path,
-    session_state_can_replay as session_can_replay, session_state_can_stop as session_can_stop,
-    session_state_label,
+    session_status_can_replay as session_can_replay, session_status_can_stop as session_can_stop,
+    session_status_label,
 };
 use sylvops_core::{
     diff::{self as diff_view, DiffLineKind},
     domain::{
-        AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, SessionState, Workspace,
-        Worktree, WorktreeStatus, state_is_active,
+        AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, Workspace, Worktree,
+        WorktreeStatus,
     },
     github::{
         GitHubCheckFilter, GitHubCheckState, GitHubIntegrationStatus, GitHubItemIdentity,
@@ -70,6 +70,10 @@ use sylvops_core::{
         ProjectRemovalRefusal, SessionDeletionRefusal, WorkspaceDeletionRefusal,
     },
     provider::{ProviderHealth, session_can_resume},
+    session_state::{
+        AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
+        lifecycle_is_active,
+    },
     ui::{
         DesktopDensity, DesktopPanel, DesktopState, DesktopTerminalCursor, DesktopTerminalFont,
         DesktopTheme, MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT,
@@ -276,6 +280,7 @@ struct DesktopApp {
     terminal_selection_state: TerminalSelectionState,
     inline_navigator_rename: Option<InlineNavigatorRename>,
     resume_pending: HashSet<SessionId>,
+    attention_acknowledgement_pending: HashSet<SessionId>,
     window_mode: window::Mode,
     update_status: UpgradeStatus,
     install_request: RequestState,
@@ -752,6 +757,7 @@ impl DesktopApp {
             terminal_selection_state: TerminalSelectionState::Idle,
             inline_navigator_rename: None,
             resume_pending: HashSet::new(),
+            attention_acknowledgement_pending: HashSet::new(),
             window_mode: window::Mode::Windowed,
             update_status: UpgradeStatus::Idle,
             install_request: RequestState::Idle,
@@ -867,6 +873,7 @@ impl DesktopApp {
             Message::HoverNavigatorNode(node) => self.hovered_navigator_node = node,
             Message::SelectOpenSession(session_id) => {
                 self.unfocus_terminal();
+                self.acknowledge_visible_attention(session_id);
                 if self.active_session_id == Some(session_id) {
                     return Task::none();
                 }
@@ -1742,7 +1749,7 @@ impl DesktopApp {
         let density = self.presentation().density;
         let is_selected = row.selected;
         let is_hovered = self.hovered_navigator_node == Some(row.id);
-        let needs_input = matches!(row.id, NavigatorNodeId::Session(id) if self.session(id).is_some_and(|session| session.state == SessionState::NeedsFeedback));
+        let needs_input = matches!(row.id, NavigatorNodeId::Session(id) if self.session(id).is_some_and(|session| session.status.activity == ProviderActivity::AwaitingInput));
         let name = text(row.label.clone())
             .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
             .size(UI_TEXT_SIZE)
@@ -1976,10 +1983,11 @@ impl DesktopApp {
             let label = session_tab_label(&session.label);
             let active = session.active;
             let session_id = session.id;
-            let state = self.session(session_id).map(|session| session.state);
-            let needs_input = state == Some(SessionState::NeedsFeedback);
+            let status = self.session(session_id).map(|session| session.status);
+            let needs_input =
+                status.is_some_and(|status| status.activity == ProviderActivity::AwaitingInput);
             let mut label_content = row![].spacing(5).align_y(Center);
-            if matches!(state, Some(SessionState::Running | SessionState::Starting)) {
+            if status.is_some_and(session_status_animates) {
                 label_content = label_content.push(running_ring(13, self.status_animation_angle()));
             }
             label_content = label_content.push(
@@ -2178,8 +2186,8 @@ impl DesktopApp {
         let Some(terminal) = self.terminals.get(&session_id) else {
             if let Some(session) = self.session(session_id)
                 && matches!(
-                    session.state,
-                    SessionState::Terminated | SessionState::Disconnected
+                    session.status.lifecycle,
+                    SessionLifecycle::Terminated | SessionLifecycle::Disconnected
                 )
             {
                 return observed_terminal_viewport(centered_message(
@@ -2880,7 +2888,8 @@ impl DesktopApp {
                 worktree.id == source.worktree_id && worktree.status == WorktreeStatus::Active
             });
             let has_active_session = self.snapshot.sessions.iter().any(|session| {
-                session.worktree_id == source.worktree_id && state_is_active(session.state)
+                session.worktree_id == source.worktree_id
+                    && lifecycle_is_active(session.status.lifecycle)
             });
             (active && !has_active_session).then_some(source.worktree_id)
         });
@@ -2965,7 +2974,7 @@ impl DesktopApp {
                     "Provider",
                     session.provider_kind.display_name().to_owned(),
                 ))
-                .push(detail("State", session_state_label(session.state).into()))
+                .push(detail("State", session_status_label(session.status).into()))
                 .push(detail(
                     "Working directory",
                     human_readable_path(&session.cwd),
@@ -3084,7 +3093,7 @@ impl DesktopApp {
         let mut actions = row![].spacing(8);
         if let Some(session) = selection.session.and_then(|id| self.session(id))
             && self.active_session_id == Some(session.id)
-            && session_can_stop(session.state)
+            && session_can_stop(session.status)
         {
             actions = actions.push(
                 button(STOP_SESSION_LABEL)
@@ -4032,7 +4041,7 @@ impl DesktopApp {
                     format!(
                         "{} · {}",
                         session.display_name,
-                        session_state_label(session.state)
+                        session_status_label(session.status)
                     )
                 },
             );
@@ -4162,6 +4171,9 @@ impl DesktopApp {
                 if let Some(Operation::Resume(session_id)) = operation {
                     self.resume_pending.remove(&session_id);
                 }
+                if let Some(Operation::AcknowledgeAttention(session_id)) = operation {
+                    self.attention_acknowledgement_pending.remove(&session_id);
+                }
                 if matches!(operation, Some(Operation::RefreshSnapshot)) {
                     self.snapshot_pending = false;
                 }
@@ -4280,6 +4292,7 @@ impl DesktopApp {
     fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
             DaemonEvent::SessionStatusChanged { session, .. } => {
+                let session_id = session.id;
                 if let Some(existing) = self
                     .snapshot
                     .sessions
@@ -4289,6 +4302,11 @@ impl DesktopApp {
                     *existing = session;
                 } else {
                     self.snapshot.sessions.push(session);
+                }
+                if self.content_surface == ContentSurface::Session
+                    && self.active_session_id == Some(session_id)
+                {
+                    self.acknowledge_visible_attention(session_id);
                 }
                 self.observe_attention();
                 self.request_snapshot();
@@ -4606,6 +4624,22 @@ impl DesktopApp {
                 self.snapshot = snapshot;
                 self.observe_attention();
                 self.restore_selection();
+            }
+            (
+                Operation::AcknowledgeAttention(expected_session_id),
+                DaemonResponse::SessionAttentionAcknowledged { revision, session },
+            ) if session.id == expected_session_id => {
+                self.attention_acknowledgement_pending
+                    .remove(&expected_session_id);
+                self.snapshot.revision = self.snapshot.revision.max(revision);
+                if let Some(existing) = self
+                    .snapshot
+                    .sessions
+                    .iter_mut()
+                    .find(|existing| existing.id == expected_session_id)
+                {
+                    *existing = session;
+                }
             }
             (
                 Operation::OpenWorkspace(workspace_id),
@@ -5913,12 +5947,9 @@ impl DesktopApp {
             self.error = Some("Retry Session requires an active sourced Worktree.".into());
             return;
         }
-        if self
-            .snapshot
-            .sessions
-            .iter()
-            .any(|session| session.worktree_id == worktree_id && state_is_active(session.state))
-        {
+        if self.snapshot.sessions.iter().any(|session| {
+            session.worktree_id == worktree_id && lifecycle_is_active(session.status.lifecycle)
+        }) {
             self.error = Some("This Worktree already has an active Session.".into());
             return;
         }
@@ -6696,11 +6727,11 @@ impl DesktopApp {
             self.error = Some("Select a session before stopping it.".into());
             return;
         };
-        if !session_can_stop(session.state) {
+        if !session_can_stop(session.status) {
             self.error = Some(format!(
                 "Session “{}” is already {}; its history remains available.",
                 session.display_name,
-                session_state_label(session.state)
+                session_status_label(session.status)
             ));
             return;
         }
@@ -6781,7 +6812,7 @@ impl DesktopApp {
                 Some("The selected session no longer exists. Refresh and try again.".into());
             return;
         };
-        if session_can_stop(session.state) {
+        if session_can_stop(session.status) {
             self.active_session_id = Some(session_id);
             self.open_stop_confirmation(true);
             return;
@@ -6928,7 +6959,7 @@ impl DesktopApp {
         if self.resume_pending.contains(&session_id) {
             return;
         }
-        if !state_is_active(session.state) {
+        if !lifecycle_is_active(session.status.lifecycle) {
             if session_can_resume(session, &self.snapshot.sessions, &self.providers) {
                 self.resume_session(session_id);
             } else {
@@ -6936,11 +6967,11 @@ impl DesktopApp {
             }
             return;
         }
-        if !session_can_stop(session.state) && !session_can_replay(session.state) {
+        if !session_can_stop(session.status) && !session_can_replay(session.status) {
             self.error = Some(format!(
                 "Session “{}” is {}; only its metadata is retained.",
                 session.display_name,
-                session_state_label(session.state)
+                session_status_label(session.status)
             ));
             return;
         }
@@ -7590,6 +7621,7 @@ impl DesktopApp {
         self.unfocus_terminal();
         self.focused_delete_action = None;
         self.pending_navigator_reveal = Some(DesktopPanel::Sessions);
+        self.acknowledge_visible_attention(session_id);
         if self.selected_session_id == Some(session_id)
             && self.active_session_id == Some(session_id)
         {
@@ -7617,6 +7649,37 @@ impl DesktopApp {
         self.mark_state_dirty();
         if self.presentation().layout == PresentationLayout::Narrow {
             self.narrow_main = true;
+        }
+    }
+
+    fn acknowledge_visible_attention(&mut self, session_id: SessionId) {
+        if self.attention_acknowledgement_pending.contains(&session_id) {
+            return;
+        }
+        let Some(event) = self
+            .session(session_id)
+            .and_then(|session| session.status.attention)
+        else {
+            return;
+        };
+        if event.acknowledgement != AttentionAcknowledgement::Pending
+            || !matches!(
+                event.reason,
+                AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
+            )
+        {
+            return;
+        }
+        if self.bridge.request(
+            Operation::AcknowledgeAttention(session_id),
+            ClientRequest::AcknowledgeAttention {
+                session_id,
+                attention_id: event.id,
+            },
+        ) {
+            self.attention_acknowledgement_pending.insert(session_id);
+        } else {
+            self.error = Some("The background service is busy. Try again.".into());
         }
     }
 
@@ -7929,6 +7992,7 @@ const fn operation_error_context(operation: Operation) -> &'static str {
         Operation::CreateWorktree => "Create checkout",
         Operation::CreateSession(_) => "Start session",
         Operation::Resume(_) => "Resume session",
+        Operation::AcknowledgeAttention(_) => "Acknowledge attention",
         Operation::RenameProject => "Rename repository",
         Operation::RenameWorktree => "Rename checkout",
         Operation::RenameSession => "Rename session",
@@ -8161,7 +8225,7 @@ const fn navigator_attention_icon(attention: NavigatorAttention) -> LineIcon {
 
 const fn navigator_attention_label(attention: NavigatorAttention) -> &'static str {
     match attention {
-        NavigatorAttention::Finished => "Finished unseen",
+        NavigatorAttention::Finished => "Completion pending",
         NavigatorAttention::NeedsFeedback => "Needs feedback",
         NavigatorAttention::Failed => "Failed",
     }
@@ -9381,6 +9445,15 @@ fn session_tab_label(name: &str) -> String {
     name.to_owned()
 }
 
+fn session_status_animates(status: sylvops_core::session_state::SessionStatus) -> bool {
+    status.lifecycle == SessionLifecycle::Starting
+        || (status.lifecycle == SessionLifecycle::Running
+            && matches!(
+                status.activity,
+                ProviderActivity::None | ProviderActivity::Working
+            ))
+}
+
 fn cancel_inline_navigator_rename(rename: &mut Option<InlineNavigatorRename>) {
     if rename.as_ref().is_some_and(|rename| !rename.pending) {
         *rename = None;
@@ -9442,15 +9515,17 @@ mod tests {
         provider::{AuthenticationRequirement, ProviderCapabilities},
     };
 
-    fn session(state: SessionState, external_session_id: Option<&str>) -> Session {
+    fn session(lifecycle: SessionLifecycle, external_session_id: Option<&str>) -> Session {
         Session {
             id: SessionId::new(),
             worktree_id: WorktreeId::new(),
             provider_profile_id: None,
             provider_kind: ProviderKind::Codex,
             display_name: "Codex".into(),
-            state,
-            status: sylvops_core::session_state::SessionStatus::default(),
+            status: sylvops_core::session_state::SessionStatus {
+                lifecycle,
+                ..sylvops_core::session_state::SessionStatus::default()
+            },
             process_id: None,
             external_session_id: external_session_id.map(str::to_owned),
             command: "codex".into(),
@@ -9498,10 +9573,17 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let project_id = ProjectId::new();
         let worktree_id = WorktreeId::new();
-        let mut first = session(SessionState::Running, None);
+        let mut first = session(SessionLifecycle::Running, None);
         first.worktree_id = worktree_id;
         first.display_name = "First".into();
-        let mut second = session(SessionState::NeedsFeedback, None);
+        let mut second = session(SessionLifecycle::Running, None);
+        second.status.activity = ProviderActivity::AwaitingInput;
+        second.status.attention = Some(sylvops_core::session_state::AttentionEvent {
+            id: sylvops_core::session_state::AttentionEventId::try_from(1).unwrap(),
+            reason: sylvops_core::session_state::AttentionReason::InputRequested,
+            acknowledgement: sylvops_core::session_state::AttentionAcknowledgement::Pending,
+            occurred_at: 1,
+        });
         second.worktree_id = worktree_id;
         second.display_name = "Second".into();
         app.snapshot.workspaces.push(Workspace {
@@ -10803,6 +10885,128 @@ mod tests {
     }
 
     #[test]
+    fn selecting_completion_or_failure_attention_acknowledges_the_exact_visible_event() {
+        for (reason, lifecycle) in [
+            (
+                AttentionReason::SuccessfulCompletion,
+                SessionLifecycle::Exited,
+            ),
+            (AttentionReason::TerminalFailure, SessionLifecycle::Failed),
+        ] {
+            let (bridge, mut harness) = Bridge::harness();
+            let mut app = DesktopApp::with_bridge(bridge);
+            let mut attention_session = session(lifecycle, None);
+            let session_id = attention_session.id;
+            let attention_id = sylvops_core::session_state::AttentionEventId::try_from(1).unwrap();
+            attention_session.status.attention =
+                Some(sylvops_core::session_state::AttentionEvent {
+                    id: attention_id,
+                    reason,
+                    acknowledgement: AttentionAcknowledgement::Pending,
+                    occurred_at: 1,
+                });
+            app.snapshot.sessions.push(attention_session.clone());
+
+            app.select_session(session_id);
+
+            assert_eq!(
+                harness.take_request(),
+                (
+                    Operation::AcknowledgeAttention(session_id),
+                    ClientRequest::AcknowledgeAttention {
+                        session_id,
+                        attention_id,
+                    },
+                )
+            );
+            assert!(app.attention_acknowledgement_pending.contains(&session_id));
+
+            attention_session
+                .status
+                .attention
+                .as_mut()
+                .unwrap()
+                .acknowledgement = AttentionAcknowledgement::Acknowledged;
+            app.handle_response(
+                Operation::AcknowledgeAttention(session_id),
+                DaemonResponse::SessionAttentionAcknowledged {
+                    revision: 2,
+                    session: attention_session.clone(),
+                },
+            );
+            assert!(!app.attention_acknowledgement_pending.contains(&session_id));
+            assert_eq!(app.snapshot.sessions[0], attention_session);
+        }
+    }
+
+    #[test]
+    fn already_visible_desktop_sessions_acknowledge_new_or_reselected_completion() {
+        let completion = |session: &mut Session, event_id| {
+            session.status.lifecycle = SessionLifecycle::Exited;
+            session.status.attention = Some(sylvops_core::session_state::AttentionEvent {
+                id: event_id,
+                reason: AttentionReason::SuccessfulCompletion,
+                acknowledgement: AttentionAcknowledgement::Pending,
+                occurred_at: 1,
+            });
+        };
+
+        let (bridge, mut harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let mut completed = session(SessionLifecycle::Exited, None);
+        let completed_id = completed.id;
+        let completed_event = sylvops_core::session_state::AttentionEventId::try_from(1).unwrap();
+        completion(&mut completed, completed_event);
+        app.snapshot.sessions.push(completed);
+        app.open_sessions.push(completed_id);
+        app.active_session_id = Some(completed_id);
+
+        let _ = app.update(Message::SelectOpenSession(completed_id));
+
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::AcknowledgeAttention(completed_id),
+                ClientRequest::AcknowledgeAttention {
+                    session_id: completed_id,
+                    attention_id: completed_event,
+                },
+            )
+        );
+
+        let (bridge, mut harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let mut live = session(SessionLifecycle::Running, None);
+        live.process_id = Some(42);
+        live.ended_at = None;
+        live.exit_code = None;
+        let live_id = live.id;
+        app.snapshot.sessions.push(live.clone());
+        app.open_sessions.push(live_id);
+        app.active_session_id = Some(live_id);
+        let completion_event = sylvops_core::session_state::AttentionEventId::try_from(2).unwrap();
+        completion(&mut live, completion_event);
+        live.status.lifecycle = SessionLifecycle::Running;
+        live.status.activity = ProviderActivity::Completed;
+
+        app.handle_daemon_event(DaemonEvent::SessionStatusChanged {
+            revision: 2,
+            session: live,
+        });
+
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::AcknowledgeAttention(live_id),
+                ClientRequest::AcknowledgeAttention {
+                    session_id: live_id,
+                    attention_id: completion_event,
+                },
+            )
+        );
+    }
+
+    #[test]
     fn navigator_context_actions_are_available_from_keyboard_selection() {
         let (mut app, project_id, worktree_id, _, second_id) = desktop_hierarchy();
 
@@ -10859,11 +11063,12 @@ mod tests {
             .iter_mut()
             .find(|session| session.id == inactive_session_id)
             .expect("inactive Session")
-            .state = SessionState::FinishedSeen;
+            .status
+            .lifecycle = SessionLifecycle::Exited;
         let inspection = sylvops_core::protocol::SessionDeletionInspection {
             session_id: inactive_session_id,
             worktree_id,
-            state: SessionState::FinishedSeen,
+            lifecycle: SessionLifecycle::Exited,
             authorization_token: Some("a".repeat(64).try_into().unwrap()),
             refusal: None,
         };
@@ -11100,7 +11305,7 @@ mod tests {
                 inspection: sylvops_core::protocol::SessionDeletionInspection {
                     session_id,
                     worktree_id,
-                    state: SessionState::FinishedSeen,
+                    lifecycle: SessionLifecycle::Exited,
                     authorization_token: Some("d".repeat(64).try_into().unwrap()),
                     refusal: None,
                 },
@@ -12734,7 +12939,7 @@ mod tests {
             last_activity_at: 1,
             removed_at: None,
         };
-        let mut running = session(SessionState::Running, None);
+        let mut running = session(SessionLifecycle::Running, None);
         running.worktree_id = worktree.id;
         let source = WorkSource {
             worktree_id: worktree.id,
@@ -12799,7 +13004,7 @@ mod tests {
             last_activity_at: 1,
             removed_at: None,
         });
-        let mut running = session(SessionState::Running, None);
+        let mut running = session(SessionLifecycle::Running, None);
         running.worktree_id = worktree_id;
         let session_id = running.id;
         app.snapshot.sessions.push(running);
@@ -12992,7 +13197,7 @@ mod tests {
         let _ = app.update(Message::RetryStartWorkSession(worktree.id));
         let _ = harness.take_request();
 
-        let mut running = session(SessionState::Running, None);
+        let mut running = session(SessionLifecycle::Running, None);
         running.worktree_id = worktree.id;
         app.handle_response(
             Operation::RetryStartWorkSession(worktree.id),
@@ -13301,30 +13506,60 @@ mod tests {
 
     #[test]
     fn inactive_session_actions_are_safe_and_explicit() {
-        assert!(session_can_stop(SessionState::Running));
-        assert!(!session_can_stop(SessionState::Terminated));
-        assert!(session_can_replay(SessionState::FinishedSeen));
-        assert!(session_can_replay(SessionState::Failed));
-        assert!(!session_can_replay(SessionState::Disconnected));
-        assert!(!session_can_replay(SessionState::Terminated));
+        assert!(session_can_stop(
+            sylvops_core::session_state::SessionStatus {
+                lifecycle: SessionLifecycle::Running,
+                ..sylvops_core::session_state::SessionStatus::default()
+            }
+        ));
+        assert!(!session_can_stop(
+            sylvops_core::session_state::SessionStatus {
+                lifecycle: SessionLifecycle::Terminated,
+                ..sylvops_core::session_state::SessionStatus::default()
+            }
+        ));
+        assert!(session_can_replay(
+            sylvops_core::session_state::SessionStatus {
+                lifecycle: SessionLifecycle::Exited,
+                ..sylvops_core::session_state::SessionStatus::default()
+            }
+        ));
+        assert!(session_can_replay(
+            sylvops_core::session_state::SessionStatus {
+                lifecycle: SessionLifecycle::Failed,
+                ..sylvops_core::session_state::SessionStatus::default()
+            }
+        ));
+        assert!(!session_can_replay(
+            sylvops_core::session_state::SessionStatus {
+                lifecycle: SessionLifecycle::Disconnected,
+                ..sylvops_core::session_state::SessionStatus::default()
+            }
+        ));
+        assert!(!session_can_replay(
+            sylvops_core::session_state::SessionStatus {
+                lifecycle: SessionLifecycle::Terminated,
+                ..sylvops_core::session_state::SessionStatus::default()
+            }
+        ));
     }
 
     #[test]
     fn resume_requires_daemon_eligible_state_and_verified_external_id() {
-        let available = session(SessionState::FinishedSeen, Some("verified-id"));
+        let available = session(SessionLifecycle::Exited, Some("verified-id"));
         let codex_health = [provider_health(ProviderKind::Codex, true, true)];
         assert!(session_can_resume(
             &available,
             std::slice::from_ref(&available),
             &codex_health
         ));
-        let missing_id = session(SessionState::FinishedSeen, None);
+        let missing_id = session(SessionLifecycle::Exited, None);
         assert!(!session_can_resume(
             &missing_id,
             std::slice::from_ref(&missing_id),
             &codex_health
         ));
-        let terminated = session(SessionState::Terminated, Some("verified-id"));
+        let terminated = session(SessionLifecycle::Terminated, Some("verified-id"));
         assert!(session_can_resume(
             &terminated,
             std::slice::from_ref(&terminated),
@@ -13371,12 +13606,12 @@ mod tests {
             std::env::temp_dir().join(format!("sylvops-desktop-resume-test-{}", SessionId::new()));
         let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
         let mut app = DesktopApp::new(paths);
-        let source = session(SessionState::FinishedSeen, Some("verified-id"));
+        let source = session(SessionLifecycle::Exited, Some("verified-id"));
         let mut successor = source.clone();
         successor.id = SessionId::new();
         successor.created_at = 2;
         successor.display_name = "Codex (resumed)".into();
-        successor.state = SessionState::Running;
+        successor.status.lifecycle = SessionLifecycle::Running;
         successor.process_id = Some(42);
         successor.ended_at = None;
         successor.exit_code = None;
@@ -13431,7 +13666,7 @@ mod tests {
         ));
         let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
         let mut app = DesktopApp::new(paths);
-        let source = session(SessionState::FinishedSeen, Some("verified-id"));
+        let source = session(SessionLifecycle::Exited, Some("verified-id"));
         app.providers
             .push(provider_health(ProviderKind::Codex, true, true));
         app.snapshot.sessions.push(source.clone());
@@ -13459,7 +13694,7 @@ mod tests {
         ));
         let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
         let mut app = DesktopApp::new(paths);
-        let source = session(SessionState::FinishedSeen, Some("verified-id"));
+        let source = session(SessionLifecycle::Exited, Some("verified-id"));
         app.resume_pending.insert(source.id);
 
         app.handle_response(

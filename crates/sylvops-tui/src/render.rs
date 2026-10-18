@@ -9,13 +9,15 @@ use ratatui::{
 };
 use sylvops_core::{
     diff::{self, DiffLineKind},
-    domain::{Session, SessionState, WorktreeStatus},
+    domain::{Session, WorktreeStatus},
     github::{
         GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubCheckState, GitHubItemKind,
         GitHubItemState, GitHubReviewState,
     },
     provider::session_can_resume,
-    session_state::AttentionReason,
+    session_state::{
+        AttentionReason, ProviderActivity, SessionLifecycle, SessionStatus, lifecycle_is_active,
+    },
     ui::{
         MAX_TUI_NAVIGATOR_WIDTH, MIN_TUI_NAVIGATOR_WIDTH, TuiContentView, TuiDensity,
         TuiNavigatorView, TuiSessionPresentation, TuiTheme,
@@ -457,10 +459,10 @@ fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
                 (
                     format!(
                         "{} {}",
-                        status_symbol(item.state, app.status_animation_frame()),
+                        status_symbol(item.status, app.status_animation_frame()),
                         item.display_name
                     ),
-                    format!("  {}", status_label(item.state)),
+                    format!("  {}", status_label(item.status)),
                 )
             }),
     }
@@ -485,7 +487,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
                 "{focus_label} · {} · {} · {} ",
                 session.display_name,
                 session.provider_kind.display_name(),
-                status_label(session.state)
+                status_label(session.status)
             )
         },
     );
@@ -529,7 +531,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
 struct SessionOverviewItem {
     id: sylvops_core::ids::SessionId,
     name: String,
-    state: SessionState,
+    status: SessionStatus,
     provider: &'static str,
     project: String,
     worktree: String,
@@ -612,7 +614,7 @@ fn session_item(
     SessionOverviewItem {
         id: session.id,
         name: session.display_name.clone(),
-        state: session.state,
+        status: session.status,
         provider: session.provider_kind.display_name(),
         project: project
             .map_or("Unknown Project", |project| project.name.as_str())
@@ -751,8 +753,8 @@ fn draw_session_overview_list(
     let (symbol, label) = session.attention.map_or_else(
         || {
             (
-                status_symbol(session.state, animation_frame),
-                status_label(session.state),
+                status_symbol(session.status, animation_frame),
+                status_label(session.status),
             )
         },
         |reason| {
@@ -806,8 +808,8 @@ fn draw_session_overview_card(
     let (symbol, label) = session.attention.map_or_else(
         || {
             (
-                status_symbol(session.state, animation_frame),
-                status_label(session.state),
+                status_symbol(session.status, animation_frame),
+                status_label(session.status),
             )
         },
         |reason| {
@@ -978,7 +980,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             Text::from(format!(
                 "{} is {}.\n\nSelecting a session never attaches automatically.\n{}",
                 session.display_name,
-                status_label(session.state),
+                status_label(session.status),
                 if can_resume {
                     "Press Enter to resume this conversation and open its terminal."
                 } else {
@@ -1189,8 +1191,8 @@ fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<
             Span::styled("State        ", theme.muted),
             Span::raw(format!(
                 "{} {}",
-                status_symbol(session.state, app.status_animation_frame()),
-                status_label(session.state)
+                status_symbol(session.status, app.status_animation_frame()),
+                status_label(session.status)
             )),
         ]),
         Line::from(vec![
@@ -1369,15 +1371,7 @@ fn worktree_removal_available(app: &App) -> bool {
 }
 
 fn session_is_active(session: Option<&Session>) -> bool {
-    session.is_some_and(|session| {
-        matches!(
-            session.state,
-            SessionState::Fresh
-                | SessionState::Starting
-                | SessionState::Running
-                | SessionState::NeedsFeedback
-        )
-    })
+    session.is_some_and(|session| lifecycle_is_active(session.status.lifecycle))
 }
 
 fn contextual_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {
@@ -3566,30 +3560,39 @@ fn draw_palette(frame: &mut Frame<'_>, app: &mut App, palette: &crate::app::Pale
     }
 }
 
-pub(crate) fn status_symbol(state: SessionState, animation_frame: usize) -> &'static str {
+pub(crate) fn status_symbol(status: SessionStatus, animation_frame: usize) -> &'static str {
     const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
-    match state {
-        SessionState::Fresh => "○",
-        SessionState::Starting | SessionState::Running => SPINNER[animation_frame % SPINNER.len()],
-        SessionState::NeedsFeedback => "!",
-        SessionState::FinishedUnseen => "◆",
-        SessionState::FinishedSeen => "✓",
-        SessionState::Failed | SessionState::Terminated => "×",
-        SessionState::Disconnected => "—",
+    match status.lifecycle {
+        SessionLifecycle::Fresh => "○",
+        SessionLifecycle::Starting => SPINNER[animation_frame % SPINNER.len()],
+        SessionLifecycle::Running => match status.activity {
+            ProviderActivity::AwaitingInput | ProviderActivity::RecoverableFailure => "!",
+            ProviderActivity::Completed => "◆",
+            ProviderActivity::None | ProviderActivity::Working | ProviderActivity::Interrupted => {
+                SPINNER[animation_frame % SPINNER.len()]
+            }
+        },
+        SessionLifecycle::Exited => "✓",
+        SessionLifecycle::Failed | SessionLifecycle::Terminated => "×",
+        SessionLifecycle::Disconnected => "—",
     }
 }
 
-pub(crate) fn status_label(state: SessionState) -> &'static str {
-    match state {
-        SessionState::Fresh => "Fresh",
-        SessionState::Starting => "Starting",
-        SessionState::Running => "Running",
-        SessionState::NeedsFeedback => "Needs feedback",
-        SessionState::FinishedUnseen => "Finished unseen",
-        SessionState::FinishedSeen => "Finished seen",
-        SessionState::Failed => "Failed",
-        SessionState::Terminated => "Stopped",
-        SessionState::Disconnected => "Disconnected",
+pub(crate) fn status_label(status: SessionStatus) -> &'static str {
+    match status.lifecycle {
+        SessionLifecycle::Fresh => "Fresh",
+        SessionLifecycle::Starting => "Starting",
+        SessionLifecycle::Running => match status.activity {
+            ProviderActivity::AwaitingInput => "Needs input",
+            ProviderActivity::Completed => "Completed",
+            ProviderActivity::Interrupted => "Interrupted",
+            ProviderActivity::RecoverableFailure => "Recoverable failure",
+            ProviderActivity::None | ProviderActivity::Working => "Running",
+        },
+        SessionLifecycle::Exited => "Finished",
+        SessionLifecycle::Failed => "Failed",
+        SessionLifecycle::Terminated => "Stopped",
+        SessionLifecycle::Disconnected => "Disconnected",
     }
 }
 

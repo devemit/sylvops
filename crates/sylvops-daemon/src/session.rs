@@ -140,7 +140,6 @@ pub struct Replay {
 pub struct SessionExit {
     pub exit_code: u32,
     pub stop_requested: bool,
-    pub was_attached: bool,
 }
 
 #[derive(Debug)]
@@ -637,9 +636,6 @@ impl Actor {
                             self.observers.insert(client_id);
                             sylvops_core::domain::AttachmentRole::Observer
                         };
-                        if let Some((_, was_attached)) = pending_exit.as_mut() {
-                            *was_attached = true;
-                        }
                         let resize_result = if role == sylvops_core::domain::AttachmentRole::Controller
                             && pending_exit.is_none()
                             && !exit_published
@@ -767,10 +763,7 @@ impl Actor {
                         if let Some(writer) = self.writer.take() {
                             let _ = writer.try_send(WriterCommand::Close);
                         }
-                        pending_exit = Some((
-                            exit_code,
-                            self.controller.is_some() || !self.observers.is_empty(),
-                        ));
+                        pending_exit = Some(exit_code);
                     }
                     ActorEvent::ForceStop => {
                         if pending_exit.is_none()
@@ -788,7 +781,7 @@ impl Actor {
             }
             if !exit_published
                 && (reader_closed || self.stop_requested)
-                && let Some((exit_code, was_attached)) = pending_exit
+                && let Some(exit_code) = pending_exit
             {
                 if self.stop_requested {
                     if let Err(error) = self.terminate_process_tree().await {
@@ -804,7 +797,6 @@ impl Actor {
                 self.exit.send_replace(Some(SessionExit {
                     exit_code,
                     stop_requested: self.stop_requested,
-                    was_attached,
                 }));
                 exit_published = true;
                 // Windows ConPTY readers do not consistently report EOF after a Job Object

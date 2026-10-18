@@ -3,7 +3,7 @@ use std::path::Path;
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use sylvops_core::{
-    domain::{ProviderKind, SessionState},
+    domain::ProviderKind,
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
     session_state::{
         AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
@@ -43,6 +43,10 @@ const LEGACY_MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0008_work_sources.sql"),
     ),
 ];
+const EXPANSION_MIGRATION: (&str, &str) = (
+    "expanded_session_state",
+    include_str!("../migrations/0009_expanded_session_state.sql"),
+);
 
 fn legacy_database(path: &Path, timestamp: i64) -> Vec<(SessionId, bool, bool)> {
     let connection = Connection::open(path).unwrap();
@@ -183,6 +187,49 @@ fn invalid_legacy_state_rolls_back_the_entire_expansion() {
     );
 }
 
+#[test]
+fn invalid_expanded_status_rolls_back_the_entire_contraction() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    legacy_database(&path, 100);
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch(EXPANSION_MIGRATION.1).unwrap();
+    connection
+        .execute(
+            "INSERT INTO schema_migrations VALUES (9, ?1, 0, ?2)",
+            params![
+                EXPANSION_MIGRATION.0,
+                format!("{:x}", Sha256::digest(EXPANSION_MIGRATION.1.as_bytes()))
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET status_json = \
+             '{\"lifecycle\":\"exited\",\"activity\":\"working\",\"attention\":null}'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(DatabaseHandle::open(&path).is_err());
+    let connection = Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 9);
+    let legacy_column_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'state'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_column_count, 1);
+}
+
 #[tokio::test]
 async fn legacy_feedback_preserves_input_and_recoverable_failure_as_distinct_reasons() {
     let directory = tempfile::tempdir().unwrap();
@@ -255,11 +302,8 @@ async fn pending_live_provider_completion_survives_restart_without_adopting_the_
     };
     database.create_session(record.clone()).await.unwrap();
     database.mark_session_running(id, 42).await.unwrap();
-    let mut machine = SessionStatusMachine::from_persisted(
-        SessionState::Running,
-        database.session(id).await.unwrap().status,
-        None,
-    );
+    let mut machine =
+        SessionStatusMachine::from_persisted(database.session(id).await.unwrap().status, None);
     let completion = machine
         .apply(
             &NormalizedProviderEvent::TurnStopped {
@@ -305,7 +349,7 @@ async fn pending_live_provider_completion_survives_restart_without_adopting_the_
         .mark_session_running(recoverable_id, 44)
         .await
         .unwrap();
-    let mut machine = SessionStatusMachine::from_persisted(running.state, running.status, None);
+    let mut machine = SessionStatusMachine::from_persisted(running.status, None);
     let recoverable = machine
         .apply(
             &NormalizedProviderEvent::TurnFailed {
@@ -325,7 +369,6 @@ async fn pending_live_provider_completion_survives_restart_without_adopting_the_
     let database = DatabaseHandle::open(&path).unwrap();
     database.reconcile_after_restart().await.unwrap();
     let recovered = database.session(id).await.unwrap();
-    assert_eq!(recovered.state, SessionState::Disconnected);
     assert_eq!(recovered.status.lifecycle, SessionLifecycle::Disconnected);
     assert_eq!(recovered.status.activity, ProviderActivity::None);
     assert_eq!(recovered.process_id, None);

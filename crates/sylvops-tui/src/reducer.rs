@@ -268,20 +268,24 @@ fn select_overview_session(
 mod tests {
     use super::*;
     use sylvops_core::{
-        domain::{DaemonSnapshot, ProviderKind, Session, SessionState},
+        domain::{DaemonSnapshot, ProviderKind, Session},
         ids::{SessionId, WorktreeId},
         provider::{AuthenticationRequirement, ProviderCapabilities, ProviderHealth},
     };
 
-    fn session(state: SessionState, external_session_id: Option<&str>) -> Session {
+    use sylvops_core::session_state::{SessionLifecycle, SessionStatus};
+
+    fn session(lifecycle: SessionLifecycle, external_session_id: Option<&str>) -> Session {
         Session {
             id: SessionId::new(),
             worktree_id: WorktreeId::new(),
             provider_profile_id: None,
             provider_kind: ProviderKind::Claude,
             display_name: "Claude".into(),
-            state,
-            status: sylvops_core::session_state::SessionStatus::default(),
+            status: SessionStatus {
+                lifecycle,
+                ..SessionStatus::default()
+            },
             process_id: None,
             external_session_id: external_session_id.map(str::to_owned),
             command: "claude".into(),
@@ -327,7 +331,7 @@ mod tests {
 
     #[test]
     fn resume_effect_is_only_offered_for_verified_eligible_sessions() {
-        let resumable = session(SessionState::FinishedSeen, Some("verified-id"));
+        let resumable = session(SessionLifecycle::Exited, Some("verified-id"));
         let resumable_id = resumable.id;
         let mut app = App::new(DaemonSnapshot::default(), vec![ready_claude()], None);
         app.snapshot.sessions.push(resumable);
@@ -343,14 +347,14 @@ mod tests {
         app.snapshot.sessions[0].external_session_id = None;
         assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
         app.snapshot.sessions[0].external_session_id = Some("verified-id".into());
-        app.snapshot.sessions[0].state = SessionState::Terminated;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Terminated;
         assert_eq!(
             reduce(&mut app, Action::Resume),
             vec![Effect::Resume(resumable_id)]
         );
         app.resume_pending = None;
 
-        app.snapshot.sessions[0].state = SessionState::FinishedSeen;
+        app.snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
         app.snapshot.sessions[0].provider_kind = ProviderKind::Shell;
         assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
 
@@ -358,7 +362,7 @@ mod tests {
         let mut successor = app.snapshot.sessions[0].clone();
         successor.id = SessionId::new();
         successor.created_at = 2;
-        successor.state = SessionState::Running;
+        successor.status.lifecycle = SessionLifecycle::Running;
         app.snapshot.sessions.push(successor);
         assert_eq!(reduce(&mut app, Action::Resume), Vec::<Effect>::new());
     }

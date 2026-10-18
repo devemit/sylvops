@@ -1,8 +1,9 @@
 //! Presentation-only alerts for newly blocked Sessions. Never include terminal contents.
 
 use crate::{
-    domain::{Session, SessionState},
+    domain::Session,
     ids::SessionId,
+    session_state::{AttentionAcknowledgement, AttentionReason},
 };
 use std::collections::HashSet;
 
@@ -44,7 +45,15 @@ impl AttentionTracker {
 fn waiting_sessions(sessions: &[Session]) -> HashSet<SessionId> {
     sessions
         .iter()
-        .filter(|session| session.state == SessionState::NeedsFeedback)
+        .filter(|session| {
+            session.status.attention.is_some_and(|event| {
+                event.acknowledgement == AttentionAcknowledgement::Pending
+                    && matches!(
+                        event.reason,
+                        AttentionReason::InputRequested | AttentionReason::RecoverableFailure
+                    )
+            })
+        })
         .map(|session| session.id)
         .collect()
 }

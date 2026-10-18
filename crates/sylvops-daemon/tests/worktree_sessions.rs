@@ -101,7 +101,8 @@ async fn exercise_two_worktrees() {
     for session_id in [first_session, second_session] {
         assert!(snapshot.sessions.iter().any(|session| {
             session.id == session_id
-                && session.state == sylvops_core::domain::SessionState::Terminated
+                && session.status.lifecycle
+                    == sylvops_core::session_state::SessionLifecycle::Terminated
         }));
     }
 

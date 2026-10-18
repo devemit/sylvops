@@ -550,19 +550,17 @@ impl App {
     }
 
     pub fn active_sessions(&self) -> Vec<&Session> {
-        let mut sessions: Vec<_> =
-            self.snapshot
-                .sessions
-                .iter()
-                .filter(|session| {
-                    matches!(
-                        session.status.lifecycle,
-                        SessionLifecycle::Starting | SessionLifecycle::Running
-                    ) && !session.status.attention.is_some_and(|event| {
-                        event.acknowledgement == AttentionAcknowledgement::Pending
-                    }) && self.node_exists(ExplorerNode::Session(session.id))
-                })
-                .collect();
+        let mut sessions: Vec<_> = self
+            .snapshot
+            .sessions
+            .iter()
+            .filter(|session| {
+                matches!(
+                    session.status.lifecycle,
+                    SessionLifecycle::Starting | SessionLifecycle::Running
+                ) && self.node_exists(ExplorerNode::Session(session.id))
+            })
+            .collect();
         sessions.sort_by_key(|session| {
             (
                 u8::from(session.status.lifecycle == SessionLifecycle::Starting),
@@ -598,7 +596,15 @@ impl App {
 
     pub fn session_overview(&self) -> Vec<&Session> {
         let mut sessions = self.needs_attention_sessions();
-        sessions.extend(self.active_sessions());
+        let mut included = sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        sessions.extend(
+            self.active_sessions()
+                .into_iter()
+                .filter(|session| included.insert(session.id)),
+        );
         sessions
     }
 

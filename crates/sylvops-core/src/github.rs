@@ -5,8 +5,9 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{ProviderKind, Session, Worktree, WorktreeStatus, state_is_active},
+    domain::{ProviderKind, Session, Worktree, WorktreeStatus},
     ids::{ProjectId, WorktreeId},
+    session_state::lifecycle_is_active,
 };
 
 pub const MAX_GITHUB_HOST_LENGTH: usize = 253;
@@ -1079,7 +1080,7 @@ pub fn issue_work_status(
             .iter()
             .filter(|session| session.worktree_id == worktree.id)
         {
-            if state_is_active(session.state) {
+            if lifecycle_is_active(session.status.lifecycle) {
                 return IssueWorkStatus::SessionActive;
             }
             has_started_session |= session.started_at.is_some();
@@ -1736,10 +1737,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        domain::{SessionState, WorktreeStatus},
-        ids::SessionId,
-    };
+    use crate::{domain::WorktreeStatus, ids::SessionId};
 
     #[test]
     fn parses_https_and_ssh_github_remotes_into_the_same_identity() {
@@ -1993,8 +1991,10 @@ mod tests {
             provider_profile_id: None,
             provider_kind: ProviderKind::Codex,
             display_name: "Issue #128".into(),
-            state: SessionState::Running,
-            status: crate::session_state::SessionStatus::default(),
+            status: crate::session_state::SessionStatus {
+                lifecycle: crate::session_state::SessionLifecycle::Running,
+                ..crate::session_state::SessionStatus::default()
+            },
             process_id: None,
             external_session_id: None,
             command: "codex".into(),
@@ -2032,7 +2032,7 @@ mod tests {
             IssueWorkStatus::SessionActive
         );
         let mut never_started = session.clone();
-        never_started.state = SessionState::Failed;
+        never_started.status.lifecycle = crate::session_state::SessionLifecycle::Failed;
         never_started.started_at = None;
         assert_eq!(
             issue_work_status(
@@ -2044,7 +2044,7 @@ mod tests {
             IssueWorkStatus::WorktreeReady
         );
         let mut stopped = session;
-        stopped.state = SessionState::FinishedSeen;
+        stopped.status.lifecycle = crate::session_state::SessionLifecycle::Exited;
         assert_eq!(
             issue_work_status(&item, &[source], &[worktree], &[stopped]),
             IssueWorkStatus::SessionStopped

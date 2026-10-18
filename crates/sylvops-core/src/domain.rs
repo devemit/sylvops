@@ -77,18 +77,6 @@ string_enum!(WorktreeStatus {
     Invalid => "invalid",
 });
 
-string_enum!(SessionState {
-    Fresh => "fresh",
-    Starting => "starting",
-    Running => "running",
-    NeedsFeedback => "needs_feedback",
-    FinishedUnseen => "finished_unseen",
-    FinishedSeen => "finished_seen",
-    Failed => "failed",
-    Terminated => "terminated",
-    Disconnected => "disconnected",
-});
-
 string_enum!(AttachmentRole {
     Controller => "controller",
     Observer => "observer",
@@ -228,8 +216,6 @@ pub struct Session {
     pub provider_profile_id: Option<ProviderProfileId>,
     pub provider_kind: ProviderKind,
     pub display_name: String,
-    pub state: SessionState,
-    /// Expanded authoritative state; `state` remains for clients during the expand phase.
     pub status: crate::session_state::SessionStatus,
     pub process_id: Option<u32>,
     pub external_session_id: Option<String>,
@@ -298,67 +284,6 @@ pub struct DaemonHealth {
     pub connected_clients: u32,
 }
 
-#[must_use]
-pub const fn attention_priority(state: SessionState) -> u8 {
-    match state {
-        SessionState::NeedsFeedback => 0,
-        SessionState::Failed => 1,
-        SessionState::FinishedUnseen => 2,
-        SessionState::Running | SessionState::Starting => 3,
-        _ => 4,
-    }
-}
-
-/// Whether a Session belongs in cross-client active-session supervision.
-#[must_use]
-pub const fn state_is_active(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::Starting | SessionState::Running | SessionState::NeedsFeedback
-    )
-}
-
-/// Stable ordering for the Active Sessions overview.
-#[must_use]
-pub const fn active_session_priority(state: SessionState) -> u8 {
-    match state {
-        SessionState::NeedsFeedback => 0,
-        SessionState::Running => 1,
-        SessionState::Starting => 2,
-        _ => 3,
-    }
-}
-
-/// Whether a terminal session state is eligible for provider-level resume.
-///
-/// A verified external session identifier is still required by the daemon.
-#[must_use]
-pub const fn state_allows_resume(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::FinishedSeen
-            | SessionState::FinishedUnseen
-            | SessionState::Failed
-            | SessionState::Terminated
-            | SessionState::Disconnected
-    )
-}
-
-/// Whether a Session state is eligible for permanent metadata deletion.
-///
-/// The daemon must additionally prove that no owned process tree remains.
-#[must_use]
-pub const fn state_allows_deletion(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::FinishedSeen
-            | SessionState::FinishedUnseen
-            | SessionState::Failed
-            | SessionState::Terminated
-            | SessionState::Disconnected
-    )
-}
-
 /// Whether a session is the latest eligible record for a verified provider conversation.
 ///
 /// Clients must additionally check the current Provider health and resume capability.
@@ -367,7 +292,7 @@ pub fn session_record_can_resume(session: &Session, sessions: &[Session]) -> boo
     let Some(external_session_id) = session.external_session_id.as_deref() else {
         return false;
     };
-    state_allows_resume(session.state)
+    crate::session_state::lifecycle_allows_resume(session.status.lifecycle)
         && !sessions.iter().any(|candidate| {
             candidate.id != session.id
                 && candidate.provider_kind == session.provider_kind
@@ -382,8 +307,7 @@ pub fn session_record_can_resume(session: &Session, sessions: &[Session]) -> boo
 mod tests {
     use super::{
         DaemonSnapshot, MAX_ENCODED_WORK_SOURCE_BYTES, MAX_SNAPSHOT_WORK_SOURCES, ProviderKind,
-        SNAPSHOT_WORK_SOURCE_BYTE_BUDGET, SessionState, active_session_priority,
-        state_allows_deletion, state_allows_resume, state_is_active,
+        SNAPSHOT_WORK_SOURCE_BYTE_BUDGET,
     };
     use crate::{
         github::{
@@ -397,74 +321,6 @@ mod tests {
     fn provider_display_names_are_distinct_from_protocol_values() {
         assert_eq!(ProviderKind::Claude.to_string(), "claude");
         assert_eq!(ProviderKind::Claude.display_name(), "Claude Code");
-    }
-
-    #[test]
-    fn only_inactive_provider_states_allow_resume() {
-        for state in [
-            SessionState::FinishedSeen,
-            SessionState::FinishedUnseen,
-            SessionState::Failed,
-            SessionState::Terminated,
-            SessionState::Disconnected,
-        ] {
-            assert!(state_allows_resume(state), "{state} should allow resume");
-        }
-        for state in [
-            SessionState::Fresh,
-            SessionState::Starting,
-            SessionState::Running,
-            SessionState::NeedsFeedback,
-        ] {
-            assert!(
-                !state_allows_resume(state),
-                "{state} should not allow resume"
-            );
-        }
-    }
-
-    #[test]
-    fn only_inactive_terminal_states_allow_deletion() {
-        for state in [
-            SessionState::FinishedSeen,
-            SessionState::FinishedUnseen,
-            SessionState::Failed,
-            SessionState::Terminated,
-            SessionState::Disconnected,
-        ] {
-            assert!(
-                state_allows_deletion(state),
-                "{state} should allow deletion"
-            );
-        }
-        for state in [
-            SessionState::Fresh,
-            SessionState::Starting,
-            SessionState::Running,
-            SessionState::NeedsFeedback,
-        ] {
-            assert!(
-                !state_allows_deletion(state),
-                "{state} should not allow deletion"
-            );
-        }
-    }
-
-    #[test]
-    fn active_session_states_have_a_stable_supervision_order() {
-        let active = [
-            SessionState::NeedsFeedback,
-            SessionState::Running,
-            SessionState::Starting,
-        ];
-        for state in active {
-            assert!(state_is_active(state));
-        }
-        assert_eq!(active_session_priority(SessionState::NeedsFeedback), 0);
-        assert_eq!(active_session_priority(SessionState::Running), 1);
-        assert_eq!(active_session_priority(SessionState::Starting), 2);
-        assert!(!state_is_active(SessionState::FinishedSeen));
-        assert_eq!(active_session_priority(SessionState::FinishedSeen), 3);
     }
 
     #[test]

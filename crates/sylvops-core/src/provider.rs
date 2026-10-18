@@ -444,8 +444,11 @@ pub fn provider_error(message: impl Into<String>) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ProviderKind, Session, SessionState};
     use crate::status::{NormalizedProviderEvent, RemainingWork, TurnFailureCategory};
+    use crate::{
+        domain::{ProviderKind, Session},
+        session_state::{SessionLifecycle, SessionStatus},
+    };
 
     #[derive(Debug)]
     struct FakeRuntime;
@@ -686,8 +689,10 @@ mod tests {
             provider_profile_id: None,
             provider_kind: kind,
             display_name: kind.to_string(),
-            state: SessionState::FinishedSeen,
-            status: crate::session_state::SessionStatus::default(),
+            status: SessionStatus {
+                lifecycle: SessionLifecycle::Exited,
+                ..SessionStatus::default()
+            },
             process_id: None,
             external_session_id: Some("verified-id".into()),
             command: kind.to_string(),

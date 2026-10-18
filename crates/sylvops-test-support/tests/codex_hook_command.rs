@@ -1,7 +1,7 @@
 use std::{path::Path, process::Stdio, time::Duration};
 
 use sylvops_core::{
-    domain::{ProviderKind, Session, SessionState},
+    domain::{ProviderKind, Session},
     ids::SessionId,
     protocol::{ClientRequest, DaemonResponse},
 };
@@ -123,7 +123,9 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
         .unwrap();
     bounded(async {
         loop {
-            if session(&client, session_id).await.state == SessionState::Terminated {
+            if session(&client, session_id).await.status.lifecycle
+                == sylvops_core::session_state::SessionLifecycle::Terminated
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
