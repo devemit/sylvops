@@ -6,12 +6,18 @@ use rusqlite::OptionalExtension;
 use sylvops_core::{
     domain::{ProviderKind, Session},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
-    protocol::{ClientRequest, DaemonResponse},
+    protocol::{ClientRequest, DaemonResponse, SessionResumeOutcome},
     session_state::{
         AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
+        SessionStatus,
     },
 };
-use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
+use sylvops_daemon::{
+    client::DaemonClient,
+    daemon,
+    database::{DatabaseHandle, NewSession, RepositoryRegistration},
+    runtime::RuntimePaths,
+};
 
 const PROMPT_SENTINEL: &str = "SYLVOPS_PRIVATE_PROMPT_25_7f8cbfea";
 const AUTO_FINISH_PROMPT: &str = "SYLVOPS_TEST_AUTO_FINISH";
@@ -19,10 +25,10 @@ const AUTO_FINISH_PROMPT: &str = "SYLVOPS_TEST_AUTO_FINISH";
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn fake_codex_hooks_attention_and_resume() {
-    tokio::time::timeout(
-        Duration::from_secs(120),
-        fake_codex_hooks_attention_and_resume_inner(),
-    )
+    tokio::time::timeout(Duration::from_secs(180), async {
+        fake_codex_hooks_attention_and_resume_inner().await;
+        typed_resume_refusals_cover_daemon_checks_inner().await;
+    })
     .await
     .expect("fake Codex scenario timeout");
 }
@@ -35,7 +41,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     let bin_directory = temporary.path().join("bin");
     std::fs::create_dir(&bin_directory).expect("fake provider bin directory");
     let fake_codex = install_fake_codex(&bin_directory);
-    let _codex_cli_path = EnvironmentGuard::set("CODEX_CLI_PATH", fake_codex);
+    let _codex_cli_path = EnvironmentGuard::set("CODEX_CLI_PATH", fake_codex.clone());
     let _path =
         EnvironmentGuard::set(
             "PATH",
@@ -88,16 +94,14 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
             rows: 24,
         })
         .await
-        .expect("missing resume ID response")
+        .expect("live leaf response")
     {
-        DaemonResponse::Error(error) => assert!(
-            error
-                .message
-                .contains("no verified provider resume identifier"),
-            "missing resume ID error should be actionable: {}",
-            error.message
-        ),
-        response => panic!("session without resume ID unexpectedly resumed: {response:?}"),
+        DaemonResponse::SessionResumed {
+            session,
+            outcome: SessionResumeOutcome::AttachedLiveLeaf,
+            ..
+        } => assert_eq!(session.id, shell_session_id),
+        response => panic!("live leaf was not returned for attachment: {response:?}"),
     }
     attach(&client, shell_session_id).await;
     client
@@ -117,6 +121,24 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         exited_shell.status.attention.map(|event| event.reason),
         Some(AttentionReason::SuccessfulCompletion)
     );
+    match client
+        .request(&ClientRequest::ResumeSession {
+            session_id: shell_session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("missing Conversation identity response")
+    {
+        DaemonResponse::SessionResumeUnavailable(unavailable) => {
+            assert_eq!(unavailable.leaf_session.id, shell_session_id);
+            assert_eq!(
+                unavailable.reason,
+                sylvops_core::protocol::SessionResumeRefusal::MissingConversationIdentity
+            );
+        }
+        response => panic!("missing identity did not return a typed refusal: {response:?}"),
+    }
 
     let terminated_session_id = create_codex_session(&client, worktree_id).await;
     assert_eq!(owned_hook_profile_count(&codex_home), 1);
@@ -242,6 +264,32 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         unexpected_exit.failure_reason.as_deref(),
         Some("process_exit_without_completion")
     );
+    let failed_successor = match client
+        .request(&ClientRequest::ResumeSession {
+            session_id: unexpected_exit_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("failed resume response")
+    {
+        DaemonResponse::SessionResumed {
+            session,
+            outcome: SessionResumeOutcome::CreatedSuccessor,
+            ..
+        } => session,
+        response => panic!("failed Conversation did not resume: {response:?}"),
+    };
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: failed_successor.id,
+        })
+        .await
+        .expect("stop failed-session successor");
+    wait_for_session(&client, failed_successor.id, |session| {
+        session.status.lifecycle == SessionLifecycle::Terminated
+    })
+    .await;
 
     let source_session_id = create_codex_session(&client, worktree_id).await;
     attach(&client, source_session_id).await;
@@ -329,6 +377,27 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     .await;
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
 
+    let unavailable_codex = fake_codex.with_extension("unavailable");
+    std::fs::rename(&fake_codex, &unavailable_codex).expect("hide fake Codex executable");
+    match client
+        .request(&ClientRequest::ResumeSession {
+            session_id: source_session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("unavailable Provider response")
+    {
+        DaemonResponse::SessionResumeUnavailable(unavailable) => assert_eq!(
+            unavailable.reason,
+            sylvops_core::protocol::SessionResumeRefusal::ProviderAuthenticationRequired {
+                provider: ProviderKind::Codex
+            }
+        ),
+        response => panic!("unavailable Provider did not return a typed refusal: {response:?}"),
+    }
+    std::fs::rename(&unavailable_codex, &fake_codex).expect("restore fake Codex executable");
+
     let first_resume = ClientRequest::ResumeSession {
         session_id: source_session_id,
         columns: 80,
@@ -340,28 +409,32 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         client.request(&concurrent_resume)
     );
     let mut resumed_id = None;
-    let mut refused = 0;
+    let mut created = 0;
+    let mut attached = 0;
     for response in [first_response, concurrent_response] {
         match response.expect("concurrent resume response") {
-            DaemonResponse::SessionResumed { session, .. } => {
+            DaemonResponse::SessionResumed {
+                session, outcome, ..
+            } => {
                 assert_eq!(
                     session.external_session_id.as_deref(),
                     Some(external_id.as_str())
                 );
-                assert!(resumed_id.replace(session.id).is_none());
-            }
-            DaemonResponse::Error(error) => {
-                assert!(
-                    error.message.contains("already been resumed"),
-                    "concurrent resume error should be actionable: {}",
-                    error.message
-                );
-                refused += 1;
+                if let Some(existing) = resumed_id {
+                    assert_eq!(existing, session.id);
+                } else {
+                    resumed_id = Some(session.id);
+                }
+                match outcome {
+                    SessionResumeOutcome::CreatedSuccessor => created += 1,
+                    SessionResumeOutcome::AttachedLiveLeaf => attached += 1,
+                }
             }
             response => panic!("unexpected concurrent resume response: {response:?}"),
         }
     }
-    assert_eq!(refused, 1);
+    assert_eq!(created, 1);
+    assert_eq!(attached, 1);
     let resumed_id = resumed_id.expect("one concurrent resume succeeds");
     match client
         .request(&ClientRequest::ResumeSession {
@@ -372,12 +445,12 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("stale resume response")
     {
-        DaemonResponse::Error(error) => assert!(
-            error.message.contains("already been resumed"),
-            "stale resume error should be actionable: {}",
-            error.message
-        ),
-        response => panic!("stale resume unexpectedly succeeded: {response:?}"),
+        DaemonResponse::SessionResumed {
+            session,
+            outcome: SessionResumeOutcome::AttachedLiveLeaf,
+            ..
+        } => assert_eq!(session.id, resumed_id),
+        response => panic!("predecessor did not follow the live leaf: {response:?}"),
     }
     let history = match client
         .request(&ClientRequest::GetSnapshot)
@@ -415,6 +488,23 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
             .iter()
             .any(|session| session.id == resumed_id)
     );
+    assert_eq!(
+        history
+            .session_lineage
+            .iter()
+            .filter(|link| link.predecessor_session_id == source_session_id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history
+            .sessions
+            .iter()
+            .find(|session| session.id == resumed_id)
+            .unwrap()
+            .display_name,
+        source_history.display_name
+    );
     attach(&client, resumed_id).await;
     client
         .request(&ClientRequest::SessionInput {
@@ -445,6 +535,19 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .expect("daemon task")
         .expect("daemon result");
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
+
+    let disconnected_status = serde_json::to_string(&SessionStatus {
+        lifecycle: SessionLifecycle::Disconnected,
+        ..SessionStatus::default()
+    })
+    .unwrap();
+    rusqlite::Connection::open(&paths.database)
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET status_json = ?2 WHERE id = ?1",
+            rusqlite::params![resumed_id.to_string(), disconnected_status],
+        )
+        .unwrap();
 
     let stale_profile = codex_home.join("sylvops-stale.config.toml");
     std::fs::write(
@@ -513,18 +616,48 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         opened_failure.status.attention.unwrap().acknowledgement,
         AttentionAcknowledgement::Acknowledged
     );
-    match restarted
+    let second_resumed_id = match restarted
         .request(&ClientRequest::ResumeSession {
             session_id: source_session_id,
             columns: 80,
             rows: 24,
         })
         .await
-        .expect("restart stale resume response")
+        .expect("restart lineage resume response")
     {
-        DaemonResponse::Error(error) => assert!(error.message.contains("already been resumed")),
-        response => panic!("restart stale resume unexpectedly succeeded: {response:?}"),
-    }
+        DaemonResponse::SessionResumed {
+            session,
+            outcome: SessionResumeOutcome::CreatedSuccessor,
+            ..
+        } => {
+            assert_ne!(session.id, resumed_id);
+            session.id
+        }
+        response => panic!("terminal leaf did not create its successor: {response:?}"),
+    };
+    let lineage = match restarted
+        .request(&ClientRequest::GetSnapshot)
+        .await
+        .expect("lineage snapshot")
+    {
+        DaemonResponse::Snapshot(snapshot) => snapshot.session_lineage,
+        response => panic!("unexpected lineage snapshot response: {response:?}"),
+    };
+    assert!(lineage.iter().any(|link| {
+        link.predecessor_session_id == resumed_id && link.successor_session_id == second_resumed_id
+    }));
+    attach(&restarted, second_resumed_id).await;
+    restarted
+        .request(&ClientRequest::SessionInput {
+            session_id: second_resumed_id,
+            bytes: input_line("finish"),
+        })
+        .await
+        .expect("second resumed finish input");
+    wait_for_session(&restarted, second_resumed_id, |session| {
+        session.process_id.is_none()
+    })
+    .await;
     exercise_session_lifecycle_stale_authorization(&restarted, worktree_id).await;
     delete_all_sessions(&restarted).await;
     let managed_worktree_id = match restarted
@@ -564,6 +697,234 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .expect("restart daemon task")
         .expect("restart daemon result");
     assert_no_persisted_text_contains(&paths.database, PROMPT_SENTINEL);
+}
+
+#[allow(clippy::too_many_lines)]
+async fn typed_resume_refusals_cover_daemon_checks_inner() {
+    use sylvops_core::protocol::SessionResumeRefusal;
+
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let repository = temporary.path().join("repository");
+    initialize_repository(&repository);
+    let canonical_repository = std::fs::canonicalize(&repository)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let paths = RuntimePaths::discover(Some(&temporary.path().join("state"))).expect("paths");
+    paths.prepare().expect("prepare runtime paths");
+    std::fs::write(&paths.config, "update_check_policy = 'disabled'\n")
+        .expect("disable update checks");
+    let database = DatabaseHandle::open(&paths.database).unwrap();
+    let (_, workspace) = database
+        .add_workspace("resume refusals".into())
+        .await
+        .unwrap();
+    let (_, _, worktree) = database
+        .add_project(RepositoryRegistration {
+            workspace_id: workspace.id,
+            name: "repository".into(),
+            repository_path: repository.to_string_lossy().into_owned(),
+            canonical_repository_path: canonical_repository.clone(),
+            default_branch: Some("main".into()),
+            remote_url: None,
+            branch: Some("main".into()),
+            base_commit: "fixture".into(),
+        })
+        .await
+        .unwrap();
+    let session_id = SessionId::new();
+    database
+        .create_session(NewSession {
+            id: session_id,
+            worktree_id: worktree.id,
+            display_name: "refusal fixture".into(),
+            provider_profile_id: None,
+            provider_kind: ProviderKind::Codex,
+            command: "codex".into(),
+            arguments_json: "[]".into(),
+            cwd: canonical_repository.clone(),
+            external_session_id: Some("verified-refusal-conversation".into()),
+            resumed_from_session_id: None,
+        })
+        .await
+        .unwrap();
+    database.mark_session_running(session_id, 42).await.unwrap();
+    database
+        .finish_session(session_id, SessionLifecycle::Exited, Some(0), None)
+        .await
+        .unwrap();
+    database.shutdown().await.unwrap();
+
+    let unavailable_codex = temporary.path().join(if cfg!(windows) {
+        "codex-unavailable.exe"
+    } else {
+        "codex-unavailable"
+    });
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-agent"), &unavailable_codex)
+        .expect("install unavailable Codex probe fixture");
+    let _codex_cli_path = EnvironmentGuard::set("CODEX_CLI_PATH", unavailable_codex);
+    let daemon_paths = paths.clone();
+    let mut daemon_task = tokio::spawn(async move { daemon::run(daemon_paths).await });
+    let client = tokio::select! {
+        result = &mut daemon_task => panic!("refusal daemon exited before connection: {result:?}"),
+        client = connect_eventually(&paths) => client,
+    };
+    let connection = rusqlite::Connection::open(&paths.database).unwrap();
+    let exited_status = serde_json::to_string(&SessionStatus {
+        lifecycle: SessionLifecycle::Exited,
+        ..SessionStatus::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        resume_refusal(&client, session_id).await,
+        SessionResumeRefusal::ProviderUnavailable {
+            provider: ProviderKind::Codex
+        }
+    );
+
+    let fresh_status = serde_json::to_string(&SessionStatus::default()).unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET status_json = ?2, process_id = NULL WHERE id = ?1",
+            rusqlite::params![session_id.to_string(), fresh_status],
+        )
+        .unwrap();
+    assert_eq!(
+        resume_refusal(&client, session_id).await,
+        SessionResumeRefusal::LifecycleNotTerminal {
+            lifecycle: SessionLifecycle::Fresh
+        }
+    );
+    connection
+        .execute(
+            "UPDATE sessions SET status_json = ?2 WHERE id = ?1",
+            rusqlite::params![session_id.to_string(), exited_status],
+        )
+        .unwrap();
+
+    connection
+        .execute(
+            "UPDATE sessions SET external_session_id = NULL WHERE id = ?1",
+            [session_id.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        resume_refusal(&client, session_id).await,
+        SessionResumeRefusal::MissingConversationIdentity
+    );
+    connection
+        .execute(
+            "UPDATE sessions SET external_session_id = 'verified-refusal-conversation' WHERE id = ?1",
+            [session_id.to_string()],
+        )
+        .unwrap();
+
+    connection
+        .execute(
+            "UPDATE sessions SET provider_kind = 'shell' WHERE id = ?1",
+            [session_id.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        resume_refusal(&client, session_id).await,
+        SessionResumeRefusal::ProviderDoesNotSupportResume {
+            provider: ProviderKind::Shell
+        }
+    );
+    connection
+        .execute(
+            "UPDATE sessions SET provider_kind = 'cursor' WHERE id = ?1",
+            [session_id.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        resume_refusal(&client, session_id).await,
+        SessionResumeRefusal::ProviderProbeFailed {
+            provider: ProviderKind::Cursor
+        }
+    );
+    connection
+        .execute(
+            "UPDATE sessions SET provider_kind = 'codex' WHERE id = ?1",
+            [session_id.to_string()],
+        )
+        .unwrap();
+
+    let unavailable_repository = temporary.path().join("repository-unavailable");
+    std::fs::rename(&repository, &unavailable_repository).unwrap();
+    assert_eq!(
+        resume_refusal(&client, session_id).await,
+        SessionResumeRefusal::WorktreeUnavailable {
+            worktree_id: worktree.id
+        }
+    );
+    std::fs::rename(&unavailable_repository, &repository).unwrap();
+
+    connection
+        .execute(
+            "UPDATE sessions SET cwd = 'C:/wrong-worktree' WHERE id = ?1",
+            [session_id.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        resume_refusal(&client, session_id).await,
+        SessionResumeRefusal::WorktreeIdentityMismatch {
+            worktree_id: worktree.id
+        }
+    );
+    connection
+        .execute(
+            "UPDATE sessions SET cwd = ?2 WHERE id = ?1",
+            rusqlite::params![session_id.to_string(), canonical_repository],
+        )
+        .unwrap();
+
+    let running_status = serde_json::to_string(&SessionStatus {
+        lifecycle: SessionLifecycle::Running,
+        ..SessionStatus::default()
+    })
+    .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET status_json = ?2, process_id = 42 WHERE id = ?1",
+            rusqlite::params![session_id.to_string(), running_status],
+        )
+        .unwrap();
+    assert_eq!(
+        resume_refusal(&client, session_id).await,
+        SessionResumeRefusal::LiveSessionUnavailable {
+            lifecycle: SessionLifecycle::Running
+        }
+    );
+
+    client
+        .request(&ClientRequest::ShutdownDaemon)
+        .await
+        .expect("refusal daemon shutdown");
+    tokio::time::timeout(Duration::from_secs(10), daemon_task)
+        .await
+        .expect("refusal daemon shutdown timeout")
+        .expect("refusal daemon task")
+        .expect("refusal daemon result");
+}
+
+async fn resume_refusal(
+    client: &DaemonClient,
+    session_id: SessionId,
+) -> sylvops_core::protocol::SessionResumeRefusal {
+    match client
+        .request(&ClientRequest::ResumeSession {
+            session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("resume refusal response")
+    {
+        DaemonResponse::SessionResumeUnavailable(unavailable) => unavailable.reason,
+        response => panic!("expected typed resume refusal, got {response:?}"),
+    }
 }
 
 fn with_codex_trust(source: &str, project: &Path) -> String {

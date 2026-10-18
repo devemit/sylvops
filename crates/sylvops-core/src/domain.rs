@@ -13,6 +13,7 @@ pub const SNAPSHOT_WORK_SOURCE_BYTE_BUDGET: usize = 256 * 1_024;
 pub const MAX_ENCODED_WORK_SOURCE_BYTES: usize = 1_536;
 pub const MAX_SNAPSHOT_WORK_SOURCES: usize =
     SNAPSHOT_WORK_SOURCE_BYTE_BUDGET / MAX_ENCODED_WORK_SOURCE_BYTES;
+pub const MAX_SNAPSHOT_SESSION_LINEAGE_LINKS: usize = 4_096;
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -231,6 +232,13 @@ pub struct Session {
     pub failure_reason: Option<String>,
 }
 
+/// One persisted predecessor/successor edge in a linear Session Lineage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionLineageLink {
+    pub predecessor_session_id: SessionId,
+    pub successor_session_id: SessionId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderProfile {
     pub id: ProviderProfileId,
@@ -253,9 +261,54 @@ pub struct DaemonSnapshot {
     pub projects: Vec<Project>,
     pub worktrees: Vec<Worktree>,
     pub sessions: Vec<Session>,
+    #[serde(default, deserialize_with = "deserialize_session_lineage")]
+    pub session_lineage: Vec<SessionLineageLink>,
     #[serde(default, deserialize_with = "deserialize_snapshot_work_sources")]
     pub work_sources: Vec<WorkSource>,
     pub provider_profiles: Vec<ProviderProfile>,
+}
+
+fn deserialize_session_lineage<'de, D>(deserializer: D) -> Result<Vec<SessionLineageLink>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let links = Vec::<SessionLineageLink>::deserialize(deserializer)?;
+    if links.len() > MAX_SNAPSHOT_SESSION_LINEAGE_LINKS {
+        return Err(serde::de::Error::custom(
+            "too many Session Lineage links in daemon snapshot",
+        ));
+    }
+    Ok(links)
+}
+
+/// Returns the one-based derived attempt number for a Session in a persisted lineage.
+///
+/// Sessions with no predecessor or successor are not attempts and return `None`.
+#[must_use]
+pub fn session_attempt_number(
+    session_id: SessionId,
+    links: &[SessionLineageLink],
+) -> Option<usize> {
+    let is_linked = links.iter().any(|link| {
+        link.predecessor_session_id == session_id || link.successor_session_id == session_id
+    });
+    if !is_linked {
+        return None;
+    }
+    let mut current = session_id;
+    let mut attempt = 1usize;
+    for _ in 0..=links.len() {
+        let Some(predecessor) = links
+            .iter()
+            .find(|link| link.successor_session_id == current)
+            .map(|link| link.predecessor_session_id)
+        else {
+            return Some(attempt);
+        };
+        current = predecessor;
+        attempt = attempt.saturating_add(1);
+    }
+    None
 }
 
 fn deserialize_snapshot_work_sources<'de, D>(
@@ -307,20 +360,43 @@ pub fn session_record_can_resume(session: &Session, sessions: &[Session]) -> boo
 mod tests {
     use super::{
         DaemonSnapshot, MAX_ENCODED_WORK_SOURCE_BYTES, MAX_SNAPSHOT_WORK_SOURCES, ProviderKind,
-        SNAPSHOT_WORK_SOURCE_BYTE_BUDGET,
+        SNAPSHOT_WORK_SOURCE_BYTE_BUDGET, SessionLineageLink, session_attempt_number,
     };
     use crate::{
         github::{
             GitHubHost, GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, GitHubOwner,
             GitHubRepositoryIdentity, GitHubRepositoryName, WorkSource,
         },
-        ids::{ProjectId, WorktreeId},
+        ids::{ProjectId, SessionId, WorktreeId},
     };
 
     #[test]
     fn provider_display_names_are_distinct_from_protocol_values() {
         assert_eq!(ProviderKind::Claude.to_string(), "claude");
         assert_eq!(ProviderKind::Claude.display_name(), "Claude Code");
+    }
+
+    #[test]
+    fn attempt_numbers_are_derived_from_persisted_lineage_without_changing_names() {
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let third = SessionId::new();
+        let unrelated = SessionId::new();
+        let links = [
+            SessionLineageLink {
+                predecessor_session_id: first,
+                successor_session_id: second,
+            },
+            SessionLineageLink {
+                predecessor_session_id: second,
+                successor_session_id: third,
+            },
+        ];
+
+        assert_eq!(session_attempt_number(first, &links), Some(1));
+        assert_eq!(session_attempt_number(second, &links), Some(2));
+        assert_eq!(session_attempt_number(third, &links), Some(3));
+        assert_eq!(session_attempt_number(unrelated, &links), None);
     }
 
     #[test]

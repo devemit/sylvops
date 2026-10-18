@@ -595,7 +595,7 @@ impl ClaudeAdapter {
     }
 
     fn build_resume_spec(&self, context: &ResumeContext) -> sylvops_core::Result<LaunchSpec> {
-        validate_external_id(&context.external_session_id)?;
+        validate_external_id(context.external_session_id.as_str())?;
         let (settings_path, environment) = self.managed_launch_context(
             context.session_id,
             context.worktree_id,
@@ -606,7 +606,7 @@ impl ClaudeAdapter {
             OsString::from("--settings"),
             settings_path.into_os_string(),
             OsString::from("--resume"),
-            OsString::from(&context.external_session_id),
+            OsString::from(context.external_session_id.as_str()),
         ]);
         Ok(LaunchSpec {
             executable: self.executable()?,
@@ -1462,12 +1462,12 @@ impl CodexAdapter {
         &self,
         context: ResumeContext,
     ) -> sylvops_core::Result<Option<LaunchSpec>> {
-        validate_external_id(&context.external_session_id)?;
+        validate_external_id(context.external_session_id.as_str())?;
         validate_selector(context.model.as_deref(), "model")?;
         validate_selector(context.effort.as_deref(), "effort")?;
         let mut arguments = vec![
             OsString::from("resume"),
-            OsString::from(context.external_session_id),
+            OsString::from(context.external_session_id.as_str()),
             OsString::from("--cd"),
             context.cwd.as_os_str().to_owned(),
         ];
@@ -2550,22 +2550,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_resume_validates_external_id() {
+    fn codex_resume_accepts_only_a_verified_external_id() {
         let adapter = CodexAdapter::from_executable(PathBuf::from(if cfg!(windows) {
             r"C:\Codex\codex.exe"
         } else {
             "/usr/bin/codex"
         }));
+        assert!(ProviderConversationId::new("../../wrong-worktree").is_err());
         let result = adapter.configure_resume(ResumeContext {
             session_id: sylvops_core::ids::SessionId::new(),
             worktree_id: sylvops_core::ids::WorktreeId::new(),
-            external_session_id: "../../wrong-worktree".into(),
+            external_session_id: ProviderConversationId::new("conversation-123").unwrap(),
             cwd: PathBuf::from("worktree"),
             model: None,
             effort: None,
             lifecycle_endpoint: None,
         });
-        assert!(result.is_err());
+        assert!(result.unwrap().is_some());
     }
 
     #[test]

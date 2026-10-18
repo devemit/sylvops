@@ -14,7 +14,6 @@ use sylvops_core::{
         GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubCheckState, GitHubItemKind,
         GitHubItemState, GitHubReviewState,
     },
-    provider::session_can_resume,
     session_state::{
         AttentionReason, ProviderActivity, SessionLifecycle, SessionStatus, lifecycle_is_active,
     },
@@ -460,7 +459,7 @@ fn explorer_label(app: &App, node: ExplorerNode) -> (String, String) {
                     format!(
                         "{} {}",
                         status_symbol(item.status, app.status_animation_frame()),
-                        item.display_name
+                        app.session_row_name(item)
                     ),
                     format!("  {}", status_label(item.status)),
                 )
@@ -485,7 +484,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         |session| {
             format!(
                 "{focus_label} · {} · {} · {} ",
-                session.display_name,
+                app.session_row_name(session),
                 session.provider_kind.display_name(),
                 status_label(session.status)
             )
@@ -613,7 +612,7 @@ fn session_item(
     });
     SessionOverviewItem {
         id: session.id,
-        name: session.display_name.clone(),
+        name: app.session_row_name(session),
         status: session.status,
         provider: session.provider_kind.display_name(),
         project: project
@@ -974,17 +973,16 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         };
         (title, terminal_text(attached.parser.screen()))
     } else if let Some(session) = app.selected_session() {
-        let can_resume = session_can_resume(session, &app.snapshot.sessions, &app.providers);
         (
             " Terminal · detached ".into(),
             Text::from(format!(
                 "{} is {}.\n\nSelecting a session never attaches automatically.\n{}",
                 session.display_name,
                 status_label(session.status),
-                if can_resume {
-                    "Press Enter to resume this conversation and open its terminal."
-                } else {
+                if lifecycle_is_active(session.status.lifecycle) {
                     "Press Enter or click Attach to connect."
+                } else {
+                    "Press Enter to follow this Conversation to its latest Session. If resume is unavailable, history remains open with the exact reason and New starts fresh."
                 }
             )),
         )
@@ -1242,13 +1240,11 @@ fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<
         ]),
         Line::from(vec![
             Span::styled("Resume       ", theme.muted),
-            Span::raw(
-                if session_can_resume(session, &app.snapshot.sessions, &app.providers) {
-                    "Available · press u"
-                } else {
-                    "Unavailable"
-                },
-            ),
+            Span::raw(if lifecycle_is_active(session.status.lifecycle) {
+                "Live Session · Enter attaches"
+            } else {
+                "Daemon-checked · press u · New starts fresh"
+            }),
         ]),
         Line::from(""),
         Line::from(
@@ -1459,7 +1455,8 @@ fn new_worktree_action(terse: bool, theme: Theme) -> ActionItem {
 }
 
 fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
-    let removal = if session_is_active(app.selected_session()) {
+    let active = session_is_active(app.selected_session());
+    let removal = if active {
         "[d] Stop Session"
     } else {
         "[d] Delete Session"
@@ -1470,6 +1467,17 @@ fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
         HitTarget::Rename,
         theme.text,
     );
+    let start_fresh = action_label(
+        if active {
+            if terse { "[n]New" } else { "[n] New Session" }
+        } else if terse {
+            "[n]Fresh"
+        } else {
+            "[n] Start Fresh"
+        },
+        HitTarget::New,
+        theme.success,
+    );
     let remove = action_label(removal, HitTarget::Delete, theme.danger);
     let new_worktree = new_worktree_action(terse, theme);
     if terse {
@@ -1477,6 +1485,7 @@ fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
         if let Some(primary) = primary {
             actions.push(primary);
         }
+        actions.push(start_fresh);
         actions.push(new_worktree);
         actions.push(rename);
         actions
@@ -1485,6 +1494,7 @@ fn session_actions(app: &App, terse: bool, theme: Theme) -> Vec<ActionItem> {
         if let Some(primary) = primary {
             actions.push(primary);
         }
+        actions.push(start_fresh);
         actions.push(new_worktree);
         actions.push(rename);
         actions.push(remove);
@@ -1505,17 +1515,15 @@ fn primary_session_action(app: &App, terse: bool, theme: Theme) -> Option<Action
         ));
     }
     let session = app.selected_session()?;
-    Some(
-        if session_can_resume(session, &app.snapshot.sessions, &app.providers) {
-            action_label("[u] Resume", HitTarget::Resume, theme.focus)
-        } else {
-            action_label(
-                if terse { "[E]Attach" } else { "[Enter] Attach" },
-                HitTarget::Attach,
-                theme.focus,
-            )
-        },
-    )
+    Some(if lifecycle_is_active(session.status.lifecycle) {
+        action_label(
+            if terse { "[E]Attach" } else { "[Enter] Attach" },
+            HitTarget::Attach,
+            theme.focus,
+        )
+    } else {
+        action_label("[u] Resume", HitTarget::Resume, theme.focus)
+    })
 }
 
 fn explorer_footer_actions(app: &App, width: u16, theme: Theme) -> Vec<ActionItem> {

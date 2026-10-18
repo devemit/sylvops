@@ -13625,7 +13625,10 @@ mod tests {
             Operation::Resume(source.id),
             DaemonResponse::SessionResumed {
                 revision: 2,
+                requested_session_id: source.id,
+                predecessor_session_id: Some(source.id),
                 session: successor.clone(),
+                outcome: sylvops_core::protocol::SessionResumeOutcome::CreatedSuccessor,
             },
         );
 
