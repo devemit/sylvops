@@ -817,7 +817,14 @@ fn build_session_rows(
         .map(|session| NavigatorRow {
             id: NavigatorNodeId::Session(session.id),
             kind: NavigatorNodeKind::Session,
-            label: session.display_name.clone(),
+            label: sylvops_core::domain::session_attempt_number(
+                session.id,
+                &daemon.session_lineage,
+            )
+            .map_or_else(
+                || session.display_name.clone(),
+                |attempt| format!("{} · attempt {attempt}", session.display_name),
+            ),
             detail: session_status_label(session.status).to_owned(),
             badge: None,
             indicator: Some(SessionIndicator::for_status(session.status)),
@@ -1794,6 +1801,50 @@ mod tests {
                 .map(|row| row.label.as_str())
                 .collect::<Vec<_>>(),
             vec!["Newest session", "Review issue 65"]
+        );
+    }
+
+    #[test]
+    fn navigator_keeps_lineage_history_with_derived_attempt_markers() {
+        let mut fixture = hierarchy_fixture(SessionStatus {
+            lifecycle: SessionLifecycle::Exited,
+            ..SessionStatus::default()
+        });
+        let first = fixture.snapshot.sessions[0].clone();
+        let mut second = first.clone();
+        second.id = SessionId::new();
+        second.status.lifecycle = SessionLifecycle::Running;
+        second.created_at = 2;
+        second.last_activity_at = 2;
+        fixture.snapshot.sessions.push(second.clone());
+        fixture
+            .snapshot
+            .session_lineage
+            .push(sylvops_core::domain::SessionLineageLink {
+                predecessor_session_id: first.id,
+                successor_session_id: second.id,
+            });
+
+        let presentation = DesktopPresentation::build(&PresentationInput {
+            daemon: &fixture.snapshot,
+            preferences: &DesktopState::default(),
+            viewport: Viewport::new(1_440, 900),
+            system_appearance: SystemAppearance::Dark,
+            interaction: InteractionState {
+                selected_project_id: Some(fixture.project_id),
+                selected_worktree_id: Some(fixture.worktree_id),
+                ..InteractionState::default()
+            },
+        });
+
+        assert_eq!(presentation.navigator.sessions.len(), 2);
+        assert_eq!(
+            presentation.navigator.sessions[0].label,
+            "Review issue 65 · attempt 2"
+        );
+        assert_eq!(
+            presentation.navigator.sessions[1].label,
+            "Review issue 65 · attempt 1"
         );
     }
 
