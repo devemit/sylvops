@@ -6,6 +6,7 @@ use std::{
 
 use ratatui::layout::Rect;
 use sylvops_core::{
+    attention::AttentionNotificationPreferences,
     domain::{DaemonSnapshot, Project, Session, Workspace, Worktree, WorktreeStatus},
     github::GitHubIntegrationStatus,
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
@@ -93,6 +94,8 @@ pub(crate) enum SettingsFocus {
     Theme,
     Presentation,
     Density,
+    NativeNotifications,
+    Sound,
     Apply,
     Cancel,
 }
@@ -104,6 +107,8 @@ impl SettingsFocus {
             Self::Theme,
             Self::Presentation,
             Self::Density,
+            Self::NativeNotifications,
+            Self::Sound,
             Self::Apply,
             Self::Cancel,
         ];
@@ -123,6 +128,7 @@ pub(crate) struct Settings {
     pub original_theme: TuiTheme,
     pub original_presentation: TuiSessionPresentation,
     pub original_density: TuiDensity,
+    pub original_notification_preferences: AttentionNotificationPreferences,
     pub focus: SettingsFocus,
     pub github_remote_index: usize,
 }
@@ -219,6 +225,8 @@ pub(crate) enum HitTarget {
     SettingsTheme(TuiTheme),
     SettingsPresentation(TuiSessionPresentation),
     SettingsDensity(TuiDensity),
+    SettingsNativeNotifications(bool),
+    SettingsSound(bool),
     SettingsGithubRemote(usize),
     SettingsGithubClear,
     SettingsGithubRefresh,
@@ -301,6 +309,7 @@ pub(crate) struct App {
     pub navigator_width: u16,
     pub navigator_resizing: NavigatorResizeState,
     pub density: TuiDensity,
+    pub notification_preferences: AttentionNotificationPreferences,
     pub selected_project_id: Option<ProjectId>,
     pub selected_worktree_id: Option<WorktreeId>,
     pub selected_session_id: Option<SessionId>,
@@ -369,6 +378,7 @@ impl App {
             navigator_width: persisted.navigator_width,
             navigator_resizing: NavigatorResizeState::Idle,
             density: persisted.density,
+            notification_preferences: AttentionNotificationPreferences::default(),
             selected_project_id: persisted.selected_project_id,
             selected_worktree_id: persisted.selected_worktree_id,
             selected_session_id: persisted.selected_session_id,
@@ -1138,6 +1148,7 @@ impl App {
             original_theme: self.theme,
             original_presentation: self.session_presentation,
             original_density: self.density,
+            original_notification_preferences: self.notification_preferences,
             focus: SettingsFocus::Theme,
             github_remote_index: 0,
         });
@@ -1157,6 +1168,7 @@ impl App {
             self.theme = settings.original_theme;
             self.session_presentation = settings.original_presentation;
             self.density = settings.original_density;
+            self.notification_preferences = settings.original_notification_preferences;
         }
         self.mode = Mode::Navigation;
     }

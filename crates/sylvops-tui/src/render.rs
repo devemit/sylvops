@@ -3475,6 +3475,52 @@ fn draw_settings(
         );
         row = row.saturating_add(1);
     }
+    if app.density == TuiDensity::Comfortable {
+        lines.push(Line::from(""));
+        row = row.saturating_add(1);
+    }
+    lines.push(Line::from(Span::styled(
+        if settings.focus == SettingsFocus::NativeNotifications {
+            "› Native and in-client notifications"
+        } else {
+            "  Native and in-client notifications"
+        },
+        Modifier::BOLD,
+    )));
+    row = row.saturating_add(1);
+    for (enabled, label) in [(true, "Enabled"), (false, "Disabled")] {
+        let selected = app.notification_preferences.native_notifications_enabled == enabled;
+        lines.push(Line::from(Span::styled(
+            format!("  {} {label}", if selected { "●" } else { "○" }),
+            if selected { theme.selected } else { theme.text },
+        )));
+        app.hit_map.push(
+            Rect::new(inner.x, row, inner.width, 1),
+            HitTarget::SettingsNativeNotifications(enabled),
+        );
+        row = row.saturating_add(1);
+    }
+    lines.push(Line::from(Span::styled(
+        if settings.focus == SettingsFocus::Sound {
+            "› Attention sound"
+        } else {
+            "  Attention sound"
+        },
+        Modifier::BOLD,
+    )));
+    row = row.saturating_add(1);
+    for (enabled, label) in [(true, "Enabled"), (false, "Disabled")] {
+        let selected = app.notification_preferences.sound_enabled == enabled;
+        lines.push(Line::from(Span::styled(
+            format!("  {} {label}", if selected { "●" } else { "○" }),
+            if selected { theme.selected } else { theme.text },
+        )));
+        app.hit_map.push(
+            Rect::new(inner.x, row, inner.width, 1),
+            HitTarget::SettingsSound(enabled),
+        );
+        row = row.saturating_add(1);
+    }
     lines.push(Line::from(""));
     row = row.saturating_add(1);
     lines.push(Line::from(Span::styled(

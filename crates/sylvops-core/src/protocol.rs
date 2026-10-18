@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     CoreError, Result,
+    attention::{AttentionNotificationClaim, AttentionNotificationPreferences},
     domain::{
         AttachmentRole, DaemonHealth, DaemonSnapshot, GitDiff, GitWorktreeState, Project,
         ProviderKind, Session, Workspace, Worktree,
@@ -24,7 +25,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 28;
+pub const PROTOCOL_MINOR: u16 = 29;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -537,6 +538,11 @@ pub enum ClientRequest {
     SaveDesktopState {
         state: crate::ui::DesktopState,
     },
+    GetAttentionNotificationPreferences,
+    SaveAttentionNotificationPreferences {
+        preferences: AttentionNotificationPreferences,
+    },
+    ClaimAttentionNotification,
     ListProviders,
     ProbeProvider {
         kind: ProviderKind,
@@ -789,6 +795,9 @@ pub enum DaemonResponse {
     TuiStateSaved,
     DesktopState(Option<crate::ui::DesktopState>),
     DesktopStateSaved,
+    AttentionNotificationPreferences(AttentionNotificationPreferences),
+    AttentionNotificationPreferencesSaved,
+    AttentionNotificationClaim(Option<AttentionNotificationClaim>),
     Providers(Vec<ProviderHealth>),
     Provider(ProviderHealth),
     GitHubStatus(GitHubIntegrationStatus),
@@ -1147,7 +1156,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 28);
+        assert_eq!(PROTOCOL_MINOR, 29);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1162,6 +1171,39 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &install).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), install);
+    }
+
+    #[test]
+    fn protocol_1_29_attention_notification_contract_round_trips() {
+        let preferences = AttentionNotificationPreferences {
+            native_notifications_enabled: false,
+            sound_enabled: true,
+        };
+        for request in [
+            ClientRequest::GetAttentionNotificationPreferences,
+            ClientRequest::SaveAttentionNotificationPreferences { preferences },
+            ClientRequest::ClaimAttentionNotification,
+        ] {
+            let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
+            assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+
+        let event = crate::session_state::AttentionEvent {
+            id: AttentionEventId::try_from(7).unwrap(),
+            reason: crate::session_state::AttentionReason::TerminalFailure,
+            acknowledgement: crate::session_state::AttentionAcknowledgement::Pending,
+            occurred_at: 42,
+        };
+        let claim = AttentionNotificationClaim::new(SessionId::new(), "Build", event, preferences);
+        for response in [
+            DaemonResponse::AttentionNotificationPreferences(preferences),
+            DaemonResponse::AttentionNotificationPreferencesSaved,
+            DaemonResponse::AttentionNotificationClaim(Some(claim)),
+        ] {
+            let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
+            assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
+        }
+        assert_eq!(PROTOCOL_MINOR, 29);
     }
 
     #[test]
@@ -1265,7 +1307,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 28);
+        assert_eq!(PROTOCOL_MINOR, 29);
     }
 
     #[test]
@@ -1305,7 +1347,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 28);
+        assert_eq!(PROTOCOL_MINOR, 29);
     }
 
     #[test]
@@ -1377,7 +1419,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 28);
+        assert_eq!(PROTOCOL_MINOR, 29);
     }
 
     #[test]
@@ -1571,7 +1613,7 @@ mod tests {
             let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
         }
-        assert_eq!(PROTOCOL_MINOR, 28);
+        assert_eq!(PROTOCOL_MINOR, 29);
     }
 
     #[test]

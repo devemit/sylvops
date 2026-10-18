@@ -58,7 +58,7 @@ impl Default for AppConfig {
             scrollback_capacity_bytes: 4 * 1024 * 1024,
             managed_worktree_directory: None,
             notifications_enabled: true,
-            sound_enabled: false,
+            sound_enabled: true,
             github_enabled: false,
             prompt_retention_count: 50,
             hook_body_limit_bytes: 64 * 1024,

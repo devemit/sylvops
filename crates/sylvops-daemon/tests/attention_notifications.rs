@@ -1,0 +1,243 @@
+use std::time::Duration;
+
+use sylvops_core::{
+    attention::AttentionNotificationPreferences,
+    domain::ProviderKind,
+    protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+    session_state::{AttentionAcknowledgement, AttentionReason},
+};
+use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
+use sylvops_test_support::{AbortOnDropTask, TemporaryRepository};
+
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_attention_claims_are_single_connection_scoped_and_preferences_persist() {
+    tokio::time::timeout(TEST_TIMEOUT, exercise_attention_notifications())
+        .await
+        .expect("attention notification integration timeout");
+}
+
+#[allow(clippy::too_many_lines)]
+async fn exercise_attention_notifications() {
+    let repository = TemporaryRepository::initialize()
+        .await
+        .expect("temporary repository");
+    let paths = RuntimePaths::discover(Some(&repository.root().join("state"))).expect("paths");
+    let daemon_paths = paths.clone();
+    let mut daemon_task = AbortOnDropTask::spawn(async move { daemon::run(daemon_paths).await });
+    let first = connect_eventually(&paths, "attention-first").await;
+
+    let defaults = preferences(&first).await;
+    assert_eq!(defaults, AttentionNotificationPreferences::default());
+    assert!(defaults.native_notifications_enabled);
+    assert!(defaults.sound_enabled);
+
+    let disabled_native = AttentionNotificationPreferences {
+        native_notifications_enabled: false,
+        sound_enabled: true,
+    };
+    assert!(matches!(
+        first
+            .request(&ClientRequest::SaveAttentionNotificationPreferences {
+                preferences: disabled_native,
+            })
+            .await
+            .expect("save preferences"),
+        DaemonResponse::AttentionNotificationPreferencesSaved
+    ));
+    assert_eq!(preferences(&first).await, disabled_native);
+
+    let workspace_id = match first
+        .request(&ClientRequest::AddWorkspace {
+            name: "attention".into(),
+        })
+        .await
+        .expect("workspace response")
+    {
+        DaemonResponse::WorkspaceAdded { workspace, .. } => workspace.id,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let worktree_id = match first
+        .request(&ClientRequest::AddProject {
+            workspace_id,
+            repository_path: repository.path().to_string_lossy().into_owned(),
+        })
+        .await
+        .expect("project response")
+    {
+        DaemonResponse::ProjectAdded { root_worktree, .. } => root_worktree.id,
+        response => panic!("unexpected project response: {response:?}"),
+    };
+
+    let second = connect_eventually(&paths, "attention-second").await;
+    let first_session = create_shell_session(&first, worktree_id, "First completion").await;
+    let first_event = finish_shell_session(&first, first_session).await;
+    let first_claim = claim(&first).await;
+    let second_claim = claim(&second).await;
+    let claimed = first_claim
+        .as_ref()
+        .or(second_claim.as_ref())
+        .expect("one live claim");
+    assert_eq!(claimed.session_id, first_session);
+    assert_eq!(claimed.attention_id, first_event.id);
+    assert_eq!(claimed.reason, AttentionReason::SuccessfulCompletion);
+    assert_eq!(claimed.session_display_name, "First completion");
+    assert_eq!(claimed.preferences, disabled_native);
+    assert!(first_claim.is_none() ^ second_claim.is_none());
+    assert!(claim(&first).await.is_none());
+    assert!(claim(&second).await.is_none());
+
+    let second_session = create_shell_session(&first, worktree_id, "Reconnect history").await;
+    let second_event = finish_shell_session(&first, second_session).await;
+    let late = connect_eventually(&paths, "attention-late").await;
+    assert!(claim(&late).await.is_none());
+    let live_claim = claim(&first).await.expect("pre-existing client claim");
+    assert_eq!(live_claim.session_id, second_session);
+    assert_eq!(live_claim.attention_id, second_event.id);
+
+    assert!(matches!(
+        first
+            .request(&ClientRequest::ShutdownDaemon)
+            .await
+            .expect("shutdown response"),
+        DaemonResponse::Acknowledged
+    ));
+    daemon_task
+        .join()
+        .await
+        .expect("daemon join")
+        .expect("daemon shutdown");
+
+    let restart_paths = paths.clone();
+    let mut restarted = AbortOnDropTask::spawn(async move { daemon::run(restart_paths).await });
+    let after_restart = connect_eventually(&paths, "attention-restarted").await;
+    assert_eq!(preferences(&after_restart).await, disabled_native);
+    let snapshot = match after_restart
+        .request(&ClientRequest::GetSnapshot)
+        .await
+        .expect("snapshot response")
+    {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => panic!("unexpected snapshot response: {response:?}"),
+    };
+    assert!(snapshot.sessions.iter().any(|session| {
+        session.id == second_session
+            && session.status.attention.is_some_and(|event| {
+                event.id == second_event.id
+                    && event.acknowledgement == AttentionAcknowledgement::Pending
+            })
+    }));
+    assert!(claim(&after_restart).await.is_none());
+    after_restart
+        .request(&ClientRequest::ShutdownDaemon)
+        .await
+        .expect("restart shutdown response");
+    restarted
+        .join()
+        .await
+        .expect("restarted daemon join")
+        .expect("restarted daemon shutdown");
+}
+
+async fn preferences(client: &DaemonClient) -> AttentionNotificationPreferences {
+    match client
+        .request(&ClientRequest::GetAttentionNotificationPreferences)
+        .await
+        .expect("preferences response")
+    {
+        DaemonResponse::AttentionNotificationPreferences(preferences) => preferences,
+        response => panic!("unexpected preferences response: {response:?}"),
+    }
+}
+
+async fn claim(
+    client: &DaemonClient,
+) -> Option<sylvops_core::attention::AttentionNotificationClaim> {
+    match client
+        .request(&ClientRequest::ClaimAttentionNotification)
+        .await
+        .expect("claim response")
+    {
+        DaemonResponse::AttentionNotificationClaim(claim) => claim,
+        response => panic!("unexpected claim response: {response:?}"),
+    }
+}
+
+async fn create_shell_session(
+    client: &DaemonClient,
+    worktree_id: sylvops_core::ids::WorktreeId,
+    display_name: &str,
+) -> sylvops_core::ids::SessionId {
+    match client
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Shell,
+            display_name: Some(display_name.into()),
+            model: None,
+            effort: None,
+            initial_prompt: None,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("session response")
+    {
+        DaemonResponse::SessionCreated { session, .. } => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    }
+}
+
+async fn finish_shell_session(
+    client: &DaemonClient,
+    session_id: sylvops_core::ids::SessionId,
+) -> sylvops_core::session_state::AttentionEvent {
+    let mut events = client.subscribe();
+    assert!(matches!(
+        client
+            .request(&ClientRequest::AttachSession {
+                session_id,
+                from_sequence: 0,
+                columns: 80,
+                rows: 24,
+            })
+            .await
+            .expect("attach response"),
+        DaemonResponse::Attached { .. }
+    ));
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: exit_shell_command(),
+        })
+        .await
+        .expect("shell exit input");
+    loop {
+        if let DaemonEvent::SessionStatusChanged { session, .. } =
+            events.recv().await.expect("session status event")
+            && session.id == session_id
+            && let Some(attention) = session.status.attention
+        {
+            return attention;
+        }
+    }
+}
+
+async fn connect_eventually(paths: &RuntimePaths, name: &str) -> DaemonClient {
+    loop {
+        match DaemonClient::connect(paths, name).await {
+            Ok(client) => return client,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn exit_shell_command() -> Vec<u8> {
+    b"exit\r".to_vec()
+}
+
+#[cfg(unix)]
+fn exit_shell_command() -> Vec<u8> {
+    b"exit\n".to_vec()
+}

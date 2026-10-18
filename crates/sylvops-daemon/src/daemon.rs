@@ -1,7 +1,7 @@
 //! Authoritative daemon lifecycle, entity mutations, and persistent PTY sessions.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::OpenOptions,
     path::{Path, PathBuf},
     process::Stdio,
@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use sylvops_core::{
+    attention::AttentionNotificationClaim,
     domain::{
         DaemonHealth, MAX_SNAPSHOT_WORK_SOURCES, ProviderKind, ProviderProfile, Session, Worktree,
         WorktreeStatus,
@@ -40,8 +41,8 @@ use sylvops_core::{
     },
     provider::{AuthenticationRequirement, LaunchContext, ProviderRuntimeSpec, ResumeContext},
     session_state::{
-        ProviderActivity, SessionLifecycle, lifecycle_allows_deletion, lifecycle_allows_resume,
-        lifecycle_is_active,
+        AttentionAcknowledgement, AttentionEvent, ProviderActivity, SessionLifecycle,
+        lifecycle_allows_deletion, lifecycle_allows_resume, lifecycle_is_active,
     },
     status::{
         ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId,
@@ -84,12 +85,82 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_QUEUE_CAPACITY: usize = 256;
 const CLIENT_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
+const ATTENTION_NOTIFICATION_CLAIM_CAPACITY: usize = 256;
 const LIFECYCLE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACTIVE_SESSION_REAP_TIMEOUT: Duration = Duration::from_secs(15);
 const CLAUDE_SESSION_START_TIMEOUT: Duration = Duration::from_secs(15);
 const CLAUDE_SESSION_START_GUIDANCE: &str = "Claude Code lifecycle hooks did not report SessionStart within 15 seconds. The Terminal remains usable; check Claude hook configuration or restart the Session.";
 const UPGRADE_HANDOFF_FILE: &str = "handoff.json";
+
+#[derive(Clone, Debug)]
+struct PendingAttentionNotificationClaim {
+    sequence: u64,
+    session_id: SessionId,
+    session_display_name: String,
+    event: AttentionEvent,
+}
+
+#[derive(Debug, Default)]
+struct AttentionNotificationClaims {
+    sequence: u64,
+    client_watermarks: HashMap<Uuid, u64>,
+    pending: VecDeque<PendingAttentionNotificationClaim>,
+}
+
+impl AttentionNotificationClaims {
+    fn register(&mut self, client_id: Uuid) {
+        self.client_watermarks.insert(client_id, self.sequence);
+        self.prune_unclaimable();
+    }
+
+    fn unregister(&mut self, client_id: Uuid) {
+        self.client_watermarks.remove(&client_id);
+        self.prune_unclaimable();
+    }
+
+    fn record(&mut self, session: &Session) {
+        let Some(event) = session.status.attention else {
+            return;
+        };
+        if event.acknowledgement != AttentionAcknowledgement::Pending
+            || self.client_watermarks.is_empty()
+        {
+            return;
+        }
+        self.sequence = self.sequence.saturating_add(1);
+        if self.pending.len() >= ATTENTION_NOTIFICATION_CLAIM_CAPACITY {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(PendingAttentionNotificationClaim {
+            sequence: self.sequence,
+            session_id: session.id,
+            session_display_name: session.display_name.clone(),
+            event,
+        });
+    }
+
+    fn claim(&mut self, client_id: Uuid) -> Option<PendingAttentionNotificationClaim> {
+        let watermark = *self.client_watermarks.get(&client_id)?;
+        let index = self
+            .pending
+            .iter()
+            .position(|candidate| candidate.sequence > watermark)?;
+        self.pending.remove(index)
+    }
+
+    fn prune_unclaimable(&mut self) {
+        if self.client_watermarks.is_empty() {
+            self.pending.clear();
+            return;
+        }
+        self.pending.retain(|candidate| {
+            self.client_watermarks
+                .values()
+                .any(|watermark| *watermark < candidate.sequence)
+        });
+    }
+}
 
 #[derive(Debug)]
 struct OutboundFrame {
@@ -349,6 +420,7 @@ struct DaemonState {
     started: Instant,
     connected_clients: Arc<AtomicU32>,
     client_processes: Arc<StdMutex<HashMap<u32, u32>>>,
+    attention_notification_claims: Arc<StdMutex<AttentionNotificationClaims>>,
     shutdown: watch::Sender<bool>,
     events: broadcast::Sender<DaemonEvent>,
     sessions: Arc<RwLock<HashMap<SessionId, ManagedSession>>>,
@@ -611,6 +683,9 @@ pub async fn run_with_handoff_launchers(
         started: Instant::now(),
         connected_clients: Arc::new(AtomicU32::new(0)),
         client_processes: Arc::new(StdMutex::new(HashMap::new())),
+        attention_notification_claims: Arc::new(StdMutex::new(
+            AttentionNotificationClaims::default(),
+        )),
         shutdown,
         events,
         sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -909,10 +984,17 @@ async fn serve_client(mut stream: BoxStream, state: DaemonState) -> Result<()> {
     };
     let client_id = Uuid::now_v7();
     state.connected_clients.fetch_add(1, Ordering::Relaxed);
+    state
+        .attention_notification_claims
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .register(client_id);
     let _client_guard = ClientGuard {
         count: state.connected_clients.clone(),
         processes: state.client_processes.clone(),
         process_id: client_process_id,
+        attention_notification_claims: state.attention_notification_claims.clone(),
+        client_id,
     };
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (incoming_tx, mut incoming) = mpsc::channel(64);
@@ -1155,6 +1237,51 @@ async fn handle_request(
         } => {
             state.database.save_desktop_state(desktop_state).await?;
             send_response_queue(outgoing, request_id, &DaemonResponse::DesktopStateSaved).await
+        }
+        ClientRequest::GetAttentionNotificationPreferences => {
+            let preferences = state.database.attention_notification_preferences().await?;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::AttentionNotificationPreferences(preferences),
+            )
+            .await
+        }
+        ClientRequest::SaveAttentionNotificationPreferences { preferences } => {
+            state
+                .database
+                .save_attention_notification_preferences(preferences)
+                .await?;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::AttentionNotificationPreferencesSaved,
+            )
+            .await
+        }
+        ClientRequest::ClaimAttentionNotification => {
+            let pending = state
+                .attention_notification_claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .claim(client_id);
+            let claim = if let Some(pending) = pending {
+                let preferences = state.database.attention_notification_preferences().await?;
+                Some(AttentionNotificationClaim::new(
+                    pending.session_id,
+                    &pending.session_display_name,
+                    pending.event,
+                    preferences,
+                ))
+            } else {
+                None
+            };
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::AttentionNotificationClaim(claim),
+            )
+            .await
         }
         ClientRequest::ListProviders => {
             let health = state.providers.probe_all().await;
@@ -3743,20 +3870,7 @@ async fn spawn_managed_session(
             state
                 .providers
                 .cleanup_runtime_paths(provider_kind, &owned_runtime_paths);
-            if let Ok((revision, session)) = state
-                .database
-                .finish_session(
-                    session_id,
-                    SessionLifecycle::Failed,
-                    None,
-                    Some(error.to_string()),
-                )
-                .await
-            {
-                let _ = state
-                    .events
-                    .send(DaemonEvent::SessionStatusChanged { revision, session });
-            }
+            persist_session_start_failure(state, session_id, error.to_string()).await;
             return Err(error);
         }
     };
@@ -3772,15 +3886,7 @@ async fn spawn_managed_session(
             state
                 .providers
                 .cleanup_runtime_paths(provider_kind, &owned_runtime_paths);
-            let _ = state
-                .database
-                .finish_session(
-                    session_id,
-                    SessionLifecycle::Failed,
-                    None,
-                    Some(error.to_string()),
-                )
-                .await;
+            persist_session_start_failure(state, session_id, error.to_string()).await;
             return Err(error);
         }
     };
@@ -3809,6 +3915,28 @@ async fn spawn_managed_session(
         spawn_claude_session_start_monitor(state.clone(), session_id, managed);
     }
     Ok((revision, running))
+}
+
+async fn persist_session_start_failure(
+    state: &DaemonState,
+    session_id: SessionId,
+    failure_reason: String,
+) {
+    if let Ok((revision, session)) = state
+        .database
+        .finish_session(
+            session_id,
+            SessionLifecycle::Failed,
+            None,
+            Some(failure_reason),
+        )
+        .await
+    {
+        record_new_attention_notification(state, None, &session);
+        let _ = state
+            .events
+            .send(DaemonEvent::SessionStatusChanged { revision, session });
+    }
 }
 
 async fn persist_provider_health(
@@ -4098,6 +4226,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
     if matches!(&event, NormalizedProviderEvent::SessionEnded) {
         state.hook_credentials.invalidate(delivery.session_id);
     }
+    record_new_attention_notification(state, persisted.status.attention, &session);
     let _ = state.events.send(DaemonEvent::ProviderEvent {
         provider: persisted.provider_kind,
         session_id: delivery.session_id,
@@ -4173,8 +4302,8 @@ fn spawn_exit_monitor(
                 (None, false)
             }
         };
+        let persisted = managed.record.read().await.clone();
         let transition = {
-            let persisted = managed.record.read().await.clone();
             let machines = state.status_machines.lock().await;
             let mut machine = machines
                 .get(&session_id)
@@ -4201,6 +4330,7 @@ fn spawn_exit_monitor(
                         .await
                         .insert(session_id, next_machine);
                     *managed.record.write().await = session.clone();
+                    record_new_attention_notification(&state, persisted.status.attention, &session);
                     let _ = state.events.send(DaemonEvent::SessionStatusChanged {
                         revision,
                         session: session.clone(),
@@ -4230,6 +4360,22 @@ fn status_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+fn record_new_attention_notification(
+    state: &DaemonState,
+    previous: Option<AttentionEvent>,
+    session: &Session,
+) {
+    let current = session.status.attention;
+    if current.map(|event| event.id) == previous.map(|event| event.id) {
+        return;
+    }
+    state
+        .attention_notification_claims
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(session);
 }
 
 fn status_machine_from_session(session: &Session) -> SessionStatusMachine {
@@ -4265,7 +4411,9 @@ fn spawn_claude_session_start_monitor(
             .await
         {
             Ok(Some((revision, session))) => {
+                let previous_attention = managed.record.read().await.status.attention;
                 *managed.record.write().await = session.clone();
+                record_new_attention_notification(&state, previous_attention, &session);
                 let _ = state
                     .events
                     .send(DaemonEvent::SessionStatusChanged { revision, session });
@@ -5008,11 +5156,17 @@ struct ClientGuard {
     count: Arc<AtomicU32>,
     processes: Arc<StdMutex<HashMap<u32, u32>>>,
     process_id: u32,
+    attention_notification_claims: Arc<StdMutex<AttentionNotificationClaims>>,
+    client_id: Uuid,
 }
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::Relaxed);
         unregister_client_process(&self.processes, self.process_id);
+        self.attention_notification_claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unregister(self.client_id);
     }
 }
 
