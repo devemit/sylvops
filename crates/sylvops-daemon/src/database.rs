@@ -1,6 +1,7 @@
 //! SQLite ownership actor, migrations, snapshots, and startup reconciliation.
 
 use std::{
+    collections::{HashMap, HashSet},
     fmt::Write as _,
     io,
     path::Path,
@@ -14,8 +15,8 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sylvops_core::domain::{
-    DaemonSnapshot, MAX_SNAPSHOT_WORK_SOURCES, Project, ProviderProfile, Session, Workspace,
-    Worktree, WorktreeStatus,
+    DaemonSnapshot, MAX_SNAPSHOT_SESSION_LINEAGE_LINKS, MAX_SNAPSHOT_WORK_SOURCES, Project,
+    ProviderProfile, Session, SessionLineageLink, Workspace, Worktree, WorktreeStatus,
 };
 use sylvops_core::github::{
     GitHubAssociation, GitHubBrowserTarget, GitHubHost, GitHubItemIdentity, GitHubItemKind,
@@ -200,6 +201,10 @@ enum DatabaseCommand {
     Session {
         id: SessionId,
         reply: oneshot::Sender<Result<Session>>,
+    },
+    SessionLineageLeaf {
+        id: SessionId,
+        reply: oneshot::Sender<Result<(u64, Session)>>,
     },
     UpsertProvider {
         profile: ProviderProfile,
@@ -785,6 +790,18 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Follows persisted successor edges and returns the latest Session with the current revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, query, validation, not-found, or corrupt-lineage error.
+    pub async fn session_lineage_leaf(&self, id: SessionId) -> Result<(u64, Session)> {
+        request(&self.inner.commands, |reply| {
+            DatabaseCommand::SessionLineageLeaf { id, reply }
+        })
+        .await
+    }
+
     /// Inserts or refreshes a provider profile and advances the authoritative revision.
     ///
     /// # Errors
@@ -1297,6 +1314,10 @@ fn database_thread(
             }
             DatabaseCommand::Session { id, reply } => {
                 let _ = reply.send(load_session(&connection, id));
+            }
+            DatabaseCommand::SessionLineageLeaf { id, reply } => {
+                let _ = reply
+                    .send(load_session_lineage_leaf(&connection, id).map(|leaf| (revision, leaf)));
             }
             DatabaseCommand::UpsertProvider { profile, reply } => {
                 let result = upsert_provider(&mut connection, &profile).map(|profile| {
@@ -2430,6 +2451,18 @@ fn insert_session(connection: &mut Connection, record: &NewSession) -> Result<Se
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
     if let Some(source_session_id) = record.resumed_from_session_id {
+        let source = load_session(&transaction, source_session_id)?;
+        if !sylvops_core::session_state::lifecycle_allows_resume(source.status.lifecycle)
+            || source.worktree_id != record.worktree_id
+            || source.provider_kind != record.provider_kind
+            || source.cwd != record.cwd
+            || source.external_session_id != record.external_session_id
+            || source.external_session_id.is_none()
+        {
+            return Err(DaemonError::Provider(
+                "Session successor no longer matches an eligible terminal lineage leaf".into(),
+            ));
+        }
         let successor: Option<String> = transaction
             .query_row(
                 "SELECT successor_session_id FROM session_resumptions \
@@ -3166,6 +3199,7 @@ fn load_snapshot(connection: &Connection, revision: u64) -> Result<DaemonSnapsho
                     failure_reason, status_json FROM sessions ORDER BY last_activity_at DESC",
             session_from_row,
         )?,
+        session_lineage: load_session_lineage(connection)?,
         work_sources: load_snapshot_work_sources(connection)?,
         provider_profiles: query_all(
             connection,
@@ -3175,6 +3209,96 @@ fn load_snapshot(connection: &Connection, revision: u64) -> Result<DaemonSnapsho
             provider_from_row,
         )?,
     })
+}
+
+fn load_session_lineage(connection: &Connection) -> Result<Vec<SessionLineageLink>> {
+    let limit =
+        i64::try_from(MAX_SNAPSHOT_SESSION_LINEAGE_LINKS.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut statement = connection
+        .prepare(
+            "SELECT source_session_id, successor_session_id FROM session_resumptions \
+             ORDER BY created_at ASC, source_session_id ASC LIMIT ?1",
+        )
+        .map_err(database_error)?;
+    let links = statement
+        .query_map([limit], |row| {
+            Ok(SessionLineageLink {
+                predecessor_session_id: parse_text(row, 0)?,
+                successor_session_id: parse_text(row, 1)?,
+            })
+        })
+        .map_err(database_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(database_error)?;
+    if links.len() > MAX_SNAPSHOT_SESSION_LINEAGE_LINKS {
+        return Err(DaemonError::Database(
+            "Session Lineage exceeds snapshot capacity".into(),
+        ));
+    }
+    validate_session_lineage(&links)?;
+    for link in &links {
+        let predecessor = load_session(connection, link.predecessor_session_id)?;
+        let successor = load_session(connection, link.successor_session_id)?;
+        if predecessor.worktree_id != successor.worktree_id
+            || predecessor.provider_kind != successor.provider_kind
+            || predecessor.external_session_id.is_none()
+            || predecessor.external_session_id != successor.external_session_id
+        {
+            return Err(DaemonError::Database(
+                "Session Lineage changes Conversation identity".into(),
+            ));
+        }
+    }
+    Ok(links)
+}
+
+fn validate_session_lineage(links: &[SessionLineageLink]) -> Result<()> {
+    let mut successors = HashMap::with_capacity(links.len());
+    let mut predecessors = HashSet::with_capacity(links.len());
+    for link in links {
+        if link.predecessor_session_id == link.successor_session_id
+            || successors
+                .insert(link.predecessor_session_id, link.successor_session_id)
+                .is_some()
+            || !predecessors.insert(link.successor_session_id)
+        {
+            return Err(DaemonError::Database(
+                "Session Lineage is not a linear predecessor/successor chain".into(),
+            ));
+        }
+    }
+    for start in successors.keys().copied() {
+        let mut visited = HashSet::new();
+        let mut current = start;
+        while let Some(successor) = successors.get(&current).copied() {
+            if !visited.insert(current) {
+                return Err(DaemonError::Database(
+                    "Session Lineage contains a cycle".into(),
+                ));
+            }
+            current = successor;
+        }
+    }
+    Ok(())
+}
+
+fn load_session_lineage_leaf(connection: &Connection, id: SessionId) -> Result<Session> {
+    let links = load_session_lineage(connection)?;
+    let successors = links
+        .into_iter()
+        .map(|link| (link.predecessor_session_id, link.successor_session_id))
+        .collect::<HashMap<_, _>>();
+    load_session(connection, id)?;
+    let mut current = id;
+    for _ in 0..=successors.len() {
+        match successors.get(&current).copied() {
+            Some(successor) => current = successor,
+            None => return load_session(connection, current),
+        }
+    }
+    Err(DaemonError::Database(
+        "Session Lineage contains a cycle".into(),
+    ))
 }
 
 fn query_all<T>(
@@ -4054,7 +4178,7 @@ mod tests {
                     command: "codex".into(),
                     arguments_json: "[]".into(),
                     cwd: repository.clone(),
-                    external_session_id: Some(format!("external-{index}")),
+                    external_session_id: Some("external-conversation".into()),
                     resumed_from_session_id: index.checked_sub(1).map(|previous| ids[previous]),
                 })
                 .await
@@ -4068,6 +4192,27 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        assert_eq!(
+            database.session_lineage_leaf(ids[0]).await.unwrap().1.id,
+            ids[2]
+        );
+        assert_eq!(
+            database.session_lineage_leaf(ids[1]).await.unwrap().1.id,
+            ids[2]
+        );
+        assert_eq!(
+            database.session_lineage_leaf(ids[2]).await.unwrap().1.id,
+            ids[2]
+        );
+        let lineage = database.snapshot().await.unwrap().session_lineage;
+        assert_eq!(lineage.len(), 2);
+        assert!(lineage.iter().any(|link| {
+            link.predecessor_session_id == ids[0] && link.successor_session_id == ids[1]
+        }));
+        assert!(lineage.iter().any(|link| {
+            link.predecessor_session_id == ids[1] && link.successor_session_id == ids[2]
+        }));
 
         let stale = database.session(ids[1]).await.unwrap();
         database

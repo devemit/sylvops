@@ -24,7 +24,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 27;
+pub const PROTOCOL_MINOR: u16 = 28;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -715,6 +715,71 @@ pub enum ClientRequest {
     ShutdownDaemon,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionResumeOutcome {
+    AttachedLiveLeaf,
+    CreatedSuccessor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionResumeRefusal {
+    LifecycleNotTerminal { lifecycle: SessionLifecycle },
+    MissingConversationIdentity,
+    ProviderDoesNotSupportResume { provider: ProviderKind },
+    ProviderUnavailable { provider: ProviderKind },
+    ProviderAuthenticationRequired { provider: ProviderKind },
+    ProviderProbeFailed { provider: ProviderKind },
+    WorktreeUnavailable { worktree_id: WorktreeId },
+    WorktreeIdentityMismatch { worktree_id: WorktreeId },
+    LiveSessionUnavailable { lifecycle: SessionLifecycle },
+}
+
+impl SessionResumeRefusal {
+    #[must_use]
+    pub fn message(self) -> String {
+        match self {
+            Self::LifecycleNotTerminal { lifecycle } => format!(
+                "The latest Session is {lifecycle:?}; only a terminal Session can resume its Conversation."
+            ),
+            Self::MissingConversationIdentity => {
+                "The latest Session has no verified Conversation identity.".into()
+            }
+            Self::ProviderDoesNotSupportResume { provider } => format!(
+                "{} does not support Resume Conversation.",
+                provider.display_name()
+            ),
+            Self::ProviderUnavailable { provider } => {
+                format!("{} is unavailable.", provider.display_name())
+            }
+            Self::ProviderAuthenticationRequired { provider } => format!(
+                "{} requires an existing login before this Conversation can resume.",
+                provider.display_name()
+            ),
+            Self::ProviderProbeFailed { provider } => {
+                format!("{} health could not be verified.", provider.display_name())
+            }
+            Self::WorktreeUnavailable { .. } => {
+                "The Session's Worktree is unavailable or no longer valid.".into()
+            }
+            Self::WorktreeIdentityMismatch { .. } => {
+                "The Session no longer matches its registered Worktree.".into()
+            }
+            Self::LiveSessionUnavailable { lifecycle } => {
+                format!("The latest Session is {lifecycle:?}, but its live process is unavailable.")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionResumeUnavailable {
+    pub requested_session_id: SessionId,
+    pub leaf_session: Session,
+    pub reason: SessionResumeRefusal,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DaemonResponse {
     Welcome(WelcomeResponse),
@@ -796,8 +861,12 @@ pub enum DaemonResponse {
     },
     SessionResumed {
         revision: u64,
+        requested_session_id: SessionId,
+        predecessor_session_id: Option<SessionId>,
         session: Session,
+        outcome: SessionResumeOutcome,
     },
+    SessionResumeUnavailable(SessionResumeUnavailable),
     SessionUpdated {
         revision: u64,
         session: Session,
@@ -1078,7 +1147,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 27);
+        assert_eq!(PROTOCOL_MINOR, 28);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1196,7 +1265,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 27);
+        assert_eq!(PROTOCOL_MINOR, 28);
     }
 
     #[test]
@@ -1236,7 +1305,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 27);
+        assert_eq!(PROTOCOL_MINOR, 28);
     }
 
     #[test]
@@ -1308,7 +1377,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 27);
+        assert_eq!(PROTOCOL_MINOR, 28);
     }
 
     #[test]
@@ -1502,7 +1571,7 @@ mod tests {
             let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
         }
-        assert_eq!(PROTOCOL_MINOR, 27);
+        assert_eq!(PROTOCOL_MINOR, 28);
     }
 
     #[test]
@@ -1810,6 +1879,83 @@ mod tests {
         for request in requests {
             let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn resume_contract_round_trips_every_outcome_and_refusal_reason() {
+        let requested_session_id = SessionId::new();
+        let worktree_id = WorktreeId::new();
+        let leaf_session = Session {
+            id: SessionId::new(),
+            worktree_id,
+            provider_profile_id: None,
+            provider_kind: ProviderKind::Codex,
+            display_name: "kept name".into(),
+            status: crate::session_state::SessionStatus {
+                lifecycle: SessionLifecycle::Exited,
+                ..crate::session_state::SessionStatus::default()
+            },
+            process_id: None,
+            external_session_id: Some("conversation-123".into()),
+            command: "codex".into(),
+            arguments_json: "[]".into(),
+            cwd: "C:/repo".into(),
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: Some(2),
+            last_activity_at: 2,
+            last_seen_output_sequence: 0,
+            exit_code: Some(0),
+            failure_reason: None,
+        };
+        let refusals = [
+            SessionResumeRefusal::LifecycleNotTerminal {
+                lifecycle: SessionLifecycle::Fresh,
+            },
+            SessionResumeRefusal::MissingConversationIdentity,
+            SessionResumeRefusal::ProviderDoesNotSupportResume {
+                provider: ProviderKind::Shell,
+            },
+            SessionResumeRefusal::ProviderUnavailable {
+                provider: ProviderKind::Codex,
+            },
+            SessionResumeRefusal::ProviderAuthenticationRequired {
+                provider: ProviderKind::Claude,
+            },
+            SessionResumeRefusal::ProviderProbeFailed {
+                provider: ProviderKind::Codex,
+            },
+            SessionResumeRefusal::WorktreeUnavailable { worktree_id },
+            SessionResumeRefusal::WorktreeIdentityMismatch { worktree_id },
+            SessionResumeRefusal::LiveSessionUnavailable {
+                lifecycle: SessionLifecycle::Running,
+            },
+        ];
+        for reason in refusals {
+            let response = DaemonResponse::SessionResumeUnavailable(SessionResumeUnavailable {
+                requested_session_id,
+                leaf_session: leaf_session.clone(),
+                reason,
+            });
+            let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
+            assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
+            assert!(!reason.message().is_empty());
+        }
+        for outcome in [
+            SessionResumeOutcome::AttachedLiveLeaf,
+            SessionResumeOutcome::CreatedSuccessor,
+        ] {
+            let response = DaemonResponse::SessionResumed {
+                revision: 2,
+                requested_session_id,
+                predecessor_session_id: (outcome == SessionResumeOutcome::CreatedSuccessor)
+                    .then_some(requested_session_id),
+                session: leaf_session.clone(),
+                outcome,
+            };
+            let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
+            assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
         }
     }
 

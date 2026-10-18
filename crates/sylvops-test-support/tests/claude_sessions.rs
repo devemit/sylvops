@@ -6,7 +6,7 @@ use rusqlite::OptionalExtension;
 use sylvops_core::{
     domain::{ProviderKind, Session},
     ids::SessionId,
-    protocol::{ClientRequest, DaemonEvent, DaemonResponse},
+    protocol::{ClientRequest, DaemonEvent, DaemonResponse, SessionResumeOutcome},
     session_state::{
         AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
     },
@@ -957,25 +957,29 @@ async fn late_session_start_recovers_after_warning() {
         client.request(&first_resume),
         client.request(&concurrent_resume)
     );
-    let mut resumed = None;
-    let mut refused = 0;
+    let mut resumed: Option<Session> = None;
+    let mut created = 0;
+    let mut attached = 0;
     for response in [first_response, concurrent_response] {
         match response.expect("concurrent Claude resume response") {
-            DaemonResponse::SessionResumed { session, .. } => {
-                assert!(resumed.replace(session).is_none());
-            }
-            DaemonResponse::Error(error) => {
-                assert!(
-                    error.message.contains("already been resumed"),
-                    "concurrent Claude resume error should be actionable: {}",
-                    error.message
-                );
-                refused += 1;
+            DaemonResponse::SessionResumed {
+                session, outcome, ..
+            } => {
+                if let Some(existing) = &resumed {
+                    assert_eq!(existing.id, session.id);
+                } else {
+                    resumed = Some(session);
+                }
+                match outcome {
+                    SessionResumeOutcome::CreatedSuccessor => created += 1,
+                    SessionResumeOutcome::AttachedLiveLeaf => attached += 1,
+                }
             }
             response => panic!("unexpected concurrent Claude resume response: {response:?}"),
         }
     }
-    assert_eq!(refused, 1);
+    assert_eq!(created, 1);
+    assert_eq!(attached, 1);
     let resumed = resumed.expect("one concurrent Claude resume succeeds");
     assert_ne!(resumed.id, failed_session_id);
     assert_eq!(resumed.provider_kind, ProviderKind::Claude);
@@ -1016,14 +1020,29 @@ async fn late_session_start_recovers_after_warning() {
         session.status.lifecycle == SessionLifecycle::Terminated && session.process_id.is_none()
     })
     .await;
-    match client
+    let second_resumed = match client
         .request(&first_resume)
         .await
-        .expect("stale Claude resume response")
+        .expect("lineage Claude resume response")
     {
-        DaemonResponse::Error(error) => assert!(error.message.contains("already been resumed")),
-        response => panic!("stale Claude resume unexpectedly succeeded: {response:?}"),
-    }
+        DaemonResponse::SessionResumed {
+            session,
+            outcome: SessionResumeOutcome::CreatedSuccessor,
+            ..
+        } => session,
+        response => panic!("terminal Claude leaf did not create a successor: {response:?}"),
+    };
+    assert_ne!(second_resumed.id, resumed.id);
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: second_resumed.id,
+        })
+        .await
+        .expect("stop second resumed Claude response");
+    wait_for_session(&client, second_resumed.id, |session| {
+        session.status.lifecycle == SessionLifecycle::Terminated
+    })
+    .await;
 
     client
         .request(&ClientRequest::ShutdownDaemon)
@@ -1057,14 +1076,29 @@ async fn late_session_start_recovers_after_warning() {
         session.id == failed_session_id
             && session.external_session_id.as_deref() == Some(external_id.as_str())
     }));
-    match restarted
+    let third_resumed = match restarted
         .request(&first_resume)
         .await
-        .expect("restart stale Claude resume response")
+        .expect("restart lineage Claude resume response")
     {
-        DaemonResponse::Error(error) => assert!(error.message.contains("already been resumed")),
-        response => panic!("restart stale Claude resume unexpectedly succeeded: {response:?}"),
-    }
+        DaemonResponse::SessionResumed {
+            session,
+            outcome: SessionResumeOutcome::CreatedSuccessor,
+            ..
+        } => session,
+        response => panic!("restart did not follow the Claude lineage: {response:?}"),
+    };
+    assert_ne!(third_resumed.id, second_resumed.id);
+    restarted
+        .request(&ClientRequest::StopSession {
+            session_id: third_resumed.id,
+        })
+        .await
+        .expect("stop third resumed Claude response");
+    wait_for_session(&restarted, third_resumed.id, |session| {
+        session.status.lifecycle == SessionLifecycle::Terminated
+    })
+    .await;
     restarted
         .request(&ClientRequest::ShutdownDaemon)
         .await

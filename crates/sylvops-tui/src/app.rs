@@ -508,6 +508,14 @@ impl App {
             .and_then(|id| self.snapshot.sessions.iter().find(|item| item.id == id))
     }
 
+    pub fn session_row_name(&self, session: &Session) -> String {
+        sylvops_core::domain::session_attempt_number(session.id, &self.snapshot.session_lineage)
+            .map_or_else(
+                || session.display_name.clone(),
+                |attempt| format!("{} · attempt {attempt}", session.display_name),
+            )
+    }
+
     pub fn visible_projects(&self) -> Vec<&Project> {
         let workspace = self.active_workspace().map(|workspace| workspace.id);
         let mut projects: Vec<_> = self

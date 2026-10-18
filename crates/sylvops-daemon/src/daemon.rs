@@ -33,7 +33,8 @@ use sylvops_core::{
         GitHubAssociationChangeInspection, HelloRequest, MessageClass, PROTOCOL_MAJOR,
         PROTOCOL_MINOR, ProjectRemovalAuthorization, ProjectRemovalInspection,
         ProjectRemovalRefusal, ProtocolFailure, ProtocolVersion, SessionDeletionAuthorization,
-        SessionDeletionInspection, SessionDeletionRefusal, WelcomeResponse,
+        SessionDeletionInspection, SessionDeletionRefusal, SessionResumeOutcome,
+        SessionResumeRefusal, SessionResumeUnavailable, WelcomeResponse,
         WorkspaceDeletionAuthorization, WorkspaceDeletionInspection, WorkspaceDeletionRefusal,
         read_frame, read_handshake_frame, validate_terminal_size, write_frame,
     },
@@ -2648,7 +2649,7 @@ async fn handle_request(
             Ok(())
         }
         ClientRequest::ResumeSession {
-            session_id: source_session_id,
+            session_id: requested_session_id,
             columns,
             rows,
         } => {
@@ -2659,110 +2660,51 @@ async fn handle_request(
                 ));
             }
             validate_terminal_size(columns, rows).map_err(DaemonError::InvalidSession)?;
-            let source = state.database.session(source_session_id).await?;
-            let external_session_id = source.external_session_id.clone().ok_or_else(|| {
-                DaemonError::Provider("session has no verified provider resume identifier".into())
-            })?;
-            if !lifecycle_allows_resume(source.status.lifecycle) {
-                return Err(DaemonError::Provider(format!(
-                    "Session lifecycle {:?} is not eligible for resume; only exited, failed, terminated, or disconnected Sessions may be resumed",
-                    source.status.lifecycle
-                )));
-            }
-            if let Some(managed) = get_managed_session(state, source_session_id).await
-                && !*managed.completed.borrow()
-            {
-                return Err(DaemonError::Provider(
-                    "a live provider process already owns this session".into(),
-                ));
-            }
-            let operation_lock = worktree_operation_lock(state, source.worktree_id).await;
+            let requested = state.database.session(requested_session_id).await?;
+            let operation_lock = worktree_operation_lock(state, requested.worktree_id).await;
             let _operation_guard = operation_lock.lock().await;
-            let worktree = verified_worktree(state, source.worktree_id).await?;
-            if source.cwd != worktree.canonical_path {
-                return Err(DaemonError::Provider(
-                    "session worktree identity no longer matches".into(),
-                ));
-            }
-            let health = state.providers.probe(source.provider_kind).await?;
-            persist_provider_health(state, &health).await?;
-            if let Some(error) = health.resume_error() {
-                return Err(DaemonError::Provider(error));
-            }
-            let session_id = SessionId::new();
-            let lifecycle_endpoint = if state
-                .providers
-                .supports_lifecycle_events(source.provider_kind)?
-            {
-                Some(state.hook_credentials.register(
-                    source.provider_kind,
-                    session_id,
-                    source.worktree_id,
-                )?)
-            } else {
-                None
-            };
-            let spec = match state.providers.resume(
-                source.provider_kind,
-                ResumeContext {
-                    session_id,
-                    worktree_id: source.worktree_id,
-                    external_session_id: external_session_id.clone(),
-                    cwd: PathBuf::from(&worktree.canonical_path),
-                    model: None,
-                    effort: None,
-                    lifecycle_endpoint,
-                },
-            ) {
-                Ok(spec) => spec,
-                Err(error) => {
-                    state.hook_credentials.invalidate(session_id);
-                    return Err(error);
-                }
-            };
-            let command = match path_text(&spec.launch.executable) {
-                Ok(command) => command,
-                Err(error) => {
-                    state.hook_credentials.invalidate(session_id);
-                    state
-                        .providers
-                        .cleanup_runtime_paths(source.provider_kind, &spec.owned_paths);
-                    return Err(error);
-                }
-            };
-            let arguments_json =
-                persisted_launch_arguments(state, session_id, source.provider_kind, &spec)?;
-            let record = NewSession {
-                id: session_id,
-                worktree_id: source.worktree_id,
-                display_name: format!("{} (resumed)", source.display_name)
-                    .chars()
-                    .take(200)
-                    .collect(),
-                provider_profile_id: source.provider_profile_id,
-                provider_kind: source.provider_kind,
-                command,
-                arguments_json,
-                cwd: worktree.canonical_path,
-                external_session_id: Some(external_session_id),
-                resumed_from_session_id: Some(source_session_id),
-            };
-            let (revision, running) =
-                spawn_managed_session(state, record, spec, columns, rows).await?;
-            send_response_queue(
-                outgoing,
-                request_id,
-                &DaemonResponse::SessionResumed {
+            match resume_conversation(state, requested_session_id, columns, rows).await? {
+                ResumeConversationResult::Opened {
                     revision,
-                    session: running.clone(),
-                },
-            )
-            .await?;
-            let _ = state.events.send(DaemonEvent::SessionCreated {
-                revision,
-                session: running,
-            });
-            Ok(())
+                    predecessor_session_id,
+                    session,
+                    outcome,
+                } => {
+                    send_response_queue(
+                        outgoing,
+                        request_id,
+                        &DaemonResponse::SessionResumed {
+                            revision,
+                            requested_session_id,
+                            predecessor_session_id,
+                            session: session.clone(),
+                            outcome,
+                        },
+                    )
+                    .await?;
+                    if outcome == SessionResumeOutcome::CreatedSuccessor {
+                        let _ = state
+                            .events
+                            .send(DaemonEvent::SessionCreated { revision, session });
+                    }
+                    Ok(())
+                }
+                ResumeConversationResult::Unavailable {
+                    leaf_session,
+                    reason,
+                } => {
+                    send_response_queue(
+                        outgoing,
+                        request_id,
+                        &DaemonResponse::SessionResumeUnavailable(SessionResumeUnavailable {
+                            requested_session_id,
+                            leaf_session,
+                            reason,
+                        }),
+                    )
+                    .await
+                }
+            }
         }
         ClientRequest::AttachSession {
             session_id,
@@ -3471,6 +3413,208 @@ async fn send_resync(
         },
     )
     .await
+}
+
+enum ResumeConversationResult {
+    Opened {
+        revision: u64,
+        predecessor_session_id: Option<SessionId>,
+        session: Session,
+        outcome: SessionResumeOutcome,
+    },
+    Unavailable {
+        leaf_session: Session,
+        reason: SessionResumeRefusal,
+    },
+}
+
+async fn resume_conversation(
+    state: &DaemonState,
+    requested_session_id: SessionId,
+    columns: u16,
+    rows: u16,
+) -> Result<ResumeConversationResult> {
+    let (revision, source) = state
+        .database
+        .session_lineage_leaf(requested_session_id)
+        .await?;
+    match inspect_resume_leaf(state, &source).await? {
+        ResumeLeafAction::AttachLive => Ok(ResumeConversationResult::Opened {
+            revision,
+            predecessor_session_id: None,
+            session: source,
+            outcome: SessionResumeOutcome::AttachedLiveLeaf,
+        }),
+        ResumeLeafAction::CreateSuccessor {
+            worktree,
+            external_session_id,
+        } => {
+            launch_resumed_successor(state, source, *worktree, external_session_id, columns, rows)
+                .await
+        }
+        ResumeLeafAction::Unavailable(reason) => Ok(ResumeConversationResult::Unavailable {
+            leaf_session: source,
+            reason,
+        }),
+    }
+}
+
+enum ResumeLeafAction {
+    AttachLive,
+    CreateSuccessor {
+        worktree: Box<Worktree>,
+        external_session_id: ProviderConversationId,
+    },
+    Unavailable(SessionResumeRefusal),
+}
+
+async fn inspect_resume_leaf(state: &DaemonState, source: &Session) -> Result<ResumeLeafAction> {
+    if lifecycle_is_active(source.status.lifecycle) {
+        return Ok(
+            if get_managed_session(state, source.id)
+                .await
+                .is_some_and(|managed| !*managed.completed.borrow())
+            {
+                ResumeLeafAction::AttachLive
+            } else {
+                ResumeLeafAction::Unavailable(SessionResumeRefusal::LiveSessionUnavailable {
+                    lifecycle: source.status.lifecycle,
+                })
+            },
+        );
+    }
+    if !lifecycle_allows_resume(source.status.lifecycle) {
+        return Ok(ResumeLeafAction::Unavailable(
+            SessionResumeRefusal::LifecycleNotTerminal {
+                lifecycle: source.status.lifecycle,
+            },
+        ));
+    }
+    let Some(external_session_id) = source.external_session_id.as_deref() else {
+        return Ok(ResumeLeafAction::Unavailable(
+            SessionResumeRefusal::MissingConversationIdentity,
+        ));
+    };
+    let external_session_id = ProviderConversationId::new(external_session_id)
+        .map_err(|_| DaemonError::Database("stored Conversation identity is invalid".into()))?;
+    let Ok(worktree) = verified_worktree(state, source.worktree_id).await else {
+        return Ok(ResumeLeafAction::Unavailable(
+            SessionResumeRefusal::WorktreeUnavailable {
+                worktree_id: source.worktree_id,
+            },
+        ));
+    };
+    if source.cwd != worktree.canonical_path {
+        return Ok(ResumeLeafAction::Unavailable(
+            SessionResumeRefusal::WorktreeIdentityMismatch {
+                worktree_id: source.worktree_id,
+            },
+        ));
+    }
+    let Ok(health) = state.providers.probe(source.provider_kind).await else {
+        return Ok(ResumeLeafAction::Unavailable(
+            SessionResumeRefusal::ProviderProbeFailed {
+                provider: source.provider_kind,
+            },
+        ));
+    };
+    persist_provider_health(state, &health).await?;
+    if let Some(reason) = provider_resume_refusal(source.provider_kind, &health) {
+        return Ok(ResumeLeafAction::Unavailable(reason));
+    }
+    Ok(ResumeLeafAction::CreateSuccessor {
+        worktree: Box::new(worktree),
+        external_session_id,
+    })
+}
+
+fn provider_resume_refusal(
+    provider: ProviderKind,
+    health: &sylvops_core::provider::ProviderHealth,
+) -> Option<SessionResumeRefusal> {
+    if !health.capabilities.resume {
+        Some(SessionResumeRefusal::ProviderDoesNotSupportResume { provider })
+    } else if !health.capabilities.interactive || !health.available {
+        Some(SessionResumeRefusal::ProviderUnavailable { provider })
+    } else if health.capabilities.authentication == AuthenticationRequirement::ExistingLogin
+        && !health.authenticated
+    {
+        Some(SessionResumeRefusal::ProviderAuthenticationRequired { provider })
+    } else {
+        None
+    }
+}
+
+async fn launch_resumed_successor(
+    state: &DaemonState,
+    source: Session,
+    worktree: Worktree,
+    external_session_id: ProviderConversationId,
+    columns: u16,
+    rows: u16,
+) -> Result<ResumeConversationResult> {
+    let session_id = SessionId::new();
+    let lifecycle_endpoint = if state
+        .providers
+        .supports_lifecycle_events(source.provider_kind)?
+    {
+        Some(state.hook_credentials.register(
+            source.provider_kind,
+            session_id,
+            source.worktree_id,
+        )?)
+    } else {
+        None
+    };
+    let spec = match state.providers.resume(
+        source.provider_kind,
+        ResumeContext {
+            session_id,
+            worktree_id: source.worktree_id,
+            external_session_id: external_session_id.clone(),
+            cwd: PathBuf::from(&worktree.canonical_path),
+            model: None,
+            effort: None,
+            lifecycle_endpoint,
+        },
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            state.hook_credentials.invalidate(session_id);
+            return Err(error);
+        }
+    };
+    let command = match path_text(&spec.launch.executable) {
+        Ok(command) => command,
+        Err(error) => {
+            state.hook_credentials.invalidate(session_id);
+            state
+                .providers
+                .cleanup_runtime_paths(source.provider_kind, &spec.owned_paths);
+            return Err(error);
+        }
+    };
+    let arguments_json =
+        persisted_launch_arguments(state, session_id, source.provider_kind, &spec)?;
+    let record = NewSession {
+        id: session_id,
+        worktree_id: source.worktree_id,
+        display_name: source.display_name,
+        provider_profile_id: source.provider_profile_id,
+        provider_kind: source.provider_kind,
+        command,
+        arguments_json,
+        cwd: worktree.canonical_path,
+        external_session_id: Some(external_session_id.as_str().to_owned()),
+        resumed_from_session_id: Some(source.id),
+    };
+    let (revision, running) = spawn_managed_session(state, record, spec, columns, rows).await?;
+    Ok(ResumeConversationResult::Opened {
+        revision,
+        predecessor_session_id: Some(source.id),
+        session: running,
+        outcome: SessionResumeOutcome::CreatedSuccessor,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

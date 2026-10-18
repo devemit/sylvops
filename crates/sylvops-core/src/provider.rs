@@ -288,7 +288,7 @@ pub struct LaunchContext {
 pub struct ResumeContext {
     pub session_id: SessionId,
     pub worktree_id: WorktreeId,
-    pub external_session_id: String,
+    pub external_session_id: ProviderConversationId,
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -520,7 +520,7 @@ mod tests {
                     executable: PathBuf::from("fake-provider"),
                     arguments: LaunchArguments::persisted(vec![
                         OsString::from("--resume"),
-                        OsString::from(context.external_session_id),
+                        OsString::from(context.external_session_id.as_str()),
                     ]),
                     environment: BTreeMap::new(),
                 },
@@ -620,7 +620,7 @@ mod tests {
             .configure_resume(ResumeContext {
                 session_id,
                 worktree_id,
-                external_session_id: "conversation-123".into(),
+                external_session_id: ProviderConversationId::new("conversation-123").unwrap(),
                 cwd: PathBuf::from("worktree"),
                 model: None,
                 effort: None,

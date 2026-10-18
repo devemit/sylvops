@@ -3308,18 +3308,8 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
     if let Some(session) = app.selected_session()
         && !lifecycle_is_active(session.status.lifecycle)
     {
-        if sylvops_core::provider::session_can_resume(
-            session,
-            &app.snapshot.sessions,
-            &app.providers,
-        ) {
-            let session_id = session.id;
-            resume_session(client, app, session_id);
-        } else {
-            app.flash = Some(Flash::error(
-                "Cannot resume this conversation: it needs a verified saved conversation, an available resume-capable provider, and no newer successor. History is retained; use New to start a fresh session explicitly.",
-            ));
-        }
+        let session_id = session.id;
+        resume_session(client, app, session_id);
         return Ok(());
     }
     attach_selected_process(client, app).await
@@ -3414,14 +3404,30 @@ async fn finish_resume(
             return Ok(());
         }
     };
-    let Some(session) = apply_resume_response(app, response) else {
+    let unavailable_leaf_id = match &response {
+        DaemonResponse::SessionResumeUnavailable(unavailable) => Some(unavailable.leaf_session.id),
+        _ => None,
+    };
+    let Some((session, outcome)) = apply_resume_response(app, response) else {
+        if let Some(leaf_id) = unavailable_leaf_id {
+            app.replace_snapshot(snapshot(client).await?);
+            app.reveal_and_select(ExplorerNode::Session(leaf_id));
+            app.set_tab(TuiContentView::Details);
+        }
         return Ok(());
     };
     app.replace_snapshot(snapshot(client).await?);
     select_resumed_session(app, &session);
     app.flash = Some(Flash::transient(
         FlashKind::Success,
-        "Session resumed into a new history record.",
+        match outcome {
+            sylvops_core::protocol::SessionResumeOutcome::AttachedLiveLeaf => {
+                "Opened the latest live Session in this Conversation."
+            }
+            sylvops_core::protocol::SessionResumeOutcome::CreatedSuccessor => {
+                "Resumed the Conversation in a new Session attempt."
+            }
+        },
     ));
     attach_selected_process(client, app).await
 }
@@ -3429,10 +3435,44 @@ async fn finish_resume(
 fn apply_resume_response(
     app: &mut App,
     response: DaemonResponse,
-) -> Option<sylvops_core::domain::Session> {
+) -> Option<(
+    sylvops_core::domain::Session,
+    sylvops_core::protocol::SessionResumeOutcome,
+)> {
     app.resume_pending = None;
     match response {
-        DaemonResponse::SessionResumed { session, .. } => Some(session),
+        DaemonResponse::SessionResumed {
+            session, outcome, ..
+        } => Some((session, outcome)),
+        DaemonResponse::SessionResumeUnavailable(unavailable) => {
+            let reason = unavailable.reason.message();
+            let leaf = unavailable.leaf_session;
+            if let Some(existing) = app
+                .snapshot
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == leaf.id)
+            {
+                *existing = leaf.clone();
+            } else {
+                app.snapshot.sessions.push(leaf.clone());
+            }
+            if let Some(worktree) = app
+                .snapshot
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.id == leaf.worktree_id)
+            {
+                app.expanded_projects.insert(worktree.project_id);
+                app.expanded_worktrees.insert(worktree.id);
+            }
+            app.reveal_and_select(ExplorerNode::Session(leaf.id));
+            app.set_tab(TuiContentView::Details);
+            app.flash = Some(Flash::error(format!(
+                "Cannot resume this Conversation: {reason} History is retained. Use New to Start Fresh."
+            )));
+            None
+        }
         response => {
             app.flash = Some(Flash::error(response_message("session resume", response)));
             None
@@ -3905,6 +3945,7 @@ mod tests {
                 exit_code: None,
                 failure_reason: None,
             }],
+            session_lineage: Vec::new(),
             work_sources: Vec::new(),
             provider_profiles: Vec::new(),
         }
@@ -4717,16 +4758,60 @@ mod tests {
         let mut successor = source.clone();
         successor.id = SessionId::new();
         successor.created_at = 3;
-        successor.display_name = "Codex (resumed)".into();
+        successor.display_name = source.display_name.clone();
         successor.status.lifecycle = SessionLifecycle::Running;
         successor.ended_at = None;
+        snapshot
+            .session_lineage
+            .push(sylvops_core::domain::SessionLineageLink {
+                predecessor_session_id: source.id,
+                successor_session_id: successor.id,
+            });
         let mut app = App::new(snapshot, Vec::new(), None);
-        app.snapshot.sessions.push(successor.clone());
-
+        app.resume_pending = Some(source.id);
+        let (returned, outcome) = apply_resume_response(
+            &mut app,
+            DaemonResponse::SessionResumed {
+                revision: 2,
+                requested_session_id: source.id,
+                predecessor_session_id: Some(source.id),
+                session: successor.clone(),
+                outcome: sylvops_core::protocol::SessionResumeOutcome::CreatedSuccessor,
+            },
+        )
+        .expect("successful resume response");
+        assert_eq!(
+            outcome,
+            sylvops_core::protocol::SessionResumeOutcome::CreatedSuccessor
+        );
+        app.snapshot.sessions.push(returned);
         select_resumed_session(&mut app, &successor);
 
         assert_eq!(app.selected_session_id, Some(successor.id));
         assert_eq!(app.main_tab, TuiContentView::Terminal);
+        assert_eq!(
+            app.session_row_name(&source),
+            format!("{} · attempt 1", source.display_name)
+        );
+        assert_eq!(
+            app.session_row_name(&successor),
+            format!("{} · attempt 2", source.display_name)
+        );
+        app.navigator_width = 80;
+        let backend = ratatui::backend::TestBackend::new(140, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("attempt 1"));
+        assert!(text.contains("attempt 2"));
         assert!(
             app.snapshot
                 .sessions
@@ -4772,6 +4857,48 @@ mod tests {
             app.flash
                 .as_ref()
                 .is_some_and(|flash| flash.text.contains("already been resumed"))
+        );
+    }
+
+    #[test]
+    fn structured_resume_refusal_opens_leaf_history_with_one_exact_reason_and_start_fresh() {
+        let snapshot = populated_snapshot();
+        let source_session_id = snapshot.sessions[0].id;
+        let mut leaf = snapshot.sessions[0].clone();
+        leaf.id = SessionId::new();
+        leaf.status.lifecycle = SessionLifecycle::Exited;
+        leaf.process_id = None;
+        leaf.external_session_id = None;
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.resume_pending = Some(source_session_id);
+
+        let resumed = apply_resume_response(
+            &mut app,
+            DaemonResponse::SessionResumeUnavailable(
+                sylvops_core::protocol::SessionResumeUnavailable {
+                    requested_session_id: source_session_id,
+                    leaf_session: leaf.clone(),
+                    reason:
+                        sylvops_core::protocol::SessionResumeRefusal::MissingConversationIdentity,
+                },
+            ),
+        );
+
+        assert!(resumed.is_none());
+        assert_eq!(app.selected_session_id, Some(leaf.id));
+        assert_eq!(app.main_tab, TuiContentView::Details);
+        let message = &app.flash.as_ref().unwrap().text;
+        assert!(message.contains("no verified Conversation identity"));
+        assert!(message.contains("History is retained"));
+        assert!(message.contains("Start Fresh"));
+        assert_eq!(
+            reduce(&mut app, reducer::Action::Resume),
+            vec![reducer::Effect::Resume(leaf.id)]
+        );
+        app.resume_pending = None;
+        assert_eq!(
+            reduce(&mut app, reducer::Action::New),
+            vec![reducer::Effect::OpenCreate]
         );
     }
 
