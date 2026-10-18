@@ -119,6 +119,7 @@ const TERMINAL_FONT_SIZE_CHOICES: [u8; 13] = [10, 11, 12, 13, 14, 15, 16, 17, 18
 const FEATURED_THEME_COUNT: usize = 4;
 const CHECK_AGAIN_LABEL: &str = "Check again";
 const STOP_SESSION_LABEL: &str = "Stop session";
+const START_FRESH_LABEL: &str = "Start Fresh";
 const DELETE_WORKSPACE_LABEL: &str = "Delete workspace";
 const REMOVE_REPOSITORY_LABEL: &str = "Remove repository";
 const DELETE_CHECKOUT_LABEL: &str = "Delete checkout";
@@ -2168,6 +2169,9 @@ impl DesktopApp {
                     .align_y(Vertical::Center)
                     .clip(true),
                 );
+            }
+            if !can_stop {
+                actions = actions.push(start_fresh_action(density, presentation_theme));
             }
             actions.into()
         })
@@ -4680,25 +4684,58 @@ impl DesktopApp {
             }
             (
                 Operation::Resume(source_session_id),
-                DaemonResponse::SessionResumed { session, .. },
+                DaemonResponse::SessionResumed {
+                    predecessor_session_id,
+                    session,
+                    outcome,
+                    ..
+                },
             ) => {
                 self.resume_pending.remove(&source_session_id);
                 let session_id = session.id;
-                if let Some(existing) = self
-                    .snapshot
-                    .sessions
-                    .iter_mut()
-                    .find(|existing| existing.id == session_id)
+                self.upsert_snapshot_session(session);
+                if outcome == sylvops_core::protocol::SessionResumeOutcome::CreatedSuccessor
+                    && let Some(predecessor_session_id) = predecessor_session_id
+                    && !self.snapshot.session_lineage.iter().any(|link| {
+                        link.predecessor_session_id == predecessor_session_id
+                            && link.successor_session_id == session_id
+                    })
                 {
-                    *existing = session;
-                } else {
-                    self.snapshot.sessions.push(session);
+                    self.snapshot
+                        .session_lineage
+                        .push(sylvops_core::domain::SessionLineageLink {
+                            predecessor_session_id,
+                            successor_session_id: session_id,
+                        });
                 }
                 self.select_session_context(session_id);
                 self.select_session(session_id);
                 self.main_tab = MainTab::Terminal;
-                self.show_success("Session resumed into a new history record.");
+                self.show_success(match outcome {
+                    sylvops_core::protocol::SessionResumeOutcome::AttachedLiveLeaf => {
+                        "Opened the latest live Session in this Conversation."
+                    }
+                    sylvops_core::protocol::SessionResumeOutcome::CreatedSuccessor => {
+                        "Resumed the Conversation in a new Session attempt."
+                    }
+                });
                 self.attach_active();
+                self.request_snapshot();
+            }
+            (
+                Operation::Resume(source_session_id),
+                DaemonResponse::SessionResumeUnavailable(unavailable),
+            ) => {
+                self.resume_pending.remove(&source_session_id);
+                let reason = unavailable.reason.message();
+                let leaf = unavailable.leaf_session;
+                let leaf_id = leaf.id;
+                self.upsert_snapshot_session(leaf);
+                self.select_session(leaf_id);
+                self.main_tab = MainTab::Details;
+                self.error = Some(bounded_redacted_diagnostic(&format!(
+                    "Cannot resume this Conversation: {reason} History is retained. Use Start Fresh to begin a new Conversation."
+                )));
                 self.request_snapshot();
             }
             (Operation::Stop(session_id), DaemonResponse::Acknowledged) => {
@@ -5216,6 +5253,19 @@ impl DesktopApp {
         }
     }
 
+    fn upsert_snapshot_session(&mut self, session: Session) {
+        if let Some(existing) = self
+            .snapshot
+            .sessions
+            .iter_mut()
+            .find(|existing| existing.id == session.id)
+        {
+            *existing = session;
+        } else {
+            self.snapshot.sessions.push(session);
+        }
+    }
+
     fn send_github_request(&mut self, operation: Operation, request: ClientRequest) {
         if self.github_request == RequestState::Pending {
             return;
@@ -5298,15 +5348,9 @@ impl DesktopApp {
     }
 
     fn begin_resume_request(&mut self, session_id: SessionId) -> Option<ClientRequest> {
-        let Some(session) = self.session(session_id) else {
+        if self.session(session_id).is_none() {
             self.error =
                 Some("The selected session is no longer available. Refresh and try again.".into());
-            return None;
-        };
-        if !session_can_resume(session, &self.snapshot.sessions, &self.providers) {
-            self.error = Some(
-                "This session is not eligible for resume. Refresh to load its latest state.".into(),
-            );
             return None;
         }
         if self.resume_pending.contains(&session_id) {
@@ -6960,11 +7004,7 @@ impl DesktopApp {
             return;
         }
         if !lifecycle_is_active(session.status.lifecycle) {
-            if session_can_resume(session, &self.snapshot.sessions, &self.providers) {
-                self.resume_session(session_id);
-            } else {
-                self.error = Some("Cannot resume this conversation: it needs a verified saved conversation, an available resume-capable provider, and no newer successor. History is retained; use New session to start fresh explicitly.".into());
-            }
+            self.resume_session(session_id);
             return;
         }
         if !session_can_stop(session.status) && !session_can_replay(session.status) {
@@ -9443,6 +9483,24 @@ fn technical_detail(label: &'static str, value: String) -> Element<'static, Mess
 
 fn session_tab_label(name: &str) -> String {
     name.to_owned()
+}
+
+fn start_fresh_action(
+    density: DensityMetrics,
+    presentation_theme: PresentationTheme,
+) -> Element<'static, Message> {
+    button(centered_button_label(
+        START_FRESH_LABEL,
+        UI_META_SIZE,
+        UI_MEDIUM,
+    ))
+    .on_press(Message::NewSession)
+    .height(density.control_height)
+    .padding([6, 9])
+    .style(move |_theme, status| {
+        button_intent_style(presentation_theme, ButtonIntent::Quiet, status)
+    })
+    .into()
 }
 
 fn session_status_animates(status: sylvops_core::session_state::SessionStatus) -> bool {
@@ -13601,11 +13659,9 @@ mod tests {
     }
 
     #[test]
-    fn successful_resume_selects_successor_and_preserves_source_history() {
-        let runtime_root =
-            std::env::temp_dir().join(format!("sylvops-desktop-resume-test-{}", SessionId::new()));
-        let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
-        let mut app = DesktopApp::new(paths);
+    fn successful_resume_selects_successor_preserves_history_and_attaches() {
+        let (bridge, mut harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
         let source = session(SessionLifecycle::Exited, Some("verified-id"));
         let mut successor = source.clone();
         successor.id = SessionId::new();
@@ -13637,6 +13693,21 @@ mod tests {
         assert_eq!(app.main_tab, MainTab::Terminal);
         assert!(app.open_sessions.contains(&successor.id));
         assert!(!app.resume_pending.contains(&source.id));
+        assert!(app.snapshot.session_lineage.iter().any(|link| {
+            link.predecessor_session_id == source.id && link.successor_session_id == successor.id
+        }));
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::Attach(successor.id),
+                ClientRequest::AttachSession {
+                    session_id: successor.id,
+                    from_sequence: 0,
+                    columns: app.terminal_dimensions().0,
+                    rows: app.terminal_dimensions().1,
+                },
+            )
+        );
         assert!(
             app.snapshot
                 .sessions
@@ -13662,7 +13733,152 @@ mod tests {
     }
 
     #[test]
-    fn desktop_suppresses_duplicate_resume_requests_while_one_is_pending() {
+    fn opening_an_older_predecessor_defers_lineage_resolution_to_the_daemon() {
+        let (bridge, mut harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let source = session(SessionLifecycle::Exited, Some("verified-id"));
+        let mut live_leaf = source.clone();
+        live_leaf.id = SessionId::new();
+        live_leaf.created_at = 2;
+        live_leaf.status.lifecycle = SessionLifecycle::Running;
+        live_leaf.ended_at = None;
+        app.snapshot.sessions.extend([source.clone(), live_leaf]);
+        app.selected_session_id = Some(source.id);
+        app.active_session_id = Some(source.id);
+
+        let _ = app.update(Message::Attach);
+
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::Resume(source.id),
+                ClientRequest::ResumeSession {
+                    session_id: source.id,
+                    columns: app.terminal_dimensions().0,
+                    rows: app.terminal_dimensions().1,
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn opening_a_live_leaf_attaches_without_creating_a_successor() {
+        let (bridge, mut harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let live = session(SessionLifecycle::Running, Some("verified-id"));
+        app.snapshot.sessions.push(live.clone());
+        app.selected_session_id = Some(live.id);
+        app.active_session_id = Some(live.id);
+
+        let _ = app.update(Message::Attach);
+
+        assert!(matches!(
+            harness.take_request(),
+            (
+                Operation::Attach(id),
+                ClientRequest::AttachSession { session_id, .. }
+            ) if id == live.id && session_id == live.id
+        ));
+    }
+
+    #[test]
+    fn opening_a_predecessor_selects_and_attaches_the_returned_live_leaf() {
+        let (bridge, mut harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let source = session(SessionLifecycle::Exited, Some("verified-id"));
+        let mut live_leaf = source.clone();
+        live_leaf.id = SessionId::new();
+        live_leaf.created_at = 2;
+        live_leaf.status.lifecycle = SessionLifecycle::Running;
+        live_leaf.ended_at = None;
+        app.snapshot.sessions.push(source.clone());
+        app.selected_session_id = Some(source.id);
+        app.active_session_id = Some(source.id);
+        app.open_sessions.push(source.id);
+        app.resume_pending.insert(source.id);
+
+        app.handle_response(
+            Operation::Resume(source.id),
+            DaemonResponse::SessionResumed {
+                revision: 2,
+                requested_session_id: source.id,
+                predecessor_session_id: None,
+                session: live_leaf.clone(),
+                outcome: sylvops_core::protocol::SessionResumeOutcome::AttachedLiveLeaf,
+            },
+        );
+
+        assert_eq!(app.selected_session_id, Some(live_leaf.id));
+        assert_eq!(app.active_session_id, Some(live_leaf.id));
+        assert!(app.open_sessions.contains(&source.id));
+        assert!(app.open_sessions.contains(&live_leaf.id));
+        assert!(app.snapshot.session_lineage.is_empty());
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::Attach(live_leaf.id),
+                ClientRequest::AttachSession {
+                    session_id: live_leaf.id,
+                    from_sequence: 0,
+                    columns: app.terminal_dimensions().0,
+                    rows: app.terminal_dimensions().1,
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn typed_resume_refusal_selects_the_leaf_and_keeps_history_accessible() {
+        let (bridge, _harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let source = session(SessionLifecycle::Exited, Some("verified-id"));
+        let mut leaf = source.clone();
+        leaf.id = SessionId::new();
+        leaf.created_at = 2;
+        leaf.external_session_id = None;
+        app.snapshot.sessions.push(source.clone());
+        app.selected_session_id = Some(source.id);
+        app.active_session_id = Some(source.id);
+        app.open_sessions.push(source.id);
+        app.resume_pending.insert(source.id);
+
+        app.handle_response(
+            Operation::Resume(source.id),
+            DaemonResponse::SessionResumeUnavailable(
+                sylvops_core::protocol::SessionResumeUnavailable {
+                    requested_session_id: source.id,
+                    leaf_session: leaf.clone(),
+                    reason:
+                        sylvops_core::protocol::SessionResumeRefusal::MissingConversationIdentity,
+                },
+            ),
+        );
+
+        assert_eq!(app.selected_session_id, Some(leaf.id));
+        assert_eq!(app.active_session_id, Some(leaf.id));
+        assert_eq!(app.main_tab, MainTab::Details);
+        assert!(app.open_sessions.contains(&leaf.id));
+        assert!(
+            app.snapshot
+                .sessions
+                .iter()
+                .any(|session| session.id == source.id)
+        );
+        assert!(
+            app.snapshot
+                .sessions
+                .iter()
+                .any(|session| session.id == leaf.id)
+        );
+        let error = app.error.as_deref().expect("exact resume refusal");
+        assert!(error.contains("no verified Conversation identity"));
+        assert!(error.contains("History is retained"));
+        assert!(error.contains("Start Fresh"));
+        assert!(!error.contains("needs a verified saved conversation"));
+    }
+
+    #[test]
+    fn desktop_defers_resume_eligibility_to_the_daemon_and_suppresses_duplicates() {
         let runtime_root = std::env::temp_dir().join(format!(
             "sylvops-desktop-resume-pending-test-{}",
             SessionId::new()
@@ -13670,9 +13886,12 @@ mod tests {
         let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
         let mut app = DesktopApp::new(paths);
         let source = session(SessionLifecycle::Exited, Some("verified-id"));
-        app.providers
-            .push(provider_health(ProviderKind::Codex, true, true));
+        let mut newer = source.clone();
+        newer.id = SessionId::new();
+        newer.created_at = 2;
+        newer.status.lifecycle = SessionLifecycle::Running;
         app.snapshot.sessions.push(source.clone());
+        app.snapshot.sessions.push(newer);
 
         let request = app
             .begin_resume_request(source.id)
@@ -13718,6 +13937,35 @@ mod tests {
     }
 
     #[test]
+    fn failed_successor_creation_keeps_the_source_history_selected() {
+        let (bridge, _harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let source = session(SessionLifecycle::Exited, Some("verified-id"));
+        app.snapshot.sessions.push(source.clone());
+        app.selected_session_id = Some(source.id);
+        app.active_session_id = Some(source.id);
+        app.open_sessions.push(source.id);
+        app.resume_pending.insert(source.id);
+
+        app.handle_response(
+            Operation::Resume(source.id),
+            DaemonResponse::Error(sylvops_core::protocol::ProtocolFailure {
+                code: "provider_launch_failed".into(),
+                message: "The resumed Provider process could not be started.".into(),
+                retryable: true,
+            }),
+        );
+
+        assert_eq!(app.selected_session_id, Some(source.id));
+        assert_eq!(app.active_session_id, Some(source.id));
+        assert!(app.open_sessions.contains(&source.id));
+        assert!(!app.resume_pending.contains(&source.id));
+        assert!(app.error.as_deref().is_some_and(|message| {
+            message.contains("The resumed Provider process could not be started")
+        }));
+    }
+
+    #[test]
     fn terminal_actions_keep_standardized_labels_at_every_width() {
         assert_eq!(
             active_terminal_action_label(ActiveTerminalAction::Open, false),
@@ -13739,6 +13987,28 @@ mod tests {
             active_terminal_action_label(ActiveTerminalAction::ViewOutput, true),
             "View output"
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_session_actions_present_start_fresh_separately_from_resume() {
+        let (mut app, _, _, session_id, _) = desktop_hierarchy();
+        let session = app
+            .snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .expect("selected session");
+        session.status.lifecycle = SessionLifecycle::Exited;
+        session.external_session_id = Some("verified-id".into());
+        session.ended_at = Some(3);
+        app.providers
+            .push(provider_health(ProviderKind::Codex, true, true));
+
+        let labels = rendered_text(app.session_actions(), iced::Size::new(640.0, 80.0)).await;
+
+        assert!(labels.iter().any(|label| label == "Resume"));
+        assert!(labels.iter().any(|label| label == START_FRESH_LABEL));
+        assert!(!labels.iter().any(|label| label == "Resume Fresh"));
     }
 
     #[test]
