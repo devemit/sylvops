@@ -69,6 +69,7 @@ pub(crate) enum Operation {
     CreateSession(WorktreeId),
     Resume(SessionId),
     AcknowledgeAttention(SessionId),
+    ClaimAttentionNotification,
     RenameProject,
     RenameWorktree,
     RenameSession,
