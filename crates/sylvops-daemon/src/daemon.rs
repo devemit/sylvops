@@ -4545,9 +4545,14 @@ fn spawn_claude_session_start_monitor(
     managed: ManagedSession,
 ) {
     tokio::spawn(async move {
-        tokio::time::sleep(CLAUDE_SESSION_START_TIMEOUT).await;
-        if *managed.completed.borrow() {
-            return;
+        let mut completed = managed.completed.clone();
+        tokio::select! {
+            () = tokio::time::sleep(CLAUDE_SESSION_START_TIMEOUT) => {}
+            changed = completed.changed() => {
+                if changed.is_err() || *completed.borrow() {
+                    return;
+                }
+            }
         }
         state
             .hook_tracking
