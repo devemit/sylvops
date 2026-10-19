@@ -100,7 +100,7 @@ fn safe_label(label: &str) -> String {
 
 #[derive(Debug)]
 pub(crate) struct SystemChannels {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     native: Option<platform::Notifier>,
     sound: Option<SoundNotifier>,
 }
@@ -108,7 +108,7 @@ pub(crate) struct SystemChannels {
 impl SystemChannels {
     pub(crate) fn new() -> Self {
         Self {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             native: platform::Notifier::new().ok(),
             sound: SoundNotifier::new().ok(),
         }
@@ -117,13 +117,13 @@ impl SystemChannels {
 
 impl NotificationChannels for SystemChannels {
     fn native(&self, title: &str, message: &str) -> bool {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         {
             self.native
                 .as_ref()
                 .is_some_and(|notifier| notifier.send(title, message))
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
             let _ = (title, message);
             false
@@ -166,6 +166,229 @@ fn play_sound() {
         windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(
             windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
         );
+    }
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeNotificationPlatform {
+    #[cfg(any(test, target_os = "macos"))]
+    Macos,
+    #[cfg(any(test, target_os = "linux"))]
+    Linux,
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Eq, PartialEq)]
+struct NativeNotificationCommand {
+    executable: &'static str,
+    arguments: Vec<String>,
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+fn native_notification_command(
+    platform: NativeNotificationPlatform,
+    title: &str,
+    message: &str,
+) -> NativeNotificationCommand {
+    // Notification Center and the freedesktop notification daemon retain authority over
+    // quiet-time and do-not-disturb presentation; SylvOps does not schedule around them.
+    match platform {
+        #[cfg(any(test, target_os = "macos"))]
+        NativeNotificationPlatform::Macos => NativeNotificationCommand {
+            executable: native_notification_executable(platform),
+            arguments: vec![
+                "-e".into(),
+                "on run argv\n display notification (item 2 of argv) with title (item 1 of argv)\nend run".into(),
+                "--".into(),
+                title.into(),
+                message.into(),
+            ],
+        },
+        #[cfg(any(test, target_os = "linux"))]
+        NativeNotificationPlatform::Linux => NativeNotificationCommand {
+            executable: native_notification_executable(platform),
+            arguments: vec![
+                "--app-name=SylvOps".into(),
+                "--expire-time=10000".into(),
+                "--urgency=normal".into(),
+                "--".into(),
+                title.into(),
+                message.into(),
+            ],
+        },
+    }
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+const fn native_notification_executable(platform: NativeNotificationPlatform) -> &'static str {
+    match platform {
+        #[cfg(any(test, target_os = "macos"))]
+        NativeNotificationPlatform::Macos => "/usr/bin/osascript",
+        #[cfg(any(test, target_os = "linux"))]
+        NativeNotificationPlatform::Linux => "/usr/bin/notify-send",
+    }
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+const fn native_notification_available(
+    platform: NativeNotificationPlatform,
+    executable_exists: bool,
+    session_bus_present: bool,
+    display_present: bool,
+    wayland_display_present: bool,
+) -> bool {
+    executable_exists
+        && match platform {
+            #[cfg(any(test, target_os = "macos"))]
+            NativeNotificationPlatform::Macos => true,
+            #[cfg(any(test, target_os = "linux"))]
+            NativeNotificationPlatform::Linux => {
+                session_bus_present && (display_present || wayland_display_present)
+            }
+        }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod platform {
+    use std::{
+        path::Path,
+        process::{Command, Stdio},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::{
+        NativeNotificationCommand, NativeNotificationPlatform, native_notification_available,
+        native_notification_command, native_notification_executable,
+    };
+
+    const PROCESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[derive(Debug)]
+    pub(crate) struct Notifier {
+        sender: mpsc::SyncSender<(String, String)>,
+        stopped: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Notifier {
+        pub fn new() -> std::io::Result<Self> {
+            let platform = current_platform();
+            if !native_session_available(platform) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "native Attention Notifications are unavailable",
+                ));
+            }
+
+            let (sender, receiver) = mpsc::sync_channel::<(String, String)>(8);
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stop = stopped.clone();
+            let thread = thread::Builder::new()
+                .name("sylvops-notifications".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let (title, message) =
+                            match receiver.recv_timeout(Duration::from_millis(100)) {
+                                Ok(notification) => notification,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            };
+                        let command = native_notification_command(platform, &title, &message);
+                        let _ = run_bounded(&command, &stop);
+                    }
+                })?;
+            Ok(Self {
+                sender,
+                stopped,
+                thread: Some(thread),
+            })
+        }
+
+        pub fn send(&self, title: &str, message: &str) -> bool {
+            self.sender
+                .try_send((title.to_owned(), message.to_owned()))
+                .is_ok()
+        }
+    }
+
+    impl Drop for Notifier {
+        fn drop(&mut self) {
+            self.stopped.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const fn current_platform() -> NativeNotificationPlatform {
+        NativeNotificationPlatform::Macos
+    }
+
+    #[cfg(target_os = "linux")]
+    const fn current_platform() -> NativeNotificationPlatform {
+        NativeNotificationPlatform::Linux
+    }
+
+    fn native_session_available(platform: NativeNotificationPlatform) -> bool {
+        native_notification_available(
+            platform,
+            Path::new(native_notification_executable(platform)).is_file(),
+            environment_present("DBUS_SESSION_BUS_ADDRESS"),
+            environment_present("DISPLAY"),
+            environment_present("WAYLAND_DISPLAY"),
+        )
+    }
+
+    fn environment_present(name: &str) -> bool {
+        std::env::var_os(name).is_some_and(|value| !value.is_empty())
+    }
+
+    fn run_bounded(command: &NativeNotificationCommand, stopped: &AtomicBool) -> bool {
+        let Ok(mut child) = Command::new(command.executable)
+            .args(&command.arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None)
+                    if !stopped.load(Ordering::Acquire) && started.elapsed() < PROCESS_TIMEOUT =>
+                {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn smoke_deliver(title: &str, message: &str) -> bool {
+        let platform = current_platform();
+        if !native_session_available(platform) {
+            return false;
+        }
+        run_bounded(
+            &native_notification_command(platform, title, message),
+            &AtomicBool::new(false),
+        )
     }
 }
 
@@ -234,7 +457,10 @@ mod tests {
         session_state::{AttentionEventId, AttentionReason},
     };
 
-    use super::{NotificationChannels, NotificationPresenter};
+    use super::{
+        NativeNotificationPlatform, NotificationChannels, NotificationPresenter,
+        native_notification_available, native_notification_command,
+    };
 
     #[derive(Debug, Default)]
     struct RecordingChannels {
@@ -330,6 +556,94 @@ mod tests {
         );
         assert_eq!(presenter.channels().native.lock().unwrap().len(), 1);
         assert_eq!(*presenter.channels().sounds.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn native_commands_pass_private_payload_as_arguments_without_a_shell() {
+        let macos = native_notification_command(
+            NativeNotificationPlatform::Macos,
+            "Input requested",
+            "quoted ' Session",
+        );
+        assert_eq!(macos.executable, "/usr/bin/osascript");
+        assert_eq!(macos.arguments[0], "-e");
+        assert_eq!(macos.arguments[2], "--");
+        assert_eq!(macos.arguments[3], "Input requested");
+        assert_eq!(macos.arguments[4], "quoted ' Session");
+
+        let linux = native_notification_command(
+            NativeNotificationPlatform::Linux,
+            "Input requested",
+            "quoted ' Session",
+        );
+        assert_eq!(linux.executable, "/usr/bin/notify-send");
+        assert_eq!(
+            linux.arguments,
+            [
+                "--app-name=SylvOps",
+                "--expire-time=10000",
+                "--urgency=normal",
+                "--",
+                "Input requested",
+                "quoted ' Session",
+            ]
+        );
+    }
+
+    #[test]
+    fn native_availability_requires_a_tool_and_linux_desktop_session() {
+        assert!(native_notification_available(
+            NativeNotificationPlatform::Macos,
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(!native_notification_available(
+            NativeNotificationPlatform::Macos,
+            false,
+            true,
+            true,
+            true,
+        ));
+        assert!(native_notification_available(
+            NativeNotificationPlatform::Linux,
+            true,
+            true,
+            true,
+            false,
+        ));
+        assert!(native_notification_available(
+            NativeNotificationPlatform::Linux,
+            true,
+            true,
+            false,
+            true,
+        ));
+        assert!(!native_notification_available(
+            NativeNotificationPlatform::Linux,
+            true,
+            false,
+            true,
+            true,
+        ));
+        assert!(!native_notification_available(
+            NativeNotificationPlatform::Linux,
+            true,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires an interactive native desktop notification service"]
+    fn native_notification_smoke_is_bounded() {
+        assert!(super::platform::smoke_deliver(
+            "SylvOps native smoke",
+            "Bounded Attention Notification smoke test",
+        ));
     }
 }
 
