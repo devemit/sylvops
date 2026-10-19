@@ -437,6 +437,8 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
 
     let unavailable_codex = fake_codex.with_extension("unavailable");
     std::fs::rename(&fake_codex, &unavailable_codex).expect("hide fake Codex executable");
+    // Discovery may find another supported Codex installation on the host after the explicit
+    // fixture disappears. Either absence or an unauthenticated fallback must refuse resume.
     match client
         .request(&ClientRequest::ResumeSession {
             session_id: source_session_id,
@@ -446,12 +448,14 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("unavailable Provider response")
     {
-        DaemonResponse::SessionResumeUnavailable(unavailable) => assert_eq!(
+        DaemonResponse::SessionResumeUnavailable(unavailable) => assert!(matches!(
             unavailable.reason,
-            sylvops_core::protocol::SessionResumeRefusal::ProviderAuthenticationRequired {
+            sylvops_core::protocol::SessionResumeRefusal::ProviderUnavailable {
+                provider: ProviderKind::Codex
+            } | sylvops_core::protocol::SessionResumeRefusal::ProviderAuthenticationRequired {
                 provider: ProviderKind::Codex
             }
-        ),
+        )),
         response => panic!("unavailable Provider did not return a typed refusal: {response:?}"),
     }
     std::fs::rename(&unavailable_codex, &fake_codex).expect("restore fake Codex executable");
