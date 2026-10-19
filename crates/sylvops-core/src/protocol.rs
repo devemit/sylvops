@@ -1991,7 +1991,7 @@ mod tests {
             });
             let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
             assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-            assert!(!reason.message().is_empty());
+            assert_ne!(reason.message(), "");
         }
         for outcome in [
             SessionResumeOutcome::AttachedLiveLeaf,
