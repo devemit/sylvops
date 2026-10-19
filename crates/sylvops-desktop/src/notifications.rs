@@ -287,6 +287,7 @@ const fn native_notification_available(
     executable_exists: bool,
     desktop_session: NativeDesktopSession,
 ) -> bool {
+    let _ = desktop_session;
     executable_exists
         && match platform {
             #[cfg(any(test, target_os = "macos"))]
