@@ -1,228 +1,126 @@
 # SylvOps
 
-SylvOps is a local-first mission control for supervising interactive coding-agent sessions in Git worktrees. It ships a native desktop client and retains a keyboard-first terminal client.
+SylvOps is a local-first mission control for supervising interactive coding-agent sessions in Git worktrees. It combines a native desktop app, a keyboard-first terminal client, and a daemon that keeps sessions running when a client disconnects.
 
-## Prerequisites
+[Documentation](https://devemit.github.io/sylvops-docs/) · [Getting started](https://devemit.github.io/sylvops-docs/getting-started) · [Installation](https://devemit.github.io/sylvops-docs/installation) · [CLI reference](https://devemit.github.io/sylvops-docs/cli-reference) · [Releases](https://github.com/devemit/sylvops/releases)
 
-Install Git yourself and make sure `git --version` works before starting SylvOps. A Rust toolchain is not required for a packaged release.
+> [!WARNING]
+> The current public build is an unsigned testing preview. Windows and Linux x86_64 packages are available; macOS packages are not included. Read the [installation guide](https://devemit.github.io/sylvops-docs/installation) before downloading.
 
-Codex and Claude Code are optional and separately installed and authenticated. Install the provider CLI and complete its login using the provider's instructions before choosing it in SylvOps. SylvOps does not install Git or provider CLIs, run their login commands, copy credentials, or store provider secrets. After SylvOps is running, use `sylvops doctor`, `sylvops provider probe codex`, or `sylvops provider probe claude` to distinguish a missing executable, old version, unsupported authentication, or logged-out state.
+## What SylvOps does
 
-Download release files only from the [SylvOps GitHub Releases](https://github.com/devemit/sylvops/releases) page. Keep the release's `SHA256SUMS` beside the downloaded package and verify the named file before opening it. Every asset also has GitHub build-provenance attestations.
+- Runs Shell, Codex, and Claude Code sessions in existing repositories or isolated Git worktrees.
+- Keeps the daemon authoritative for session processes, terminal attachment, state, and recovery.
+- Lets you detach from a terminal or close the desktop without stopping the session.
+- Provides a native desktop client and a keyboard-first TUI over the same authenticated local IPC boundary.
+- Can associate a project with a validated GitHub remote to browse Issues and Pull Requests and start isolated work from an Issue.
+- Keeps credentials outside SylvOps. Provider CLIs and GitHub CLI are installed and authenticated separately.
 
-## Free unsigned previews
+## Getting started
 
-Unsigned previews are testing builds, not official signed application releases. They contain a Windows x86_64 portable ZIP and Linux x86_64 portable archive, AppImage, and Debian package. They do not contain macOS packages or a native Windows installer, and they do not receive signed in-app updates.
+### 1. Install Git
 
-The current testing build is [`v0.1.0-preview.6`](https://github.com/devemit/sylvops/releases/tag/v0.1.0-preview.6), published from commit `b97bb02be5f9ae118e43258b7595503fb22838e3` after the complete hosted CI and unsigned-preview workflow passed.
+Install Git using your operating system's normal method, then confirm it is available:
 
-To install `v0.1.0-preview.6` on Windows from PowerShell, download the matching installer script first so it can be inspected before execution:
-
-```powershell
-$tag = 'v0.1.0-preview.6'; $script = Join-Path $env:TEMP 'install-sylvops.ps1'; Invoke-WebRequest "https://raw.githubusercontent.com/devemit/sylvops/$tag/scripts/install.ps1" -OutFile $script; & $script -Version $tag.TrimStart('v')
+```sh
+git --version
 ```
 
-Launch the portable installation explicitly:
+SylvOps uses your installed `git` executable. Registering a repository does not copy or move it, and does not perform a network operation.
+
+### 2. Install SylvOps
+
+The current public version is [`0.1.0-preview.10`](https://github.com/devemit/sylvops/releases/tag/v0.1.0-preview.10). Choose the appropriate installation path:
+
+- [Windows x86_64 preview](https://devemit.github.io/sylvops-docs/installation#windows-preview)
+- [Linux Debian or Ubuntu](https://devemit.github.io/sylvops-docs/installation#debian-or-ubuntu)
+- [Linux AppImage](https://devemit.github.io/sylvops-docs/installation#appimage)
+- [Portable Linux archive](https://devemit.github.io/sylvops-docs/installation#portable-linux-archive)
+
+Release assets, checksums, and provenance attestations are published on [GitHub Releases](https://github.com/devemit/sylvops/releases).
+
+### 3. Optionally install an agent CLI
+
+The built-in Shell provider works without another agent. To use Codex or Claude Code, install and authenticate the CLI outside SylvOps.
+
+For Codex, follow the [official Codex CLI guide](https://learn.chatgpt.com/docs/codex/cli):
+
+```sh
+codex login
+codex login status
+```
+
+For Claude Code, install an official native CLI version 2.1.145 or newer using the [official Claude Code setup guide](https://docs.anthropic.com/en/docs/claude-code/getting-started):
+
+```sh
+claude --version
+claude auth login
+claude auth status
+```
+
+SylvOps does not install or update provider CLIs, perform login, copy credentials, store provider secrets, or choose a provider's permission mode.
+
+### 4. Launch SylvOps with a repository
+
+Give SylvOps the path to an existing Git repository:
+
+```text
+sylvops up /path/to/repository
+```
+
+On Windows preview installations, invoke the executable explicitly if its directory is not on `PATH`:
 
 ```powershell
 & "$env:LOCALAPPDATA\SylvOps\bin\sylvops.exe" up C:\path\to\repository
 ```
 
-Windows may identify the executable as coming from an unknown publisher. Do not bypass operating-system security warnings. The preview ZIP includes `UNSIGNED-PREVIEW.txt`; verify `SHA256SUMS`, inspect the downloaded script, or build from source when trust cannot be established.
+`up` starts or reconnects to the local daemon, creates or reuses the **Local** workspace, registers the repository, and opens the native desktop client. It does not automatically start an agent.
 
-On Linux x86_64:
+### 5. Create or choose a workspace
 
-```sh
-tag=v0.1.0-preview.6; curl --fail --location --proto '=https' --tlsv1.2 "https://raw.githubusercontent.com/devemit/sylvops/$tag/scripts/install.sh" --output /tmp/install-sylvops.sh; SYLVOPS_VERSION="${tag#v}" sh /tmp/install-sylvops.sh
-```
+A **Workspace** groups repositories you want to supervise together. Use **New workspace** in the desktop switcher, or keep **Local** if you only need one group.
 
-The manual **Unsigned Preview** GitHub Actions workflow publishes these files as a non-latest GitHub testing release after the complete CI gate passes. The signed `v0.1.0` workflow remains separate and still fails closed unless its protected publisher credentials are configured.
+### 6. Register a repository
 
-The signed Windows and macOS instructions below apply only to an official application release. For an unsigned preview, use the commands in this section and the files attached to that exact preview tag.
+Choose **Add repository** and select an existing Git repository. SylvOps records the repository and its current checkout without copying or moving it. The CLI and internal APIs call a registered repository a **Project**.
 
-## Install on Windows
+### 7. Select or create a checkout
 
-Windows packages support x86_64 Windows 10 version 1809 or newer and Windows 11.
+Every registered repository has a root checkout. Work there directly or choose **New checkout** to create an isolated branch and worktree.
 
-1. Download `sylvops-windows-x86_64-setup.exe` and `SHA256SUMS` from the same release.
-2. In PowerShell, verify the checksum and Authenticode signature:
+When creating a checkout, you can base it on the latest default branch, the current checkout, or a custom local ref. Fetching the latest default branch does not switch or rewrite the root checkout. The application calls this a **Checkout**; Git calls it a **worktree**.
 
-   ```powershell
-   $expected = (Select-String -Path .\SHA256SUMS -Pattern 'sylvops-windows-x86_64-setup.exe$').Line.Split()[0]
-   $actual = (Get-FileHash .\sylvops-windows-x86_64-setup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-   if ($actual -ne $expected) { throw 'SylvOps installer checksum mismatch' }
-   (Get-AuthenticodeSignature .\sylvops-windows-x86_64-setup.exe).Status
-   ```
+### 8. Start a session
 
-   The signature status must be `Valid`. The installer and application executable are signed and timestamped; do not run a missing, invalid, or mismatched signature.
-3. Run the installer. It is per-user, needs no administrator privileges, installs under `%LOCALAPPDATA%\Programs\SylvOps`, and adds **SylvOps** to the Start Menu.
-4. Launch **SylvOps** from the Start Menu. The first launch starts the local daemon and opens the native desktop client.
+Select a checkout, choose **New session**, and select a provider:
 
-The installer registers `sylvops.exe` through the current user's Windows App Paths. PowerShell can invoke a CLI command without editing `PATH`:
+- **Shell** starts a normal interactive terminal.
+- **Codex** starts an installed and authenticated Codex CLI.
+- **Claude Code** starts a supported, installed, and authenticated Claude Code CLI.
 
-```powershell
-Start-Process sylvops -ArgumentList 'doctor'
-```
+You can also assign a display name. Advanced provider model, effort, and initial-prompt options are available through the CLI.
 
-If a shell does not resolve App Paths, use `%LOCALAPPDATA%\Programs\SylvOps\sylvops.exe` explicitly.
-The installer also places this guide at `%LOCALAPPDATA%\Programs\SylvOps\README.md`.
+### 9. Open the embedded terminal
 
-## Install on macOS
+Select the session and choose **Open terminal**. The daemon owns the process, so **Leave terminal** and closing the desktop only detach the client. Reopen SylvOps later to attach again. Choose **Stop** only when you want to terminate the session and its complete process tree.
 
-1. Run `uname -m`. Download `sylvops-macos-x86_64.dmg` for `x86_64` (Intel) or `sylvops-macos-aarch64.dmg` for `arm64` (Apple silicon), plus `SHA256SUMS` from the same release.
-2. Verify the selected file. This Apple-silicon example uses the same commands with the Intel filename when appropriate:
+Inactive Codex and Claude Code conversations can resume through a guarded successor session when the provider conversation is verified as resumable.
 
-   ```sh
-   grep 'sylvops-macos-aarch64.dmg$' SHA256SUMS | shasum -a 256 --check -
-   codesign --verify --verbose=2 sylvops-macos-aarch64.dmg
-   xcrun stapler validate sylvops-macos-aarch64.dmg
-   spctl --assess --type open --context context:primary-signature --verbose=4 sylvops-macos-aarch64.dmg
-   ```
+### 10. Optionally connect GitHub
 
-   The DMG and application are Developer ID signed, the application uses the hardened runtime, and the notarization ticket is stapled. Stop if checksum, signature, notarization, or Gatekeeper assessment fails.
-3. Open the DMG and drag **SylvOps** to `/Applications` (or another Applications location you control).
-4. Launch **SylvOps** from Finder. Gatekeeper should accept the normal first launch without an unsigned-application workaround.
+Install and authenticate GitHub CLI outside SylvOps, select a project, and associate it with one of the repository's validated GitHub remotes. The desktop and TUI can then browse Issues and Pull Requests. **Start Work** on an Issue can create an isolated worktree and Codex session while retaining the Issue as its work source.
 
-Advanced CLI users can run `/Applications/SylvOps.app/Contents/MacOS/sylvops` directly.
-The application bundle carries this guide at `/Applications/SylvOps.app/Contents/Resources/README.md`.
+See [GitHub Issues and Pull Requests](https://devemit.github.io/sylvops-docs/github) for setup and security boundaries.
 
-## Install on Linux
+## Clients and session lifecycle
 
-Linux packages support x86_64 graphical Linux systems. Choose one format:
+Run `sylvops` or `sylvops up [PATH]` for the native desktop client. Run `sylvops tui` for the keyboard-first terminal client. Both connect to the same local daemon and show the same workspace, project, checkout, provider, and session state.
 
-- Debian or Ubuntu: download `sylvops-linux-x86_64.deb` and `SHA256SUMS`, then run:
-
-  ```sh
-  grep 'sylvops-linux-x86_64.deb$' SHA256SUMS | sha256sum --check -
-  sudo apt install ./sylvops-linux-x86_64.deb
-  ```
-
-  Launch **SylvOps** from the desktop application menu or run `sylvops`. The Debian package installs `/usr/bin/sylvops`, the icon, desktop entry, and AppStream metadata.
-  It installs this guide at `/usr/lib/sylvops/README.md`.
-
-- No-administrator AppImage: download `sylvops-linux-x86_64.AppImage` and `SHA256SUMS`, then run:
-
-  ```sh
-  grep 'sylvops-linux-x86_64.AppImage$' SHA256SUMS | sha256sum --check -
-  chmod +x sylvops-linux-x86_64.AppImage
-  ./sylvops-linux-x86_64.AppImage
-  ```
-
-  The AppImage is a portable executable: it does not install desktop integration or edit `PATH`. It carries this guide at `usr/lib/sylvops/README.md` inside its package filesystem.
-
-Linux packages do not currently carry a platform package signature. The published checksum and GitHub provenance attestations verify the release bytes. Installed Debian files can later be checked with `sudo dpkg --verify sylvops`.
-
-## Portable fallback
-
-Portable archives are an advanced distribution and recovery path:
-
-- Windows x86_64: `sylvops-windows-x86_64.zip`
-- macOS Intel: `sylvops-macos-x86_64.tar.gz`
-- macOS Apple silicon: `sylvops-macos-aarch64.tar.gz`
-- Linux x86_64: `sylvops-linux-x86_64.tar.gz`
-
-On Windows, verify, extract, and launch without relying on `PATH`:
-
-```powershell
-$archive = 'sylvops-windows-x86_64.zip'
-$expected = (Select-String -Path .\SHA256SUMS -Pattern "$archive$").Line.Split()[0]
-$actual = (Get-FileHash ".\$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actual -ne $expected) { throw 'SylvOps archive checksum mismatch' }
-Expand-Archive -LiteralPath ".\$archive" -DestinationPath .\sylvops-portable
-.\sylvops-portable\sylvops.exe up C:\path\to\repository
-```
-
-The official signed-release Windows ZIP includes `Start-SylvOps.ps1`, `Start SylvOps.cmd`, `QUICKSTART.txt`, and this `README.md`. The unsigned-preview ZIP includes the launchers, `UNSIGNED-PREVIEW.txt`, and this `README.md`, but deliberately omits signed-release instructions.
-
-On macOS Apple silicon, use the following commands; substitute `sylvops-macos-x86_64.tar.gz` on an Intel Mac:
-
-```sh
-grep 'sylvops-macos-aarch64.tar.gz$' SHA256SUMS | shasum -a 256 --check -
-mkdir -p sylvops-portable
-tar -xzf sylvops-macos-aarch64.tar.gz -C sylvops-portable
-./sylvops-portable/sylvops up /path/to/repository
-```
-
-On Linux x86_64:
-
-```sh
-grep 'sylvops-linux-x86_64.tar.gz$' SHA256SUMS | sha256sum --check -
-mkdir -p sylvops-portable
-tar -xzf sylvops-linux-x86_64.tar.gz -C sylvops-portable
-./sylvops-portable/sylvops up /path/to/repository
-```
-
-The macOS portable archives are unsigned. Portable archives do not register an application, add desktop integration, or edit `PATH`; invoke the extracted executable as shown.
-
-This starts the daemon, creates or reuses the `Local` workspace, registers the repository idempotently, and opens the native desktop app. It does not start a shell or agent. `sylvops open .` is a compatibility alias; `sylvops tui` opens the keyboard-first terminal client.
-
-## First run
-
-The desktop supports first launch without a repository through an in-context checklist spanning `Workspace -> Project/root Worktree -> Session`. Completed steps remain visibly marked while the current step opens the focused form it needs:
-
-1. Create a **Workspace**, a local group of repositories to supervise together.
-2. Choose an existing Git repository. SylvOps registers it as a **Project** and records its current checkout as the root **Worktree**; it does not copy or move the repository.
-3. Choose the root Worktree (or later create a managed Worktree), then choose **Start shell** or select Codex and choose **Start Codex**. If discovery reports that Codex is missing or logged out, install or authenticate Codex outside SylvOps and choose **Check again**. Shell remains available without Codex.
-4. Choose **Open terminal** to attach. Closing or detaching the desktop does not stop the daemon-owned session.
-
-The first Codex session is created only after the visible action in step 3; SylvOps never launches an agent just because the application opened.
-
-## Updates and rollback
-
-These update controls apply only to official signed application releases. Unsigned previews fail closed for signed-update discovery and must be replaced by explicitly installing a later preview or building a newer revision from source.
-
-In **Settings -> Updates**, use the single available update action: **Check again**, **Download verified upgrade**, or **Install update**, depending on the current status. The desktop shows the target version, human-readable download size, and bounded release notes. Periodic checks are on by default at a bounded 24-hour interval and can be disabled with **Periodic checks: Off**. Checks read signed metadata; downloads and installation always require visible user actions.
-
-The equivalent CLI flow is:
-
-```text
-sylvops update check
-sylvops update download
-sylvops update status
-sylvops update install
-```
-
-Installation defers while sessions are active. To override that protection, confirm every session named by the blocked response by repeating `--confirm-active-session <SESSION_ID>` on `sylvops update install`. The named sessions and their complete process trees will stop.
-
-Before replacement, SylvOps retains the previous package and a compatible database snapshot. It then checks the installed version, IPC protocol, database startup, executable/package identity, and desktop relaunch. Windows also checks Authenticode identity, macOS checks the bundle and Developer ID team, and Linux checks the active AppImage or Debian-owned files and desktop integration. If health fails or the helper is interrupted, SylvOps performs one rollback and relaunches the previous version. Run `sylvops update status` to see whether the current state is installed, rolled back, or failed; there is no separate manual rollback command.
-
-## Uninstall and remove user data
-
-Normal uninstall removes application files and OS integration but preserves configuration, session data, repositories, worktrees, and branches:
-
-- Windows: open **Installed apps**, uninstall **SylvOps**, or run `%LOCALAPPDATA%\Programs\SylvOps\uninstall.exe`.
-- Windows unsigned preview: stop SylvOps, then remove `%LOCALAPPDATA%\SylvOps\bin\sylvops.exe`; no Start Menu or uninstall registration was created.
-- macOS: remove `/Applications/SylvOps.app` (or the Applications location chosen during installation).
-- Debian or Ubuntu: run `sudo apt remove sylvops`.
-- AppImage or portable archive: remove the downloaded file or extracted application directory.
-
-SylvOps-owned data uses these paths:
-
-- Windows data and runtime: `%LOCALAPPDATA%\SylvOps` and `%LOCALAPPDATA%\SylvOps\run`; configuration: `%APPDATA%\SylvOps`.
-- macOS and Linux data: `$XDG_DATA_HOME/sylvops`, or `~/.local/share/sylvops` when `XDG_DATA_HOME` is unset.
-- macOS and Linux configuration: `$XDG_CONFIG_HOME/sylvops`, or `~/.config/sylvops` when `XDG_CONFIG_HOME` is unset.
-- macOS and Linux runtime: `$XDG_RUNTIME_DIR/sylvops` when set, otherwise the data directory's `run` subdirectory.
-
-To remove that data deliberately, first stop every session, then use **Settings -> Advanced -> Safety and data -> Remove SylvOps user data** or:
-
-```text
-sylvops data remove --confirm "DELETE SYLVOPS USER DATA"
-```
-
-The exact phrase is required. The daemon refuses removal while sessions are active, shuts down before deletion, revalidates only SylvOps-owned paths, and preserves registered or structurally discovered repositories, worktrees, and Git branches. Partial removal can be retried with the same action.
-
-## Troubleshooting
-
-- **Provider discovery:** run `sylvops provider probe codex` or `sylvops provider probe claude`. Missing installation, old version, unsupported authentication, and logged-out results remain distinct. Install, update, or sign in to the provider outside SylvOps; SylvOps never performs those actions.
-- **Daemon startup:** launch the installed application or run `sylvops daemon start`, then `sylvops daemon status`. If startup still fails, run `sylvops doctor` from the same installation.
-- **Mixed versions:** compare `sylvops --version` with the daemon version printed by `sylvops daemon status` or `sylvops doctor`. If they differ, run `sylvops daemon stop`, then reopen the intended installed application. For a portable copy, invoke that copy explicitly so an older executable on `PATH` is not selected.
-- **Package verification:** never open a file that fails `SHA256SUMS`. Official Windows releases must also report a valid Authenticode signature, while an unsigned preview makes no publisher-trust claim and must display its warning. Official macOS packages must pass `codesign`, `stapler`, and Gatekeeper checks. An installed Debian package can be checked with `sudo dpkg --verify sylvops`.
-- **Upgrade failure:** run `sylvops update status`. A failed health check should report that the previous version was restored; the same failed target is not retried in a loop.
-- **Diagnostics:** `sylvops doctor` checks local state, Git, daemon version/protocol/database health, provider availability, and PTY lifecycle. Its process output is bounded and redacted: it does not print credentials or environment values. Share only the version, platform, categorical status, and redacted logs.
+The daemon owns every mutable PTY session. Clients attach and detach; they do not adopt agent processes or mutate Git directly. Terminal scrollback and IPC messages are bounded, and unknown protocol, hook, and approval types fail closed.
 
 ## Build from source
 
-To build from source, install stable Rust 1.88 or newer, Git, and the platform C toolchain:
+Install stable Rust 1.88 or newer, Git, and your platform's C toolchain:
 
 ```text
 git clone https://github.com/devemit/sylvops.git
@@ -230,122 +128,23 @@ cd sylvops
 cargo build --release -p sylvops-cli
 ```
 
-The executable is written to `target/release/sylvops` (`sylvops.exe` on Windows):
+The executable is written to `target/release/sylvops` (`target\release\sylvops.exe` on Windows). Launch it against the current repository with:
 
-```text
+```sh
 ./target/release/sylvops up .
 ```
 
-On Windows, use `target\release\sylvops.exe` from PowerShell. Maintainers can build the ordinary portable ZIP with `powershell -File scripts/package-windows.ps1` or the warning-bearing unsigned-preview ZIP with `powershell -File scripts/package-windows-preview.ps1`; native Windows, macOS, and Linux package workflows are documented in [docs/development/releasing.md](docs/development/releasing.md). Generated packages are intentionally excluded from Git.
+On Windows, run:
 
-The repository now contains a **cross-platform application-release baseline**. It includes:
-
-- versioned, length-prefixed MessagePack framing;
-- authenticated local Unix-socket and Windows named-pipe control transport;
-- an authoritative daemon with concurrent client handling;
-- an embedded, checksum-validated SQLite migration and dedicated database actor;
-- versioned TOML configuration with machine-local overrides and atomic writes;
-- startup reconciliation that marks unverifiable active sessions disconnected;
-- read-only registration of Git repositories and their root checkouts;
-- daemon-owned plain-shell PTYs with bounded sequenced scrollback;
-- controller/observer attachment, detach, resize, input, reconnect, and parser snapshots;
-- explicit process-tree termination and persisted exit state;
-- guarded managed-worktree creation, status, and removal;
-- explicit state-bound deletion of inactive Sessions, removal of cleared Projects, and deletion of empty Workspaces without cascading into user content;
-- startup reconciliation for missing and externally discovered worktrees;
-- per-project Git mutation serialization and per-worktree session/removal coordination;
-- a provider adapter registry for plain shells, Codex, and Claude Code, all selectable from the CLI, TUI, and desktop;
-- bounded Codex and Claude discovery, version, and authentication probes;
-- application-owned provider hook settings plus an authenticated loopback hook relay;
-- deterministic attention states, verified provider conversation-ID capture, and guarded Codex and Claude resume;
-- a native, mouse-first desktop client with workspace tabs, guided repository/worktree/session management, responsive resizable navigation, a dominant terminal workspace, session tabs, Changes/Details views, persisted appearance and layout, and daemon-backed terminal attachment;
-- a hierarchical Ratatui mission-control client with an explorer, Terminal/Changes/Details views, a responsive Active Sessions overview, guided forms, keyboard and mouse controls, attention selection, safe embedded terminal rendering, bounded read-only diffs, restored navigation context, and persisted terminal-safe appearance and Cards/List settings;
-- CLI workspace, project, worktree, provider, session, bounded GitHub status/list/view, desktop, and TUI commands.
-
-GitHub CLI connection health, explicit Project-to-remote association, and bounded read-only Issue and Pull Request listing and detail are available through the daemon and CLI without SylvOps storing credentials. The Desktop adds responsive project-level browsing, while the TUI provides the equivalent keyboard-native project modal; both use ephemeral filters and selection, bounded pagination, typed failure recovery, and explicit validated browser opening without requiring a Worktree or Session. Both clients also support guided Issue-driven Start Work, optional Session names, navigation to existing local work, explicit parallel Worktrees, preserved partial-success recovery, Retry Session, and inherited Work Source details. Claude cloud Sessions, background-agent management, Remote Control, plugins and enterprise authentication, GitHub mutations and Pull Request checkout/review flows, background polling, notifications, remote execution, file finding, and Git grep remain planned. SylvOps never copies or stores provider or GitHub credentials.
-
-The Windows implementation contains a Win32 ConPTY launcher that supplies both the pseudoconsole and kill-on-close Job Object through `STARTUPINFOEX` at process creation. The prior cross-platform baseline passed the complete hosted Windows, Linux, and macOS quality gates; the current tree must pass those gates before `v0.1.0` is promoted.
-
-### TUI essentials
-
-- The explorer shows the active workspace hierarchy: project → worktree → session.
-- `Tab` switches between Explorer and Main; arrows navigate and collapse/expand.
-- `1`, `2`, `3`, and `4` open Terminal, Changes, Details, and Active Sessions. A fresh TUI opens Active Sessions; the last view is restored after that.
-- Active Sessions shows only Starting, Running, and Needs feedback Sessions across the open Workspace. Starting and Running use an animated ring, while Sessions waiting for input use a subtle attention-colored surface in Cards and List. Only Needs feedback Sessions appear in the input-needed banner and Shift+A navigation. Cards use two columns when each card is at least 36 columns wide; List is always one column. Arrows and the wheel move selection without attaching, while `Enter` or **Open terminal** attaches explicitly.
-- While the TUI is open, a Session newly entering Needs feedback rings the terminal bell and shows a native Windows notification-area popup. Repeated updates do not repeat the alert; returning to work and then needing input again triggers a new alert. Existing waiting Sessions do not alert on startup. Terminal sound and popup visibility follow the terminal and Windows notification settings. The popup contains only a bounded Session name and no conversation content, and its temporary tray icon is removed when the TUI closes. Other platforms currently receive the terminal bell only.
-- `Enter` explicitly attaches a selected session; `Ctrl+]` detaches without stopping it. While attached, the wheel, Shift+PageUp/Shift+PageDown, and clickable **Older**/**Newer** controls scroll history. Programs requesting mouse input receive wheel events; full-screen programs receive page keys when mouse reporting is unavailable. Shift+Home/Shift+End move through local history, and typing returns to the live row. Observers can inspect local history but cannot send scrolling input to the program.
-- Attached terminal input is delivered in order without blocking screen updates on acknowledgements. Output wakes the TUI immediately, and compatible terminals display each frame and its cursor placement together. Input congestion or delivery failure is reported explicitly; failed delivery requires detach/reattach before continuing.
-- `n` and `r` create and rename in context. `d` names the selected target's action: Stop Session for a live Session, Delete Session for an inactive Session, Remove Worktree, Remove Project, or Delete Workspace. Each removal is inspected before an explicit `y` confirmation; a refusal explains which child, process, or Worktree condition blocks it. `/` searches commands and entities.
-- A Worktree blocked by leftover content opens a scrollable dialog showing up to 10 tracked, untracked, or ignored paths. An entry such as `target/` can represent an entire folder. Review and remove or move that content yourself before retrying; SylvOps does not clean it automatically.
-- `s`, the header Settings target, or **Command: open settings** opens the distinct settings mode. Theme, Cards/List presentation, and Comfortable/Compact density changes preview immediately; **Apply** persists them, while `Esc` or **Cancel** restores the complete pre-open TUI settings.
-- Named themes extend their background into compatible terminal padding, including Windows Terminal, and restore the terminal profile background when the TUI exits. Terminal-controlled tabs, title bars, and native window borders keep their own appearance.
-- The footer shows the running build or preview version at the right edge when the terminal is wide enough, without displacing contextual actions.
-- Mouse selection, tabs, actions, forms, confirmations, and wheel navigation are supported. Attached terminal wheel events follow the program's requested mouse mode, with page-key fallback for full-screen programs without mouse reporting; terminal click and drag forwarding remain deferred.
-
-### Desktop essentials
-
-- `sylvops` or `sylvops up [PATH]` opens the native window; closing it leaves daemon-owned sessions running.
-- The top bar switches workspaces and uses a borderless **+** control to create one. Wide windows show three independently resizable columns—**Repositories**, **Checkouts**, and **Sessions**—beside the large Terminal/Changes/Details workspace. Compact windows use a tabbed navigator, and narrow windows switch between Navigator and Main.
-- Session rows keep their written state inline with the name, and navigator/footer regions retain stable positions as selection and context change.
-- Select a session once to open it, then click **Open terminal** to interact. The wheel, history scrollbar, or Shift+PageUp/Shift+PageDown reads terminal history; **Latest**, Shift+End, clicking to type, or typing returns to the live input row. **Leave terminal** or `Ctrl+]` disconnects the desktop without stopping the session.
-- The footer shows the real build or preview tag, local-daemon health, responsive Workspace/Repository/Checkout/Session context, current view, and key hints.
-- Settings is one centered, scrollable modal at every window size. **Essentials** contains signature themes, density, terminal typeface, 10–22 px text sizing, and Block/Line cursor. **Updates** exposes one context-sensitive action. Collapsed **Advanced** contains Classic themes, layout reset, and protected data-removal controls.
-- The desktop interface bundles JetBrains Mono for consistent developer-focused typography across Windows, Linux, and macOS; terminal text keeps its independent font preference.
-- Details shows dates in the operating-system locale and timezone and labels repository locations **Path**. IDs, raw timestamps, process/transport terms, and exact quantities stay under expandable **Technical details** with bounded copy actions. Session-record retention and non-persisted terminal output are described separately.
-- Universal controls such as add, refresh, full screen, navigator visibility, and close use the bundled line icons. Named and risky actions retain visible text, including **Start shell**, **Start Codex**, **Open terminal**, **Leave terminal**, and **Stop session**. The narrow exception is the selected entity's trash-icon removal control: its accessible name and hover/focus tooltip say **Delete workspace**, **Remove repository**, **Delete checkout**, or **Delete session**, and its confirmation remains fully textual. Blocked controls stay actionable so they can explain the required leaf-first cleanup. The terminal TUI remains available as a keyboard-first alternative.
-
-## Leaf-first removal
-
-Stop Session is separate from removal: it ends the process tree but retains the Session record and history. The four removal operations inspect current daemon state before presenting a target-specific confirmation, revalidate that state during execution, and have no undo. In the desktop, confirm in the textual dialog; in the TUI, press `d` on the selected entity and then `y`; in the CLI, pass the explicit `--confirm` flag shown below.
-
-| Operation | CLI | Eligibility and filesystem boundary |
-|---|---|---|
-| Delete Session | `sylvops session delete <session-id> --confirm` | The Session must be inactive with no owned process tree. Its retained SylvOps history is removed; its Worktree and files are preserved. |
-| Remove Project | `sylvops project remove <project-id> --confirm` | The Project must have no Sessions or active managed non-root Worktrees. It is unregistered; the repository, root checkout, Git data, and external Worktrees are preserved. |
-| Remove Worktree | `sylvops worktree remove <worktree-id> --confirm` | The Worktree must be clean, active, managed, non-root, and have no active Sessions. This is the only operation that removes a working directory, and its Git branch is preserved. |
-| Delete Workspace | `sylvops workspace delete <workspace-id> --confirm` | The Workspace must contain no Projects. Only the group is deleted; repositories, Worktrees, branches, and files are preserved. |
-
-## Current commands
-
-```text
-sylvops
-sylvops up .
-sylvops open .
-sylvops open . --provider codex --prompt "..."
-sylvops open . --provider claude --prompt "..."
-sylvops doctor
-sylvops update check
-sylvops update download
-sylvops update status
-sylvops update cancel
-sylvops update install
-sylvops update install --confirm-active-session <SESSION_ID>
-sylvops data remove --confirm "DELETE SYLVOPS USER DATA"
-sylvops daemon start
-sylvops daemon status
-sylvops workspace add my-workspace
-sylvops workspace delete <workspace-id> --confirm
-sylvops project add --workspace <workspace-id> <repository-path>
-sylvops project remove <project-id> --confirm
-sylvops worktree create --project <project-id> --branch feature/example --base HEAD
-sylvops worktree status <worktree-id>
-sylvops provider list
-sylvops provider probe codex
-sylvops provider probe claude
-sylvops session create --worktree <worktree-id> --provider shell
-sylvops session create --worktree <worktree-id> --provider codex --model <model> --effort high --prompt "..."
-sylvops session create --worktree <worktree-id> --provider claude --model <model> --effort high --prompt "..."
-sylvops session attach <session-id>
-sylvops session resume <session-id>
-sylvops session stop <session-id>
-sylvops session delete <session-id> --confirm
-sylvops worktree remove <worktree-id> --confirm
-sylvops tui
-sylvops snapshot
-sylvops daemon stop
+```powershell
+.\target\release\sylvops.exe up .
 ```
 
-## Developer commands
+Platform packaging and release procedures are documented in [docs/development/releasing.md](docs/development/releasing.md).
+
+## Development
+
+Before submitting a change, run the workspace quality gates:
 
 ```text
 cargo fmt --all -- --check
@@ -353,8 +152,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 ```
 
-The default suite is offline. The explicit real-Claude release smoke requires a pre-authenticated host and is documented in [the testing guide](docs/development/testing.md); it is never enabled by the commands above.
+Read the [contributing guide](https://devemit.github.io/sylvops-docs/contributing), [MVP definition](docs/product/mvp.md), and [process architecture](docs/architecture/process-model.md) for project expectations and design context.
 
-See [the MVP definition](docs/product/mvp.md) and [process architecture](docs/architecture/process-model.md).
+## License
 
-The standard Windows target requires Visual C++ Build Tools and the Windows SDK. See [the PTY architecture](docs/architecture/pty.md) for the atomic ConPTY/Job Object boundary.
+SylvOps is released under the [MIT License](LICENSE).
