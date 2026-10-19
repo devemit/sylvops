@@ -3,13 +3,14 @@
 use std::{ffi::OsString, path::Path, process::Command, time::Duration};
 
 use sylvops_core::{
-    domain::ProviderKind,
+    domain::{ProviderKind, Session},
     github::{
         GitHubItemKind, GitHubItemNumber, GitHubLabelName, GitHubListFilters, GitHubListQuery,
         GitHubPageSize, GitHubSearchText, GitRemoteName, StartWorkBranch, StartWorkFailureKind,
         StartWorkInstructions, StartWorkOutcome,
     },
-    protocol::{ClientRequest, DaemonResponse},
+    protocol::{ClientRequest, DaemonResponse, SessionResumeOutcome},
+    session_state::SessionLifecycle,
 };
 use sylvops_daemon::{client::DaemonClient, daemon, runtime::RuntimePaths};
 use sylvops_test_support::{AbortOnDropTask, TemporaryRepository, git_branch_exists};
@@ -311,6 +312,58 @@ async fn scenario() {
         response => panic!("unexpected snapshot response: {response:?}"),
     };
     assert_eq!(snapshot.work_sources, vec![expected_source.clone()]);
+    let source_session = wait_for_session(&client, session_id, |session| {
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.external_session_id.is_some()
+    })
+    .await;
+    client
+        .request(&ClientRequest::StopSession { session_id })
+        .await
+        .unwrap();
+    wait_for_session(&client, session_id, |session| {
+        session.status.lifecycle == SessionLifecycle::Terminated && session.process_id.is_none()
+    })
+    .await;
+    let resumed_session = match client
+        .request(&ClientRequest::ResumeSession {
+            session_id,
+            columns: 100,
+            rows: 30,
+        })
+        .await
+        .unwrap()
+    {
+        DaemonResponse::SessionResumed {
+            predecessor_session_id: Some(predecessor_session_id),
+            session,
+            outcome: SessionResumeOutcome::CreatedSuccessor,
+            ..
+        } => {
+            assert_eq!(predecessor_session_id, session_id);
+            session
+        }
+        response => panic!("stopped Work Source Session did not resume: {response:?}"),
+    };
+    assert_eq!(resumed_session.worktree_id, source_session.worktree_id);
+    assert_eq!(resumed_session.provider_kind, source_session.provider_kind);
+    assert_eq!(
+        resumed_session.provider_profile_id,
+        source_session.provider_profile_id
+    );
+    assert_eq!(resumed_session.display_name, source_session.display_name);
+    assert_eq!(
+        resumed_session.external_session_id,
+        source_session.external_session_id
+    );
+    assert_eq!(
+        client
+            .request(&ClientRequest::GetWorkSource { worktree_id })
+            .await
+            .unwrap(),
+        DaemonResponse::WorkSource(Some(expected_source.clone()))
+    );
+    let resumed_session_id = resumed_session.id;
     let parallel_preparation = prepare(&client, project_id).await;
     assert_eq!(
         parallel_preparation.existing_work,
@@ -553,7 +606,9 @@ async fn scenario() {
         response => panic!("unexpected restored association response: {response:?}"),
     };
     client
-        .request(&ClientRequest::StopSession { session_id })
+        .request(&ClientRequest::StopSession {
+            session_id: resumed_session_id,
+        })
         .await
         .unwrap();
     client
@@ -708,6 +763,36 @@ async fn scenario() {
         .await
         .unwrap();
     restarted.join().await.unwrap().unwrap();
+}
+
+async fn wait_for_session(
+    client: &DaemonClient,
+    session_id: sylvops_core::ids::SessionId,
+    predicate: impl Fn(&Session) -> bool,
+) -> Session {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_observed = None;
+    loop {
+        if let DaemonResponse::Snapshot(snapshot) = client
+            .request(&ClientRequest::GetSnapshot)
+            .await
+            .expect("snapshot response")
+            && let Some(session) = snapshot
+                .sessions
+                .into_iter()
+                .find(|session| session.id == session_id)
+        {
+            if predicate(&session) {
+                return session;
+            }
+            last_observed = Some(session);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Session status timeout; last observed: {last_observed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn prepare(

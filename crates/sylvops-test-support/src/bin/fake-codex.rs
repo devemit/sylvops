@@ -34,17 +34,10 @@ fn run() -> io::Result<()> {
 
     let resume_index = arguments.iter().position(|argument| argument == "resume");
     let resumed = resume_index.is_some();
-    let external_id = if let Some(resume_index) = resume_index {
-        arguments
-            .get(resume_index + 1)
-            .cloned()
-            .unwrap_or_else(|| "fake-missing".into())
-    } else {
-        format!(
-            "fake-{}",
-            env::var("SYLVOPS_SESSION_ID").unwrap_or_else(|_| "session".into())
-        )
-    };
+    let external_id = fake_external_id(&arguments, resume_index);
+    if resumed && fail_next_resume()? {
+        return Err(io::Error::other("injected resumed-process launch failure"));
+    }
     emit_hook(
         "SessionStart",
         &external_id,
@@ -140,6 +133,35 @@ fn invalidate_codex_home_if_requested() -> io::Result<()> {
         ));
     }
     std::fs::rename(home, invalidated)
+}
+
+fn fail_next_resume() -> io::Result<bool> {
+    let Some(home) = env::var_os("CODEX_HOME").map(std::path::PathBuf::from) else {
+        return Ok(false);
+    };
+    let marker = home.join(".fake-codex-fail-next-resume");
+    match std::fs::remove_file(marker) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn fake_external_id(arguments: &[String], resume_index: Option<usize>) -> String {
+    resume_index.map_or_else(
+        || {
+            format!(
+                "fake-{}",
+                env::var("SYLVOPS_SESSION_ID").unwrap_or_else(|_| "session".into())
+            )
+        },
+        |resume_index| {
+            arguments
+                .get(resume_index + 1)
+                .cloned()
+                .unwrap_or_else(|| "fake-missing".into())
+        },
+    )
 }
 
 fn initial_prompt(arguments: &[String]) -> Option<&str> {

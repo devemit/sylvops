@@ -13938,7 +13938,7 @@ mod tests {
 
     #[test]
     fn failed_successor_creation_keeps_the_source_history_selected() {
-        let (bridge, _harness) = Bridge::harness();
+        let (bridge, mut harness) = Bridge::harness();
         let mut app = DesktopApp::with_bridge(bridge);
         let source = session(SessionLifecycle::Exited, Some("verified-id"));
         app.snapshot.sessions.push(source.clone());
@@ -13963,6 +13963,50 @@ mod tests {
         assert!(app.error.as_deref().is_some_and(|message| {
             message.contains("The resumed Provider process could not be started")
         }));
+
+        let mut failed_leaf = source.clone();
+        failed_leaf.id = SessionId::new();
+        failed_leaf.created_at = source.created_at + 1;
+        failed_leaf.status.lifecycle = SessionLifecycle::Failed;
+        failed_leaf.exit_code = None;
+        failed_leaf.failure_reason = Some("provider_launch_failed".into());
+        app.handle_daemon_event(DaemonEvent::SessionStatusChanged {
+            revision: 2,
+            session: failed_leaf.clone(),
+        });
+        assert_eq!(
+            harness.take_request(),
+            (Operation::RefreshSnapshot, ClientRequest::GetSnapshot)
+        );
+        let mut authoritative = app.snapshot.clone();
+        authoritative
+            .session_lineage
+            .push(sylvops_core::domain::SessionLineageLink {
+                predecessor_session_id: source.id,
+                successor_session_id: failed_leaf.id,
+            });
+        app.handle_response(
+            Operation::RefreshSnapshot,
+            DaemonResponse::Snapshot(authoritative),
+        );
+
+        assert!(
+            app.snapshot
+                .sessions
+                .iter()
+                .any(|session| session.id == source.id)
+        );
+        assert!(app.snapshot.session_lineage.iter().any(|link| {
+            link.predecessor_session_id == source.id && link.successor_session_id == failed_leaf.id
+        }));
+        assert!(!sylvops_core::domain::session_record_can_resume(
+            &source,
+            &app.snapshot.sessions
+        ));
+        assert!(sylvops_core::domain::session_record_can_resume(
+            &failed_leaf,
+            &app.snapshot.sessions
+        ));
     }
 
     #[test]

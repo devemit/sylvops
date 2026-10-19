@@ -216,6 +216,13 @@ fn run() -> io::Result<()> {
                 println!("FAKE_CLAUDE_DUPLICATE_HOOK");
             }
             "unexpected-exit" => std::process::exit(17),
+            "clean-exit" => {
+                emit_stop_hook(&external_id, "clean-exit", false, false)?;
+                emit_hook("SessionEnd", &external_id)?;
+                println!("FAKE_CLAUDE_FINISHED");
+                io::stdout().flush()?;
+                return Ok(());
+            }
             "session-end" => {
                 emit_hook("SessionEnd", &external_id)?;
                 println!("FAKE_CLAUDE_SESSION_END");

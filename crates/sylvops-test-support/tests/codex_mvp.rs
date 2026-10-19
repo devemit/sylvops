@@ -128,16 +128,18 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
             rows: 24,
         })
         .await
-        .expect("missing Conversation identity response")
+        .expect("unsupported Provider response")
     {
         DaemonResponse::SessionResumeUnavailable(unavailable) => {
             assert_eq!(unavailable.leaf_session.id, shell_session_id);
             assert_eq!(
                 unavailable.reason,
-                sylvops_core::protocol::SessionResumeRefusal::MissingConversationIdentity
+                sylvops_core::protocol::SessionResumeRefusal::ProviderDoesNotSupportResume {
+                    provider: ProviderKind::Shell
+                }
             );
         }
-        response => panic!("missing identity did not return a typed refusal: {response:?}"),
+        response => panic!("plain shell did not return its typed refusal: {response:?}"),
     }
 
     let terminated_session_id = create_codex_session(&client, worktree_id).await;
@@ -264,6 +266,11 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         unexpected_exit.failure_reason.as_deref(),
         Some("process_exit_without_completion")
     );
+    std::fs::write(
+        codex_home.join(".fake-codex-fail-next-resume"),
+        b"fail once",
+    )
+    .expect("install one-shot resumed-process failure");
     let failed_successor = match client
         .request(&ClientRequest::ResumeSession {
             session_id: unexpected_exit_id,
@@ -280,13 +287,64 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         } => session,
         response => panic!("failed Conversation did not resume: {response:?}"),
     };
-    client
-        .request(&ClientRequest::StopSession {
-            session_id: failed_successor.id,
+    let failed_successor = wait_for_session(&client, failed_successor.id, |session| {
+        session.status.lifecycle == SessionLifecycle::Failed && session.process_id.is_none()
+    })
+    .await;
+    assert_eq!(failed_successor.worktree_id, unexpected_exit.worktree_id);
+    assert_eq!(
+        failed_successor.provider_kind,
+        unexpected_exit.provider_kind
+    );
+    assert_eq!(
+        failed_successor.provider_profile_id,
+        unexpected_exit.provider_profile_id
+    );
+    assert_eq!(failed_successor.display_name, unexpected_exit.display_name);
+    assert_eq!(
+        failed_successor.external_session_id,
+        unexpected_exit.external_session_id
+    );
+    assert_eq!(owned_hook_profile_count(&codex_home), 0);
+    let failed_launch_history = match client
+        .request(&ClientRequest::GetSnapshot)
+        .await
+        .expect("failed successor history response")
+    {
+        DaemonResponse::Snapshot(snapshot) => snapshot,
+        response => panic!("unexpected failed successor history response: {response:?}"),
+    };
+    assert!(failed_launch_history.session_lineage.iter().any(|link| {
+        link.predecessor_session_id == unexpected_exit_id
+            && link.successor_session_id == failed_successor.id
+    }));
+    let retry_successor = match client
+        .request(&ClientRequest::ResumeSession {
+            session_id: unexpected_exit_id,
+            columns: 80,
+            rows: 24,
         })
         .await
-        .expect("stop failed-session successor");
-    wait_for_session(&client, failed_successor.id, |session| {
+        .expect("failed successor retry response")
+    {
+        DaemonResponse::SessionResumed {
+            predecessor_session_id: Some(predecessor_session_id),
+            session,
+            outcome: SessionResumeOutcome::CreatedSuccessor,
+            ..
+        } => {
+            assert_eq!(predecessor_session_id, failed_successor.id);
+            session
+        }
+        response => panic!("failed successor was not retryable from the leaf: {response:?}"),
+    };
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: retry_successor.id,
+        })
+        .await
+        .expect("stop retried successor");
+    wait_for_session(&client, retry_successor.id, |session| {
         session.status.lifecycle == SessionLifecycle::Terminated
     })
     .await;
@@ -505,6 +563,14 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
             .display_name,
         source_history.display_name
     );
+    let resumed_profile = codex_home.join(format!("sylvops-{resumed_id}.config.toml"));
+    let resumed_profile_source =
+        std::fs::read_to_string(&resumed_profile).expect("resumed Codex profile");
+    std::fs::write(
+        &resumed_profile,
+        with_codex_trust(&resumed_profile_source, &repository),
+    )
+    .expect("Codex adds trust to the resumed Session profile");
     attach(&client, resumed_id).await;
     client
         .request(&ClientRequest::SessionInput {
@@ -514,6 +580,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("resumed finish input");
     wait_for_session(&client, resumed_id, |session| session.process_id.is_none()).await;
+    assert!(!resumed_profile.exists());
     assert_eq!(owned_hook_profile_count(&codex_home), 0);
 
     exercise_codex_cleanup_refusal(&client, worktree_id, &codex_home, &repository).await;

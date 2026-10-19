@@ -5,7 +5,7 @@ use std::{ffi::OsString, path::Path, process::Command, time::Duration};
 use rusqlite::OptionalExtension;
 use sylvops_core::{
     domain::{ProviderKind, Session},
-    ids::SessionId,
+    ids::{SessionId, WorktreeId},
     protocol::{ClientRequest, DaemonEvent, DaemonResponse, SessionResumeOutcome},
     session_state::{
         AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
@@ -1026,13 +1026,28 @@ async fn late_session_start_recovers_after_warning() {
         .expect("lineage Claude resume response")
     {
         DaemonResponse::SessionResumed {
+            predecessor_session_id: Some(predecessor_session_id),
             session,
             outcome: SessionResumeOutcome::CreatedSuccessor,
             ..
-        } => session,
+        } => {
+            assert_eq!(predecessor_session_id, resumed.id);
+            session
+        }
         response => panic!("terminal Claude leaf did not create a successor: {response:?}"),
     };
     assert_ne!(second_resumed.id, resumed.id);
+    assert_eq!(second_resumed.provider_kind, ProviderKind::Claude);
+    assert_eq!(second_resumed.worktree_id, resumed.worktree_id);
+    assert_eq!(
+        second_resumed.provider_profile_id,
+        resumed.provider_profile_id
+    );
+    assert_eq!(second_resumed.display_name, resumed.display_name);
+    assert_eq!(
+        second_resumed.external_session_id.as_deref(),
+        Some(external_id.as_str())
+    );
     client
         .request(&ClientRequest::StopSession {
             session_id: second_resumed.id,
@@ -1043,6 +1058,45 @@ async fn late_session_start_recovers_after_warning() {
         session.status.lifecycle == SessionLifecycle::Terminated
     })
     .await;
+
+    std::fs::remove_file(&session_start_fixture).expect("restore immediate SessionStart fixture");
+    let exited_source = create_claude_session(&client, worktree_id, "clean-exit Claude").await;
+    let exited_source = wait_for_session(&client, exited_source.id, |session| {
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.external_session_id.is_some()
+    })
+    .await;
+    let exited_external_id = exited_source
+        .external_session_id
+        .clone()
+        .expect("clean-exit Claude identity");
+    attach(&client, exited_source.id, 0).await;
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id: exited_source.id,
+            bytes: input_line("clean-exit"),
+        })
+        .await
+        .expect("clean Claude exit input");
+    wait_for_session(&client, exited_source.id, |session| {
+        session.status.lifecycle == SessionLifecycle::Exited && session.process_id.is_none()
+    })
+    .await;
+    let exited_successor = resume_created_successor(&client, exited_source.id).await;
+    assert_inherited_claude_resume(&exited_source, &exited_successor, &exited_external_id);
+    stop_session(&client, exited_successor.id).await;
+
+    let disconnected_source =
+        create_claude_session(&client, worktree_id, "disconnected Claude").await;
+    let disconnected_source = wait_for_session(&client, disconnected_source.id, |session| {
+        session.status.lifecycle == SessionLifecycle::Running
+            && session.external_session_id.is_some()
+    })
+    .await;
+    let disconnected_external_id = disconnected_source
+        .external_session_id
+        .clone()
+        .expect("disconnected Claude identity");
 
     client
         .request(&ClientRequest::ShutdownDaemon)
@@ -1057,6 +1111,18 @@ async fn late_session_start_recovers_after_warning() {
         managed_claude_settings(&paths.runtime_directory),
         Vec::<std::path::PathBuf>::new()
     );
+    let disconnected_status = serde_json::to_string(&sylvops_core::session_state::SessionStatus {
+        lifecycle: SessionLifecycle::Disconnected,
+        ..sylvops_core::session_state::SessionStatus::default()
+    })
+    .unwrap();
+    rusqlite::Connection::open(&paths.database)
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET status_json = ?2, process_id = NULL WHERE id = ?1",
+            rusqlite::params![disconnected_source.id.to_string(), disconnected_status],
+        )
+        .unwrap();
 
     let restart_paths = paths.clone();
     let mut restart_task = tokio::spawn(async move { daemon::run(restart_paths).await });
@@ -1076,6 +1142,18 @@ async fn late_session_start_recovers_after_warning() {
         session.id == failed_session_id
             && session.external_session_id.as_deref() == Some(external_id.as_str())
     }));
+    assert!(snapshot.sessions.iter().any(|session| {
+        session.id == disconnected_source.id
+            && session.status.lifecycle == SessionLifecycle::Disconnected
+            && session.external_session_id.as_deref() == Some(disconnected_external_id.as_str())
+    }));
+    let disconnected_successor = resume_created_successor(&restarted, disconnected_source.id).await;
+    assert_inherited_claude_resume(
+        &disconnected_source,
+        &disconnected_successor,
+        &disconnected_external_id,
+    );
+    stop_session(&restarted, disconnected_successor.id).await;
     let third_resumed = match restarted
         .request(&first_resume)
         .await
@@ -1108,6 +1186,83 @@ async fn late_session_start_recovers_after_warning() {
         .expect("restart daemon shutdown timeout")
         .expect("restart daemon task")
         .expect("restart daemon result");
+}
+
+async fn create_claude_session(
+    client: &DaemonClient,
+    worktree_id: WorktreeId,
+    display_name: &str,
+) -> Session {
+    match client
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Claude,
+            display_name: Some(display_name.into()),
+            model: None,
+            effort: None,
+            initial_prompt: None,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("Claude Session response")
+    {
+        DaemonResponse::SessionCreated { session, .. } => session,
+        response => panic!("unexpected Claude Session response: {response:?}"),
+    }
+}
+
+async fn resume_created_successor(client: &DaemonClient, session_id: SessionId) -> Session {
+    match client
+        .request(&ClientRequest::ResumeSession {
+            session_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .expect("Claude resume response")
+    {
+        DaemonResponse::SessionResumed {
+            session,
+            outcome: SessionResumeOutcome::CreatedSuccessor,
+            ..
+        } => session,
+        response => panic!("Claude terminal Session did not create a successor: {response:?}"),
+    }
+}
+
+fn assert_inherited_claude_resume(
+    source: &Session,
+    successor: &Session,
+    external_session_id: &str,
+) {
+    assert_ne!(successor.id, source.id);
+    assert_eq!(successor.worktree_id, source.worktree_id);
+    assert_eq!(successor.provider_kind, source.provider_kind);
+    assert_eq!(successor.provider_profile_id, source.provider_profile_id);
+    assert_eq!(successor.display_name, source.display_name);
+    assert_eq!(
+        successor.external_session_id.as_deref(),
+        Some(external_session_id)
+    );
+    let arguments: Vec<String> =
+        serde_json::from_str(&successor.arguments_json).expect("Claude resume arguments");
+    assert!(
+        arguments
+            .windows(2)
+            .any(|arguments| { arguments[0] == "--resume" && arguments[1] == external_session_id })
+    );
+}
+
+async fn stop_session(client: &DaemonClient, session_id: SessionId) {
+    client
+        .request(&ClientRequest::StopSession { session_id })
+        .await
+        .expect("stop Claude Session response");
+    wait_for_session(client, session_id, |session| {
+        session.status.lifecycle == SessionLifecycle::Terminated && session.process_id.is_none()
+    })
+    .await;
 }
 
 fn managed_claude_settings(directory: &Path) -> Vec<std::path::PathBuf> {
