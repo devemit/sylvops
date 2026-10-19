@@ -287,8 +287,9 @@ struct DesktopApp {
     install_request: RequestState,
     modal_focus: ModalFocus,
     disclosures: DisclosureState,
-    attention_alerts: Option<sylvops_core::attention::AttentionTracker>,
-    attention_sound: Option<notifications::SoundNotifier>,
+    attention_notifications: notifications::AttentionNotificationAdapter,
+    attention_claim: AttentionClaimState,
+    pending_attention_activation: Option<SessionId>,
     status_animation_started_at: Instant,
     status_animation_phase: f32,
 }
@@ -304,6 +305,14 @@ struct DisclosureState {
 enum RequestState {
     #[default]
     Idle,
+    Pending,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AttentionClaimState {
+    #[default]
+    Idle,
+    Due,
     Pending,
 }
 
@@ -698,6 +707,27 @@ impl DesktopApp {
     }
 
     fn with_bridge(bridge: Bridge) -> Self {
+        Self::with_bridge_and_adapter(
+            bridge,
+            notifications::AttentionNotificationAdapter::system(),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_bridge_and_notifications(
+        bridge: Bridge,
+        channels: impl notifications::NotificationChannels + 'static,
+    ) -> Self {
+        Self::with_bridge_and_adapter(
+            bridge,
+            notifications::AttentionNotificationAdapter::new(channels),
+        )
+    }
+
+    fn with_bridge_and_adapter(
+        bridge: Bridge,
+        attention_notifications: notifications::AttentionNotificationAdapter,
+    ) -> Self {
         let (mut panes, projects) = pane_grid::State::new(DesktopPane::Projects);
         let (worktrees, first) = panes
             .split(pane_grid::Axis::Vertical, projects, DesktopPane::Worktrees)
@@ -764,8 +794,9 @@ impl DesktopApp {
             install_request: RequestState::Idle,
             modal_focus: ModalFocus::Idle,
             disclosures: DisclosureState::default(),
-            attention_alerts: None,
-            attention_sound: notifications::SoundNotifier::new().ok(),
+            attention_notifications,
+            attention_claim: AttentionClaimState::Idle,
+            pending_attention_activation: None,
             status_animation_started_at: Instant::now(),
             status_animation_phase: 0.0,
         }
@@ -783,6 +814,16 @@ impl DesktopApp {
                     / 1.2
                     * std::f32::consts::TAU;
                 self.flush_timers();
+                self.request_attention_notification_claim();
+                if let Some(notification) = self.attention_notifications.take_fallback() {
+                    self.show_attention_notification(&notification);
+                }
+                if let Some(window_id) = self.take_attention_notification_activation() {
+                    return Task::batch([
+                        window::minimize(window_id, false),
+                        window::gain_focus(window_id),
+                    ]);
+                }
                 if self.modal_focus == ModalFocus::Pending {
                     self.modal_focus = ModalFocus::Idle;
                     return widget::operation::focus_next();
@@ -4139,12 +4180,11 @@ impl DesktopApp {
                 providers,
                 desktop_state,
             } => {
-                self.attention_alerts = Some(sylvops_core::attention::AttentionTracker::new(
-                    &snapshot.sessions,
-                ));
                 self.snapshot = snapshot;
                 self.providers = providers;
                 self.connection = ConnectionState::Connected;
+                self.attention_claim = AttentionClaimState::Due;
+                self.request_attention_notification_claim();
                 if let Some(state) = desktop_state {
                     self.apply_desktop_state(state);
                 }
@@ -4177,6 +4217,10 @@ impl DesktopApp {
                 }
                 if let Some(Operation::AcknowledgeAttention(session_id)) = operation {
                     self.attention_acknowledgement_pending.remove(&session_id);
+                }
+                if matches!(operation, Some(Operation::ClaimAttentionNotification)) {
+                    self.attention_claim = AttentionClaimState::Idle;
+                    return;
                 }
                 if matches!(operation, Some(Operation::RefreshSnapshot)) {
                     self.snapshot_pending = false;
@@ -4312,7 +4356,8 @@ impl DesktopApp {
                 {
                     self.acknowledge_visible_attention(session_id);
                 }
-                self.observe_attention();
+                self.attention_claim = AttentionClaimState::Due;
+                self.request_attention_notification_claim();
                 self.request_snapshot();
             }
             DaemonEvent::ProviderHealthChanged { health } => {
@@ -4389,6 +4434,22 @@ impl DesktopApp {
             }))
         );
         match (operation, response) {
+            (
+                Operation::ClaimAttentionNotification,
+                DaemonResponse::AttentionNotificationClaim(claim),
+            ) => {
+                self.attention_claim = AttentionClaimState::Idle;
+                let Some(claim) = claim else {
+                    return;
+                };
+                if let notifications::NotificationDelivery::InClient(notification) =
+                    self.attention_notifications.deliver(&claim)
+                {
+                    self.show_attention_notification(&notification);
+                }
+                self.attention_claim = AttentionClaimState::Due;
+                self.request_attention_notification_claim();
+            }
             (Operation::GetGitHubStatus(expected), DaemonResponse::GitHubStatus(status))
                 if expected == self.selected_project_id =>
             {
@@ -4626,8 +4687,8 @@ impl DesktopApp {
             (Operation::RefreshSnapshot, DaemonResponse::Snapshot(snapshot)) => {
                 self.snapshot_pending = false;
                 self.snapshot = snapshot;
-                self.observe_attention();
                 self.restore_selection();
+                self.resolve_pending_attention_activation();
             }
             (
                 Operation::AcknowledgeAttention(expected_session_id),
@@ -4661,6 +4722,7 @@ impl DesktopApp {
                     *item = workspace;
                 }
                 self.restore_selection();
+                self.resolve_pending_attention_activation();
                 self.request_snapshot();
             }
             (
@@ -5149,6 +5211,10 @@ impl DesktopApp {
                 self.error = Some(contextual_error(Some(operation), failure.message()));
             }
             (operation, DaemonResponse::Error(failure)) => {
+                if matches!(operation, Operation::ClaimAttentionNotification) {
+                    self.attention_claim = AttentionClaimState::Idle;
+                    return;
+                }
                 let message = bounded_redacted_diagnostic(&failure.message);
                 let github_operation = matches!(
                     operation,
@@ -7642,18 +7708,79 @@ impl DesktopApp {
         self.status_animation_phase
     }
 
-    fn observe_attention(&mut self) {
-        let Some(alerts) = &mut self.attention_alerts else {
-            self.attention_alerts = Some(sylvops_core::attention::AttentionTracker::new(
-                &self.snapshot.sessions,
-            ));
+    fn request_attention_notification_claim(&mut self) {
+        if self.attention_claim != AttentionClaimState::Due
+            || !matches!(self.connection, ConnectionState::Connected)
+        {
+            return;
+        }
+        if self.bridge.request(
+            Operation::ClaimAttentionNotification,
+            ClientRequest::ClaimAttentionNotification,
+        ) {
+            self.attention_claim = AttentionClaimState::Pending;
+        }
+    }
+
+    fn show_attention_notification(&mut self, notification: &notifications::InClientNotification) {
+        self.show_success(format!("{} · {}", notification.title, notification.message));
+    }
+
+    fn take_attention_notification_activation(&mut self) -> Option<window::Id> {
+        let session_id = self.attention_notifications.take_activation()?;
+        self.activate_attention_notification(session_id);
+        self.window_id
+    }
+
+    fn activate_attention_notification(&mut self, session_id: SessionId) {
+        self.content_surface = ContentSurface::Session;
+        self.main_tab = MainTab::Terminal;
+        if self.session(session_id).is_none() {
+            self.pending_attention_activation = Some(session_id);
+            self.request_snapshot();
+            return;
+        }
+        self.open_attention_session(session_id);
+    }
+
+    fn open_attention_session(&mut self, session_id: SessionId) {
+        let workspace_id = self.session_workspace_id(session_id);
+        if let Some(workspace_id) = workspace_id
+            && self.active_workspace().map(|workspace| workspace.id) != Some(workspace_id)
+        {
+            self.pending_attention_activation = Some(session_id);
+            self.send_request(
+                Operation::OpenWorkspace(workspace_id),
+                ClientRequest::OpenWorkspace { workspace_id },
+            );
+            return;
+        }
+        self.select_session(session_id);
+    }
+
+    fn session_workspace_id(&self, session_id: SessionId) -> Option<WorkspaceId> {
+        let worktree_id = self.session(session_id)?.worktree_id;
+        let project_id = self
+            .snapshot
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.id == worktree_id)?
+            .project_id;
+        self.snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.workspace_id)
+    }
+
+    fn resolve_pending_attention_activation(&mut self) {
+        let Some(session_id) = self.pending_attention_activation.take() else {
             return;
         };
-        if let Some(message) = alerts.update(&self.snapshot.sessions) {
-            if let Some(sound) = &self.attention_sound {
-                sound.notify();
-            }
-            self.show_success(message);
+        if self.session(session_id).is_some() {
+            self.content_surface = ContentSurface::Session;
+            self.main_tab = MainTab::Terminal;
+            self.open_attention_session(session_id);
         }
     }
 
@@ -8033,6 +8160,7 @@ const fn operation_error_context(operation: Operation) -> &'static str {
         Operation::CreateSession(_) => "Start session",
         Operation::Resume(_) => "Resume session",
         Operation::AcknowledgeAttention(_) => "Acknowledge attention",
+        Operation::ClaimAttentionNotification => "Claim Attention Notification",
         Operation::RenameProject => "Rename repository",
         Operation::RenameWorktree => "Rename checkout",
         Operation::RenameSession => "Rename session",
@@ -9567,11 +9695,50 @@ mod tests {
         renderer::{Headless, Renderer as _},
         widget::{Operation as WidgetOperation, Tree},
     };
-    use std::time::Duration;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
     use sylvops_core::{
+        attention::{AttentionNotificationClaim, AttentionNotificationPreferences},
         github::GitHubItemKind,
         provider::{AuthenticationRequirement, ProviderCapabilities},
+        session_state::AttentionEventId,
     };
+
+    #[derive(Debug, Default)]
+    struct RecordingNotificationChannels {
+        payloads: Mutex<Vec<notifications::NotificationPayload>>,
+        activations: Mutex<VecDeque<SessionId>>,
+        native_succeeds: bool,
+        sounds: Mutex<usize>,
+    }
+
+    impl RecordingNotificationChannels {
+        fn succeeding() -> Arc<Self> {
+            Arc::new(Self {
+                native_succeeds: true,
+                ..Self::default()
+            })
+        }
+    }
+
+    impl notifications::NotificationChannels for Arc<RecordingNotificationChannels> {
+        fn native(&self, payload: &notifications::NotificationPayload) -> bool {
+            self.payloads.lock().unwrap().push(payload.clone());
+            self.native_succeeds
+        }
+
+        fn sound(&self) -> bool {
+            *self.sounds.lock().unwrap() += 1;
+            true
+        }
+
+        fn take_activation(&self) -> Option<SessionId> {
+            self.activations.lock().unwrap().pop_front()
+        }
+    }
 
     fn session(lifecycle: SessionLifecycle, external_session_id: Option<&str>) -> Session {
         Session {
@@ -10940,6 +11107,186 @@ mod tests {
 
         app.select_main_tab(MainTab::Changes);
         assert_eq!(app.active_session_id, Some(second_id));
+    }
+
+    #[test]
+    fn claimed_notification_activation_focuses_retained_history_without_resuming() {
+        let (template, _, _, first_id, second_id) = desktop_hierarchy();
+        let (bridge, mut harness) = Bridge::harness();
+        let channels = RecordingNotificationChannels::succeeding();
+        let mut app = DesktopApp::with_bridge_and_notifications(bridge, channels.clone());
+        app.snapshot = template.snapshot;
+        app.selected_project_id = template.selected_project_id;
+        app.selected_worktree_id = template.selected_worktree_id;
+        app.selected_session_id = Some(first_id);
+        app.active_session_id = Some(first_id);
+        app.open_sessions.push(first_id);
+        app.connection = ConnectionState::Connected;
+        let claim = AttentionNotificationClaim {
+            session_id: second_id,
+            attention_id: AttentionEventId::try_from(1).unwrap(),
+            reason: AttentionReason::InputRequested,
+            session_display_name: "Second".into(),
+            preferences: AttentionNotificationPreferences {
+                native_notifications_enabled: true,
+                sound_enabled: false,
+            },
+        };
+
+        app.handle_response(
+            Operation::ClaimAttentionNotification,
+            DaemonResponse::AttentionNotificationClaim(Some(claim)),
+        );
+        assert_eq!(
+            channels.payloads.lock().unwrap().as_slice(),
+            &[notifications::NotificationPayload {
+                session_id: second_id,
+                reason: AttentionReason::InputRequested,
+                title: "Input requested".into(),
+                message: "Second".into(),
+            }]
+        );
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::ClaimAttentionNotification,
+                ClientRequest::ClaimAttentionNotification,
+            )
+        );
+
+        channels.activations.lock().unwrap().push_back(second_id);
+        let window_id = window::Id::unique();
+        app.window_id = Some(window_id);
+        assert_eq!(
+            app.take_attention_notification_activation(),
+            Some(window_id)
+        );
+
+        assert_eq!(app.selected_session_id, Some(second_id));
+        assert_eq!(app.active_session_id, Some(second_id));
+        assert!(app.open_sessions.contains(&second_id));
+        assert!(
+            !harness.has_request(),
+            "activation must not Resume or Start Fresh"
+        );
+    }
+
+    #[test]
+    fn notification_activation_opens_the_sessions_workspace_before_selecting_history() {
+        let (template, _, _, first_id, second_id) = desktop_hierarchy();
+        let (bridge, mut harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge_and_notifications(
+            bridge,
+            RecordingNotificationChannels::succeeding(),
+        );
+        app.snapshot = template.snapshot;
+        app.selected_project_id = template.selected_project_id;
+        app.selected_worktree_id = template.selected_worktree_id;
+        app.selected_session_id = Some(first_id);
+        app.active_session_id = Some(first_id);
+        app.open_sessions.push(first_id);
+        app.connection = ConnectionState::Connected;
+        let workspace = Workspace {
+            id: WorkspaceId::new(),
+            name: "Other".into(),
+            created_at: 2,
+            updated_at: 2,
+            last_opened_at: None,
+            is_open: false,
+        };
+        let mut project = app.snapshot.projects[0].clone();
+        project.id = ProjectId::new();
+        project.workspace_id = workspace.id;
+        let mut worktree = app.snapshot.worktrees[0].clone();
+        worktree.id = WorktreeId::new();
+        worktree.project_id = project.id;
+        app.snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == second_id)
+            .unwrap()
+            .worktree_id = worktree.id;
+        app.snapshot.workspaces.push(workspace.clone());
+        app.snapshot.projects.push(project);
+        app.snapshot.worktrees.push(worktree);
+
+        app.activate_attention_notification(second_id);
+
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::OpenWorkspace(workspace.id),
+                ClientRequest::OpenWorkspace {
+                    workspace_id: workspace.id,
+                },
+            )
+        );
+        assert_eq!(app.selected_session_id, Some(first_id));
+        app.handle_response(
+            Operation::OpenWorkspace(workspace.id),
+            DaemonResponse::WorkspaceOpened {
+                revision: 2,
+                workspace: Workspace {
+                    is_open: true,
+                    ..workspace
+                },
+            },
+        );
+
+        assert_eq!(app.selected_session_id, Some(second_id));
+        assert_eq!(app.active_session_id, Some(second_id));
+        assert!(matches!(
+            harness.take_request(),
+            (Operation::RefreshSnapshot, ClientRequest::GetSnapshot)
+        ));
+        assert!(
+            !harness.has_request(),
+            "activation must not Resume or Start Fresh"
+        );
+    }
+
+    #[test]
+    fn native_notification_failure_falls_back_without_changing_session_state() {
+        let (template, _, _, first_id, second_id) = desktop_hierarchy();
+        let original_sessions = template.snapshot.sessions.clone();
+        let (bridge, mut harness) = Bridge::harness();
+        let channels = Arc::new(RecordingNotificationChannels::default());
+        let mut app = DesktopApp::with_bridge_and_notifications(bridge, channels.clone());
+        app.snapshot = template.snapshot;
+        app.selected_session_id = Some(first_id);
+        app.active_session_id = Some(first_id);
+        app.connection = ConnectionState::Connected;
+
+        app.handle_response(
+            Operation::ClaimAttentionNotification,
+            DaemonResponse::AttentionNotificationClaim(Some(AttentionNotificationClaim {
+                session_id: second_id,
+                attention_id: AttentionEventId::try_from(1).unwrap(),
+                reason: AttentionReason::RecoverableFailure,
+                session_display_name: "Second".into(),
+                preferences: AttentionNotificationPreferences {
+                    native_notifications_enabled: true,
+                    sound_enabled: false,
+                },
+            })),
+        );
+
+        assert_eq!(app.snapshot.sessions, original_sessions);
+        assert_eq!(app.selected_session_id, Some(first_id));
+        assert_eq!(app.active_session_id, Some(first_id));
+        assert_eq!(
+            app.success.as_ref().unwrap().0,
+            "Recoverable failure · Second"
+        );
+        assert_eq!(*channels.sounds.lock().unwrap(), 0);
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::ClaimAttentionNotification,
+                ClientRequest::ClaimAttentionNotification,
+            )
+        );
+        assert!(!harness.has_request());
     }
 
     #[test]
