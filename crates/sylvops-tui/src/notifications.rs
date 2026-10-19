@@ -231,12 +231,17 @@ const fn native_notification_executable(platform: NativeNotificationPlatform) ->
 }
 
 #[cfg(any(test, target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDesktopSession {
+    Available,
+    Unavailable,
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 const fn native_notification_available(
     platform: NativeNotificationPlatform,
     executable_exists: bool,
-    session_bus_present: bool,
-    display_present: bool,
-    wayland_display_present: bool,
+    desktop_session: NativeDesktopSession,
 ) -> bool {
     executable_exists
         && match platform {
@@ -244,7 +249,7 @@ const fn native_notification_available(
             NativeNotificationPlatform::Macos => true,
             #[cfg(any(test, target_os = "linux"))]
             NativeNotificationPlatform::Linux => {
-                session_bus_present && (display_present || wayland_display_present)
+                matches!(desktop_session, NativeDesktopSession::Available)
             }
         }
 }
@@ -264,8 +269,8 @@ mod platform {
     };
 
     use super::{
-        NativeNotificationCommand, NativeNotificationPlatform, native_notification_available,
-        native_notification_command, native_notification_executable,
+        NativeDesktopSession, NativeNotificationCommand, NativeNotificationPlatform,
+        native_notification_available, native_notification_command, native_notification_executable,
     };
 
     const PROCESS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -338,12 +343,17 @@ mod platform {
     }
 
     fn native_session_available(platform: NativeNotificationPlatform) -> bool {
+        let desktop_session = if environment_present("DBUS_SESSION_BUS_ADDRESS")
+            && (environment_present("DISPLAY") || environment_present("WAYLAND_DISPLAY"))
+        {
+            NativeDesktopSession::Available
+        } else {
+            NativeDesktopSession::Unavailable
+        };
         native_notification_available(
             platform,
             Path::new(native_notification_executable(platform)).is_file(),
-            environment_present("DBUS_SESSION_BUS_ADDRESS"),
-            environment_present("DISPLAY"),
-            environment_present("WAYLAND_DISPLAY"),
+            desktop_session,
         )
     }
 
@@ -458,8 +468,8 @@ mod tests {
     };
 
     use super::{
-        NativeNotificationPlatform, NotificationChannels, NotificationPresenter,
-        native_notification_available, native_notification_command,
+        NativeDesktopSession, NativeNotificationPlatform, NotificationChannels,
+        NotificationPresenter, native_notification_available, native_notification_command,
     };
 
     #[derive(Debug, Default)]
@@ -595,44 +605,32 @@ mod tests {
         assert!(native_notification_available(
             NativeNotificationPlatform::Macos,
             true,
-            false,
-            false,
-            false,
+            NativeDesktopSession::Unavailable,
         ));
         assert!(!native_notification_available(
             NativeNotificationPlatform::Macos,
             false,
-            true,
-            true,
-            true,
+            NativeDesktopSession::Available,
         ));
         assert!(native_notification_available(
             NativeNotificationPlatform::Linux,
             true,
-            true,
-            true,
-            false,
+            NativeDesktopSession::Available,
         ));
         assert!(native_notification_available(
             NativeNotificationPlatform::Linux,
             true,
-            true,
-            false,
-            true,
+            NativeDesktopSession::Available,
         ));
         assert!(!native_notification_available(
             NativeNotificationPlatform::Linux,
             true,
-            false,
-            true,
-            true,
+            NativeDesktopSession::Unavailable,
         ));
         assert!(!native_notification_available(
             NativeNotificationPlatform::Linux,
             true,
-            true,
-            false,
-            false,
+            NativeDesktopSession::Unavailable,
         ));
     }
 

@@ -14113,7 +14113,7 @@ mod tests {
         assert_eq!(app.active_session_id, Some(live_leaf.id));
         assert!(app.open_sessions.contains(&source.id));
         assert!(app.open_sessions.contains(&live_leaf.id));
-        assert!(app.snapshot.session_lineage.is_empty());
+        assert_eq!(app.snapshot.session_lineage, []);
         assert_eq!(
             harness.take_request(),
             (
