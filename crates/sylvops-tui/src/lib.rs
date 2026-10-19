@@ -4922,8 +4922,14 @@ mod tests {
 
     #[test]
     fn stale_resume_error_clears_pending_and_is_actionable() {
-        let source_session_id = SessionId::new();
-        let mut app = App::new(DaemonSnapshot::default(), Vec::new(), None);
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions[0].provider_kind = ProviderKind::Codex;
+        snapshot.sessions[0].status.lifecycle = SessionLifecycle::Exited;
+        snapshot.sessions[0].process_id = None;
+        snapshot.sessions[0].external_session_id = Some("verified-id".into());
+        let source = snapshot.sessions[0].clone();
+        let source_session_id = source.id;
+        let mut app = App::new(snapshot, Vec::new(), None);
         app.resume_pending = Some(source_session_id);
 
         let resumed = apply_resume_response(
@@ -4942,6 +4948,47 @@ mod tests {
                 .as_ref()
                 .is_some_and(|flash| flash.text.contains("already been resumed"))
         );
+
+        let mut failed_leaf = source.clone();
+        failed_leaf.id = SessionId::new();
+        failed_leaf.created_at = source.created_at + 1;
+        failed_leaf.status.lifecycle = SessionLifecycle::Failed;
+        failed_leaf.failure_reason = Some("provider_launch_failed".into());
+        assert!(event_requires_snapshot_refresh(
+            &DaemonEvent::SessionStatusChanged {
+                revision: 2,
+                session: failed_leaf.clone(),
+            }
+        ));
+        let mut authoritative = app.snapshot.clone();
+        authoritative.sessions.push(failed_leaf.clone());
+        authoritative
+            .session_lineage
+            .push(sylvops_core::domain::SessionLineageLink {
+                predecessor_session_id: source.id,
+                successor_session_id: failed_leaf.id,
+            });
+        app.replace_snapshot(authoritative);
+
+        assert!(app.snapshot.session_lineage.iter().any(|link| {
+            link.predecessor_session_id == source.id && link.successor_session_id == failed_leaf.id
+        }));
+        assert_eq!(
+            app.session_row_name(&source),
+            format!("{} · attempt 1", source.display_name)
+        );
+        assert_eq!(
+            app.session_row_name(&failed_leaf),
+            format!("{} · attempt 2", source.display_name)
+        );
+        assert!(!sylvops_core::domain::session_record_can_resume(
+            &source,
+            &app.snapshot.sessions
+        ));
+        assert!(sylvops_core::domain::session_record_can_resume(
+            &failed_leaf,
+            &app.snapshot.sessions
+        ));
     }
 
     #[test]

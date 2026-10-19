@@ -3617,6 +3617,13 @@ async fn inspect_resume_leaf(state: &DaemonState, source: &Session) -> Result<Re
             },
         ));
     }
+    if source.provider_kind == ProviderKind::Shell {
+        return Ok(ResumeLeafAction::Unavailable(
+            SessionResumeRefusal::ProviderDoesNotSupportResume {
+                provider: source.provider_kind,
+            },
+        ));
+    }
     let Some(external_session_id) = source.external_session_id.as_deref() else {
         return Ok(ResumeLeafAction::Unavailable(
             SessionResumeRefusal::MissingConversationIdentity,
