@@ -41,8 +41,8 @@ use sylvops_core::{
     },
     provider::{AuthenticationRequirement, LaunchContext, ProviderRuntimeSpec, ResumeContext},
     session_state::{
-        AttentionAcknowledgement, AttentionEvent, ProviderActivity, SessionLifecycle,
-        lifecycle_allows_deletion, lifecycle_allows_resume, lifecycle_is_active,
+        AttentionAcknowledgement, AttentionEvent, AttentionReason, ProviderActivity,
+        SessionLifecycle, lifecycle_allows_deletion, lifecycle_allows_resume, lifecycle_is_active,
     },
     status::{
         ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId,
@@ -105,6 +105,7 @@ struct PendingAttentionNotificationClaim {
 struct AttentionNotificationClaims {
     sequence: u64,
     client_watermarks: HashMap<Uuid, u64>,
+    foreground_sessions: HashMap<Uuid, SessionId>,
     pending: VecDeque<PendingAttentionNotificationClaim>,
 }
 
@@ -116,17 +117,47 @@ impl AttentionNotificationClaims {
 
     fn unregister(&mut self, client_id: Uuid) {
         self.client_watermarks.remove(&client_id);
+        self.foreground_sessions.remove(&client_id);
         self.prune_unclaimable();
     }
 
-    fn record(&mut self, session: &Session) {
-        let Some(event) = session.status.attention else {
+    fn report_focus(&mut self, client_id: Uuid, session_id: Option<SessionId>) {
+        if !self.client_watermarks.contains_key(&client_id) {
             return;
+        }
+        match session_id {
+            Some(session_id) => {
+                self.foreground_sessions.insert(client_id, session_id);
+                self.pending
+                    .retain(|candidate| candidate.session_id != session_id);
+            }
+            None => {
+                self.foreground_sessions.remove(&client_id);
+            }
+        }
+    }
+
+    fn cancel(&mut self, session_id: SessionId) {
+        self.pending
+            .retain(|candidate| candidate.session_id != session_id);
+    }
+
+    fn record(&mut self, session: &Session) -> bool {
+        self.cancel(session.id);
+        let Some(event) = session.status.attention else {
+            return false;
         };
         if event.acknowledgement != AttentionAcknowledgement::Pending
             || self.client_watermarks.is_empty()
         {
-            return;
+            return false;
+        }
+        if self
+            .foreground_sessions
+            .values()
+            .any(|session_id| *session_id == session.id)
+        {
+            return true;
         }
         self.sequence = self.sequence.saturating_add(1);
         if self.pending.len() >= ATTENTION_NOTIFICATION_CLAIM_CAPACITY {
@@ -138,6 +169,7 @@ impl AttentionNotificationClaims {
             session_display_name: session.display_name.clone(),
             event,
         });
+        false
     }
 
     fn claim(&mut self, client_id: Uuid) -> Option<PendingAttentionNotificationClaim> {
@@ -1258,6 +1290,26 @@ async fn handle_request(
                 &DaemonResponse::AttentionNotificationPreferencesSaved,
             )
             .await
+        }
+        ClientRequest::ReportAttentionFocus { session_id } => {
+            if let Some(session_id) = session_id {
+                let operation_lock = session_operation_lock(state, session_id).await;
+                let _operation_guard = operation_lock.lock().await;
+                let session = state.database.session(session_id).await?;
+                state
+                    .attention_notification_claims
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .report_focus(client_id, Some(session_id));
+                acknowledge_visible_terminal_attention(state, &session).await?;
+            } else {
+                state
+                    .attention_notification_claims
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .report_focus(client_id, None);
+            }
+            send_response_queue(outgoing, request_id, &DaemonResponse::AttentionFocusUpdated).await
         }
         ClientRequest::ClaimAttentionNotification => {
             let pending = state
@@ -2945,6 +2997,11 @@ async fn handle_request(
             if let Some(managed) = state.sessions.read().await.get(&session_id).cloned() {
                 *managed.record.write().await = session.clone();
             }
+            state
+                .attention_notification_claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel(session_id);
             mirror_attention_acknowledgement(state, &session).await;
             send_response_queue(
                 outgoing,
@@ -2979,6 +3036,11 @@ async fn handle_request(
             if let Some(managed) = state.sessions.read().await.get(&session_id).cloned() {
                 *managed.record.write().await = session.clone();
             }
+            state
+                .attention_notification_claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel(session_id);
             mirror_attention_acknowledgement(state, &session).await;
             send_response_queue(
                 outgoing,
@@ -3939,7 +4001,8 @@ async fn persist_session_start_failure(
         )
         .await
     {
-        record_new_attention_notification(state, None, &session);
+        let (revision, session) =
+            coordinate_attention_notification(state, None, revision, session).await;
         let _ = state
             .events
             .send(DaemonEvent::SessionStatusChanged { revision, session });
@@ -4233,7 +4296,12 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
     if matches!(&event, NormalizedProviderEvent::SessionEnded) {
         state.hook_credentials.invalidate(delivery.session_id);
     }
-    record_new_attention_notification(state, persisted.status.attention, &session);
+    let (revision, session) =
+        coordinate_attention_notification(state, persisted.status.attention, revision, session)
+            .await;
+    if let Some(managed) = get_managed_session(state, delivery.session_id).await {
+        *managed.record.write().await = session.clone();
+    }
     let _ = state.events.send(DaemonEvent::ProviderEvent {
         provider: persisted.provider_kind,
         session_id: delivery.session_id,
@@ -4336,8 +4404,14 @@ fn spawn_exit_monitor(
                         .lock()
                         .await
                         .insert(session_id, next_machine);
+                    let (revision, session) = coordinate_attention_notification(
+                        &state,
+                        persisted.status.attention,
+                        revision,
+                        session,
+                    )
+                    .await;
                     *managed.record.write().await = session.clone();
-                    record_new_attention_notification(&state, persisted.status.attention, &session);
                     let _ = state.events.send(DaemonEvent::SessionStatusChanged {
                         revision,
                         session: session.clone(),
@@ -4369,20 +4443,90 @@ fn status_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
-fn record_new_attention_notification(
+async fn coordinate_attention_notification(
     state: &DaemonState,
     previous: Option<AttentionEvent>,
-    session: &Session,
-) {
+    revision: u64,
+    session: Session,
+) -> (u64, Session) {
     let current = session.status.attention;
     if current.map(|event| event.id) == previous.map(|event| event.id) {
-        return;
+        if current.is_none_or(|event| event.acknowledgement != AttentionAcknowledgement::Pending) {
+            state
+                .attention_notification_claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel(session.id);
+        }
+        return (revision, session);
     }
+    let suppressed = state
+        .attention_notification_claims
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(&session);
+    if suppressed {
+        match persist_visible_terminal_attention_ack(state, &session).await {
+            Ok(Some(acknowledged)) => return acknowledged,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, session_id = %session.id, "cannot acknowledge visible attention");
+            }
+        }
+    }
+    (revision, session)
+}
+
+async fn acknowledge_visible_terminal_attention(
+    state: &DaemonState,
+    session: &Session,
+) -> Result<()> {
+    if let Some((revision, session)) =
+        persist_visible_terminal_attention_ack(state, session).await?
+    {
+        let _ = state
+            .events
+            .send(DaemonEvent::SessionStatusChanged { revision, session });
+    }
+    Ok(())
+}
+
+async fn persist_visible_terminal_attention_ack(
+    state: &DaemonState,
+    session: &Session,
+) -> Result<Option<(u64, Session)>> {
+    let Some(event) = session.status.attention else {
+        return Ok(None);
+    };
+    if event.acknowledgement != AttentionAcknowledgement::Pending
+        || !visible_attention_is_acknowledged(event.reason)
+    {
+        return Ok(None);
+    }
+    let Some(acknowledged) = state
+        .database
+        .acknowledge_opened_attention(session.id, event.id)
+        .await?
+    else {
+        return Ok(None);
+    };
     state
         .attention_notification_claims
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .record(session);
+        .cancel(session.id);
+    if let Some(managed) = get_managed_session(state, session.id).await {
+        *managed.record.write().await = acknowledged.1.clone();
+    }
+    mirror_attention_acknowledgement(state, &acknowledged.1).await;
+    Ok(Some(acknowledged))
+}
+
+const fn visible_attention_is_acknowledged(reason: AttentionReason) -> bool {
+    matches!(
+        reason,
+        AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
+    )
 }
 
 fn status_machine_from_session(session: &Session) -> SessionStatusMachine {
@@ -4419,8 +4563,14 @@ fn spawn_claude_session_start_monitor(
         {
             Ok(Some((revision, session))) => {
                 let previous_attention = managed.record.read().await.status.attention;
+                let (revision, session) = coordinate_attention_notification(
+                    &state,
+                    previous_attention,
+                    revision,
+                    session,
+                )
+                .await;
                 *managed.record.write().await = session.clone();
-                record_new_attention_notification(&state, previous_attention, &session);
                 let _ = state
                     .events
                     .send(DaemonEvent::SessionStatusChanged { revision, session });
@@ -5182,17 +5332,33 @@ mod tests {
     use super::{
         ApplicationMutationCoordinator, CONTROL_OPCODE, HookTracking, LifecycleCoordinator,
         decode_request, provider_external_id_update, release_work_source_capacity,
-        same_project_identity,
+        same_project_identity, visible_attention_is_acknowledged,
     };
     use std::sync::atomic::AtomicUsize;
     use sylvops_core::{
         domain::Project,
         ids::{ProjectId, WorkspaceId},
         protocol::{ClientRequest, Frame, MessageClass},
-        session_state::ProviderActivity,
+        session_state::{AttentionReason, ProviderActivity},
         status::{ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId},
     };
     use tokio::sync::Semaphore;
+
+    #[test]
+    fn visible_attention_acknowledgement_is_reason_specific() {
+        assert!(visible_attention_is_acknowledged(
+            AttentionReason::SuccessfulCompletion
+        ));
+        assert!(visible_attention_is_acknowledged(
+            AttentionReason::TerminalFailure
+        ));
+        assert!(!visible_attention_is_acknowledged(
+            AttentionReason::InputRequested
+        ));
+        assert!(!visible_attention_is_acknowledged(
+            AttentionReason::RecoverableFailure
+        ));
+    }
 
     #[test]
     fn persisted_capacity_excess_is_paid_down_before_a_slot_is_released() {

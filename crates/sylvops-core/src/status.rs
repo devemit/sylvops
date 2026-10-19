@@ -278,12 +278,18 @@ impl SessionStatusMachine {
                 )?;
             }
             NormalizedProviderEvent::TurnFailed { category } => {
+                let materially_new = self
+                    .failure_category
+                    .as_ref()
+                    .is_some_and(|current| current != category);
                 self.failure_category = Some(category.clone());
-                self.set_live_condition(
-                    ProviderActivity::RecoverableFailure,
-                    Some(AttentionReason::RecoverableFailure),
+                self.status.activity = ProviderActivity::RecoverableFailure;
+                self.set_attention_condition(
+                    AttentionReason::RecoverableFailure,
                     occurred_at,
+                    materially_new,
                 )?;
+                self.status.validate()?;
             }
             NormalizedProviderEvent::SubagentStarted { agent_id } => {
                 if !self.active_subagents.contains(agent_id) {
@@ -413,9 +419,21 @@ impl SessionStatusMachine {
         reason: AttentionReason,
         occurred_at: i64,
     ) -> Result<(), &'static str> {
-        if self.status.attention.is_some_and(|event| {
-            event.reason == reason && event.acknowledgement != AttentionAcknowledgement::Resolved
-        }) {
+        self.set_attention_condition(reason, occurred_at, false)
+    }
+
+    fn set_attention_condition(
+        &mut self,
+        reason: AttentionReason,
+        occurred_at: i64,
+        materially_new: bool,
+    ) -> Result<(), &'static str> {
+        if !materially_new
+            && self.status.attention.is_some_and(|event| {
+                event.reason == reason
+                    && event.acknowledgement != AttentionAcknowledgement::Resolved
+            })
+        {
             return Ok(());
         }
         let next = self
@@ -664,6 +682,49 @@ mod tests {
             failed.failure_category.unwrap().as_str(),
             "process_exit_nonzero"
         );
+    }
+
+    #[test]
+    fn recoverable_failure_categories_deduplicate_only_unchanged_conditions() {
+        let mut machine = SessionStatusMachine::new(SessionLifecycle::Running);
+        let rate_limit = NormalizedProviderEvent::TurnFailed {
+            category: TurnFailureCategory::new("rate_limit").unwrap(),
+        };
+        let first = machine.apply(&rate_limit, 10).unwrap();
+        let first_id = first.status.attention.unwrap().id;
+
+        let unchanged = machine.apply(&rate_limit, 11).unwrap();
+        assert_eq!(unchanged.status.attention.unwrap().id, first_id);
+
+        let network = machine
+            .apply(
+                &NormalizedProviderEvent::TurnFailed {
+                    category: TurnFailureCategory::new("network").unwrap(),
+                },
+                12,
+            )
+            .unwrap();
+        let network_event = network.status.attention.unwrap();
+        assert!(u64::from(network_event.id) > u64::from(first_id));
+        assert_eq!(network_event.occurred_at, 12);
+        assert_eq!(network.failure_category.unwrap().as_str(), "network");
+
+        let resolved = machine
+            .apply(&NormalizedProviderEvent::PromptSubmitted, 13)
+            .unwrap();
+        assert_eq!(
+            resolved.status.attention.unwrap().acknowledgement,
+            AttentionAcknowledgement::Resolved
+        );
+        let reentered = machine
+            .apply(
+                &NormalizedProviderEvent::TurnFailed {
+                    category: TurnFailureCategory::new("network").unwrap(),
+                },
+                14,
+            )
+            .unwrap();
+        assert!(u64::from(reentered.status.attention.unwrap().id) > u64::from(network_event.id));
     }
 
     #[test]

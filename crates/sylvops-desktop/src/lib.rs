@@ -32,7 +32,7 @@ use iced::{
     Background, Border, Center, Color, Element, Fill, Font, Length, Point, Subscription, Task,
     Theme,
     alignment::Vertical,
-    clipboard, keyboard,
+    clipboard, event, keyboard,
     keyboard::{Key, key::Named},
     mouse, system, time,
     widget::{
@@ -70,10 +70,7 @@ use sylvops_core::{
         ProjectRemovalRefusal, SessionDeletionRefusal, WorkspaceDeletionRefusal,
     },
     provider::{ProviderHealth, session_can_resume},
-    session_state::{
-        AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
-        lifecycle_is_active,
-    },
+    session_state::{ProviderActivity, SessionLifecycle, lifecycle_is_active},
     ui::{
         DesktopDensity, DesktopPanel, DesktopState, DesktopTerminalCursor, DesktopTerminalFont,
         DesktopTheme, MAX_OPEN_DESKTOP_SESSIONS, MAX_TERMINAL_FONT_SIZE, MIN_DESKTOP_HEIGHT,
@@ -281,7 +278,6 @@ struct DesktopApp {
     terminal_selection_state: TerminalSelectionState,
     inline_navigator_rename: Option<InlineNavigatorRename>,
     resume_pending: HashSet<SessionId>,
-    attention_acknowledgement_pending: HashSet<SessionId>,
     window_mode: window::Mode,
     update_status: UpgradeStatus,
     install_request: RequestState,
@@ -289,6 +285,8 @@ struct DesktopApp {
     disclosures: DisclosureState,
     attention_notifications: notifications::AttentionNotificationAdapter,
     attention_claim: AttentionClaimState,
+    window_attention_state: WindowAttentionState,
+    reported_attention_focus: ReportedAttentionFocus,
     pending_attention_activation: Option<SessionId>,
     status_animation_started_at: Instant,
     status_animation_phase: f32,
@@ -314,6 +312,27 @@ enum AttentionClaimState {
     Idle,
     Due,
     Pending,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum WindowAttentionState {
+    #[default]
+    Background,
+    Foreground,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ReportedAttentionFocus {
+    #[default]
+    Unknown,
+    Background,
+    Session(SessionId),
+}
+
+impl From<Option<SessionId>> for ReportedAttentionFocus {
+    fn from(session_id: Option<SessionId>) -> Self {
+        session_id.map_or(Self::Background, Self::Session)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -685,6 +704,7 @@ enum Message {
     SelectCompactPanel(DesktopPanel),
     ToggleNavigator,
     WindowResized(window::Id, iced::Size),
+    WindowFocusChanged(window::Id, bool),
     WindowReady(Option<window::Id>),
     SystemThemeChanged(iced::theme::Mode),
     CloseRequested(window::Id),
@@ -788,7 +808,6 @@ impl DesktopApp {
             terminal_selection_state: TerminalSelectionState::Idle,
             inline_navigator_rename: None,
             resume_pending: HashSet::new(),
-            attention_acknowledgement_pending: HashSet::new(),
             window_mode: window::Mode::Windowed,
             update_status: UpgradeStatus::Idle,
             install_request: RequestState::Idle,
@@ -796,6 +815,8 @@ impl DesktopApp {
             disclosures: DisclosureState::default(),
             attention_notifications,
             attention_claim: AttentionClaimState::Idle,
+            window_attention_state: WindowAttentionState::Background,
+            reported_attention_focus: ReportedAttentionFocus::Unknown,
             pending_attention_activation: None,
             status_animation_started_at: Instant::now(),
             status_animation_phase: 0.0,
@@ -814,6 +835,7 @@ impl DesktopApp {
                     / 1.2
                     * std::f32::consts::TAU;
                 self.flush_timers();
+                self.sync_attention_focus();
                 self.request_attention_notification_claim();
                 if let Some(notification) = self.attention_notifications.take_fallback() {
                     self.show_attention_notification(&notification);
@@ -915,7 +937,6 @@ impl DesktopApp {
             Message::HoverNavigatorNode(node) => self.hovered_navigator_node = node,
             Message::SelectOpenSession(session_id) => {
                 self.unfocus_terminal();
-                self.acknowledge_visible_attention(session_id);
                 if self.active_session_id == Some(session_id) {
                     return Task::none();
                 }
@@ -929,6 +950,7 @@ impl DesktopApp {
                 self.select_session_context(session_id);
                 self.active_session_id = Some(session_id);
                 self.mark_state_dirty();
+                self.sync_attention_focus();
             }
             Message::CloseSessionTab(session_id) => {
                 self.unfocus_terminal();
@@ -951,6 +973,7 @@ impl DesktopApp {
                     }
                 }
                 self.mark_state_dirty();
+                self.sync_attention_focus();
             }
             Message::SelectMainTab(tab) => self.select_main_tab(tab),
             Message::NewWorkspace => {
@@ -1222,7 +1245,21 @@ impl DesktopApp {
                 self.queue_terminal_resize();
             }
             Message::WindowResized(id, size) => self.window_resized(id, size),
-            Message::WindowReady(id) => self.window_id = id,
+            Message::WindowFocusChanged(id, focused) => {
+                if self.window_id.is_none() || self.window_id == Some(id) {
+                    self.window_id = Some(id);
+                    self.window_attention_state = if focused {
+                        WindowAttentionState::Foreground
+                    } else {
+                        WindowAttentionState::Background
+                    };
+                    self.sync_attention_focus();
+                }
+            }
+            Message::WindowReady(id) => {
+                self.window_id = id;
+                self.sync_attention_focus();
+            }
             Message::SystemThemeChanged(mode) => self.system_theme = mode,
             Message::CloseRequested(id) => {
                 self.window_id = Some(id);
@@ -4183,8 +4220,6 @@ impl DesktopApp {
                 self.snapshot = snapshot;
                 self.providers = providers;
                 self.connection = ConnectionState::Connected;
-                self.attention_claim = AttentionClaimState::Due;
-                self.request_attention_notification_claim();
                 if let Some(state) = desktop_state {
                     self.apply_desktop_state(state);
                 }
@@ -4197,6 +4232,10 @@ impl DesktopApp {
                     self.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
                     self.modal_focus = ModalFocus::Pending;
                 }
+                self.reported_attention_focus = ReportedAttentionFocus::Unknown;
+                self.sync_attention_focus();
+                self.attention_claim = AttentionClaimState::Due;
+                self.request_attention_notification_claim();
             }
             BridgeEvent::Daemon(event) => self.handle_daemon_event(event),
             BridgeEvent::Response {
@@ -4215,11 +4254,12 @@ impl DesktopApp {
                 if let Some(Operation::Resume(session_id)) = operation {
                     self.resume_pending.remove(&session_id);
                 }
-                if let Some(Operation::AcknowledgeAttention(session_id)) = operation {
-                    self.attention_acknowledgement_pending.remove(&session_id);
-                }
                 if matches!(operation, Some(Operation::ClaimAttentionNotification)) {
                     self.attention_claim = AttentionClaimState::Idle;
+                    return;
+                }
+                if matches!(operation, Some(Operation::ReportAttentionFocus)) {
+                    self.reported_attention_focus = ReportedAttentionFocus::Unknown;
                     return;
                 }
                 if matches!(operation, Some(Operation::RefreshSnapshot)) {
@@ -4330,6 +4370,7 @@ impl DesktopApp {
             },
             BridgeEvent::Closed => {
                 self.connection = ConnectionState::Disconnected;
+                self.reported_attention_focus = ReportedAttentionFocus::Unknown;
                 self.terminal_focus = TerminalFocus::Unfocused;
                 self.terminal_selection_state = TerminalSelectionState::Idle;
                 self.error = Some("The daemon connection closed. Sessions remain daemon-owned; reopen SylvOps or restart the daemon.".into());
@@ -4340,7 +4381,6 @@ impl DesktopApp {
     fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
             DaemonEvent::SessionStatusChanged { session, .. } => {
-                let session_id = session.id;
                 if let Some(existing) = self
                     .snapshot
                     .sessions
@@ -4351,11 +4391,8 @@ impl DesktopApp {
                 } else {
                     self.snapshot.sessions.push(session);
                 }
-                if self.content_surface == ContentSurface::Session
-                    && self.active_session_id == Some(session_id)
-                {
-                    self.acknowledge_visible_attention(session_id);
-                }
+                self.reported_attention_focus = ReportedAttentionFocus::Unknown;
+                self.sync_attention_focus();
                 self.attention_claim = AttentionClaimState::Due;
                 self.request_attention_notification_claim();
                 self.request_snapshot();
@@ -4691,22 +4728,6 @@ impl DesktopApp {
                 self.resolve_pending_attention_activation();
             }
             (
-                Operation::AcknowledgeAttention(expected_session_id),
-                DaemonResponse::SessionAttentionAcknowledged { revision, session },
-            ) if session.id == expected_session_id => {
-                self.attention_acknowledgement_pending
-                    .remove(&expected_session_id);
-                self.snapshot.revision = self.snapshot.revision.max(revision);
-                if let Some(existing) = self
-                    .snapshot
-                    .sessions
-                    .iter_mut()
-                    .find(|existing| existing.id == expected_session_id)
-                {
-                    *existing = session;
-                }
-            }
-            (
                 Operation::OpenWorkspace(workspace_id),
                 DaemonResponse::WorkspaceOpened { workspace, .. },
             ) => {
@@ -4861,7 +4882,8 @@ impl DesktopApp {
                     diff.text
                 });
             }
-            (Operation::Resize, DaemonResponse::Acknowledged)
+            (Operation::ReportAttentionFocus, DaemonResponse::AttentionFocusUpdated)
+            | (Operation::Resize, DaemonResponse::Acknowledged)
             | (Operation::PrepareDataRemoval, DaemonResponse::DataRemovalPrepared) => {}
             (Operation::SaveDesktopState, DaemonResponse::DesktopStateSaved) => {
                 self.state_save_pending = false;
@@ -5726,11 +5748,13 @@ impl DesktopApp {
             self.load_diff();
         }
         self.mark_state_dirty();
+        self.sync_attention_focus();
     }
 
     fn open_github_surface(&mut self, kind: GitHubSurfaceKind) {
         self.unfocus_terminal();
         self.content_surface = ContentSurface::GitHub;
+        self.sync_attention_focus();
         let Some(project_id) = self.selected_project_id else {
             return;
         };
@@ -6123,6 +6147,7 @@ impl DesktopApp {
         }
         self.selected_project_id = Some(source.project_id);
         self.content_surface = ContentSurface::GitHub;
+        self.sync_attention_focus();
         let _ = self
             .github_surface
             .open(source.project_id, GitHubSurfaceKind::Issues);
@@ -7722,6 +7747,31 @@ impl DesktopApp {
         }
     }
 
+    fn sync_attention_focus(&mut self) {
+        if !matches!(self.connection, ConnectionState::Connected) {
+            return;
+        }
+        let session_id = (self.window_attention_state == WindowAttentionState::Foreground
+            && self.content_surface == ContentSurface::Session)
+            .then_some(self.active_session_id)
+            .flatten();
+        let report = ReportedAttentionFocus::from(session_id);
+        if report == ReportedAttentionFocus::Background
+            && self.reported_attention_focus == ReportedAttentionFocus::Unknown
+        {
+            return;
+        }
+        if self.reported_attention_focus == report {
+            return;
+        }
+        if self.bridge.request(
+            Operation::ReportAttentionFocus,
+            ClientRequest::ReportAttentionFocus { session_id },
+        ) {
+            self.reported_attention_focus = report;
+        }
+    }
+
     fn show_attention_notification(&mut self, notification: &notifications::InClientNotification) {
         self.show_success(format!("{} · {}", notification.title, notification.message));
     }
@@ -7788,12 +7838,12 @@ impl DesktopApp {
         self.unfocus_terminal();
         self.focused_delete_action = None;
         self.pending_navigator_reveal = Some(DesktopPanel::Sessions);
-        self.acknowledge_visible_attention(session_id);
         if self.selected_session_id == Some(session_id)
             && self.active_session_id == Some(session_id)
         {
             self.keyboard_panel = DesktopPanel::Sessions;
             self.desktop_state.compact_panel = DesktopPanel::Sessions;
+            self.sync_attention_focus();
             return;
         }
         if self
@@ -7817,37 +7867,7 @@ impl DesktopApp {
         if self.presentation().layout == PresentationLayout::Narrow {
             self.narrow_main = true;
         }
-    }
-
-    fn acknowledge_visible_attention(&mut self, session_id: SessionId) {
-        if self.attention_acknowledgement_pending.contains(&session_id) {
-            return;
-        }
-        let Some(event) = self
-            .session(session_id)
-            .and_then(|session| session.status.attention)
-        else {
-            return;
-        };
-        if event.acknowledgement != AttentionAcknowledgement::Pending
-            || !matches!(
-                event.reason,
-                AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
-            )
-        {
-            return;
-        }
-        if self.bridge.request(
-            Operation::AcknowledgeAttention(session_id),
-            ClientRequest::AcknowledgeAttention {
-                session_id,
-                attention_id: event.id,
-            },
-        ) {
-            self.attention_acknowledgement_pending.insert(session_id);
-        } else {
-            self.error = Some("The background service is busy. Try again.".into());
-        }
+        self.sync_attention_focus();
     }
 
     fn select_session_context(&mut self, session_id: SessionId) {
@@ -7965,6 +7985,15 @@ fn subscription(app: &DesktopApp) -> Subscription<Message> {
         app.bridge.subscription().map(|()| Message::BridgeReady),
         time::every(TIMER_TICK).map(|_| Message::Tick),
         keyboard::listen().map(Message::Keyboard),
+        event::listen_with(|event, _status, window_id| match event {
+            event::Event::Window(window::Event::Focused) => {
+                Some(Message::WindowFocusChanged(window_id, true))
+            }
+            event::Event::Window(window::Event::Unfocused) => {
+                Some(Message::WindowFocusChanged(window_id, false))
+            }
+            _ => None,
+        }),
         window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
         window::close_requests().map(Message::CloseRequested),
         system::theme_changes().map(Message::SystemThemeChanged),
@@ -8159,7 +8188,7 @@ const fn operation_error_context(operation: Operation) -> &'static str {
         Operation::CreateWorktree => "Create checkout",
         Operation::CreateSession(_) => "Start session",
         Operation::Resume(_) => "Resume session",
-        Operation::AcknowledgeAttention(_) => "Acknowledge attention",
+        Operation::ReportAttentionFocus => "Report attention focus",
         Operation::ClaimAttentionNotification => "Claim Attention Notification",
         Operation::RenameProject => "Rename repository",
         Operation::RenameWorktree => "Rename checkout",
@@ -9704,7 +9733,7 @@ mod tests {
         attention::{AttentionNotificationClaim, AttentionNotificationPreferences},
         github::GitHubItemKind,
         provider::{AuthenticationRequirement, ProviderCapabilities},
-        session_state::AttentionEventId,
+        session_state::{AttentionEventId, AttentionReason},
     };
 
     #[derive(Debug, Default)]
@@ -11290,123 +11319,48 @@ mod tests {
     }
 
     #[test]
-    fn selecting_completion_or_failure_attention_acknowledges_the_exact_visible_event() {
-        for (reason, lifecycle) in [
-            (
-                AttentionReason::SuccessfulCompletion,
-                SessionLifecycle::Exited,
-            ),
-            (AttentionReason::TerminalFailure, SessionLifecycle::Failed),
-        ] {
-            let (bridge, mut harness) = Bridge::harness();
-            let mut app = DesktopApp::with_bridge(bridge);
-            let mut attention_session = session(lifecycle, None);
-            let session_id = attention_session.id;
-            let attention_id = sylvops_core::session_state::AttentionEventId::try_from(1).unwrap();
-            attention_session.status.attention =
-                Some(sylvops_core::session_state::AttentionEvent {
-                    id: attention_id,
-                    reason,
-                    acknowledgement: AttentionAcknowledgement::Pending,
-                    occurred_at: 1,
-                });
-            app.snapshot.sessions.push(attention_session.clone());
-
-            app.select_session(session_id);
-
-            assert_eq!(
-                harness.take_request(),
-                (
-                    Operation::AcknowledgeAttention(session_id),
-                    ClientRequest::AcknowledgeAttention {
-                        session_id,
-                        attention_id,
-                    },
-                )
-            );
-            assert!(app.attention_acknowledgement_pending.contains(&session_id));
-
-            attention_session
-                .status
-                .attention
-                .as_mut()
-                .unwrap()
-                .acknowledgement = AttentionAcknowledgement::Acknowledged;
-            app.handle_response(
-                Operation::AcknowledgeAttention(session_id),
-                DaemonResponse::SessionAttentionAcknowledged {
-                    revision: 2,
-                    session: attention_session.clone(),
-                },
-            );
-            assert!(!app.attention_acknowledgement_pending.contains(&session_id));
-            assert_eq!(app.snapshot.sessions[0], attention_session);
-        }
-    }
-
-    #[test]
-    fn already_visible_desktop_sessions_acknowledge_new_or_reselected_completion() {
-        let completion = |session: &mut Session, event_id| {
-            session.status.lifecycle = SessionLifecycle::Exited;
-            session.status.attention = Some(sylvops_core::session_state::AttentionEvent {
-                id: event_id,
-                reason: AttentionReason::SuccessfulCompletion,
-                acknowledgement: AttentionAcknowledgement::Pending,
-                occurred_at: 1,
-            });
-        };
-
+    fn foreground_desktop_reports_only_the_visible_session_and_deduplicates_refreshes() {
         let (bridge, mut harness) = Bridge::harness();
         let mut app = DesktopApp::with_bridge(bridge);
-        let mut completed = session(SessionLifecycle::Exited, None);
-        let completed_id = completed.id;
-        let completed_event = sylvops_core::session_state::AttentionEventId::try_from(1).unwrap();
-        completion(&mut completed, completed_event);
-        app.snapshot.sessions.push(completed);
-        app.open_sessions.push(completed_id);
-        app.active_session_id = Some(completed_id);
+        let visible = session(SessionLifecycle::Running, None);
+        let visible_id = visible.id;
+        let other = session(SessionLifecycle::Running, None);
+        let other_id = other.id;
+        app.snapshot.sessions.extend([visible, other]);
+        app.connection = ConnectionState::Connected;
+        app.window_attention_state = WindowAttentionState::Foreground;
 
-        let _ = app.update(Message::SelectOpenSession(completed_id));
-
+        app.select_session(visible_id);
         assert_eq!(
             harness.take_request(),
             (
-                Operation::AcknowledgeAttention(completed_id),
-                ClientRequest::AcknowledgeAttention {
-                    session_id: completed_id,
-                    attention_id: completed_event,
+                Operation::ReportAttentionFocus,
+                ClientRequest::ReportAttentionFocus {
+                    session_id: Some(visible_id),
+                },
+            )
+        );
+        app.sync_attention_focus();
+        assert!(!harness.has_request());
+
+        app.select_session(other_id);
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::ReportAttentionFocus,
+                ClientRequest::ReportAttentionFocus {
+                    session_id: Some(other_id),
                 },
             )
         );
 
-        let (bridge, mut harness) = Bridge::harness();
-        let mut app = DesktopApp::with_bridge(bridge);
-        let mut live = session(SessionLifecycle::Running, None);
-        live.process_id = Some(42);
-        live.ended_at = None;
-        live.exit_code = None;
-        let live_id = live.id;
-        app.snapshot.sessions.push(live.clone());
-        app.open_sessions.push(live_id);
-        app.active_session_id = Some(live_id);
-        let completion_event = sylvops_core::session_state::AttentionEventId::try_from(2).unwrap();
-        completion(&mut live, completion_event);
-        live.status.lifecycle = SessionLifecycle::Running;
-        live.status.activity = ProviderActivity::Completed;
-
-        app.handle_daemon_event(DaemonEvent::SessionStatusChanged {
-            revision: 2,
-            session: live,
-        });
-
+        app.window_attention_state = WindowAttentionState::Background;
+        app.sync_attention_focus();
         assert_eq!(
             harness.take_request(),
             (
-                Operation::AcknowledgeAttention(live_id),
-                ClientRequest::AcknowledgeAttention {
-                    session_id: live_id,
-                    attention_id: completion_event,
-                },
+                Operation::ReportAttentionFocus,
+                ClientRequest::ReportAttentionFocus { session_id: None },
             )
         );
     }

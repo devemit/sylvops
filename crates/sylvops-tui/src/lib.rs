@@ -25,8 +25,8 @@ use app::{
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     style::Print,
@@ -80,6 +80,20 @@ pub(crate) struct FormOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TuiExit {
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ReportedAttentionFocus {
+    #[default]
+    Unknown,
+    Background,
+    Session(SessionId),
+}
+
+impl From<Option<SessionId>> for ReportedAttentionFocus {
+    fn from(session_id: Option<SessionId>) -> Self {
+        session_id.map_or(Self::Background, Self::Session)
+    }
 }
 
 fn event_requires_snapshot_refresh(event: &DaemonEvent) -> bool {
@@ -149,8 +163,17 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     let mut animation_frame = app.status_animation_frame();
+    let mut terminal_focused = false;
+    let mut reported_attention_focus = ReportedAttentionFocus::Unknown;
 
     loop {
+        sync_attention_focus(
+            &client,
+            &app,
+            terminal_focused,
+            &mut reported_attention_focus,
+        )
+        .await?;
         let controller = app
             .attached
             .as_ref()
@@ -239,6 +262,10 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                         dirty = true;
                     }
                 }
+                Ok(event @ DaemonEvent::SessionStatusChanged { .. }) => {
+                    reported_attention_focus = ReportedAttentionFocus::Unknown;
+                    refresh |= event_requires_snapshot_refresh(&event);
+                }
                 Ok(event) => refresh |= event_requires_snapshot_refresh(&event),
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
                     refresh = true;
@@ -253,6 +280,13 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         }
         if refresh {
             app.replace_snapshot(snapshot(&client).await?);
+            sync_attention_focus(
+                &client,
+                &app,
+                terminal_focused,
+                &mut reported_attention_focus,
+            )
+            .await?;
             deliver_attention_notifications(&client, &mut app, &notification_presenter).await?;
             dirty = true;
         }
@@ -333,6 +367,17 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             },
             _ = maintenance.tick() => continue,
         };
+        match &input {
+            Event::FocusGained => {
+                terminal_focused = true;
+                continue;
+            }
+            Event::FocusLost => {
+                terminal_focused = false;
+                continue;
+            }
+            _ => {}
+        }
         if let Event::Key(key) = &input
             && key.kind == KeyEventKind::Release
         {
@@ -394,6 +439,44 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             save_tui_state(&client, &app).await?;
             return Ok(TuiExit::Quit);
         }
+    }
+}
+
+async fn sync_attention_focus(
+    client: &DaemonClient,
+    app: &App,
+    terminal_focused: bool,
+    reported: &mut ReportedAttentionFocus,
+) -> Result<(), DaemonError> {
+    let session_id = visible_attention_session(app, terminal_focused);
+    let report = ReportedAttentionFocus::from(session_id);
+    if *reported == report {
+        return Ok(());
+    }
+    match client
+        .request(&ClientRequest::ReportAttentionFocus { session_id })
+        .await?
+    {
+        DaemonResponse::AttentionFocusUpdated => {
+            *reported = report;
+            Ok(())
+        }
+        DaemonResponse::Error(error) => Err(DaemonError::Lifecycle(error.message)),
+        response => Err(DaemonError::Lifecycle(format!(
+            "unexpected attention focus response: {response:?}"
+        ))),
+    }
+}
+
+fn visible_attention_session(app: &App, terminal_focused: bool) -> Option<SessionId> {
+    if !terminal_focused {
+        None
+    } else if matches!(app.mode, Mode::TerminalAttached) {
+        app.attached.as_ref().map(|attached| attached.session_id)
+    } else if matches!(app.mode, Mode::Navigation) && app.main_tab != TuiContentView::Sessions {
+        app.selected_session_id
+    } else {
+        None
     }
 }
 
@@ -3893,7 +3976,12 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> Result<Self, DaemonError> {
         enable_raw_mode().map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        if let Err(error) = execute!(stdout(), EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(error) = execute!(
+            stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange
+        ) {
             let _ = disable_raw_mode();
             return Err(DaemonError::Lifecycle(error.to_string()));
         }
@@ -3913,6 +4001,7 @@ impl Drop for TerminalGuard {
             stdout(),
             EndSynchronizedUpdate,
             Print(RESET_TERMINAL_BACKGROUND),
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -4708,6 +4797,30 @@ mod tests {
                 reason: AttentionReason::SuccessfulCompletion,
             }]
         );
+    }
+
+    #[test]
+    fn attention_focus_requires_a_foreground_session_surface() {
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        let selected = app.selected_session_id.expect("selected Session");
+
+        app.mode = Mode::Navigation;
+        app.main_tab = TuiContentView::Sessions;
+        assert_eq!(visible_attention_session(&app, true), None);
+
+        app.main_tab = TuiContentView::Details;
+        assert_eq!(visible_attention_session(&app, true), Some(selected));
+        assert_eq!(visible_attention_session(&app, false), None);
+
+        app.mode = Mode::Settings(app::Settings {
+            original_theme: app.theme,
+            original_presentation: app.session_presentation,
+            original_density: app.density,
+            original_notification_preferences: app.notification_preferences,
+            focus: SettingsFocus::Theme,
+            github_remote_index: 0,
+        });
+        assert_eq!(visible_attention_session(&app, true), None);
     }
 
     #[test]
