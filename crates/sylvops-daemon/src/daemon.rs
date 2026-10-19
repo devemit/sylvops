@@ -4094,10 +4094,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             "hook session/worktree association is invalid".into(),
         ));
     }
-    if !state.hook_credentials.is_registered(delivery.session_id)
-        || persisted.process_id.is_none()
-        || !lifecycle_is_active(persisted.status.lifecycle)
-    {
+    if persisted.process_id.is_none() || !lifecycle_is_active(persisted.status.lifecycle) {
         state
             .database
             .audit(
@@ -4364,9 +4361,16 @@ fn spawn_exit_monitor(
         let mut handle = managed.handle.clone();
         let provider_kind = managed.record.read().await.provider_kind;
         let exit = handle.wait().await;
+        if !state
+            .hook_credentials
+            .invalidate_and_drain(session_id)
+            .await
+        {
+            tracing::warn!(%session_id, "timed out draining accepted Provider hook events");
+        }
         let operation_lock = session_operation_lock(&state, session_id).await;
         let _operation_guard = operation_lock.lock().await;
-        revoke_session_hook_access(&state, session_id).await;
+        state.hook_tracking.lock().await.remove(&session_id);
         state
             .providers
             .cleanup_runtime_paths(provider_kind, &managed.owned_runtime_paths);

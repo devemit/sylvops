@@ -29,8 +29,9 @@ use tokio::{
 
 const HEADER_LIMIT: usize = 16 * 1024;
 const DEFAULT_BODY_LIMIT: usize = 64 * 1024;
-const PER_SESSION_CONNECTION_LIMIT: usize = 8;
-const PER_SESSION_QUEUE_LIMIT: usize = 32;
+const PER_SESSION_CONNECTION_LIMIT: u32 = 8;
+const PER_SESSION_QUEUE_LIMIT: u32 = 32;
+const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 struct RateWindow {
@@ -146,8 +147,12 @@ impl HookCredentials {
             worktree_id,
             token: token.expose().to_owned(),
             limiter: Arc::new(RateLimiter::new(self.requests_per_minute)),
-            connection_slots: Arc::new(Semaphore::new(PER_SESSION_CONNECTION_LIMIT)),
-            queue_slots: Arc::new(Semaphore::new(PER_SESSION_QUEUE_LIMIT)),
+            connection_slots: Arc::new(Semaphore::new(
+                usize::try_from(PER_SESSION_CONNECTION_LIMIT).unwrap_or(usize::MAX),
+            )),
+            queue_slots: Arc::new(Semaphore::new(
+                usize::try_from(PER_SESSION_QUEUE_LIMIT).unwrap_or(usize::MAX),
+            )),
             body_limit: self.body_limit,
         };
         self.sessions
@@ -163,6 +168,37 @@ impl HookCredentials {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&session_id);
+    }
+
+    /// Prevents new deliveries for one Session and waits for already-authenticated work to drain.
+    pub async fn invalidate_and_drain(&self, session_id: SessionId) -> bool {
+        let credential = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session_id);
+        let Some(credential) = credential else {
+            return true;
+        };
+        timeout(SESSION_DRAIN_TIMEOUT, async move {
+            let Ok(_connections) = credential
+                .connection_slots
+                .acquire_many_owned(PER_SESSION_CONNECTION_LIMIT)
+                .await
+            else {
+                return false;
+            };
+            let Ok(_deliveries) = credential
+                .queue_slots
+                .acquire_many_owned(PER_SESSION_QUEUE_LIMIT)
+                .await
+            else {
+                return false;
+            };
+            true
+        })
+        .await
+        .unwrap_or(false)
     }
 
     #[must_use]
@@ -591,6 +627,49 @@ mod tests {
         assert!(limiter.allow());
         assert!(limiter.allow());
         assert!(!limiter.allow());
+    }
+
+    #[tokio::test]
+    async fn invalidation_waits_for_authenticated_connections_and_queued_deliveries() {
+        let receiver =
+            HookReceiver::bind(std::env::current_exe().expect("test executable"), 1_024, 8)
+                .await
+                .expect("hook receiver");
+        let session_id = SessionId::new();
+        let worktree_id = WorktreeId::new();
+        let endpoint = receiver
+            .register(ProviderKind::Codex, session_id, worktree_id)
+            .expect("session credential");
+        let credentials = receiver.credentials();
+        let credential = credentials
+            .authenticate(Some(endpoint.bearer_token()), session_id, worktree_id)
+            .expect("authenticated session");
+        let connection = credential
+            .connection_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("connection permit");
+        let delivery = credential
+            .queue_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("delivery permit");
+
+        let drain_credentials = credentials.clone();
+        let drain =
+            tokio::spawn(async move { drain_credentials.invalidate_and_drain(session_id).await });
+        tokio::task::yield_now().await;
+        assert!(!credentials.is_registered(session_id));
+        assert!(!drain.is_finished());
+        drop(connection);
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        drop(delivery);
+        assert!(drain.await.expect("drain task"));
+
+        receiver.shutdown().await;
     }
 
     #[tokio::test]
