@@ -18,6 +18,98 @@ async fn live_attention_claims_are_single_connection_scoped_and_preferences_pers
         .expect("attention notification integration timeout");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreground_focus_suppresses_only_that_session_and_acknowledges_terminal_attention() {
+    tokio::time::timeout(TEST_TIMEOUT, exercise_foreground_focus())
+        .await
+        .expect("attention focus integration timeout");
+}
+
+async fn exercise_foreground_focus() {
+    let repository = TemporaryRepository::initialize()
+        .await
+        .expect("temporary repository");
+    let paths = RuntimePaths::discover(Some(&repository.root().join("state"))).expect("paths");
+    let daemon_paths = paths.clone();
+    let mut daemon_task = AbortOnDropTask::spawn(async move { daemon::run(daemon_paths).await });
+    let desktop = connect_eventually(&paths, "attention-desktop").await;
+    let tui = connect_eventually(&paths, "attention-tui").await;
+
+    let workspace_id = match desktop
+        .request(&ClientRequest::AddWorkspace {
+            name: "focus".into(),
+        })
+        .await
+        .expect("workspace response")
+    {
+        DaemonResponse::WorkspaceAdded { workspace, .. } => workspace.id,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let worktree_id = match desktop
+        .request(&ClientRequest::AddProject {
+            workspace_id,
+            repository_path: repository.path().to_string_lossy().into_owned(),
+        })
+        .await
+        .expect("project response")
+    {
+        DaemonResponse::ProjectAdded { root_worktree, .. } => root_worktree.id,
+        response => panic!("unexpected project response: {response:?}"),
+    };
+
+    let visible = create_shell_session(&desktop, worktree_id, "Visible session").await;
+    let other = create_shell_session(&desktop, worktree_id, "Other\nprivate").await;
+    report_focus(&desktop, Some(visible)).await;
+    let visible_event = finish_shell_session(&desktop, visible).await;
+
+    assert!(claim(&desktop).await.is_none());
+    assert!(claim(&tui).await.is_none());
+    assert_eq!(
+        attention(&desktop, visible).await.acknowledgement,
+        AttentionAcknowledgement::Acknowledged
+    );
+
+    let other_event = finish_shell_session(&desktop, other).await;
+    let (desktop_claim, tui_claim) = tokio::join!(claim(&desktop), claim(&tui));
+    let granted = desktop_claim
+        .as_ref()
+        .or(tui_claim.as_ref())
+        .expect("one delivery grant for the non-visible Session");
+    assert!(desktop_claim.is_none() ^ tui_claim.is_none());
+    assert_eq!(granted.session_id, other);
+    assert_eq!(granted.attention_id, other_event.id);
+    assert_eq!(granted.session_display_name, "Otherprivate");
+    assert_eq!(visible_event.reason, AttentionReason::SuccessfulCompletion);
+
+    if desktop_claim.is_some() {
+        drop(desktop);
+        assert!(claim(&tui).await.is_none());
+        assert_eq!(
+            attention(&tui, other).await.acknowledgement,
+            AttentionAcknowledgement::Pending
+        );
+        tui.request(&ClientRequest::ShutdownDaemon)
+            .await
+            .expect("shutdown response");
+    } else {
+        drop(tui);
+        assert!(claim(&desktop).await.is_none());
+        assert_eq!(
+            attention(&desktop, other).await.acknowledgement,
+            AttentionAcknowledgement::Pending
+        );
+        desktop
+            .request(&ClientRequest::ShutdownDaemon)
+            .await
+            .expect("shutdown response");
+    }
+    daemon_task
+        .join()
+        .await
+        .expect("daemon join")
+        .expect("daemon shutdown");
+}
+
 #[allow(clippy::too_many_lines)]
 async fn exercise_attention_notifications() {
     let repository = TemporaryRepository::initialize()
@@ -161,6 +253,35 @@ async fn claim(
     {
         DaemonResponse::AttentionNotificationClaim(claim) => claim,
         response => panic!("unexpected claim response: {response:?}"),
+    }
+}
+
+async fn report_focus(client: &DaemonClient, session_id: Option<sylvops_core::ids::SessionId>) {
+    assert!(matches!(
+        client
+            .request(&ClientRequest::ReportAttentionFocus { session_id })
+            .await
+            .expect("attention focus response"),
+        DaemonResponse::AttentionFocusUpdated
+    ));
+}
+
+async fn attention(
+    client: &DaemonClient,
+    session_id: sylvops_core::ids::SessionId,
+) -> sylvops_core::session_state::AttentionEvent {
+    match client
+        .request(&ClientRequest::GetSnapshot)
+        .await
+        .expect("snapshot response")
+    {
+        DaemonResponse::Snapshot(snapshot) => snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.status.attention)
+            .expect("Session attention"),
+        response => panic!("unexpected snapshot response: {response:?}"),
     }
 }
 

@@ -68,7 +68,7 @@ pub(crate) enum Operation {
     CreateWorktree,
     CreateSession(WorktreeId),
     Resume(SessionId),
-    AcknowledgeAttention(SessionId),
+    ReportAttentionFocus,
     ClaimAttentionNotification,
     RenameProject,
     RenameWorktree,
@@ -501,10 +501,12 @@ async fn run_worker_async(
         };
         match command {
             BridgeCommand::Request { operation, request } => {
-                let request_client = client.clone();
-                let request_events = events.clone();
-                tokio::spawn(async move {
-                    let event = match request_client.request(&request).await {
+                if matches!(
+                    request.as_ref(),
+                    ClientRequest::ReportAttentionFocus { .. }
+                        | ClientRequest::ClaimAttentionNotification
+                ) {
+                    let event = match client.request(&request).await {
                         Ok(response) => BridgeEvent::Response {
                             operation,
                             response,
@@ -514,8 +516,24 @@ async fn run_worker_async(
                             message: error.to_string(),
                         },
                     };
-                    request_events.send_critical(event);
-                });
+                    events.send_critical(event);
+                } else {
+                    let request_client = client.clone();
+                    let request_events = events.clone();
+                    tokio::spawn(async move {
+                        let event = match request_client.request(&request).await {
+                            Ok(response) => BridgeEvent::Response {
+                                operation,
+                                response,
+                            },
+                            Err(error) => BridgeEvent::Error {
+                                operation: Some(operation),
+                                message: error.to_string(),
+                            },
+                        };
+                        request_events.send_critical(event);
+                    });
+                }
             }
             BridgeCommand::RemoveUserData { confirmation } => {
                 let response = client
