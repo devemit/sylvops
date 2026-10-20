@@ -16,7 +16,7 @@ mod theme;
 use std::{
     io::stdout,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use app::{
@@ -165,8 +165,29 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
     let mut animation_frame = app.status_animation_frame();
     let mut terminal_focused = false;
     let mut reported_attention_focus = ReportedAttentionFocus::Unknown;
+    let mut health_checked_at = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or_else(Instant::now);
 
     loop {
+        if health_checked_at.elapsed() >= Duration::from_secs(5) {
+            health_checked_at = Instant::now();
+            if let Some(session_id) = app.selected_session_id
+                && let Ok(DaemonResponse::SessionLifecycleHealth { session_id, health }) = client
+                    .request(&ClientRequest::GetSessionLifecycleHealth { session_id })
+                    .await
+            {
+                app.lifecycle_health = Some((session_id, health));
+                if health == sylvops_core::attention::LifecycleHealth::Missing {
+                    app.flash = Some(Flash::error(health.guidance()));
+                } else if app.flash.as_ref().is_some_and(|flash| {
+                    flash.text == sylvops_core::attention::LifecycleHealth::Missing.guidance()
+                }) {
+                    app.flash = None;
+                }
+                dirty = true;
+            }
+        }
         sync_attention_focus(
             &client,
             &app,
@@ -186,6 +207,13 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         guard.sync_theme(app.theme);
         let had_flash = app.flash.is_some();
         app.expire_flash();
+        if notification_presenter.take_native_failure() {
+            app.flash = Some(Flash::transient(
+                FlashKind::Error,
+                "Native notification delivery failed. Pending attention remains in Active Sessions.",
+            ));
+            dirty = true;
+        }
         dirty |= had_flash != app.flash.is_some();
         let next_animation_frame = app.status_animation_frame();
         dirty |= next_animation_frame != animation_frame
@@ -416,7 +444,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 false
             }
             Mode::Settings(_) => {
-                handle_settings(&client, &mut app, &input).await?;
+                handle_settings(&client, &mut app, &input, &notification_presenter).await?;
                 false
             }
             Mode::GitHub(_) => {
@@ -473,7 +501,7 @@ fn visible_attention_session(app: &App, terminal_focused: bool) -> Option<Sessio
         None
     } else if matches!(app.mode, Mode::TerminalAttached) {
         app.attached.as_ref().map(|attached| attached.session_id)
-    } else if matches!(app.mode, Mode::Navigation) && app.main_tab != TuiContentView::Sessions {
+    } else if matches!(app.mode, Mode::Navigation) && app.main_tab == TuiContentView::Details {
         app.selected_session_id
     } else {
         None
@@ -498,6 +526,21 @@ async fn handle_navigation(
     app: &mut App,
     event: Event,
 ) -> Result<bool, DaemonError> {
+    if is_review_key(&event)
+        && let Some(session) = app.selected_session()
+        && let Some(attention) = session.status.pending_review()
+    {
+        review_attention(client, app, session.id, attention.id).await?;
+        return Ok(false);
+    }
+    if let Event::Mouse(mouse) = &event
+        && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        && let Some(HitTarget::MarkReviewed(id, event_id)) =
+            app.hit_map.target_at(mouse.column, mouse.row)
+    {
+        review_attention(client, app, id, event_id).await?;
+        return Ok(false);
+    }
     if app.help {
         if matches!(event, Event::Key(key) if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?')))
         {
@@ -564,7 +607,7 @@ async fn dismiss_attention(
         .await?
     {
         DaemonResponse::SessionAttentionDismissed { revision, session } => {
-            replace_session_snapshot(app, revision, session);
+            replace_session_snapshot(app, revision, &session);
             app.flash = Some(Flash::transient(
                 FlashKind::Success,
                 "Recoverable failure dismissed.",
@@ -599,6 +642,18 @@ async fn open_attention(
     let live = app
         .selected_session()
         .is_some_and(|session| session.status.lifecycle == SessionLifecycle::Running);
+    if live {
+        attach_selected_process(client, app).await?;
+        if !app
+            .attached
+            .as_ref()
+            .is_some_and(|attached| attached.session_id == session_id)
+        {
+            return Ok(());
+        }
+    } else {
+        app.set_tab(TuiContentView::Details);
+    }
     match client
         .request(&ClientRequest::AcknowledgeAttention {
             session_id,
@@ -607,11 +662,8 @@ async fn open_attention(
         .await?
     {
         DaemonResponse::SessionAttentionAcknowledged { revision, session } => {
-            replace_session_snapshot(app, revision, session);
-            if live {
-                attach_selected_process(client, app).await?;
-            } else {
-                app.set_tab(TuiContentView::Details);
+            replace_session_snapshot(app, revision, &session);
+            if !live {
                 app.flash = Some(Flash::transient(
                     FlashKind::Success,
                     "Session history opened and attention acknowledged.",
@@ -628,15 +680,17 @@ async fn open_attention(
     Ok(())
 }
 
-fn replace_session_snapshot(app: &mut App, revision: u64, session: sylvops_core::domain::Session) {
+fn replace_session_snapshot(app: &mut App, revision: u64, session: &sylvops_core::domain::Session) {
     let mut next = app.snapshot.clone();
-    next.revision = revision;
+    next.revision = next.revision.max(revision);
     if let Some(existing) = next
         .sessions
         .iter_mut()
         .find(|existing| existing.id == session.id)
     {
-        *existing = session;
+        existing
+            .status
+            .apply_attention_acknowledgement(session.status);
     }
     app.replace_snapshot(next);
 }
@@ -2922,6 +2976,7 @@ enum SettingsDecision {
     AssociateGitHub(usize),
     ClearGitHub,
     RefreshGitHub,
+    TestNotification,
 }
 
 fn cycle_choice<T: Copy + PartialEq>(choices: &[T], current: T, delta: isize) -> T {
@@ -2959,7 +3014,10 @@ fn adjust_setting(app: &mut App, settings: SettingsFocus, delta: isize) {
                     !app.notification_preferences.sound_enabled;
             }
         }
-        SettingsFocus::GitHub | SettingsFocus::Apply | SettingsFocus::Cancel => {}
+        SettingsFocus::GitHub
+        | SettingsFocus::TestNotification
+        | SettingsFocus::Apply
+        | SettingsFocus::Cancel => {}
     }
 }
 
@@ -2973,6 +3031,7 @@ fn handle_settings_input(app: &mut App, input: &Event) -> SettingsDecision {
         None
     };
     match clicked {
+        Some(HitTarget::SettingsTestNotification) => return SettingsDecision::TestNotification,
         Some(HitTarget::SettingsGithubRemote(index)) => {
             if let Mode::Settings(settings) = &mut app.mode {
                 settings.focus = SettingsFocus::GitHub;
@@ -3039,6 +3098,9 @@ fn handle_settings_input(app: &mut App, input: &Event) -> SettingsDecision {
         return SettingsDecision::Continue;
     };
     match key.code {
+        KeyCode::Enter if settings.focus == SettingsFocus::TestNotification => {
+            return SettingsDecision::TestNotification;
+        }
         KeyCode::Down | KeyCode::Tab => settings.focus = settings.focus.moved(1),
         KeyCode::Up | KeyCode::BackTab => settings.focus = settings.focus.moved(-1),
         KeyCode::Left | KeyCode::Char('h') if settings.focus == SettingsFocus::GitHub => {
@@ -3094,8 +3156,28 @@ async fn handle_settings(
     client: &DaemonClient,
     app: &mut App,
     input: &Event,
+    presenter: &notifications::NotificationPresenter<notifications::SystemChannels>,
 ) -> Result<(), DaemonError> {
     match handle_settings_input(app, input) {
+        SettingsDecision::TestNotification => {
+            let preferences = load_attention_notification_preferences(client).await?;
+            let claim = sylvops_core::attention::AttentionNotificationClaim::test(preferences);
+            let result = presenter.present(&claim);
+            app.flash = Some(Flash::transient(
+                FlashKind::Info,
+                match result {
+                    Some(notification) if notification.native_queued => {
+                        "Test notification queued; OS policy controls its display."
+                    }
+                    Some(_) => {
+                        "Test notification: native delivery unavailable; in-client fallback works."
+                    }
+                    None => {
+                        "Visual notifications are disabled; sound follows your shared preference."
+                    }
+                },
+            ));
+        }
         SettingsDecision::Apply => {
             save_attention_notification_preferences(client, app.notification_preferences).await?;
             save_tui_state(client, app).await?;
@@ -3603,6 +3685,23 @@ async fn handle_terminal(
     };
     let session_id = attached.session_id;
     let role = attached.role;
+    if is_review_key(&input)
+        && let Some(session) = app
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        && let Some(event) = session.status.pending_review()
+    {
+        return review_attention(client, app, session_id, event.id).await;
+    }
+    if let Event::Mouse(mouse) = &input
+        && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        && let Some(HitTarget::MarkReviewed(id, event_id)) =
+            app.hit_map.target_at(mouse.column, mouse.row)
+    {
+        return review_attention(client, app, id, event_id).await;
+    }
     let clicked_detach = matches!(&input, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) && matches!(app.hit_map.target_at(mouse.column, mouse.row), Some(HitTarget::Detach)));
     let history = match &input {
         Event::Key(key) => history_action(*key),
@@ -3672,6 +3771,32 @@ async fn handle_terminal(
         }
         _ => Ok(()),
     }
+}
+
+fn is_review_key(input: &Event) -> bool {
+    matches!(input, Event::Key(key) if matches!(key.code, KeyCode::Char('r' | 'R'))
+        && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT))
+}
+
+async fn review_attention(
+    client: &DaemonClient,
+    app: &mut App,
+    session_id: SessionId,
+    attention_id: sylvops_core::session_state::AttentionEventId,
+) -> Result<(), DaemonError> {
+    match client
+        .request(&ClientRequest::AcknowledgeAttention {
+            session_id,
+            attention_id,
+        })
+        .await?
+    {
+        DaemonResponse::SessionAttentionAcknowledged { revision, session } => {
+            replace_session_snapshot(app, revision, &session);
+        }
+        response => app.flash = Some(Flash::error(response_message("Mark reviewed", response))),
+    }
+    Ok(())
 }
 
 fn enqueue_terminal_input(app: &mut App, pump: Option<&InputPump>, bytes: Vec<u8>) {
@@ -4411,6 +4536,106 @@ mod tests {
     }
 
     #[test]
+    fn delayed_attention_acknowledgement_preserves_newer_provider_state() {
+        let mut snapshot = populated_snapshot();
+        let completed = with_pending_attention(
+            snapshot.sessions[0].clone(),
+            "completed",
+            AttentionReason::SuccessfulCompletion,
+            3,
+            3,
+        );
+        let id = completed.id;
+        snapshot.sessions = vec![completed.clone()];
+        let mut app = App::new(snapshot, Vec::new(), None);
+        let mut response = completed;
+        response.status.attention.as_mut().unwrap().acknowledgement =
+            AttentionAcknowledgement::Acknowledged;
+        app.snapshot.sessions[0]
+            .status
+            .attention
+            .as_mut()
+            .unwrap()
+            .id = sylvops_core::session_state::AttentionEventId::try_from(4).unwrap();
+        app.snapshot.sessions[0]
+            .status
+            .attention
+            .as_mut()
+            .unwrap()
+            .reason = AttentionReason::InputRequested;
+        app.snapshot.sessions[0].status.activity = ProviderActivity::AwaitingInput;
+        let newer = app.snapshot.sessions[0].clone();
+        replace_session_snapshot(&mut app, 2, &response);
+        assert_eq!(app.snapshot.sessions[0].id, id);
+        assert_eq!(app.snapshot.sessions[0], newer);
+    }
+
+    #[test]
+    fn active_cards_and_lists_use_pending_reason_backgrounds_across_themes() {
+        for theme_choice in TuiTheme::ALL {
+            for presentation in TuiSessionPresentation::ALL {
+                for reason in [
+                    AttentionReason::InputRequested,
+                    AttentionReason::RecoverableFailure,
+                    AttentionReason::SuccessfulCompletion,
+                    AttentionReason::TerminalFailure,
+                ] {
+                    let mut snapshot = populated_snapshot();
+                    let session = with_pending_attention(
+                        snapshot.sessions[0].clone(),
+                        "attention",
+                        reason,
+                        1,
+                        1,
+                    );
+                    let id = session.id;
+                    snapshot.sessions = vec![session];
+                    let mut app = App::new(snapshot, Vec::new(), None);
+                    app.select_navigator_view(TuiNavigatorView::Active);
+                    app.theme = theme_choice;
+                    app.session_presentation = presentation;
+                    app.navigator_width = 60;
+                    for selected in [false, true] {
+                        app.selected_session_id = selected.then_some(id);
+                        let mut terminal =
+                            Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+                        terminal
+                            .draw(|frame| render::draw(frame, &mut app))
+                            .unwrap();
+                        let area = app
+                            .hit_map
+                            .0
+                            .iter()
+                            .find(|region| region.target == HitTarget::SessionOverview(id))
+                            .unwrap()
+                            .area;
+                        assert_eq!(
+                            terminal
+                                .backend()
+                                .buffer()
+                                .cell((area.x, area.y))
+                                .unwrap()
+                                .bg,
+                            theme::Theme::resolve(theme_choice)
+                                .attention_surface(reason, selected)
+                                .bg
+                                .unwrap(),
+                            "{theme_choice:?} {presentation:?} {reason:?} selected={selected}"
+                        );
+                    }
+                    app.snapshot.sessions[0]
+                        .status
+                        .attention
+                        .as_mut()
+                        .unwrap()
+                        .acknowledgement = AttentionAcknowledgement::Acknowledged;
+                    assert!(app.needs_attention_sessions().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rendered_attention_rows_pair_distinct_icons_labels_and_semantic_surfaces() {
         let reasons = [
             (AttentionReason::InputRequested, "?", "Input requested"),
@@ -4806,6 +5031,10 @@ mod tests {
 
         app.mode = Mode::Navigation;
         app.main_tab = TuiContentView::Sessions;
+        assert_eq!(visible_attention_session(&app, true), None);
+        app.main_tab = TuiContentView::Terminal;
+        assert_eq!(visible_attention_session(&app, true), None);
+        app.main_tab = TuiContentView::Changes;
         assert_eq!(visible_attention_session(&app, true), None);
 
         app.main_tab = TuiContentView::Details;

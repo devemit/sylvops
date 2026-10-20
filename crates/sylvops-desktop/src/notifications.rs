@@ -464,7 +464,7 @@ mod platform {
             mpsc,
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use sylvops_core::ids::SessionId;
@@ -544,6 +544,7 @@ mod platform {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Win32 handles and pumping stay on one owning thread.
     fn run_notification_loop(
         receiver: &mpsc::Receiver<NotificationPayload>,
         activation_sender: &mpsc::SyncSender<SessionId>,
@@ -589,7 +590,13 @@ mod platform {
             }
             let _ = initialized_sender.try_send(true);
             let mut active_session_id = None;
+            let mut active_since = Instant::now();
             while !stop.load(Ordering::Acquire) {
+                // Explorer can omit balloon callbacks (quiet time, restart, or policy).
+                // Bound ownership so one missing callback cannot stall the delivery queue.
+                if active_since.elapsed() >= Duration::from_secs(15) {
+                    active_session_id = None;
+                }
                 let next = if active_session_id.is_none() {
                     match receiver.recv_timeout(Duration::from_millis(100)) {
                         Ok(payload) => Some(payload),
@@ -602,7 +609,9 @@ mod platform {
                 };
                 let mut message = MSG::default();
                 while PeekMessageW(&raw mut message, window, 0, 0, PM_REMOVE) != 0 {
-                    if message.message == NOTIFICATION_CALLBACK_MESSAGE {
+                    if message.message == NOTIFICATION_CALLBACK_MESSAGE
+                        && u32::try_from(message.wParam).ok() == Some(data.uID)
+                    {
                         let callback = u32::try_from(message.lParam).ok();
                         if callback == Some(NIN_BALLOONUSERCLICK)
                             && let Some(session_id) = active_session_id
@@ -622,6 +631,22 @@ mod platform {
                 if active_session_id.is_none()
                     && let Some(payload) = next
                 {
+                    // A fresh icon ID binds callbacks to this delivery. Late callbacks for a
+                    // timed-out/deleted balloon must never activate the next Session.
+                    Shell_NotifyIconW(NIM_DELETE, &raw const data);
+                    let Some(next_id) = data.uID.checked_add(1) else {
+                        let _ = failure_sender.try_send(payload);
+                        break;
+                    };
+                    data.uID = next_id;
+                    data.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+                    if Shell_NotifyIconW(NIM_ADD, &raw const data) == 0 {
+                        let _ = failure_sender.try_send(payload);
+                        for pending in receiver.try_iter() {
+                            let _ = failure_sender.try_send(pending);
+                        }
+                        break;
+                    }
                     data.uFlags = NIF_INFO;
                     data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND | NIIF_RESPECT_QUIET_TIME;
                     copy_text(&mut data.szInfoTitle, &payload.title);
@@ -634,6 +659,7 @@ mod platform {
                         break;
                     }
                     active_session_id = Some(payload.session_id);
+                    active_since = Instant::now();
                 }
             }
             Shell_NotifyIconW(NIM_DELETE, &raw const data);
@@ -678,6 +704,20 @@ mod tests {
         ids::SessionId,
         session_state::{AttentionEventId, AttentionReason},
     };
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive Windows Explorer notification service"]
+    fn windows_native_notification_smoke_is_bounded() {
+        let notifier = super::platform::Notifier::new().expect("native notification service");
+        let payload = super::presentation(&AttentionNotificationClaim::test(
+            AttentionNotificationPreferences::default(),
+        ));
+        assert!(notifier.send(&payload));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(notifier.take_failure().is_none());
+        // Acceptance by Explorer does not prove visible display: OS policy remains authoritative.
+    }
 
     use super::{
         AttentionNotificationAdapter, NativeDesktopSession, NativeNotificationPlatform,

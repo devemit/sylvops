@@ -139,6 +139,37 @@ impl TryFrom<SessionStatusWire> for SessionStatus {
 }
 
 impl SessionStatus {
+    /// Applies an event-bound acknowledgement without replacing newer lifecycle/activity data.
+    pub fn apply_attention_acknowledgement(&mut self, reviewed: Self) -> bool {
+        let Some(event) = reviewed.attention else {
+            return false;
+        };
+        if event.acknowledgement != AttentionAcknowledgement::Acknowledged
+            || event.reason == AttentionReason::InputRequested
+            || !self.attention.is_some_and(|current| {
+                current.id == event.id
+                    && current.reason == event.reason
+                    && current.acknowledgement == AttentionAcknowledgement::Pending
+            })
+        {
+            return false;
+        }
+        self.attention = Some(event);
+        true
+    }
+
+    /// Returns the exact pending event that an explicit history-open/review may acknowledge.
+    /// Input and recoverable failures have separate resolution/dismissal policies.
+    pub fn pending_review(self) -> Option<AttentionEvent> {
+        self.attention.filter(|event| {
+            event.acknowledgement == AttentionAcknowledgement::Pending
+                && matches!(
+                    event.reason,
+                    AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
+                )
+        })
+    }
+
     /// Rejects impossible combinations at protocol and persistence boundaries.
     ///
     /// # Errors

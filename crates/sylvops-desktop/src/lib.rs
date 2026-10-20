@@ -285,6 +285,8 @@ struct DesktopApp {
     disclosures: DisclosureState,
     attention_notifications: notifications::AttentionNotificationAdapter,
     attention_claim: AttentionClaimState,
+    lifecycle_health: Option<(SessionId, sylvops_core::attention::LifecycleHealth)>,
+    lifecycle_health_requested_at: Option<Instant>,
     window_attention_state: WindowAttentionState,
     reported_attention_focus: ReportedAttentionFocus,
     pending_attention_activation: Option<SessionId>,
@@ -640,6 +642,8 @@ enum Message {
     FolderPicked(Result<Option<String>, String>),
     ConfirmAction,
     Attach,
+    ReviewAttention(SessionId, sylvops_core::session_state::AttentionEventId),
+    TestNotifications,
     Detach,
     Resume(SessionId),
     TerminalPointerMoved(Point),
@@ -815,6 +819,8 @@ impl DesktopApp {
             disclosures: DisclosureState::default(),
             attention_notifications,
             attention_claim: AttentionClaimState::Idle,
+            lifecycle_health: None,
+            lifecycle_health_requested_at: None,
             window_attention_state: WindowAttentionState::Background,
             reported_attention_focus: ReportedAttentionFocus::Unknown,
             pending_attention_activation: None,
@@ -837,6 +843,7 @@ impl DesktopApp {
                 self.flush_timers();
                 self.sync_attention_focus();
                 self.request_attention_notification_claim();
+                self.poll_lifecycle_health();
                 if let Some(notification) = self.attention_notifications.take_fallback() {
                     self.show_attention_notification(&notification);
                 }
@@ -930,13 +937,31 @@ impl DesktopApp {
             }
             Message::SelectProject(project_id) => self.select_project(project_id),
             Message::SelectWorktree(worktree_id) => self.select_worktree(worktree_id),
-            Message::SelectSession(session_id) => self.select_session(session_id),
+            Message::SelectSession(session_id) => {
+                self.content_surface = ContentSurface::Session;
+                if self
+                    .session(session_id)
+                    .is_some_and(|session| session.status.pending_review().is_some())
+                    && !self.terminals.contains_key(&session_id)
+                {
+                    self.main_tab = MainTab::Details;
+                }
+                self.select_session(session_id);
+                if matches!(self.main_tab, MainTab::Terminal | MainTab::Details) {
+                    self.review_opened_attention(session_id);
+                }
+            }
             Message::RunNavigatorAction(action) => {
                 return self.run_navigator_action(action);
             }
             Message::HoverNavigatorNode(node) => self.hovered_navigator_node = node,
             Message::SelectOpenSession(session_id) => {
                 self.unfocus_terminal();
+                self.content_surface = ContentSurface::Session;
+                if !self.terminals.contains_key(&session_id) {
+                    self.main_tab = MainTab::Details;
+                }
+                self.review_opened_attention(session_id);
                 if self.active_session_id == Some(session_id) {
                     return Task::none();
                 }
@@ -1043,6 +1068,21 @@ impl DesktopApp {
             Message::FolderPicked(result) => self.apply_picked_folder(result),
             Message::ConfirmAction => self.confirm_action(),
             Message::Attach => self.attach_active(),
+            Message::ReviewAttention(session_id, attention_id) => {
+                self.send_request(
+                    Operation::ReviewAttention(session_id),
+                    ClientRequest::AcknowledgeAttention {
+                        session_id,
+                        attention_id,
+                    },
+                );
+            }
+            Message::TestNotifications => {
+                self.send_request(
+                    Operation::TestNotifications,
+                    ClientRequest::GetAttentionNotificationPreferences,
+                );
+            }
             Message::Detach => self.detach_active(),
             Message::Resume(session_id) => self.resume_session(session_id),
             Message::TerminalPointerMoved(point) => self.move_terminal_pointer(point),
@@ -1828,7 +1868,6 @@ impl DesktopApp {
         let density = self.presentation().density;
         let is_selected = row.selected;
         let is_hovered = self.hovered_navigator_node == Some(row.id);
-        let needs_input = matches!(row.id, NavigatorNodeId::Session(id) if self.session(id).is_some_and(|session| session.status.activity == ProviderActivity::AwaitingInput));
         let name = text(row.label.clone())
             .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
             .size(UI_TEXT_SIZE)
@@ -1877,14 +1916,7 @@ impl DesktopApp {
             .height(density.control_height + 14)
             .padding([4, 6])
             .clip(true)
-            .style(move |theme| {
-                let style = navigator_row_container_style(theme, is_selected, is_hovered);
-                if needs_input {
-                    attention_row_style(theme, style, is_selected || is_hovered)
-                } else {
-                    style
-                }
-            });
+            .style(move |theme| navigator_row_container_style(theme, is_selected, is_hovered));
         let select = match row.id {
             NavigatorNodeId::Repository(id) => Message::SelectProject(id),
             NavigatorNodeId::Checkout(id) => Message::SelectWorktree(id),
@@ -2001,16 +2033,17 @@ impl DesktopApp {
                 MainTab::Details => self.details_view(),
             }
         };
-        container(column![
-            tabs,
-            rule::horizontal(1),
-            views,
-            rule::horizontal(1),
-            content
-        ])
-        .width(Fill)
-        .height(Fill)
-        .into()
+        let mut body = column![tabs, rule::horizontal(1), views, rule::horizontal(1)];
+        if let Some((id, health)) = self.lifecycle_health
+            && self.active_session_id == Some(id)
+            && health == sylvops_core::attention::LifecycleHealth::Missing
+        {
+            body = body.push(text(health.guidance()).size(UI_META_SIZE));
+        }
+        container(body.push(content))
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
 
     fn github_context_header(&self) -> Element<'_, Message> {
@@ -2063,8 +2096,6 @@ impl DesktopApp {
             let active = session.active;
             let session_id = session.id;
             let status = self.session(session_id).map(|session| session.status);
-            let needs_input =
-                status.is_some_and(|status| status.activity == ProviderActivity::AwaitingInput);
             let mut label_content = row![].spacing(5).align_y(Center);
             if status.is_some_and(session_status_animates) {
                 label_content = label_content.push(running_ring(13, self.status_animation_angle()));
@@ -2084,20 +2115,7 @@ impl DesktopApp {
                             .on_press(Message::SelectOpenSession(session_id))
                             .height(density.row_height)
                             .padding([5, 9])
-                            .style(move |theme, status| {
-                                let mut style = tab_label_style(theme, status, active);
-                                if needs_input {
-                                    style.background = Some(Background::Color(
-                                        theme
-                                            .extended_palette()
-                                            .warning
-                                            .base
-                                            .color
-                                            .scale_alpha(if active { 0.22 } else { 0.14 }),
-                                    ));
-                                }
-                                style
-                            }),
+                            .style(move |theme, status| { tab_label_style(theme, status, active) }),
                         button(line_icon(LineIcon::Close, 15))
                             .on_press(Message::CloseSessionTab(session_id))
                             .height(density.row_height)
@@ -2107,14 +2125,7 @@ impl DesktopApp {
                     .spacing(0)
                     .align_y(Center),
                 )
-                .style(move |theme| {
-                    let style = session_tab_group_style(theme, active);
-                    if needs_input {
-                        attention_row_style(theme, style, active)
-                    } else {
-                        style
-                    }
-                }),
+                .style(move |theme| session_tab_group_style(theme, active)),
             );
         }
         if presentation.active_session.tabs.is_empty() {
@@ -2157,6 +2168,7 @@ impl DesktopApp {
         .into()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn session_actions(&self) -> Element<'_, Message> {
         let presentation = self.presentation();
         let density = presentation.density;
@@ -2170,9 +2182,18 @@ impl DesktopApp {
         let resume_pending = self.resume_pending.contains(&session_id);
         let state_label = context.state.clone();
         let presentation_theme = presentation.theme;
+        let review = self
+            .session(session_id)
+            .and_then(|session| session.status.pending_review());
         responsive(move |size| {
             let compact = size.width < 260.0;
             let mut actions = row![].spacing(4);
+            if let Some(event) = review {
+                actions = actions.push(
+                    button(text("Mark reviewed").size(UI_META_SIZE))
+                        .on_press(Message::ReviewAttention(session_id, event.id)),
+                );
+            }
             if let Some(action) = terminal_action {
                 let message = match action {
                     ActiveTerminalAction::Leave => Message::Detach,
@@ -2957,6 +2978,11 @@ impl DesktopApp {
         let presentation = self.presentation();
         let selection = presentation.details_selection;
         let mut content = column![text("Selection details").font(UI_SEMIBOLD).size(24)].spacing(12);
+        if let Some((id, health)) = self.lifecycle_health
+            && self.active_session_id == Some(id)
+        {
+            content = content.push(text(health.guidance()).size(UI_META_SIZE));
+        }
         let mut technical = column![].spacing(8);
         let mut has_technical_details = false;
         let work_source = selection.worktree.and_then(|worktree_id| {
@@ -3344,6 +3370,9 @@ impl DesktopApp {
                     text("Essentials").font(UI_SEMIBOLD).size(16),
                     appearance,
                     appearance_controls,
+                    text("Notifications").font(UI_SEMIBOLD).size(16),
+                    button("Test notification").on_press(Message::TestNotifications),
+                    text("Uses saved shared notification and sound preferences. Operating-system policy controls display.").size(UI_META_SIZE),
                     rule::horizontal(1),
                     github_settings,
                     rule::horizontal(1),
@@ -4882,6 +4911,48 @@ impl DesktopApp {
                     diff.text
                 });
             }
+            (
+                Operation::ReviewAttention(id),
+                DaemonResponse::SessionAttentionAcknowledged { revision, session },
+            ) if id == session.id => {
+                if let Some(current) = self
+                    .snapshot
+                    .sessions
+                    .iter_mut()
+                    .find(|current| current.id == id)
+                {
+                    current
+                        .status
+                        .apply_attention_acknowledgement(session.status);
+                }
+                self.snapshot.revision = self.snapshot.revision.max(revision);
+            }
+            (
+                Operation::LifecycleHealth(id),
+                DaemonResponse::SessionLifecycleHealth { session_id, health },
+            ) if id == session_id => {
+                if self.active_session_id == Some(id) {
+                    self.lifecycle_health = Some((id, health));
+                }
+            }
+            (
+                Operation::TestNotifications,
+                DaemonResponse::AttentionNotificationPreferences(preferences),
+            ) => {
+                let claim = sylvops_core::attention::AttentionNotificationClaim::test(preferences);
+                let delivery = self.attention_notifications.deliver(&claim);
+                self.show_success(match delivery {
+                    notifications::NotificationDelivery::Native => {
+                        "Test notification queued; operating-system policy controls its display."
+                    }
+                    notifications::NotificationDelivery::InClient(_) => {
+                        "Test notification: native delivery unavailable; in-client fallback works."
+                    }
+                    notifications::NotificationDelivery::Disabled => {
+                        "Visual notifications are disabled; sound follows your shared preference."
+                    }
+                });
+            }
             (Operation::ReportAttentionFocus, DaemonResponse::AttentionFocusUpdated)
             | (Operation::Resize, DaemonResponse::Acknowledged)
             | (Operation::PrepareDataRemoval, DaemonResponse::DataRemovalPrepared) => {}
@@ -5740,10 +5811,16 @@ impl DesktopApp {
     fn select_main_tab(&mut self, tab: MainTab) {
         self.unfocus_terminal();
         if self.main_tab == tab && self.content_surface == ContentSurface::Session {
+            if let Some(session_id) = self.active_session_id {
+                self.review_opened_attention(session_id);
+            }
             return;
         }
         self.content_surface = ContentSurface::Session;
         self.main_tab = tab;
+        if let Some(session_id) = self.active_session_id {
+            self.review_opened_attention(session_id);
+        }
         if tab == MainTab::Changes {
             self.load_diff();
         }
@@ -7095,6 +7172,19 @@ impl DesktopApp {
             return;
         }
         if !lifecycle_is_active(session.status.lifecycle) {
+            if session.status.attention.is_some_and(|event| {
+                event.acknowledgement
+                    == sylvops_core::session_state::AttentionAcknowledgement::Pending
+                    && matches!(
+                        event.reason,
+                        sylvops_core::session_state::AttentionReason::SuccessfulCompletion
+                            | sylvops_core::session_state::AttentionReason::TerminalFailure
+                    )
+            }) {
+                self.main_tab = MainTab::Details;
+                self.review_opened_attention(session_id);
+                return;
+            }
             self.resume_session(session_id);
             return;
         }
@@ -7752,9 +7842,15 @@ impl DesktopApp {
             return;
         }
         let session_id = (self.window_attention_state == WindowAttentionState::Foreground
-            && self.content_surface == ContentSurface::Session)
-            .then_some(self.active_session_id)
-            .flatten();
+            && self.content_surface == ContentSurface::Session
+            && self.modal.is_none()
+            && (self.main_tab == MainTab::Details
+                || (self.main_tab == MainTab::Terminal
+                    && self
+                        .active_session_id
+                        .is_some_and(|id| self.terminals.contains_key(&id)))))
+        .then_some(self.active_session_id)
+        .flatten();
         let report = ReportedAttentionFocus::from(session_id);
         if report == ReportedAttentionFocus::Background
             && self.reported_attention_focus == ReportedAttentionFocus::Unknown
@@ -7774,6 +7870,45 @@ impl DesktopApp {
 
     fn show_attention_notification(&mut self, notification: &notifications::InClientNotification) {
         self.show_success(format!("{} · {}", notification.title, notification.message));
+    }
+
+    fn poll_lifecycle_health(&mut self) {
+        if self.connection != ConnectionState::Connected
+            || self
+                .lifecycle_health_requested_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        if let Some(session_id) = self.active_session_id
+            && self.bridge.request(
+                Operation::LifecycleHealth(session_id),
+                ClientRequest::GetSessionLifecycleHealth { session_id },
+            )
+        {
+            self.lifecycle_health_requested_at = Some(Instant::now());
+        }
+    }
+
+    fn review_opened_attention(&mut self, session_id: SessionId) {
+        if self.content_surface != ContentSurface::Session
+            || !(self.main_tab == MainTab::Details
+                || (self.main_tab == MainTab::Terminal && self.terminals.contains_key(&session_id)))
+        {
+            return;
+        }
+        if let Some(event) = self
+            .session(session_id)
+            .and_then(|session| session.status.pending_review())
+        {
+            self.send_request(
+                Operation::ReviewAttention(session_id),
+                ClientRequest::AcknowledgeAttention {
+                    session_id,
+                    attention_id: event.id,
+                },
+            );
+        }
     }
 
     fn take_attention_notification_activation(&mut self) -> Option<window::Id> {
@@ -8190,6 +8325,9 @@ const fn operation_error_context(operation: Operation) -> &'static str {
         Operation::Resume(_) => "Resume session",
         Operation::ReportAttentionFocus => "Report attention focus",
         Operation::ClaimAttentionNotification => "Claim Attention Notification",
+        Operation::ReviewAttention(_) => "Mark attention reviewed",
+        Operation::LifecycleHealth(_) => "Check lifecycle callbacks",
+        Operation::TestNotifications => "Test notification",
         Operation::RenameProject => "Rename repository",
         Operation::RenameWorktree => "Rename checkout",
         Operation::RenameSession => "Rename session",
@@ -9376,22 +9514,6 @@ fn list_item_container_style(theme: &Theme, selected: bool, hovered: bool) -> co
     }
 }
 
-fn attention_row_style(
-    theme: &Theme,
-    mut style: container::Style,
-    emphasized: bool,
-) -> container::Style {
-    style.background = Some(Background::Color(
-        theme
-            .extended_palette()
-            .warning
-            .base
-            .color
-            .scale_alpha(if emphasized { 0.22 } else { 0.14 }),
-    ));
-    style
-}
-
 fn navigator_row_container_style(theme: &Theme, selected: bool, hovered: bool) -> container::Style {
     list_item_container_style(theme, selected, hovered)
 }
@@ -10298,54 +10420,54 @@ mod tests {
 
     #[cfg(windows)]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        1_216_322_799_436_020_358,
+        14_536_029_247_521_509_305,
         12_365_258_274_555_457_046,
         11_704_634_815_454_000_937,
-        782_010_617_141_479_802,
-        15_322_464_653_732_437_499,
+        7_948_722_545_032_471_940,
+        18_332_765_517_874_962_912,
         3_418_532_975_102_054_885,
-        13_197_478_582_319_900_060,
-        658_921_050_509_893_099,
+        573_190_509_987_984_074,
+        5_558_003_353_688_268_661,
         10_103_567_952_100_179_337,
-        6_249_857_035_340_334_881,
+        15_479_219_696_005_556_702,
         3_979_220_309_231_598_554,
-        1_281_012_255_869_362_417,
+        9_850_678_726_175_224_460,
         1_823_448_962_296_347_469,
-        8_817_924_087_867_216_229,
+        4_916_797_884_967_723_132,
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        1_216_322_799_436_020_358,
+        14_536_029_247_521_509_305,
         12_365_258_274_555_457_046,
         11_704_634_815_454_000_937,
-        782_010_617_141_479_802,
-        15_322_464_653_732_437_499,
+        7_948_722_545_032_471_940,
+        18_332_765_517_874_962_912,
         3_418_532_975_102_054_885,
-        13_197_478_582_319_900_060,
-        658_921_050_509_893_099,
+        573_190_509_987_984_074,
+        5_558_003_353_688_268_661,
         10_103_567_952_100_179_337,
-        6_249_857_035_340_334_881,
+        15_479_219_696_005_556_702,
         3_979_220_309_231_598_554,
-        1_281_012_255_869_362_417,
+        9_850_678_726_175_224_460,
         1_823_448_962_296_347_469,
-        8_817_924_087_867_216_229,
+        4_916_797_884_967_723_132,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
     const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        1_216_322_799_436_020_358,
+        14_536_029_247_521_509_305,
         12_365_258_274_555_457_046,
         11_704_634_815_454_000_937,
-        782_010_617_141_479_802,
-        15_322_464_653_732_437_499,
+        7_948_722_545_032_471_940,
+        18_332_765_517_874_962_912,
         3_418_532_975_102_054_885,
-        13_197_478_582_319_900_060,
-        658_921_050_509_893_099,
+        573_190_509_987_984_074,
+        5_558_003_353_688_268_661,
         10_103_567_952_100_179_337,
-        6_249_857_035_340_334_881,
+        15_479_219_696_005_556_702,
         3_979_220_309_231_598_554,
-        1_281_012_255_869_362_417,
+        9_850_678_726_175_224_460,
         1_823_448_962_296_347_469,
-        8_817_924_087_867_216_229,
+        4_916_797_884_967_723_132,
     ];
     #[cfg(windows)]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
@@ -10475,6 +10597,17 @@ mod tests {
         let checksum = pixels.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
+        if std::env::var_os("SYLVOPS_EXPORT_VISUALS").is_some() {
+            let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/notification-visuals");
+            std::fs::create_dir_all(&directory).unwrap();
+            let file =
+                std::fs::File::create(directory.join(format!("{width}-{height}-{checksum}.png")))
+                    .unwrap();
+            ico::IconImage::from_rgba_data(u32::from(width), u32::from(height), pixels.clone())
+                .write_png(file)
+                .unwrap();
+        }
         RenderedBaseline {
             width,
             height,
@@ -11319,6 +11452,79 @@ mod tests {
     }
 
     #[test]
+    fn foreground_events_stay_pending_until_an_event_bound_review_action() {
+        let (bridge, mut harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        let mut completed = session(SessionLifecycle::Running, None);
+        completed.status.activity = ProviderActivity::Completed;
+        let event = sylvops_core::session_state::AttentionEvent {
+            id: AttentionEventId::try_from(3).unwrap(),
+            reason: AttentionReason::SuccessfulCompletion,
+            acknowledgement: sylvops_core::session_state::AttentionAcknowledgement::Pending,
+            occurred_at: 5,
+        };
+        completed.status.attention = Some(event);
+        let id = completed.id;
+        app.snapshot.sessions.push(completed.clone());
+        app.active_session_id = Some(id);
+        app.window_attention_state = WindowAttentionState::Foreground;
+        app.main_tab = MainTab::Details;
+        app.connection = ConnectionState::Connected;
+        app.handle_daemon_event(DaemonEvent::SessionStatusChanged {
+            revision: 1,
+            session: completed,
+        });
+        while harness.has_request() {
+            assert!(!matches!(
+                harness.take_request().1,
+                ClientRequest::AcknowledgeAttention { .. }
+            ));
+        }
+        assert_eq!(app.session(id).unwrap().status.attention, Some(event));
+        let _ = app.update(Message::ReviewAttention(id, event.id));
+        assert_eq!(
+            harness.take_request(),
+            (
+                Operation::ReviewAttention(id),
+                ClientRequest::AcknowledgeAttention {
+                    session_id: id,
+                    attention_id: event.id
+                }
+            )
+        );
+        assert_eq!(app.session(id).unwrap().status.attention, Some(event));
+        let mut old_response = app.session(id).unwrap().clone();
+        old_response
+            .status
+            .attention
+            .as_mut()
+            .unwrap()
+            .acknowledgement = sylvops_core::session_state::AttentionAcknowledgement::Acknowledged;
+        let current = app
+            .snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .unwrap();
+        current.status.attention.as_mut().unwrap().id = AttentionEventId::try_from(4).unwrap();
+        current.status.attention.as_mut().unwrap().reason = AttentionReason::InputRequested;
+        current.status.activity = ProviderActivity::AwaitingInput;
+        let newer = current.clone();
+        app.handle_response(
+            Operation::ReviewAttention(id),
+            DaemonResponse::SessionAttentionAcknowledged {
+                revision: 2,
+                session: old_response,
+            },
+        );
+        assert_eq!(
+            app.session(id),
+            Some(&newer),
+            "a delayed review response must preserve the newer event"
+        );
+    }
+
+    #[test]
     fn foreground_desktop_reports_only_the_visible_session_and_deduplicates_refreshes() {
         let (bridge, mut harness) = Bridge::harness();
         let mut app = DesktopApp::with_bridge(bridge);
@@ -11329,6 +11535,11 @@ mod tests {
         app.snapshot.sessions.extend([visible, other]);
         app.connection = ConnectionState::Connected;
         app.window_attention_state = WindowAttentionState::Foreground;
+
+        // A selected card with no terminal surface must not suppress notifications.
+        app.select_session(visible_id);
+        assert!(!harness.has_request());
+        app.main_tab = MainTab::Details;
 
         app.select_session(visible_id);
         assert_eq!(
@@ -11937,7 +12148,7 @@ mod tests {
                 confirmation_error.layout_nodes,
             ],
             [
-                187, 126, 90, 185, 130, 87, 213, 156, 113, 94, 19, 243, 158, 150
+                187, 126, 90, 189, 130, 87, 213, 156, 113, 94, 19, 247, 158, 150
             ]
         );
         let baselines = [

@@ -8,6 +8,89 @@ use sylvops_core::{
 use sylvops_daemon::{client::DaemonClient, runtime::RuntimePaths};
 use sylvops_test_support::{TemporaryRepository, bounded};
 
+/// Requires an existing real Codex login and prior /hooks approval of the stable
+/// hook-daemon source. Never approves hooks, bypasses trust, or prints PTY contents.
+#[tokio::test]
+#[ignore = "opt-in real account: set SYLVOPS_REAL_CODEX_PATH to an absolute native executable"]
+async fn real_codex_delivers_completion_across_sessions_and_daemon_restart() {
+    let executable = std::env::var_os("SYLVOPS_REAL_CODEX_PATH")
+        .map(std::path::PathBuf::from)
+        .expect("set SYLVOPS_REAL_CODEX_PATH explicitly");
+    assert!(executable.is_absolute() && executable.is_file());
+    tokio::time::timeout(Duration::from_secs(180), async {
+        let repository = TemporaryRepository::initialize().await.unwrap();
+        let state_root = repository.root().join("real-codex-state");
+        let paths = RuntimePaths::discover(Some(&state_root)).unwrap();
+        let start = || {
+            let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_hook-daemon"));
+            command.arg("daemon").arg(&state_root).env("CODEX_CLI_PATH", &executable)
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+            #[cfg(windows)]
+            command.creation_flags(0x0800_0000);
+            command.spawn().expect("real-provider daemon")
+        };
+        let mut daemon = start();
+        let client = connect(&paths).await;
+        let workspace_id = match client.request(&ClientRequest::AddWorkspace { name: "Real Codex smoke".into() }).await.unwrap() {
+            DaemonResponse::WorkspaceAdded { workspace, .. } => workspace.id,
+            _ => panic!("workspace creation failed"),
+        };
+        let worktree_id = match client.request(&ClientRequest::AddProject {
+            workspace_id, repository_path: repository.path().to_str().unwrap().into(),
+        }).await.unwrap() {
+            DaemonResponse::ProjectAdded { root_worktree, .. } => root_worktree.id,
+            _ => panic!("scratch Project creation failed"),
+        };
+        for _ in 0..2 {
+            let id = match client.request(&ClientRequest::CreateSession {
+                worktree_id, provider: ProviderKind::Codex, display_name: Some("Real hook smoke".into()),
+                model: None, effort: None,
+                initial_prompt: Some("Reply with exactly SYLVOPS_SMOKE_OK. Do not use tools or change files.".into()),
+                columns: 80, rows: 24,
+            }).await.unwrap() {
+                DaemonResponse::SessionCreated { session, .. } => session.id,
+                _ => panic!("real Codex launch failed; check provider installation and login"),
+            };
+            let event = tokio::time::timeout(Duration::from_secs(45), async {
+                loop {
+                    let current = session(&client, id).await;
+                    if let Some(event) = current.status.attention
+                        && event.reason == sylvops_core::session_state::AttentionReason::SuccessfulCompletion
+                    { break event; }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await.expect("No completion callback: review the stable hook-daemon source with Codex /hooks, verify login, and rerun. No trust bypass is permitted.");
+            let claim = client.request(&ClientRequest::ClaimAttentionNotification).await.unwrap();
+            assert!(matches!(claim, DaemonResponse::AttentionNotificationClaim(Some(claim)) if claim.session_id == id && claim.attention_id == event.id));
+            assert!(matches!(client.request(&ClientRequest::GetSessionLifecycleHealth { session_id: id }).await.unwrap(),
+                DaemonResponse::SessionLifecycleHealth { health: sylvops_core::attention::LifecycleHealth::Ready, .. }));
+            client.request(&ClientRequest::StopSession { session_id: id }).await.unwrap();
+        }
+        client.request(&ClientRequest::ShutdownDaemon).await.unwrap();
+        assert!(bounded(daemon.wait()).await.unwrap().unwrap().success());
+        drop(client);
+        daemon = start();
+        // Reconnect after restart and prove callbacks arrive without modifying hook trust.
+        let restarted = connect(&paths).await;
+        let id = match restarted.request(&ClientRequest::CreateSession {
+            worktree_id, provider: ProviderKind::Codex, display_name: Some("Restart hook smoke".into()),
+            model: None, effort: None, initial_prompt: Some("Reply OK. Do not use tools or change files.".into()), columns: 80, rows: 24,
+        }).await.unwrap() {
+            DaemonResponse::SessionCreated { session, .. } => session.id,
+            _ => panic!("real Codex restart launch failed"),
+        };
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                if session(&restarted, id).await.status.attention.is_some_and(|event|
+                    event.reason == sylvops_core::session_state::AttentionReason::SuccessfulCompletion) { break; }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }).await.expect("completion callback missing after daemon restart");
+        restarted.request(&ClientRequest::ShutdownDaemon).await.unwrap();
+        assert!(bounded(daemon.wait()).await.unwrap().unwrap().success());
+    }).await.expect("bounded real Codex smoke timeout");
+}
+
 #[tokio::test]
 async fn generated_codex_hook_captures_and_persists_conversation_identity() {
     tokio::time::timeout(

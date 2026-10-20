@@ -19,7 +19,7 @@ async fn live_attention_claims_are_single_connection_scoped_and_preferences_pers
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn foreground_focus_suppresses_only_that_session_and_acknowledges_terminal_attention() {
+async fn foreground_focus_suppresses_delivery_but_requires_explicit_review() {
     tokio::time::timeout(TEST_TIMEOUT, exercise_foreground_focus())
         .await
         .expect("attention focus integration timeout");
@@ -66,6 +66,27 @@ async fn exercise_foreground_focus() {
     assert!(claim(&tui).await.is_none());
     assert_eq!(
         attention(&desktop, visible).await.acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
+
+    report_focus(&desktop, None).await;
+    report_focus(&desktop, Some(visible)).await;
+    assert_eq!(
+        attention(&tui, visible).await.acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
+    assert!(matches!(
+        desktop
+            .request(&ClientRequest::AcknowledgeAttention {
+                session_id: visible,
+                attention_id: visible_event.id,
+            })
+            .await
+            .expect("explicit review"),
+        DaemonResponse::SessionAttentionAcknowledged { .. }
+    ));
+    assert_eq!(
+        attention(&tui, visible).await.acknowledgement,
         AttentionAcknowledgement::Acknowledged
     );
 
