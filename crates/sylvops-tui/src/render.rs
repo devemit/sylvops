@@ -1002,6 +1002,38 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         terminal = terminal.style(theme.text).wrap(Wrap { trim: false });
     }
     frame.render_widget(terminal, area);
+    if let Some(session) = app
+        .attached
+        .as_ref()
+        .and_then(|attached| {
+            app.snapshot
+                .sessions
+                .iter()
+                .find(|s| s.id == attached.session_id)
+        })
+        .or_else(|| app.selected_session())
+        && let Some(event) = session.status.attention
+        && event.acknowledgement == sylvops_core::session_state::AttentionAcknowledgement::Pending
+        && matches!(
+            event.reason,
+            AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
+        )
+        && area.width >= 20
+        && area.height >= 2
+    {
+        let target = HitTarget::MarkReviewed(session.id, event.id);
+        let button = Rect::new(
+            area.right().saturating_sub(19),
+            area.bottom().saturating_sub(1),
+            18,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new("[ Mark reviewed ]").style(theme.focus),
+            button,
+        );
+        app.hit_map.push(button, target);
+    }
     let viewport = area.inner(ratatui::layout::Margin {
         horizontal: 1,
         vertical: 1,
@@ -1177,6 +1209,11 @@ fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 
 fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<Line<'a>> {
     let mut lines = vec![
+        Line::from(
+            app.lifecycle_health
+                .filter(|(id, _)| *id == session.id)
+                .map_or("", |(_, health)| health.guidance()),
+        ),
         Line::from(vec![
             Span::styled("Session      ", theme.muted),
             Span::raw(&session.display_name),
@@ -3521,10 +3558,21 @@ fn draw_settings(
         );
         row = row.saturating_add(1);
     }
-    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if settings.focus == SettingsFocus::TestNotification {
+            "› [ Test notification ]"
+        } else {
+            "  [ Test notification ]"
+        },
+        theme.focus,
+    )));
+    app.hit_map.push(
+        Rect::new(inner.x, row, inner.width, 1),
+        HitTarget::SettingsTestNotification,
+    );
     row = row.saturating_add(1);
     lines.push(Line::from(Span::styled(
-        "Preview is local until Apply. Escape and Cancel restore all choices.",
+        "Preview is local until Apply. Test uses saved shared notification settings.",
         theme.muted,
     )));
     row = row.saturating_add(2);

@@ -13,6 +13,7 @@ const MAX_NOTIFICATION_MESSAGE_CHARS: usize = 160;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InClientNotification {
+    pub native_queued: bool,
     pub reason: AttentionReason,
     pub title: String,
     pub message: String,
@@ -21,6 +22,9 @@ pub(crate) struct InClientNotification {
 pub(crate) trait NotificationChannels: std::fmt::Debug {
     fn native(&self, title: &str, message: &str) -> bool;
     fn sound(&self) -> bool;
+    fn take_native_failure(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -29,6 +33,9 @@ pub(crate) struct NotificationPresenter<C> {
 }
 
 impl<C: NotificationChannels> NotificationPresenter<C> {
+    pub(crate) fn take_native_failure(&self) -> bool {
+        self.channels.take_native_failure()
+    }
     pub(crate) const fn new(channels: C) -> Self {
         Self { channels }
     }
@@ -37,14 +44,14 @@ impl<C: NotificationChannels> NotificationPresenter<C> {
         &self,
         claim: &AttentionNotificationClaim,
     ) -> Option<InClientNotification> {
-        let notification = presentation(claim);
+        let mut notification = presentation(claim);
         if claim.preferences.sound_enabled {
             let _ = self.channels.sound();
         }
         if !claim.preferences.native_notifications_enabled {
             return None;
         }
-        let _ = self
+        notification.native_queued = self
             .channels
             .native(&notification.title, &notification.message);
         Some(notification)
@@ -76,6 +83,7 @@ fn presentation(claim: &AttentionNotificationClaim) -> InClientNotification {
         }
     };
     InClientNotification {
+        native_queued: false,
         reason: claim.reason,
         title: title.chars().take(MAX_NOTIFICATION_TITLE_CHARS).collect(),
         message: message
@@ -116,6 +124,18 @@ impl SystemChannels {
 }
 
 impl NotificationChannels for SystemChannels {
+    fn take_native_failure(&self) -> bool {
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+        {
+            self.native
+                .as_ref()
+                .is_some_and(platform::Notifier::take_failure)
+        }
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
     fn native(&self, title: &str, message: &str) -> bool {
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         {
@@ -279,6 +299,7 @@ mod platform {
     #[derive(Debug)]
     pub(crate) struct Notifier {
         sender: mpsc::SyncSender<(String, String)>,
+        failed: Arc<AtomicBool>,
         stopped: Arc<AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
     }
@@ -296,6 +317,8 @@ mod platform {
             let (sender, receiver) = mpsc::sync_channel::<(String, String)>(8);
             let stopped = Arc::new(AtomicBool::new(false));
             let stop = stopped.clone();
+            let failed = Arc::new(AtomicBool::new(false));
+            let failure = failed.clone();
             let thread = thread::Builder::new()
                 .name("sylvops-notifications".into())
                 .spawn(move || {
@@ -307,14 +330,21 @@ mod platform {
                                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                             };
                         let command = native_notification_command(platform, &title, &message);
-                        let _ = run_bounded(&command, &stop);
+                        if !run_bounded(&command, &stop) {
+                            failure.store(true, Ordering::Release);
+                        }
                     }
                 })?;
             Ok(Self {
                 sender,
+                failed,
                 stopped,
                 thread: Some(thread),
             })
+        }
+
+        pub fn take_failure(&self) -> bool {
+            self.failed.swap(false, Ordering::AcqRel)
         }
 
         pub fn send(&self, title: &str, message: &str) -> bool {
@@ -675,6 +705,7 @@ pub(crate) mod platform {
     #[derive(Debug)]
     pub(crate) struct Notifier {
         sender: mpsc::SyncSender<(String, String)>,
+        failed: Arc<AtomicBool>,
         stopped: Arc<AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
     }
@@ -684,6 +715,8 @@ pub(crate) mod platform {
             let (sender, receiver) = mpsc::sync_channel::<(String, String)>(8);
             let stopped = Arc::new(AtomicBool::new(false));
             let stop = stopped.clone();
+            let failed = Arc::new(AtomicBool::new(false));
+            let failure = failed.clone();
             let thread = thread::Builder::new()
                 .name("sylvops-notifications".into())
                 .spawn(move || {
@@ -705,6 +738,7 @@ pub(crate) mod platform {
                             std::ptr::null(),
                         );
                         if window.is_null() {
+                            failure.store(true, Ordering::Release);
                             return;
                         }
                         let mut data = NOTIFYICONDATAW {
@@ -718,6 +752,7 @@ pub(crate) mod platform {
                         };
                         copy_text(&mut data.szTip, "SylvOps session alerts");
                         if Shell_NotifyIconW(NIM_ADD, &raw const data) == 0 {
+                            failure.store(true, Ordering::Release);
                             DestroyWindow(window);
                             return;
                         }
@@ -730,6 +765,7 @@ pub(crate) mod platform {
                                     copy_text(&mut data.szInfoTitle, &title);
                                     copy_text(&mut data.szInfo, &message);
                                     if Shell_NotifyIconW(NIM_MODIFY, &raw const data) == 0 {
+                                        failure.store(true, Ordering::Release);
                                         break;
                                     }
                                 }
@@ -748,9 +784,14 @@ pub(crate) mod platform {
                 })?;
             Ok(Self {
                 sender,
+                failed,
                 stopped,
                 thread: Some(thread),
             })
+        }
+
+        pub fn take_failure(&self) -> bool {
+            self.failed.swap(false, Ordering::AcqRel)
         }
 
         pub fn send(&self, title: &str, message: &str) -> bool {

@@ -41,8 +41,8 @@ use sylvops_core::{
     },
     provider::{AuthenticationRequirement, LaunchContext, ProviderRuntimeSpec, ResumeContext},
     session_state::{
-        AttentionAcknowledgement, AttentionEvent, AttentionReason, ProviderActivity,
-        SessionLifecycle, lifecycle_allows_deletion, lifecycle_allows_resume, lifecycle_is_active,
+        AttentionAcknowledgement, AttentionEvent, ProviderActivity, SessionLifecycle,
+        lifecycle_allows_deletion, lifecycle_allows_resume, lifecycle_is_active,
     },
     status::{
         ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId,
@@ -90,7 +90,6 @@ const LIFECYCLE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACTIVE_SESSION_REAP_TIMEOUT: Duration = Duration::from_secs(15);
 const CLAUDE_SESSION_START_TIMEOUT: Duration = Duration::from_secs(15);
-const CLAUDE_SESSION_START_GUIDANCE: &str = "Claude Code lifecycle hooks did not report SessionStart within 15 seconds. The Terminal remains usable; check Claude hook configuration or restart the Session.";
 const UPGRADE_HANDOFF_FILE: &str = "handoff.json";
 
 #[derive(Clone, Debug)]
@@ -478,6 +477,7 @@ struct DaemonState {
 
 #[derive(Clone, Debug, Default)]
 struct HookTracking {
+    callback_received: bool,
     fingerprints: HashSet<String>,
     stopped_turns: HashSet<String>,
     session_start_missing: bool,
@@ -1295,13 +1295,12 @@ async fn handle_request(
             if let Some(session_id) = session_id {
                 let operation_lock = session_operation_lock(state, session_id).await;
                 let _operation_guard = operation_lock.lock().await;
-                let session = state.database.session(session_id).await?;
+                state.database.session(session_id).await?;
                 state
                     .attention_notification_claims
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .report_focus(client_id, Some(session_id));
-                acknowledge_visible_terminal_attention(state, &session).await?;
             } else {
                 state
                     .attention_notification_claims
@@ -1310,6 +1309,38 @@ async fn handle_request(
                     .report_focus(client_id, None);
             }
             send_response_queue(outgoing, request_id, &DaemonResponse::AttentionFocusUpdated).await
+        }
+        ClientRequest::GetSessionLifecycleHealth { session_id } => {
+            use sylvops_core::attention::LifecycleHealth;
+            let session = state.database.session(session_id).await?;
+            let health = if !lifecycle_is_active(session.status.lifecycle)
+                || !matches!(
+                    session.provider_kind,
+                    ProviderKind::Codex | ProviderKind::Claude
+                ) {
+                LifecycleHealth::NotApplicable
+            } else if state
+                .hook_tracking
+                .lock()
+                .await
+                .get(&session_id)
+                .is_some_and(|tracking| tracking.callback_received)
+            {
+                LifecycleHealth::Ready
+            } else if status_timestamp()
+                .saturating_sub(session.started_at.unwrap_or(session.created_at))
+                < 15_000
+            {
+                LifecycleHealth::Waiting
+            } else {
+                LifecycleHealth::Missing
+            };
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::SessionLifecycleHealth { session_id, health },
+            )
+            .await
         }
         ClientRequest::ClaimAttentionNotification => {
             let pending = state
@@ -4001,8 +4032,7 @@ async fn persist_session_start_failure(
         )
         .await
     {
-        let (revision, session) =
-            coordinate_attention_notification(state, None, revision, session).await;
+        let (revision, session) = coordinate_attention_notification(state, None, revision, session);
         let _ = state
             .events
             .send(DaemonEvent::SessionStatusChanged { revision, session });
@@ -4077,6 +4107,7 @@ fn provider_external_id_update(
 
 #[allow(clippy::too_many_lines)]
 async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Result<()> {
+    tracing::debug!(session_id = %delivery.session_id, "authenticated provider hook received");
     let operation_lock = session_operation_lock(state, delivery.session_id).await;
     let _operation_guard = operation_lock.lock().await;
     let persisted = state.database.session(delivery.session_id).await?;
@@ -4130,6 +4161,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             return Err(error);
         }
     };
+    tracing::debug!(session_id = %delivery.session_id, "provider lifecycle payload normalized");
     let identity_transition = normalized.event.as_ref().and_then(|event| match event {
         NormalizedProviderEvent::TurnStarted {
             conversation: Some(conversation),
@@ -4273,6 +4305,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             tracking.classify(delivery.fingerprint, &event, normalized.turn_id.as_deref());
         debug_assert!(classification.is_none());
         tracking.record_applied(&event, transition.status.activity);
+        tracking.callback_received = true;
         if is_claude_session_start || recovers_claude_lifecycle {
             tracking.session_start_missing = false;
         }
@@ -4294,8 +4327,7 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
         state.hook_credentials.invalidate(delivery.session_id);
     }
     let (revision, session) =
-        coordinate_attention_notification(state, persisted.status.attention, revision, session)
-            .await;
+        coordinate_attention_notification(state, persisted.status.attention, revision, session);
     if let Some(managed) = get_managed_session(state, delivery.session_id).await {
         *managed.record.write().await = session.clone();
     }
@@ -4413,8 +4445,7 @@ fn spawn_exit_monitor(
                         persisted.status.attention,
                         revision,
                         session,
-                    )
-                    .await;
+                    );
                     *managed.record.write().await = session.clone();
                     let _ = state.events.send(DaemonEvent::SessionStatusChanged {
                         revision,
@@ -4447,7 +4478,7 @@ fn status_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
-async fn coordinate_attention_notification(
+fn coordinate_attention_notification(
     state: &DaemonState,
     previous: Option<AttentionEvent>,
     revision: u64,
@@ -4469,68 +4500,8 @@ async fn coordinate_attention_notification(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record(&session);
-    if suppressed {
-        match persist_visible_terminal_attention_ack(state, &session).await {
-            Ok(Some(acknowledged)) => return acknowledged,
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(%error, session_id = %session.id, "cannot acknowledge visible attention");
-            }
-        }
-    }
+    tracing::debug!(session_id = %session.id, suppressed, "attention notification coordinated");
     (revision, session)
-}
-
-async fn acknowledge_visible_terminal_attention(
-    state: &DaemonState,
-    session: &Session,
-) -> Result<()> {
-    if let Some((revision, session)) =
-        persist_visible_terminal_attention_ack(state, session).await?
-    {
-        let _ = state
-            .events
-            .send(DaemonEvent::SessionStatusChanged { revision, session });
-    }
-    Ok(())
-}
-
-async fn persist_visible_terminal_attention_ack(
-    state: &DaemonState,
-    session: &Session,
-) -> Result<Option<(u64, Session)>> {
-    let Some(event) = session.status.attention else {
-        return Ok(None);
-    };
-    if event.acknowledgement != AttentionAcknowledgement::Pending
-        || !visible_attention_is_acknowledged(event.reason)
-    {
-        return Ok(None);
-    }
-    let Some(acknowledged) = state
-        .database
-        .acknowledge_opened_attention(session.id, event.id)
-        .await?
-    else {
-        return Ok(None);
-    };
-    state
-        .attention_notification_claims
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .cancel(session.id);
-    if let Some(managed) = get_managed_session(state, session.id).await {
-        *managed.record.write().await = acknowledged.1.clone();
-    }
-    mirror_attention_acknowledgement(state, &acknowledged.1).await;
-    Ok(Some(acknowledged))
-}
-
-const fn visible_attention_is_acknowledged(reason: AttentionReason) -> bool {
-    matches!(
-        reason,
-        AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
-    )
 }
 
 fn status_machine_from_session(session: &Session) -> SessionStatusMachine {
@@ -4558,44 +4529,23 @@ fn spawn_claude_session_start_monitor(
                 }
             }
         }
-        state
-            .hook_tracking
-            .lock()
-            .await
-            .entry(session_id)
-            .or_default()
-            .session_start_missing = true;
-        match state
-            .database
-            .mark_session_lifecycle_missing(session_id, CLAUDE_SESSION_START_GUIDANCE.into())
-            .await
         {
-            Ok(Some((revision, session))) => {
-                let previous_attention = managed.record.read().await.status.attention;
-                let (revision, session) = coordinate_attention_notification(
-                    &state,
-                    previous_attention,
-                    revision,
-                    session,
-                )
-                .await;
-                *managed.record.write().await = session.clone();
-                let _ = state
-                    .events
-                    .send(DaemonEvent::SessionStatusChanged { revision, session });
+            let mut tracking = state.hook_tracking.lock().await;
+            let tracking = tracking.entry(session_id).or_default();
+            if tracking.callback_received {
+                return;
             }
-            Ok(None) => {
-                if let Some(tracking) = state.hook_tracking.lock().await.get_mut(&session_id) {
-                    tracking.session_start_missing = false;
-                }
-            }
-            Err(error) => {
-                if let Some(tracking) = state.hook_tracking.lock().await.get_mut(&session_id) {
-                    tracking.session_start_missing = false;
-                }
-                tracing::warn!(%error, %session_id, "cannot persist missing Claude lifecycle warning");
-            }
+            tracking.session_start_missing = true;
         }
+        // Monitoring health is observational; absent hooks are not a failed provider turn.
+        let _ = state
+            .database
+            .audit(
+                "provider_lifecycle_missing",
+                "missing",
+                &serde_json::json!({"session_id": session_id}).to_string(),
+            )
+            .await;
     });
 }
 
@@ -5341,33 +5291,17 @@ mod tests {
     use super::{
         ApplicationMutationCoordinator, CONTROL_OPCODE, HookTracking, LifecycleCoordinator,
         decode_request, provider_external_id_update, release_work_source_capacity,
-        same_project_identity, visible_attention_is_acknowledged,
+        same_project_identity,
     };
     use std::sync::atomic::AtomicUsize;
     use sylvops_core::{
         domain::Project,
         ids::{ProjectId, WorkspaceId},
         protocol::{ClientRequest, Frame, MessageClass},
-        session_state::{AttentionReason, ProviderActivity},
+        session_state::ProviderActivity,
         status::{ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId},
     };
     use tokio::sync::Semaphore;
-
-    #[test]
-    fn visible_attention_acknowledgement_is_reason_specific() {
-        assert!(visible_attention_is_acknowledged(
-            AttentionReason::SuccessfulCompletion
-        ));
-        assert!(visible_attention_is_acknowledged(
-            AttentionReason::TerminalFailure
-        ));
-        assert!(!visible_attention_is_acknowledged(
-            AttentionReason::InputRequested
-        ));
-        assert!(!visible_attention_is_acknowledged(
-            AttentionReason::RecoverableFailure
-        ));
-    }
 
     #[test]
     fn persisted_capacity_excess_is_paid_down_before_a_slot_is_released() {

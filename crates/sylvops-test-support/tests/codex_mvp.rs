@@ -144,8 +144,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
 
     let terminated_session_id = create_codex_session(&client, worktree_id).await;
     assert_eq!(owned_hook_profile_count(&codex_home), 1);
-    let terminated_profile =
-        codex_home.join(format!("sylvops-{terminated_session_id}.config.toml"));
+    let terminated_profile = stable_hook_profile(&codex_home);
     let terminated_profile_source =
         std::fs::read_to_string(&terminated_profile).expect("read owned Codex profile");
     attach(&client, terminated_session_id).await;
@@ -184,7 +183,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         terminated.status.attention.map(|event| event.reason),
         Some(AttentionReason::SuccessfulCompletion)
     );
-    assert_eq!(owned_hook_profile_count(&codex_home), 0);
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
     let stopped_successor = match client
         .request(&ClientRequest::ResumeSession {
             session_id: terminated_session_id,
@@ -208,7 +207,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         session.status.lifecycle == SessionLifecycle::Terminated
     })
     .await;
-    assert_eq!(owned_hook_profile_count(&codex_home), 0);
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
     std::fs::write(
         &terminated_profile,
         with_codex_trust(&terminated_profile_source, &repository),
@@ -238,7 +237,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         DaemonResponse::SessionDeleted { session_id, .. }
             if session_id == terminated_session_id
     ));
-    assert_eq!(owned_hook_profile_count(&codex_home), 0);
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
 
     let unexpected_exit_id = create_codex_session(&client, worktree_id).await;
     wait_for_session(&client, unexpected_exit_id, |session| {
@@ -305,7 +304,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         failed_successor.external_session_id,
         unexpected_exit.external_session_id
     );
-    assert_eq!(owned_hook_profile_count(&codex_home), 0);
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
     let failed_launch_history = match client
         .request(&ClientRequest::GetSnapshot)
         .await
@@ -366,7 +365,19 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     })
     .await;
     let external_id = waiting.external_session_id.expect("external Codex ID");
-    let source_profile = codex_home.join(format!("sylvops-{source_session_id}.config.toml"));
+    assert!(matches!(
+        client
+            .request(&ClientRequest::GetSessionLifecycleHealth {
+                session_id: source_session_id,
+            })
+            .await
+            .expect("callback health"),
+        DaemonResponse::SessionLifecycleHealth {
+            health: sylvops_core::attention::LifecycleHealth::Ready,
+            ..
+        }
+    ));
+    let source_profile = stable_hook_profile(&codex_home);
     let source_profile_text = std::fs::read_to_string(&source_profile).expect("source profile");
     std::fs::write(
         &source_profile,
@@ -433,7 +444,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         session.process_id.is_none() && session.status.lifecycle == SessionLifecycle::Exited
     })
     .await;
-    assert_eq!(owned_hook_profile_count(&codex_home), 0);
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
 
     let unavailable_codex = fake_codex.with_extension("unavailable");
     std::fs::rename(&fake_codex, &unavailable_codex).expect("hide fake Codex executable");
@@ -567,7 +578,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
             .display_name,
         source_history.display_name
     );
-    let resumed_profile = codex_home.join(format!("sylvops-{resumed_id}.config.toml"));
+    let resumed_profile = stable_hook_profile(&codex_home);
     let resumed_profile_source =
         std::fs::read_to_string(&resumed_profile).expect("resumed Codex profile");
     std::fs::write(
@@ -584,8 +595,8 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .await
         .expect("resumed finish input");
     wait_for_session(&client, resumed_id, |session| session.process_id.is_none()).await;
-    assert!(!resumed_profile.exists());
-    assert_eq!(owned_hook_profile_count(&codex_home), 0);
+    assert!(resumed_profile.exists());
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
 
     exercise_codex_cleanup_refusal(&client, worktree_id, &codex_home, &repository).await;
 
@@ -605,7 +616,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         .expect("daemon shutdown timeout")
         .expect("daemon task")
         .expect("daemon result");
-    assert_eq!(owned_hook_profile_count(&codex_home), 0);
+    assert_eq!(owned_hook_profile_count(&codex_home), 1);
 
     let disconnected_status = serde_json::to_string(&SessionStatus {
         lifecycle: SessionLifecycle::Disconnected,
@@ -639,8 +650,8 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         client = connect_eventually(&paths) => client,
     };
     assert!(
-        !stale_profile.exists(),
-        "startup removes provably owned stale profiles"
+        stale_profile.exists(),
+        "startup must not delete profiles potentially in use by another daemon"
     );
     for path in [&unrelated, &unknown_profile] {
         assert_eq!(std::fs::read_to_string(path).unwrap(), unrelated_source);
@@ -999,6 +1010,7 @@ async fn resume_refusal(
 }
 
 fn with_codex_trust(source: &str, project: &Path) -> String {
+    let source = source.split("\n[projects.").next().unwrap();
     let project = serde_json::to_string(&project.to_string_lossy()).expect("quoted Project path");
     format!("{source}\n[projects.{project}]\ntrust_level = \"trusted\"\n")
 }
@@ -1015,7 +1027,7 @@ async fn exercise_codex_cleanup_refusal(
         session.external_session_id.is_some()
     })
     .await;
-    let profile = codex_home.join(format!("sylvops-{session_id}.config.toml"));
+    let profile = stable_hook_profile(codex_home);
     let original = std::fs::read_to_string(&profile).expect("owned profile");
     let changed = format!("{original}\n[notice]\nprivate_unknown_edit = true\n");
     std::fs::write(&profile, &changed).expect("unknown Codex profile edit");
@@ -1037,28 +1049,14 @@ async fn exercise_codex_cleanup_refusal(
             authorization_token,
         })
         .await
-        .expect("unknown mutation deletion refusal")
+        .expect("Session deletion preserves shared profiles")
     {
-        DaemonResponse::Error(error) => {
-            assert!(error.message.len() < 512);
-            assert!(!error.message.contains("private_unknown_edit"));
-        }
-        other => panic!("unknown mutation must refuse deletion: {other:?}"),
+        DaemonResponse::SessionDeleted { .. } => {}
+        other => panic!("Session deletion must preserve shared profiles: {other:?}"),
     }
     assert_eq!(std::fs::read_to_string(&profile).unwrap(), changed);
     std::fs::write(&profile, with_codex_trust(&original, project)).expect("repair unknown edit");
-    let authorization_token = session_deletion_token(client, session_id).await;
-    assert!(matches!(
-        client
-            .request(&ClientRequest::DeleteSession {
-                session_id,
-                authorization_token
-            })
-            .await
-            .unwrap(),
-        DaemonResponse::SessionDeleted { .. }
-    ));
-    assert!(!profile.exists());
+    assert!(profile.exists());
 }
 
 async fn exercise_session_lifecycle_stale_authorization(
@@ -1215,6 +1213,20 @@ async fn delete_workspace(client: &DaemonClient, workspace_id: WorkspaceId) {
             .expect("Workspace deletion response"),
         DaemonResponse::WorkspaceDeleted { .. }
     ));
+}
+
+fn stable_hook_profile(codex_home: &Path) -> std::path::PathBuf {
+    std::fs::read_dir(codex_home)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sylvops-hooks-v1-")
+        })
+        .expect("stable hook profile")
 }
 
 fn owned_hook_profile_count(codex_home: &Path) -> usize {

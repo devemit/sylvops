@@ -10,6 +10,31 @@ use std::collections::HashSet;
 
 pub const MAX_ATTENTION_NOTIFICATION_LABEL_CHARS: usize = 80;
 
+/// Observational callback health; never changes process state or creates attention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleHealth {
+    NotApplicable,
+    Waiting,
+    Ready,
+    Missing,
+}
+
+impl LifecycleHealth {
+    pub const fn guidance(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "Lifecycle monitoring is not applicable.",
+            Self::Waiting => {
+                "Waiting for provider lifecycle callbacks. Review Codex hooks with /hooks if prompted."
+            }
+            Self::Ready => "Provider lifecycle callbacks received.",
+            Self::Missing => {
+                "Provider lifecycle callbacks are missing; attention and notifications may be incomplete. In Codex, review and trust SylvOps hooks with /hooks; then submit a prompt. Check provider hook configuration if this persists."
+            }
+        }
+    }
+}
+
 /// Shared daemon-backed channel preferences for Attention Notifications.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -39,6 +64,20 @@ pub struct AttentionNotificationClaim {
 }
 
 impl AttentionNotificationClaim {
+    /// Fixed-content presentation probe. Does not create or acknowledge an Attention Event.
+    ///
+    /// # Panics
+    /// Panics only if the fixed valid Attention Event identity is rejected by its validator.
+    pub fn test(preferences: AttentionNotificationPreferences) -> Self {
+        Self {
+            session_id: SessionId::new(),
+            attention_id: AttentionEventId::try_from(1).expect("valid fixed event identity"),
+            reason: AttentionReason::InputRequested,
+            session_display_name: "SylvOps notification test".into(),
+            preferences,
+        }
+    }
+
     #[must_use]
     pub fn new(
         session_id: SessionId,

@@ -877,18 +877,29 @@ async fn late_session_start_recovers_after_warning() {
     let mut events = client.subscribe();
     attach(&client, session_id, 0).await;
 
-    let warning = wait_for_session_for(&client, session_id, Duration::from_secs(20), |session| {
-        session.status.activity == ProviderActivity::RecoverableFailure
-            && session.process_id.is_some()
-            && session.external_session_id.is_none()
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if matches!(
+                client
+                    .request(&ClientRequest::GetSessionLifecycleHealth { session_id })
+                    .await
+                    .unwrap(),
+                DaemonResponse::SessionLifecycleHealth {
+                    health: sylvops_core::attention::LifecycleHealth::Missing,
+                    ..
+                }
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     })
-    .await;
-    assert!(
-        warning
-            .failure_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("lifecycle hooks"))
-    );
+    .await
+    .expect("missing callback health");
+    let warning =
+        wait_for_session(&client, session_id, |session| session.process_id.is_some()).await;
+    assert!(warning.failure_reason.is_none());
+    assert!(warning.status.attention.is_none());
 
     client
         .request(&ClientRequest::SessionInput {
@@ -905,6 +916,16 @@ async fn late_session_start_recovers_after_warning() {
     })
     .await;
     assert!(recovered.failure_reason.is_none());
+    assert!(matches!(
+        client
+            .request(&ClientRequest::GetSessionLifecycleHealth { session_id })
+            .await
+            .unwrap(),
+        DaemonResponse::SessionLifecycleHealth {
+            health: sylvops_core::attention::LifecycleHealth::Ready,
+            ..
+        }
+    ));
 
     client
         .request(&ClientRequest::SessionInput {

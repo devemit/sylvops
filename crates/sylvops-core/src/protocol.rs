@@ -25,7 +25,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 30;
+pub const PROTOCOL_MINOR: u16 = 31;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -546,6 +546,9 @@ pub enum ClientRequest {
         session_id: Option<SessionId>,
     },
     ClaimAttentionNotification,
+    GetSessionLifecycleHealth {
+        session_id: SessionId,
+    },
     ListProviders,
     ProbeProvider {
         kind: ProviderKind,
@@ -802,6 +805,10 @@ pub enum DaemonResponse {
     AttentionNotificationPreferencesSaved,
     AttentionFocusUpdated,
     AttentionNotificationClaim(Option<AttentionNotificationClaim>),
+    SessionLifecycleHealth {
+        session_id: SessionId,
+        health: crate::attention::LifecycleHealth,
+    },
     Providers(Vec<ProviderHealth>),
     Provider(ProviderHealth),
     GitHubStatus(GitHubIntegrationStatus),
@@ -1160,7 +1167,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 30);
+        assert_eq!(PROTOCOL_MINOR, 31);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1191,6 +1198,9 @@ mod tests {
             },
             ClientRequest::ReportAttentionFocus { session_id: None },
             ClientRequest::ClaimAttentionNotification,
+            ClientRequest::GetSessionLifecycleHealth {
+                session_id: SessionId::new(),
+            },
         ] {
             let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
@@ -1208,11 +1218,15 @@ mod tests {
             DaemonResponse::AttentionNotificationPreferencesSaved,
             DaemonResponse::AttentionFocusUpdated,
             DaemonResponse::AttentionNotificationClaim(Some(claim)),
+            DaemonResponse::SessionLifecycleHealth {
+                session_id: SessionId::new(),
+                health: crate::attention::LifecycleHealth::Missing,
+            },
         ] {
             let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
             assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
         }
-        assert_eq!(PROTOCOL_MINOR, 30);
+        assert_eq!(PROTOCOL_MINOR, 31);
     }
 
     #[test]
@@ -1316,7 +1330,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 30);
+        assert_eq!(PROTOCOL_MINOR, 31);
     }
 
     #[test]
@@ -1356,7 +1370,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 30);
+        assert_eq!(PROTOCOL_MINOR, 31);
     }
 
     #[test]
@@ -1428,7 +1442,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 30);
+        assert_eq!(PROTOCOL_MINOR, 31);
     }
 
     #[test]
@@ -1622,7 +1636,7 @@ mod tests {
             let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
         }
-        assert_eq!(PROTOCOL_MINOR, 30);
+        assert_eq!(PROTOCOL_MINOR, 31);
     }
 
     #[test]

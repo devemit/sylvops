@@ -207,6 +207,14 @@ impl Theme {
             }
         };
         let mut style = self.text.bg(background);
+        // Once a surface has a fixed RGB background, never inherit an unknown host
+        // foreground (Terminal Default may be a light terminal with black text).
+        let foreground = match self.text.fg {
+            Some(color @ Color::Rgb(..)) if contrast(color, background) >= 4.5 => color,
+            _ if contrast(Color::Rgb(0, 0, 0), background) >= 4.5 => Color::Rgb(0, 0, 0),
+            _ => Color::Rgb(255, 255, 255),
+        };
+        style = style.fg(foreground);
         if selected {
             style = style.add_modifier(Modifier::BOLD);
         }
@@ -231,6 +239,26 @@ pub(crate) fn terminal_background_rgb(choice: TuiTheme) -> Option<(u8, u8, u8)> 
 
 const fn rgb(red: u8, green: u8, blue: u8) -> Color {
     Color::Rgb(red, green, blue)
+}
+
+fn contrast(first: Color, second: Color) -> f64 {
+    fn luminance(color: Color) -> f64 {
+        let Color::Rgb(red, green, blue) = color else {
+            return 0.0;
+        };
+        let linear = |channel: u8| {
+            let value = f64::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
+    let first = luminance(first);
+    let second = luminance(second);
+    (first.max(second) + 0.05) / (first.min(second) + 0.05)
 }
 
 fn blend(base: Color, accent: Color, accent_percent: u16) -> Color {
@@ -275,6 +303,26 @@ mod tests {
             assert_ne!(theme.diff_addition.bg, theme.background.bg, "{choice}");
             assert_ne!(theme.diff_deletion.bg, theme.background.bg, "{choice}");
             assert_ne!(theme.diff_addition.bg, theme.diff_deletion.bg, "{choice}");
+        }
+    }
+
+    #[test]
+    fn every_attention_surface_has_readable_text_including_terminal_default() {
+        for choice in TuiTheme::ALL {
+            for reason in [
+                AttentionReason::InputRequested,
+                AttentionReason::RecoverableFailure,
+                AttentionReason::TerminalFailure,
+                AttentionReason::SuccessfulCompletion,
+            ] {
+                for selected in [false, true] {
+                    let style = Theme::resolve(choice).attention_surface(reason, selected);
+                    assert!(
+                        contrast(style.fg.unwrap(), style.bg.unwrap()) >= 4.5,
+                        "{choice:?} {reason:?} selected={selected}"
+                    );
+                }
+            }
         }
     }
 

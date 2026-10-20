@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
+tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -52,7 +53,6 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 sylvops-test-support = { path = "../sylvops-test-support" }
-tempfile = "3"
 
 [target.'cfg(windows)'.dev-dependencies]
 junction = "2"

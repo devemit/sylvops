@@ -106,7 +106,6 @@ impl ProviderRegistry {
                         "cannot canonicalize Codex configuration directory: {error}"
                     ))
                 })?;
-                cleanup_stale_profiles(&directory);
                 CodexAdapter::discover_with_hooks(relay.to_owned(), directory)
             } else {
                 CodexAdapter::discover()
@@ -1278,31 +1277,9 @@ impl CodexAdapter {
                 "Codex configuration directory identity changed",
             ));
         }
-        let profile_name = format!("sylvops-{}", context.session_id);
-        let profile_path = revalidated_directory.join(format!("{profile_name}.config.toml"));
         let command = hook_command(relay)?;
         let source = hook_profile_source(&command);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&profile_path)
-            .map_err(|error| {
-                provider_error(format!("cannot install Codex hook profile: {error}"))
-            })?;
-        if let Err(error) = std::io::Write::write_all(&mut file, source.as_bytes()) {
-            drop(file);
-            let _ = std::fs::remove_file(&profile_path);
-            return Err(provider_error(format!(
-                "cannot write Codex hook profile: {error}"
-            )));
-        }
-        if let Err(error) = file.sync_all() {
-            drop(file);
-            let _ = std::fs::remove_file(&profile_path);
-            return Err(provider_error(format!(
-                "cannot sync Codex hook profile: {error}"
-            )));
-        }
+        let profile_name = install_stable_hook_profile(&revalidated_directory, &source)?;
 
         launch
             .arguments
@@ -1315,7 +1292,8 @@ impl CodexAdapter {
             OsString::from("SYLVOPS_HOOK_TOKEN"),
             OsString::from(endpoint.bearer_token()),
         );
-        Ok(vec![profile_path])
+        // Shared across Sessions and daemon lifetimes: never add it to per-Session cleanup.
+        Ok(Vec::new())
     }
 }
 
@@ -1566,6 +1544,11 @@ impl ProviderRuntime for CodexAdapter {
             let Some(name) = path.file_name().and_then(OsStr::to_str) else {
                 return Err(provider_error("Codex runtime path has no valid file name"));
             };
+            if name.starts_with("sylvops-hooks-v1-") {
+                return Err(provider_error(
+                    "shared Codex hook profiles cannot be removed by Session cleanup",
+                ));
+            }
             if !name.starts_with("sylvops-") || !name.ends_with(".config.toml") {
                 return Err(provider_error(
                     "Codex runtime path is not application-owned",
@@ -1712,35 +1695,64 @@ fn hook_profile_source(command: &str) -> String {
     format!("# sylvops-managed-v1 sha256={checksum}\n{body}")
 }
 
-fn cleanup_stale_profiles(directory: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("sylvops-") || !name.ends_with(".config.toml") {
-            continue;
-        }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_file() || file_type.is_symlink() {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.len() > 64 * 1024 {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        if owned_profile_checksum_is_valid(&source) {
-            let _ = std::fs::remove_file(entry.path());
+fn install_stable_hook_profile(directory: &Path, source: &str) -> sylvops_core::Result<String> {
+    use std::io::{Read, Write};
+
+    // Content includes the validated relay path. Changed installations/definitions get a new
+    // immutable source, so no running Codex process sees its profile overwritten beneath it.
+    let name = format!("sylvops-hooks-v1-{:x}", Sha256::digest(source.as_bytes()));
+    let path = directory.join(format!("{name}.config.toml"));
+    if !path
+        .try_exists()
+        .map_err(|_| provider_error("cannot inspect Codex hook profile"))?
+    {
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)
+            .map_err(|_| provider_error("cannot stage Codex hook profile"))?;
+        temporary
+            .write_all(source.as_bytes())
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|_| provider_error("cannot write Codex hook profile"))?;
+        match temporary.persist_noclobber(&path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(provider_error("cannot install Codex hook profile")),
         }
     }
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| provider_error("cannot validate Codex hook profile"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
+        return Err(provider_error(
+            "Codex hook profile is not an owned regular file",
+        ));
+    }
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|_| provider_error("cannot canonicalize Codex hook profile"))?;
+    if canonical.parent() != Some(directory) {
+        return Err(provider_error(
+            "Codex hook profile escaped its configuration directory",
+        ));
+    }
+    let file =
+        std::fs::File::open(&path).map_err(|_| provider_error("cannot open Codex hook profile"))?;
+    let identity = same_file::Handle::from_file(
+        file.try_clone()
+            .map_err(|_| provider_error("cannot inspect Codex hook profile identity"))?,
+    )
+    .map_err(|_| provider_error("cannot inspect Codex hook profile identity"))?;
+    let mut existing = String::new();
+    file.take(64 * 1024 + 1)
+        .read_to_string(&mut existing)
+        .map_err(|_| provider_error("cannot read Codex hook profile"))?;
+    if existing.len() > 64 * 1024
+        || !owned_profile_checksum_is_valid(&existing)
+        || (existing != source && !codex_trust_metadata_is_valid(source, &existing))
+        || same_file::Handle::from_path(&path).ok().as_ref() != Some(&identity)
+    {
+        return Err(provider_error(
+            "Codex hook profile was modified; refusing to overwrite it",
+        ));
+    }
+    Ok(name)
 }
 
 fn owned_profile_checksum_is_valid(source: &str) -> bool {
@@ -2501,6 +2513,54 @@ mod tests {
     }
 
     #[test]
+    fn stable_hook_installation_is_atomic_concurrent_and_refuses_modified_sources() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temporary.path()).unwrap();
+        let source = hook_profile_source("sylvops hook emit");
+        std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    let directory = &directory;
+                    let source = &source;
+                    scope.spawn(move || install_stable_hook_profile(directory, source).unwrap())
+                })
+                .collect::<Vec<_>>();
+            let names = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            assert!(names.iter().all(|name| name == &names[0]));
+        });
+        let name = install_stable_hook_profile(&directory, &source).unwrap();
+        let path = directory.join(format!("{name}.config.toml"));
+        let edited = source.replace("hook emit", "hook other-command");
+        std::fs::write(&path, &edited).unwrap();
+        assert!(install_stable_hook_profile(&directory, &source).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        let changed_name =
+            install_stable_hook_profile(&directory, &hook_profile_source("another hook emit"))
+                .unwrap();
+        assert_ne!(name, changed_name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_hook_installation_refuses_symlinks_without_overwriting_targets() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temporary.path()).unwrap();
+        let source = hook_profile_source("sylvops hook emit");
+        let name = format!("sylvops-hooks-v1-{:x}", Sha256::digest(source.as_bytes()));
+        let target = directory.join("user.config.toml");
+        std::fs::write(&target, "user configuration").unwrap();
+        std::os::unix::fs::symlink(&target, directory.join(format!("{name}.config.toml"))).unwrap();
+        assert!(install_stable_hook_profile(&directory, &source).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "user configuration"
+        );
+    }
+
+    #[test]
     fn hook_profile_has_observational_events_only() {
         let source = hook_profile_source("sylvops hook emit");
         assert!(owned_profile_checksum_is_valid(&source));
@@ -2690,9 +2750,13 @@ mod tests {
                 .get(OsStr::new("SYLVOPS_HOOK_TOKEN")),
             Some(&OsString::from(endpoint.bearer_token()))
         );
-        assert_eq!(configured.owned_paths.len(), 1);
-        let source = std::fs::read_to_string(&configured.owned_paths[0])
-            .expect("application-owned hook profile");
+        assert!(configured.owned_paths.is_empty());
+        let profile = configured.launch.arguments.all()[1]
+            .to_string_lossy()
+            .into_owned();
+        let source =
+            std::fs::read_to_string(temporary.path().join(format!("{profile}.config.toml")))
+                .expect("application-owned hook profile");
         assert!(owned_profile_checksum_is_valid(&source));
         assert_eq!(
             configured.launch.arguments.all()[0],
@@ -2801,7 +2865,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_cleanup_removes_only_intact_application_owned_profiles() {
+    fn stable_hook_profile_survives_sessions_cleanup_and_restart() {
         let temporary = tempfile::tempdir().expect("temporary hook directory");
         let runtime = Arc::new(CodexAdapter::from_executable_with_hooks(
             PathBuf::from(if cfg!(windows) {
@@ -2843,12 +2907,29 @@ mod tests {
         };
 
         let intact = configure(sylvops_core::ids::SessionId::new());
-        let intact_path = intact.owned_paths[0].clone();
+        let profile = intact.launch.arguments.all()[1]
+            .to_string_lossy()
+            .into_owned();
+        let intact_path = temporary.path().join(format!("{profile}.config.toml"));
         registry.cleanup_runtime_paths(ProviderKind::Codex, &intact.owned_paths);
-        assert!(!intact_path.exists());
+        assert!(intact.owned_paths.is_empty());
+        assert!(intact_path.exists());
+        assert!(
+            registry
+                .cleanup_runtime_paths_checked(
+                    ProviderKind::Codex,
+                    std::slice::from_ref(&intact_path)
+                )
+                .is_err()
+        );
+        assert!(intact_path.exists());
 
         let trusted = configure(sylvops_core::ids::SessionId::new());
-        let trusted_path = &trusted.owned_paths[0];
+        assert_eq!(
+            intact.launch.arguments.all()[1],
+            trusted.launch.arguments.all()[1]
+        );
+        let trusted_path = &intact_path;
         let source = std::fs::read_to_string(trusted_path).expect("managed profile");
         let project = toml::Value::String(temporary.path().to_string_lossy().into_owned());
         std::fs::write(
@@ -2859,15 +2940,28 @@ mod tests {
         registry
             .cleanup_runtime_paths_checked(ProviderKind::Codex, &trusted.owned_paths)
             .expect("Codex trust metadata preserves ownership");
-        assert!(!trusted_path.exists());
+        assert!(trusted_path.exists());
         registry
             .cleanup_runtime_paths_checked(ProviderKind::Codex, &trusted.owned_paths)
             .expect("repeated cleanup succeeds");
 
-        let tampered = configure(sylvops_core::ids::SessionId::new());
-        let tampered_path = tampered.owned_paths[0].clone();
-        std::fs::write(&tampered_path, "user-owned replacement").expect("replace managed profile");
-        registry.cleanup_runtime_paths(ProviderKind::Codex, &tampered.owned_paths);
-        assert!(tampered_path.exists());
+        let restarted = CodexAdapter::from_executable_with_hooks(
+            std::env::current_exe().unwrap(),
+            std::env::current_exe().unwrap(),
+            temporary.path().to_owned(),
+        );
+        let source = hook_profile_source(&hook_command(&std::env::current_exe().unwrap()).unwrap());
+        let directory = std::fs::canonicalize(temporary.path()).unwrap();
+        assert_eq!(
+            install_stable_hook_profile(&directory, &source).unwrap(),
+            profile
+        );
+        drop(restarted);
+        std::fs::write(trusted_path, "user-owned replacement").expect("replace managed profile");
+        assert!(install_stable_hook_profile(&directory, &source).is_err());
+        assert_eq!(
+            std::fs::read_to_string(trusted_path).unwrap(),
+            "user-owned replacement"
+        );
     }
 }
