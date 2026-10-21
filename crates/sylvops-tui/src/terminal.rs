@@ -170,6 +170,18 @@ pub(crate) fn is_detach_key(key: KeyEvent) -> bool {
 }
 
 pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
+    // Pending-question navigation uses modified arrows; plain arrows are different actions.
+    let modifier = 1
+        + u8::from(key.modifiers.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(key.modifiers.contains(KeyModifiers::ALT))
+        + 4 * u8::from(key.modifiers.contains(KeyModifiers::CONTROL));
+    let cursor_key = |suffix| {
+        if modifier == 1 {
+            format!("\x1b[{suffix}").into_bytes()
+        } else {
+            format!("\x1b[1;{modifier}{suffix}").into_bytes()
+        }
+    };
     let bytes = match key.code {
         KeyCode::Char(character)
             if key.modifiers.contains(KeyModifiers::CONTROL) && character.is_ascii() =>
@@ -183,12 +195,12 @@ pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::Up => cursor_key('A'),
+        KeyCode::Down => cursor_key('B'),
+        KeyCode::Right => cursor_key('C'),
+        KeyCode::Left => cursor_key('D'),
+        KeyCode::Home => cursor_key('H'),
+        KeyCode::End => cursor_key('F'),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
         KeyCode::Insert => b"\x1b[2~".to_vec(),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
@@ -210,6 +222,28 @@ mod tests {
             last_sequence: 0,
             columns,
             rows,
+        }
+    }
+
+    #[test]
+    fn question_navigation_preserves_modified_arrow_keys() {
+        for (code, modifiers, expected) in [
+            (KeyCode::Up, KeyModifiers::SHIFT, "\x1b[1;2A"),
+            (KeyCode::Down, KeyModifiers::SHIFT, "\x1b[1;2B"),
+            (KeyCode::Down, KeyModifiers::ALT, "\x1b[1;3B"),
+            (KeyCode::Up, KeyModifiers::CONTROL, "\x1b[1;5A"),
+            (
+                KeyCode::Up,
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+                "\x1b[1;8A",
+            ),
+            (KeyCode::Up, KeyModifiers::NONE, "\x1b[A"),
+        ] {
+            assert_eq!(
+                encode_key(KeyEvent::new(code, modifiers)),
+                Some(expected.as_bytes().to_vec()),
+                "{code:?} {modifiers:?}"
+            );
         }
     }
 

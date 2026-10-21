@@ -366,6 +366,18 @@ pub(crate) fn encode_key(
     modifiers: keyboard::Modifiers,
     produced_text: Option<&str>,
 ) -> Option<Vec<u8>> {
+    // Keep question-navigation shortcuts distinct from ordinary cursor movement.
+    let modifier = 1
+        + u8::from(modifiers.shift())
+        + 2 * u8::from(modifiers.alt())
+        + 4 * u8::from(modifiers.control());
+    let cursor_key = |suffix| {
+        if modifier == 1 {
+            format!("\x1b[{suffix}").into_bytes()
+        } else {
+            format!("\x1b[1;{modifier}{suffix}").into_bytes()
+        }
+    };
     let mut bytes = match key.as_ref() {
         Key::Named(Named::Enter) if modifiers.shift() => vec![b'\n'],
         Key::Named(Named::Enter) => vec![b'\r'],
@@ -374,12 +386,12 @@ pub(crate) fn encode_key(
         Key::Named(Named::Tab) => vec![b'\t'],
         Key::Named(Named::Backspace) => vec![0x7f],
         Key::Named(Named::Escape) => vec![0x1b],
-        Key::Named(Named::ArrowUp) => b"\x1b[A".to_vec(),
-        Key::Named(Named::ArrowDown) => b"\x1b[B".to_vec(),
-        Key::Named(Named::ArrowRight) => b"\x1b[C".to_vec(),
-        Key::Named(Named::ArrowLeft) => b"\x1b[D".to_vec(),
-        Key::Named(Named::Home) => b"\x1b[H".to_vec(),
-        Key::Named(Named::End) => b"\x1b[F".to_vec(),
+        Key::Named(Named::ArrowUp) => cursor_key('A'),
+        Key::Named(Named::ArrowDown) => cursor_key('B'),
+        Key::Named(Named::ArrowRight) => cursor_key('C'),
+        Key::Named(Named::ArrowLeft) => cursor_key('D'),
+        Key::Named(Named::Home) => cursor_key('H'),
+        Key::Named(Named::End) => cursor_key('F'),
         Key::Named(Named::Delete) => b"\x1b[3~".to_vec(),
         Key::Named(Named::Insert) => b"\x1b[2~".to_vec(),
         Key::Named(Named::PageUp) => b"\x1b[5~".to_vec(),
@@ -652,6 +664,28 @@ fn display_contents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_navigation_preserves_modified_arrow_keys() {
+        for (key, modifiers, expected) in [
+            (Named::ArrowUp, keyboard::Modifiers::SHIFT, "\x1b[1;2A"),
+            (Named::ArrowDown, keyboard::Modifiers::SHIFT, "\x1b[1;2B"),
+            (Named::ArrowDown, keyboard::Modifiers::ALT, "\x1b[1;3B"),
+            (Named::ArrowUp, keyboard::Modifiers::CTRL, "\x1b[1;5A"),
+            (
+                Named::ArrowUp,
+                keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT | keyboard::Modifiers::CTRL,
+                "\x1b[1;8A",
+            ),
+            (Named::ArrowUp, keyboard::Modifiers::default(), "\x1b[A"),
+        ] {
+            assert_eq!(
+                encode_key(&Key::Named(key), modifiers, None),
+                Some(expected.as_bytes().to_vec()),
+                "{key:?} {modifiers:?}"
+            );
+        }
+    }
 
     fn assert_cached_matches_uncached(
         terminal: &TerminalState,
