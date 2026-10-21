@@ -24,6 +24,7 @@ async fn real_codex_delivers_completion_across_sessions_and_daemon_restart() {
         let start = || {
             let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_hook-daemon"));
             command.arg("daemon").arg(&state_root).env("CODEX_CLI_PATH", &executable)
+                .env("TERM", "xterm-256color")
                 .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
             #[cfg(windows)]
             command.creation_flags(0x0800_0000);
@@ -64,7 +65,8 @@ async fn real_codex_delivers_completion_across_sessions_and_daemon_restart() {
             assert!(matches!(claim, DaemonResponse::AttentionNotificationClaim(Some(claim)) if claim.session_id == id && claim.attention_id == event.id));
             assert!(matches!(client.request(&ClientRequest::GetSessionLifecycleHealth { session_id: id }).await.unwrap(),
                 DaemonResponse::SessionLifecycleHealth { health: sylvops_core::attention::LifecycleHealth::Ready, .. }));
-            client.request(&ClientRequest::StopSession { session_id: id }).await.unwrap();
+            assert!(session(&client, id).await.external_session_id.is_some(), "completion must capture Conversation identity");
+            resume_and_stop(&client, id).await;
         }
         client.request(&ClientRequest::ShutdownDaemon).await.unwrap();
         assert!(bounded(daemon.wait()).await.unwrap().unwrap().success());
@@ -86,6 +88,7 @@ async fn real_codex_delivers_completion_across_sessions_and_daemon_restart() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }).await.expect("completion callback missing after daemon restart");
+        resume_and_stop(&restarted, id).await;
         restarted.request(&ClientRequest::ShutdownDaemon).await.unwrap();
         assert!(bounded(daemon.wait()).await.unwrap().unwrap().success());
     }).await.expect("bounded real Codex smoke timeout");
@@ -223,6 +226,26 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
     assert!(bounded(daemon.wait()).await.unwrap().unwrap().success());
     drop(client);
 
+    // Fake Codex does not implement trust review. Replay the approval metadata written
+    // by real Codex so restart and resume exercise the profile validation boundary.
+    let profile = std::fs::read_dir(&codex_home)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sylvops-hooks-v1-")
+        })
+        .unwrap();
+    let profile_key =
+        toml::Value::String(format!("{}:session_start:0:0", profile.to_string_lossy()));
+    let original = std::fs::read_to_string(&profile).unwrap();
+    let approved = format!(
+        "{original}\n[hooks.state.{profile_key}]\ntrusted_hash = 'sha256:{}'\n",
+        "a".repeat(64)
+    );
+    std::fs::write(&profile, &approved).unwrap();
     let mut restarted = start_daemon(&relay, &codex_home, &state_root);
     let client = connect(&paths).await;
     assert_eq!(
@@ -232,11 +255,106 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
             .as_deref(),
         Some(expected_id.as_str())
     );
+    resume_and_stop(&client, session_id).await;
+    assert_eq!(std::fs::read_to_string(&profile).unwrap(), approved);
     client
         .request(&ClientRequest::ShutdownDaemon)
         .await
         .unwrap();
     assert!(bounded(restarted.wait()).await.unwrap().unwrap().success());
+}
+
+async fn resume_and_stop(client: &DaemonClient, source_id: SessionId) {
+    let identity = session(client, source_id)
+        .await
+        .external_session_id
+        .expect("verified Conversation identity before exit");
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: source_id,
+        })
+        .await
+        .unwrap();
+    bounded(async {
+        while session(client, source_id).await.process_id.is_some() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = client
+        .request(&ClientRequest::ResumeSession {
+            session_id: source_id,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    let DaemonResponse::SessionResumed {
+        session: successor,
+        outcome,
+        predecessor_session_id,
+        ..
+    } = response
+    else {
+        panic!("verified Conversation failed to resume");
+    };
+    assert_eq!(
+        outcome,
+        sylvops_core::protocol::SessionResumeOutcome::CreatedSuccessor
+    );
+    assert_eq!(predecessor_session_id, Some(source_id));
+    assert_ne!(successor.id, source_id);
+    assert_eq!(
+        successor.external_session_id.as_deref(),
+        Some(identity.as_str())
+    );
+    let DaemonResponse::Snapshot(snapshot) =
+        client.request(&ClientRequest::GetSnapshot).await.unwrap()
+    else {
+        panic!("missing lineage snapshot");
+    };
+    assert!(
+        snapshot
+            .session_lineage
+            .iter()
+            .any(|link| link.predecessor_session_id == source_id
+                && link.successor_session_id == successor.id)
+    );
+    bounded(async {
+        loop {
+            if matches!(
+                client
+                    .request(&ClientRequest::GetSessionLifecycleHealth {
+                        session_id: successor.id
+                    })
+                    .await
+                    .unwrap(),
+                DaemonResponse::SessionLifecycleHealth {
+                    health: sylvops_core::attention::LifecycleHealth::Ready,
+                    ..
+                }
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("resumed Provider did not deliver a lifecycle callback");
+    client
+        .request(&ClientRequest::StopSession {
+            session_id: successor.id,
+        })
+        .await
+        .unwrap();
+    bounded(async {
+        while session(client, successor.id).await.process_id.is_some() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 fn start_daemon(relay: &Path, codex_home: &Path, state_root: &Path) -> tokio::process::Child {

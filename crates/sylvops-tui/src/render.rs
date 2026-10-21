@@ -1210,9 +1210,19 @@ fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<Line<'a>> {
     let mut lines = vec![
         Line::from(
-            app.lifecycle_health
-                .filter(|(id, _)| *id == session.id)
-                .map_or("", |(_, health)| health.guidance()),
+            sylvops_core::attention::conversation_identity_guidance(session).map_or("", |_| {
+                if session.external_session_id.is_some() {
+                    "Conversation identity recorded"
+                } else if lifecycle_is_active(session.status.lifecycle) {
+                    if session.provider_kind == sylvops_core::domain::ProviderKind::Codex {
+                        "Identity missing; /hooks: trust (t), check Active, prompt."
+                    } else {
+                        "Identity missing; check Claude SessionStart hooks."
+                    }
+                } else {
+                    "Identity never recorded; cannot resume. Use Start Fresh."
+                }
+            }),
         ),
         Line::from(vec![
             Span::styled("Session      ", theme.muted),
@@ -1289,6 +1299,9 @@ fn session_details<'a>(app: &'a App, session: &'a Session, theme: Theme) -> Vec<
         ),
     ];
     lines.extend(work_source_detail_lines(app, session, theme));
+    if let Some((_, health)) = app.lifecycle_health.filter(|(id, _)| *id == session.id) {
+        lines.push(Line::from(health.guidance()));
+    }
     lines
 }
 

@@ -4629,7 +4629,7 @@ mod tests {
                         .as_mut()
                         .unwrap()
                         .acknowledgement = AttentionAcknowledgement::Acknowledged;
-                    assert!(app.needs_attention_sessions().is_empty());
+                    assert_eq!(app.needs_attention_sessions(), Vec::<&Session>::new());
                 }
             }
         }
@@ -5331,6 +5331,44 @@ mod tests {
             &failed_leaf,
             &app.snapshot.sessions
         ));
+    }
+
+    #[test]
+    fn details_show_conversation_identity_independently_of_callback_health() {
+        let mut snapshot = populated_snapshot();
+        snapshot.sessions[0].provider_kind = ProviderKind::Codex;
+        snapshot.sessions[0].external_session_id = None;
+        snapshot.sessions[0].status.lifecycle = SessionLifecycle::Running;
+        let id = snapshot.sessions[0].id;
+        let mut app = App::new(snapshot, Vec::new(), None);
+        app.selected_session_id = Some(id);
+        app.main_tab = TuiContentView::Details;
+        app.lifecycle_health = Some((id, sylvops_core::attention::LifecycleHealth::Ready));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("/hooks"));
+        app.snapshot.sessions[0].external_session_id = Some("verified-id".into());
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Conversation identity recorded"));
+        assert!(!text.contains("/hooks"));
     }
 
     #[test]

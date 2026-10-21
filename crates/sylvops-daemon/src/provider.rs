@@ -1593,7 +1593,7 @@ impl ProviderRuntime for CodexAdapter {
             let source = std::fs::read_to_string(&canonical_path).map_err(|error| {
                 provider_error(format!("cannot read Codex runtime file: {error}"))
             })?;
-            if !owned_profile_checksum_is_valid(&source) {
+            if !owned_profile_checksum_is_valid(&source, &canonical_path) {
                 return Err(provider_error(
                     "Codex runtime file is no longer application-owned",
                 ));
@@ -1688,7 +1688,8 @@ fn hook_profile_source(command: &str) -> String {
     ] {
         let _ = write!(
             body,
-            "\n[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command}\ncommand_windows = {command}\nasync = true\ntimeout = 2\n"
+            "\n[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command}\ncommand_windows = {command}\nasync = {}\ntimeout = 2\n",
+            event != "SessionEnd"
         );
     }
     let checksum = format!("{:x}", Sha256::digest(body.as_bytes()));
@@ -1744,8 +1745,8 @@ fn install_stable_hook_profile(directory: &Path, source: &str) -> sylvops_core::
         .read_to_string(&mut existing)
         .map_err(|_| provider_error("cannot read Codex hook profile"))?;
     if existing.len() > 64 * 1024
-        || !owned_profile_checksum_is_valid(&existing)
-        || (existing != source && !codex_trust_metadata_is_valid(source, &existing))
+        || !owned_profile_checksum_is_valid(&existing, &canonical)
+        || (existing != source && !codex_trust_metadata_is_valid(source, &existing, &canonical))
         || same_file::Handle::from_path(&path).ok().as_ref() != Some(&identity)
     {
         return Err(provider_error(
@@ -1755,7 +1756,7 @@ fn install_stable_hook_profile(directory: &Path, source: &str) -> sylvops_core::
     Ok(name)
 }
 
-fn owned_profile_checksum_is_valid(source: &str) -> bool {
+fn owned_profile_checksum_is_valid(source: &str, profile_path: &Path) -> bool {
     if source.len() > 64 * 1024 {
         return false;
     }
@@ -1776,36 +1777,93 @@ fn owned_profile_checksum_is_valid(source: &str) -> bool {
         checksum.update(line.as_bytes());
         end += line.len();
         if format!("{:x}", checksum.clone().finalize()) == expected {
-            return end == body.len() || codex_trust_metadata_is_valid(&body[..end], body);
+            return end == body.len()
+                || codex_trust_metadata_is_valid(&body[..end], body, profile_path);
         }
     }
     false
 }
 
-fn codex_trust_metadata_is_valid(owned: &str, body: &str) -> bool {
+fn codex_trust_metadata_is_valid(owned: &str, body: &str, profile_path: &Path) -> bool {
     let (Ok(owned), Ok(mut document)) = (owned.parse::<toml::Table>(), body.parse::<toml::Table>())
     else {
         return false;
     };
-    let Some(toml::Value::Table(projects)) = document.remove("projects") else {
+    if let Some(projects) = document.remove("projects")
+        && !project_trust_metadata_is_valid(&projects)
+    {
         return false;
-    };
+    }
+    if let Some(state) = document
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|hooks| hooks.remove("state"))
+        && !hook_trust_metadata_is_valid(&state, profile_path)
+    {
+        return false;
+    }
     // Parse the complete document so dotted keys cannot silently add fields to the
     // final hook table, or redefine an immutable table across the checksum boundary.
     document == owned
-        && !projects.is_empty()
-        && projects.iter().all(|(path, metadata)| {
-            Path::new(path).is_absolute()
+}
+
+fn project_trust_metadata_is_valid(projects: &toml::Value) -> bool {
+    projects.as_table().is_some_and(|projects| {
+        !projects.is_empty()
+            && projects.iter().all(|(path, metadata)| {
+                Path::new(path).is_absolute()
+                    && !path.chars().any(char::is_control)
+                    && !Path::new(path)
+                        .components()
+                        .any(|component| component == std::path::Component::ParentDir)
+                    && metadata.as_table().is_some_and(|metadata| {
+                        metadata.len() == 1
+                            && matches!(
+                                metadata.get("trust_level").and_then(toml::Value::as_str),
+                                Some("trusted" | "untrusted")
+                            )
+                    })
+            })
+    })
+}
+
+fn hook_trust_metadata_is_valid(state: &toml::Value, profile_path: &Path) -> bool {
+    const EVENTS: &[&str] = &[
+        "session_start",
+        "session_end",
+        "user_prompt_submit",
+        "permission_request",
+        "subagent_start",
+        "subagent_stop",
+        "stop",
+        "interrupt",
+    ];
+    let Some(state) = state.as_table() else {
+        return false;
+    };
+    !state.is_empty()
+        && state.len() <= EVENTS.len()
+        && state.iter().all(|(key, metadata)| {
+            let Some((path, event)) = key
+                .strip_suffix(":0:0")
+                .and_then(|key| key.rsplit_once(':'))
+            else {
+                return false;
+            };
+            EVENTS.contains(&event)
                 && !path.chars().any(char::is_control)
-                && !Path::new(path)
-                    .components()
-                    .any(|component| component == std::path::Component::ParentDir)
+                && Path::new(path).is_absolute()
+                && std::fs::canonicalize(path).ok().as_deref() == Some(profile_path)
                 && metadata.as_table().is_some_and(|metadata| {
                     metadata.len() == 1
-                        && matches!(
-                            metadata.get("trust_level").and_then(toml::Value::as_str),
-                            Some("trusted" | "untrusted")
-                        )
+                        && metadata
+                            .get("trusted_hash")
+                            .and_then(toml::Value::as_str)
+                            .and_then(|hash| hash.strip_prefix("sha256:"))
+                            .is_some_and(|hash| {
+                                hash.len() == 64
+                                    && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
                 })
         })
 }
@@ -2513,6 +2571,51 @@ mod tests {
     }
 
     #[test]
+    fn stable_hook_profile_preserves_codex_hook_approval() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temporary.path()).unwrap();
+        let source = hook_profile_source("sylvops hook emit");
+        let name = install_stable_hook_profile(&directory, &source).unwrap();
+        let path = directory.join(format!("{name}.config.toml"));
+        let ordinary = path
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_owned();
+        let key = toml::Value::String(format!("{ordinary}:session_start:0:0"));
+        let hash = "a".repeat(64);
+        let approval = format!("\n[hooks.state.{key}]\ntrusted_hash = 'sha256:{hash}'\n");
+        let trusted = format!("{source}{approval}");
+        std::fs::write(&path, &trusted).unwrap();
+        assert_eq!(
+            install_stable_hook_profile(&directory, &source).unwrap(),
+            name
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), trusted);
+        let project = toml::Value::String(ordinary.clone());
+        let combined = format!("{trusted}\n[projects.{project}]\ntrust_level = 'trusted'\n");
+        std::fs::write(&path, &combined).unwrap();
+        assert_eq!(
+            install_stable_hook_profile(&directory, &source).unwrap(),
+            name
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), combined);
+        for invalid in [
+            trusted.replace(&hash, "invalid"),
+            trusted.replace(":session_start:0:0", ":unknown:0:0"),
+            trusted.replace(":session_start:0:0", ":session_start:1:0"),
+            trusted.replace(&ordinary, "/unrelated/profile.config.toml"),
+            format!("{trusted}command = 'injected'\n"),
+            trusted.replace("hook emit", "hook other"),
+            format!("{trusted}\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ncommand='injected'\n"),
+            format!("{trusted}#{}", "x".repeat(65_536)),
+        ] {
+            std::fs::write(&path, &invalid).unwrap();
+            assert!(install_stable_hook_profile(&directory, &source).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+        }
+    }
+
+    #[test]
     fn stable_hook_installation_is_atomic_concurrent_and_refuses_modified_sources() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = std::fs::canonicalize(temporary.path()).unwrap();
@@ -2563,7 +2666,10 @@ mod tests {
     #[test]
     fn hook_profile_has_observational_events_only() {
         let source = hook_profile_source("sylvops hook emit");
-        assert!(owned_profile_checksum_is_valid(&source));
+        assert!(owned_profile_checksum_is_valid(
+            &source,
+            Path::new("unused")
+        ));
         assert!(source.contains("hooks.PermissionRequest"));
         assert!(source.contains("hooks.SubagentStop"));
         assert!(!source.contains("behavior = \"allow\""));
@@ -2750,14 +2856,17 @@ mod tests {
                 .get(OsStr::new("SYLVOPS_HOOK_TOKEN")),
             Some(&OsString::from(endpoint.bearer_token()))
         );
-        assert!(configured.owned_paths.is_empty());
+        assert_eq!(configured.owned_paths, Vec::<PathBuf>::new());
         let profile = configured.launch.arguments.all()[1]
             .to_string_lossy()
             .into_owned();
         let source =
             std::fs::read_to_string(temporary.path().join(format!("{profile}.config.toml")))
                 .expect("application-owned hook profile");
-        assert!(owned_profile_checksum_is_valid(&source));
+        assert!(owned_profile_checksum_is_valid(
+            &source,
+            Path::new("unused")
+        ));
         assert_eq!(
             configured.launch.arguments.all()[0],
             OsStr::new("--profile")
@@ -2912,7 +3021,7 @@ mod tests {
             .into_owned();
         let intact_path = temporary.path().join(format!("{profile}.config.toml"));
         registry.cleanup_runtime_paths(ProviderKind::Codex, &intact.owned_paths);
-        assert!(intact.owned_paths.is_empty());
+        assert_eq!(intact.owned_paths, Vec::<PathBuf>::new());
         assert!(intact_path.exists());
         assert!(
             registry
