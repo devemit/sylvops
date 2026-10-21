@@ -8,6 +8,35 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// Identity capture is independent of callback health and Provider availability.
+#[must_use]
+pub fn conversation_identity_guidance(session: &Session) -> Option<&'static str> {
+    use crate::{domain::ProviderKind, session_state::lifecycle_is_active};
+    if !matches!(
+        session.provider_kind,
+        ProviderKind::Codex | ProviderKind::Claude
+    ) {
+        return None;
+    }
+    if session.external_session_id.is_some() {
+        return Some(if lifecycle_is_active(session.status.lifecycle) {
+            "Conversation identity recorded. Resume will be available after this Session ends if the Provider and Worktree remain available."
+        } else {
+            "Conversation identity recorded. Resume is checked against Provider and Worktree availability."
+        });
+    }
+    if !lifecycle_is_active(session.status.lifecycle) {
+        return Some(
+            "Conversation identity was never recorded. This Session cannot resume; history is retained. Use Start Fresh.",
+        );
+    }
+    Some(if session.provider_kind == ProviderKind::Codex {
+        "Resume is unavailable until Codex records its Conversation identity. Open /hooks, review and trust SylvOps hooks (press t in the hook browser), verify they are Active, then submit another prompt."
+    } else {
+        "Resume is unavailable until Claude records its Conversation identity through SessionStart. Check Provider hook configuration if this persists."
+    })
+}
+
 pub const MAX_ATTENTION_NOTIFICATION_LABEL_CHARS: usize = 80;
 
 /// Observational callback health; never changes process state or creates attention.
@@ -29,7 +58,7 @@ impl LifecycleHealth {
             }
             Self::Ready => "Provider lifecycle callbacks received.",
             Self::Missing => {
-                "Provider lifecycle callbacks are missing; attention and notifications may be incomplete. In Codex, review and trust SylvOps hooks with /hooks; then submit a prompt. Check provider hook configuration if this persists."
+                "Provider lifecycle callbacks are missing; attention and notifications may be incomplete. In Codex, open /hooks, review SylvOps hooks, press t to trust them and verify they are Active; then submit a prompt. Check provider hook configuration if this persists."
             }
         }
     }

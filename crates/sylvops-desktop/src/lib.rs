@@ -2034,6 +2034,12 @@ impl DesktopApp {
             }
         };
         let mut body = column![tabs, rule::horizontal(1), views, rule::horizontal(1)];
+        if !github_surface_open
+            && main_tab != MainTab::Details
+            && let Some(guidance) = self.pending_conversation_identity_guidance()
+        {
+            body = body.push(text(guidance).size(UI_META_SIZE));
+        }
         if let Some((id, health)) = self.lifecycle_health
             && self.active_session_id == Some(id)
             && health == sylvops_core::attention::LifecycleHealth::Missing
@@ -2044,6 +2050,18 @@ impl DesktopApp {
             .width(Fill)
             .height(Fill)
             .into()
+    }
+
+    fn pending_conversation_identity_guidance(&self) -> Option<&'static str> {
+        let session = self.active_session_id.and_then(|id| self.session(id))?;
+        if session.external_session_id.is_some()
+            || !self
+                .lifecycle_health
+                .is_some_and(|(id, _)| id == session.id)
+        {
+            return None;
+        }
+        sylvops_core::attention::conversation_identity_guidance(session)
     }
 
     fn github_context_header(&self) -> Element<'_, Message> {
@@ -2978,6 +2996,14 @@ impl DesktopApp {
         let presentation = self.presentation();
         let selection = presentation.details_selection;
         let mut content = column![text("Selection details").font(UI_SEMIBOLD).size(24)].spacing(12);
+        if let Some(session) = selection.session.and_then(|id| self.session(id))
+            && self
+                .lifecycle_health
+                .is_some_and(|(id, _)| id == session.id)
+            && let Some(guidance) = sylvops_core::attention::conversation_identity_guidance(session)
+        {
+            content = content.push(text(guidance).size(UI_META_SIZE));
+        }
         if let Some((id, health)) = self.lifecycle_health
             && self.active_session_id == Some(id)
         {
@@ -14112,6 +14138,63 @@ mod tests {
                 ..sylvops_core::session_state::SessionStatus::default()
             }
         ));
+    }
+
+    #[test]
+    fn conversation_identity_guidance_recovers_from_live_missing_identity() {
+        let mut current = session(SessionLifecycle::Running, None);
+        let missing = sylvops_core::attention::conversation_identity_guidance(&current).unwrap();
+        assert!(missing.contains("/hooks"));
+        assert!(missing.contains("Active"));
+        current.external_session_id = Some("verified-id".into());
+        let ready = sylvops_core::attention::conversation_identity_guidance(&current).unwrap();
+        assert!(ready.contains("identity recorded"));
+        assert!(!ready.contains("/hooks"));
+        current.external_session_id = None;
+        current.status.lifecycle = SessionLifecycle::Exited;
+        assert!(
+            sylvops_core::attention::conversation_identity_guidance(&current)
+                .unwrap()
+                .contains("Start Fresh")
+        );
+    }
+
+    #[test]
+    fn shell_has_no_conversation_identity_guidance() {
+        let mut current = session(SessionLifecycle::Running, None);
+        current.provider_kind = ProviderKind::Shell;
+        assert!(sylvops_core::attention::conversation_identity_guidance(&current).is_none());
+    }
+
+    #[tokio::test]
+    async fn details_show_conversation_identity_independently_of_callback_health() {
+        let (mut app, _, _, id, _) = desktop_hierarchy();
+        let current = app
+            .snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .unwrap();
+        current.provider_kind = ProviderKind::Codex;
+        current.status.lifecycle = SessionLifecycle::Running;
+        current.external_session_id = None;
+        app.selected_session_id = Some(id);
+        app.lifecycle_health = Some((id, sylvops_core::attention::LifecycleHealth::Ready));
+        let labels = rendered_text(app.details_view(), iced::Size::new(900.0, 700.0)).await;
+        assert!(labels.iter().any(|label| label.contains("/hooks")));
+        app.snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .unwrap()
+            .external_session_id = Some("verified-id".into());
+        let labels = rendered_text(app.details_view(), iced::Size::new(900.0, 700.0)).await;
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Conversation identity recorded"))
+        );
+        assert!(!labels.iter().any(|label| label.contains("/hooks")));
     }
 
     #[test]

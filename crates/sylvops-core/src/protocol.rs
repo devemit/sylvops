@@ -756,7 +756,7 @@ impl SessionResumeRefusal {
                 "The latest Session is {lifecycle:?}; only a terminal Session can resume its Conversation."
             ),
             Self::MissingConversationIdentity => {
-                "The latest Session has no verified Conversation identity.".into()
+                "The latest Session has no verified Conversation identity. Its identity was never recorded, so it cannot resume. History is retained; use Start Fresh.".into()
             }
             Self::ProviderDoesNotSupportResume { provider } => format!(
                 "{} does not support Resume Conversation.",
