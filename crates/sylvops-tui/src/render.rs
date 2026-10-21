@@ -57,6 +57,42 @@ struct MainAreas {
 
 const SETTINGS_LABEL: &str = " [s] Settings ";
 
+pub(crate) fn draw_startup(frame: &mut Frame<'_>, choice: TuiTheme, ready: bool) {
+    let theme = Theme::resolve(choice);
+    let area = frame.area();
+    frame.render_widget(Block::default().style(theme.background), area);
+    let wordmark = sylvops_core::ui::STARTUP_WORDMARK;
+    let width = wordmark.lines().map(str::len).max().unwrap_or(0);
+    let wide = usize::from(area.width) >= width && area.height >= 9;
+    let mut lines = if wide {
+        wordmark
+            .lines()
+            .map(|line| Line::styled(format!("{line:width$}"), theme.focus))
+            .collect::<Vec<_>>()
+    } else {
+        vec![Line::styled("SYLVOPS", theme.focus)]
+    };
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        if ready {
+            "Ready"
+        } else {
+            "Loading workspace…"
+        },
+        theme.muted,
+    ));
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let content = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(height) / 2,
+        area.width,
+        height,
+    );
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
+}
+
 const fn focus_marker(focused: bool) -> &'static str {
     if focused { "● " } else { "  " }
 }
@@ -3759,6 +3795,30 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_wordmark_fits_large_and_small_terminals() {
+        for (width, height) in [(80, 24), (50, 9), (30, 8), (7, 3), (1, 1)] {
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw_startup(frame, TuiTheme::default(), false))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            if width >= 50 {
+                assert!(rendered.contains("/ ___|"));
+                assert!(rendered.contains("Loading workspace…"));
+            } else if width >= 7 {
+                assert!(rendered.contains("SYLVOPS"));
+            }
+        }
+    }
 
     #[test]
     fn tui_diff_lines_use_semantic_theme_styles_and_fill_short_rows() {

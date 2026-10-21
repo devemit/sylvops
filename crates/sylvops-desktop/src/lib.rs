@@ -292,6 +292,7 @@ struct DesktopApp {
     pending_attention_activation: Option<SessionId>,
     status_animation_started_at: Instant,
     status_animation_phase: f32,
+    startup_started_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -727,7 +728,9 @@ enum Message {
 
 impl DesktopApp {
     fn new(paths: RuntimePaths) -> Self {
-        Self::with_bridge(Bridge::spawn(paths))
+        let mut app = Self::with_bridge(Bridge::spawn(paths));
+        app.startup_started_at = Some(Instant::now());
+        app
     }
 
     fn with_bridge(bridge: Bridge) -> Self {
@@ -826,11 +829,13 @@ impl DesktopApp {
             pending_attention_activation: None,
             status_animation_started_at: Instant::now(),
             status_animation_phase: 0.0,
+            startup_started_at: None,
         }
     }
 
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.advance_startup(Instant::now());
         match message {
             Message::Tick => {
                 self.status_animation_phase = self
@@ -853,7 +858,7 @@ impl DesktopApp {
                         window::gain_focus(window_id),
                     ]);
                 }
-                if self.modal_focus == ModalFocus::Pending {
+                if self.modal_focus == ModalFocus::Pending && self.startup_started_at.is_none() {
                     self.modal_focus = ModalFocus::Idle;
                     return widget::operation::focus_next();
                 }
@@ -874,6 +879,9 @@ impl DesktopApp {
             }
             Message::BridgeReady => self.process_bridge_events(),
             Message::Keyboard(event) => {
+                if self.startup_started_at.is_some() {
+                    return Task::none();
+                }
                 if let Some(task) = self.handle_terminal_clipboard(&event) {
                     return task;
                 }
@@ -1297,6 +1305,9 @@ impl DesktopApp {
                 }
             }
             Message::WindowReady(id) => {
+                if self.window_id.is_none() && self.startup_started_at.is_some() {
+                    self.startup_started_at = Some(Instant::now());
+                }
                 self.window_id = id;
                 self.sync_attention_focus();
             }
@@ -1333,7 +1344,21 @@ impl DesktopApp {
             }
             Message::ClearError => self.error = None,
         }
+        self.advance_startup(Instant::now());
         self.take_navigator_reveal_task()
+    }
+
+    fn advance_startup(&mut self, now: Instant) {
+        if self.error.is_some()
+            || self.connection == ConnectionState::Disconnected
+            || (self.connection == ConnectionState::Connected
+                && self.window_id.is_some()
+                && self.startup_started_at.is_some_and(|started| {
+                    now.saturating_duration_since(started) >= sylvops_core::ui::STARTUP_MIN_DURATION
+                }))
+        {
+            self.startup_started_at = None;
+        }
     }
 
     fn theme(&self) -> Theme {
@@ -1378,6 +1403,27 @@ impl DesktopApp {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        if self.startup_started_at.is_some() {
+            let status = if self.connection == ConnectionState::Connected {
+                "Ready"
+            } else {
+                "Loading workspace…"
+            };
+            return container(
+                column![
+                    text(sylvops_core::ui::STARTUP_WORDMARK)
+                        .font(UI_FONT)
+                        .size(18)
+                        .line_height(1.0)
+                        .style(text::primary),
+                    text(status).size(UI_META_SIZE).style(text::secondary),
+                ]
+                .spacing(24)
+                .align_x(Center),
+            )
+            .center(Fill)
+            .into();
+        }
         let top = self.top_bar();
         let mission_control = self.mission_control();
         let body: Element<'_, Message> = if let Some(modal) = &self.modal {
@@ -7867,7 +7913,8 @@ impl DesktopApp {
         if !matches!(self.connection, ConnectionState::Connected) {
             return;
         }
-        let session_id = (self.window_attention_state == WindowAttentionState::Foreground
+        let session_id = (self.startup_started_at.is_none()
+            && self.window_attention_state == WindowAttentionState::Foreground
             && self.content_surface == ContentSurface::Session
             && self.modal.is_none()
             && (self.main_tab == MainTab::Details
@@ -9866,6 +9913,58 @@ fn github_tab_focus_direction(key: &Key, modifiers: keyboard::Modifiers) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_waits_for_readiness_and_minimum_time_without_replaying() {
+        let (bridge, _harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        app.startup_started_at = Some(Instant::now());
+        app.window_id = Some(window::Id::unique());
+        let started = app.startup_started_at.unwrap();
+        app.advance_startup(started + Duration::from_secs(3));
+        assert!(app.startup_started_at.is_some(), "still connecting");
+        app.connection = ConnectionState::Connected;
+        app.advance_startup(started + Duration::from_millis(1_999));
+        assert!(app.startup_started_at.is_some());
+        app.advance_startup(started + sylvops_core::ui::STARTUP_MIN_DURATION);
+        assert!(app.startup_started_at.is_none());
+        app.connection = ConnectionState::Connecting;
+        app.advance_startup(started + Duration::from_secs(4));
+        assert!(app.startup_started_at.is_none());
+    }
+
+    #[test]
+    fn startup_errors_and_disconnects_bypass_minimum_time() {
+        for disconnected in [false, true] {
+            let (bridge, _harness) = Bridge::harness();
+            let mut app = DesktopApp::with_bridge(bridge);
+            app.startup_started_at = Some(Instant::now());
+            if disconnected {
+                app.connection = ConnectionState::Disconnected;
+            } else {
+                app.error = Some("Startup failed".into());
+            }
+            app.advance_startup(app.startup_started_at.unwrap());
+            assert!(app.startup_started_at.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_view_contains_only_wordmark_and_loading_status() {
+        let (bridge, _harness) = Bridge::harness();
+        let mut app = DesktopApp::with_bridge(bridge);
+        app.startup_started_at = Some(Instant::now());
+        for (width, height) in [(680, 480), (1440, 900)] {
+            let size = iced::Size::new(f32::from(width), f32::from(height));
+            let labels = rendered_text(app.view(), size).await;
+            assert_eq!(
+                labels,
+                [sylvops_core::ui::STARTUP_WORDMARK, "Loading workspace…"]
+            );
+            let rendered = render_desktop_baseline(&app, width, height).await;
+            assert!(rendered.distinct_colors > 1);
+        }
+    }
     use iced::advanced::{
         Layout,
         layout::{Limits, Node},
@@ -9971,7 +10070,7 @@ mod tests {
             SessionId::new()
         ));
         let paths = RuntimePaths::discover(Some(&runtime_root)).expect("runtime paths");
-        let mut app = DesktopApp::new(paths);
+        let mut app = DesktopApp::with_bridge(Bridge::spawn(paths));
         let workspace_id = WorkspaceId::new();
         let project_id = ProjectId::new();
         let worktree_id = WorktreeId::new();
@@ -12138,9 +12237,9 @@ mod tests {
             "sylvops-desktop-first-run-baseline-{}",
             SessionId::new()
         ));
-        let mut first_run = DesktopApp::new(
+        let mut first_run = DesktopApp::with_bridge(Bridge::spawn(
             RuntimePaths::discover(Some(&runtime_root)).expect("first-run runtime paths"),
-        );
+        ));
         first_run.connection = ConnectionState::Connected;
         first_run.desktop_state.theme = DesktopTheme::Grove;
         first_run.desktop_state.window_width = 1_440;
