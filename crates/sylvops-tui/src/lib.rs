@@ -6154,6 +6154,71 @@ mod tests {
     }
 
     #[test]
+    fn session_terminal_defaults_follow_theme_across_redraws_and_resets() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        app.set_tab(TuiContentView::Terminal);
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[0mD\x1b[31mI\x1b[38;2;12;34;56;48;2;65;43;21mT\x1b[39;49;7mV\x1b[0m");
+        app.attached = Some(AttachedTerminal {
+            session_id: app.snapshot.sessions[0].id,
+            role: AttachmentRole::Controller,
+            parser,
+            last_sequence: 1,
+            columns: 80,
+            rows: 24,
+        });
+
+        for choice in TuiTheme::ALL {
+            app.theme = choice;
+            app.attached
+                .as_mut()
+                .unwrap()
+                .parser
+                .process(b"\x1b]111\x1b\\\x1b]11;rgb:00/00/00\x1b\\");
+            terminal.clear().unwrap();
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            let viewport = app
+                .hit_map
+                .0
+                .iter()
+                .find(|region| region.target == HitTarget::TerminalViewport)
+                .unwrap()
+                .area;
+            let buffer = terminal.backend().buffer();
+            let expected = theme::Theme::resolve(choice).text;
+            let foreground = expected.fg.unwrap_or(Color::Reset);
+            let background = expected.bg.unwrap_or(Color::Reset);
+            let default = &buffer[(viewport.x, viewport.y)];
+            assert_eq!(default.symbol(), "D");
+            assert_eq!(default.fg, foreground, "{choice:?} default foreground");
+            assert_eq!(
+                default.bg, background,
+                "{choice:?} default background must not depend on host defaults"
+            );
+            let indexed = &buffer[(viewport.x + 1, viewport.y)];
+            assert_eq!(indexed.fg, Color::Indexed(1));
+            assert_eq!(indexed.bg, background);
+            let rgb = &buffer[(viewport.x + 2, viewport.y)];
+            assert_eq!(rgb.fg, Color::Rgb(12, 34, 56));
+            assert_eq!(rgb.bg, Color::Rgb(65, 43, 21));
+            let inverse = &buffer[(viewport.x + 3, viewport.y)];
+            assert_eq!(inverse.fg, foreground);
+            assert_eq!(inverse.bg, background);
+            assert!(inverse.modifier.contains(Modifier::REVERSED));
+            assert_eq!(
+                buffer[(viewport.x + 4, viewport.y)].bg,
+                background,
+                "blank cells must keep the theme too"
+            );
+        }
+    }
+
+    #[test]
     fn application_theme_does_not_rewrite_provider_terminal_colors() {
         use ratatui::style::Color;
         use sylvops_core::ui::TuiTheme;
@@ -6186,7 +6251,7 @@ mod tests {
             .find(|cell| cell.symbol() == "R" && cell.fg == Color::Indexed(1))
             .expect("provider-owned red cell");
         assert_eq!(provider_cell.fg, Color::Indexed(1));
-        assert_eq!(provider_cell.bg, Color::Reset);
+        assert_eq!(provider_cell.bg, Color::Rgb(253, 246, 227));
     }
 
     #[test]
