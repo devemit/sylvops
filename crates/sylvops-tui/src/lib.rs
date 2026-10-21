@@ -77,6 +77,12 @@ pub(crate) struct FormOutcome {
     selection: Option<ExplorerNode>,
 }
 
+struct InitializedTui {
+    client: DaemonClient,
+    app: App,
+    events: tokio::sync::broadcast::Receiver<DaemonEvent>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TuiExit {
     Quit,
@@ -139,23 +145,29 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
     let invocation_directory = std::env::current_dir().map_err(|error| {
         DaemonError::Lifecycle(format!("cannot capture TUI invocation directory: {error}"))
     })?;
-    let client = DaemonClient::connect(paths, "sylvops-tui").await?;
-    let mut app = App::new_at(
-        snapshot(&client).await?,
-        list_providers(&client).await?,
-        load_tui_state(&client).await?,
-        invocation_directory,
-    );
-    app.notification_preferences = load_attention_notification_preferences(&client).await?;
-    let mut events = client.subscribe();
-    let (github_results_tx, mut github_results) = tokio::sync::mpsc::channel(16);
-    let mut github_tasks = GitHubTasks::default();
-    let notification_presenter =
-        notifications::NotificationPresenter::new(notifications::SystemChannels::new());
     let mut guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .map_err(|error| DaemonError::Lifecycle(format!("cannot initialize TUI: {error}")))?;
     let mut inputs = event::EventStream::new();
+    let Some(InitializedTui {
+        client,
+        mut app,
+        mut events,
+    }) = load_with_startup(
+        paths,
+        invocation_directory,
+        &mut terminal,
+        &mut inputs,
+        &mut guard,
+    )
+    .await?
+    else {
+        return Ok(TuiExit::Quit);
+    };
+    let (github_results_tx, mut github_results) = tokio::sync::mpsc::channel(16);
+    let mut github_tasks = GitHubTasks::default();
+    let notification_presenter =
+        notifications::NotificationPresenter::new(notifications::SystemChannels::new());
     let mut pending_event = None;
     let mut input_pump: Option<InputPump> = None;
     let mut input_failed = false;
@@ -466,6 +478,62 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         if quit {
             save_tui_state(&client, &app).await?;
             return Ok(TuiExit::Quit);
+        }
+    }
+}
+
+async fn load_with_startup(
+    paths: &RuntimePaths,
+    invocation_directory: PathBuf,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    inputs: &mut event::EventStream,
+    guard: &mut TerminalGuard,
+) -> Result<Option<InitializedTui>, DaemonError> {
+    let started = Instant::now();
+    let initialization = async {
+        let client = DaemonClient::connect(paths, "sylvops-tui").await?;
+        let events = client.subscribe();
+        let mut app = App::new_at(
+            snapshot(&client).await?,
+            list_providers(&client).await?,
+            load_tui_state(&client).await?,
+            invocation_directory,
+        );
+        app.notification_preferences = load_attention_notification_preferences(&client).await?;
+        Ok::<_, DaemonError>(InitializedTui {
+            client,
+            app,
+            events,
+        })
+    };
+    tokio::pin!(initialization);
+    let mut initialized: Option<InitializedTui> = None;
+    let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if initialized.is_some() && started.elapsed() >= sylvops_core::ui::STARTUP_MIN_DURATION {
+            return Ok(initialized);
+        }
+        let theme = initialized
+            .as_ref()
+            .map_or(TuiTheme::default(), |loaded| loaded.app.theme);
+        guard.sync_theme(theme);
+        draw_synchronized(terminal, |frame| {
+            render::draw_startup(frame, theme, initialized.is_some());
+        })
+        .map_err(|error| DaemonError::Lifecycle(format!("cannot draw startup: {error}")))?;
+        tokio::select! {
+            result = &mut initialization, if initialized.is_none() => initialized = Some(result?),
+            input = inputs.next() => {
+                let input = input.ok_or_else(|| DaemonError::Lifecycle("terminal input stream closed".into()))?
+                    .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+                if matches!(input, Event::Key(key) if key.kind != KeyEventKind::Release &&
+                    (matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) ||
+                    (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))) {
+                    return Ok(None);
+                }
+            }
+            _ = tick.tick() => {}
         }
     }
 }

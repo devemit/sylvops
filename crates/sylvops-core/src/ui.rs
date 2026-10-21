@@ -6,6 +6,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ProjectId, SessionId, WorktreeId};
 
+/// Shared startup-only wordmark, rendered with a monospace font by both clients.
+pub const STARTUP_WORDMARK: &str = concat!(
+    r" ____ __   __ _     __     __  ___   ____   ____ ",
+    "\n",
+    r"/ ___|\ \ / /| |    \ \   / / / _ \ |  _ \ / ___|",
+    "\n",
+    r"\___ \ \ V / | |     \ \ / / | | | || |_) |\___ \",
+    "\n",
+    r" ___) | | |  | |___   \ V /  | |_| ||  __/  ___) |",
+    "\n",
+    r"|____/  |_|  |_____|   \_/    \___/ |_|    |____/",
+);
+/// Minimum visible startup time; actual initialization may take longer.
+pub const STARTUP_MIN_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub const MAX_OPEN_DESKTOP_SESSIONS: usize = 16;
 pub const MIN_TERMINAL_FONT_SIZE: u8 = 10;
 pub const MAX_TERMINAL_FONT_SIZE: u8 = 22;
