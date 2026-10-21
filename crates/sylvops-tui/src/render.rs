@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
@@ -1007,7 +1007,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         } else {
             format!(" Terminal · attached as {role} · wheel scrolls history ")
         };
-        (title, terminal_text(attached.parser.screen()))
+        (title, terminal_text(attached.parser.screen(), theme.text))
     } else if let Some(session) = app.selected_session() {
         (
             " Terminal · detached ".into(),
@@ -1095,7 +1095,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     }
 }
 
-fn terminal_text(screen: &vt100::Screen) -> Text<'static> {
+fn terminal_text(screen: &vt100::Screen, defaults: Style) -> Text<'static> {
     let (rows, columns) = screen.size();
     let mut lines = Vec::with_capacity(usize::from(rows));
     for row in 0..rows {
@@ -1109,7 +1109,7 @@ fn terminal_text(screen: &vt100::Screen) -> Text<'static> {
             if cell.is_wide_continuation() {
                 continue;
             }
-            let style = terminal_cell_style(cell);
+            let style = terminal_cell_style(cell, defaults);
             if current_style.is_some_and(|existing| existing != style) {
                 spans.push(Span::styled(
                     std::mem::take(&mut current),
@@ -1131,10 +1131,18 @@ fn terminal_text(screen: &vt100::Screen) -> Text<'static> {
     Text::from(lines)
 }
 
-fn terminal_cell_style(cell: &vt100::Cell) -> ratatui::style::Style {
-    let mut style = ratatui::style::Style::default()
-        .fg(terminal_color(cell.fgcolor()))
-        .bg(terminal_color(cell.bgcolor()));
+fn terminal_cell_style(cell: &vt100::Cell, defaults: Style) -> Style {
+    // Host defaults can change independently of the selected application theme.
+    // Resolve only default colors here; explicit Provider colors stay intact.
+    let mut style = Style::default()
+        .fg(terminal_color(
+            cell.fgcolor(),
+            defaults.fg.unwrap_or(Color::Reset),
+        ))
+        .bg(terminal_color(
+            cell.bgcolor(),
+            defaults.bg.unwrap_or(Color::Reset),
+        ));
     let mut modifiers = Modifier::empty();
     if cell.bold() {
         modifiers.insert(Modifier::BOLD);
@@ -1155,11 +1163,11 @@ fn terminal_cell_style(cell: &vt100::Cell) -> ratatui::style::Style {
     style
 }
 
-const fn terminal_color(color: vt100::Color) -> ratatui::style::Color {
+const fn terminal_color(color: vt100::Color, fallback: Color) -> Color {
     match color {
-        vt100::Color::Default => ratatui::style::Color::Reset,
-        vt100::Color::Idx(index) => ratatui::style::Color::Indexed(index),
-        vt100::Color::Rgb(red, green, blue) => ratatui::style::Color::Rgb(red, green, blue),
+        vt100::Color::Default => fallback,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 
