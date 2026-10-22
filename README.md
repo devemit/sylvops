@@ -30,7 +30,7 @@ SylvOps uses your installed `git` executable. Registering a repository does not 
 
 ### 2. Install SylvOps
 
-The current preview is [`0.1.0-preview.12`](https://github.com/devemit/sylvops/releases/tag/v0.1.0-preview.12). Choose the appropriate installation path:
+Choose a published unsigned testing preview from [GitHub Releases](https://github.com/devemit/sylvops/releases). The public installation guide identifies the current preview and its exact assets:
 
 - [Windows x86_64 preview](https://devemit.github.io/sylvops-docs/installation#windows-preview)
 - [Linux Debian or Ubuntu](https://devemit.github.io/sylvops-docs/installation#debian-or-ubuntu)
@@ -118,6 +118,14 @@ Run `sylvops` or `sylvops up [PATH]` for the native desktop client. Run `sylvops
 
 The daemon owns every mutable PTY session. Clients attach and detach; they do not adopt agent processes or mutate Git directly. Terminal scrollback and IPC messages are bounded, and unknown protocol, hook, and approval types fail closed.
 
+### Attention, notifications, and Codex hook review
+
+Pending attention uses amber for input requests and recoverable failures, green for successful completion awaiting review, and red for terminal failure. The TUI Cards and List views and desktop Session rows retain this signal while selected. A visibly open foreground Session shows attention without an external notification or sound; visibility alone does not acknowledge it. Explicit **Stop session** clears prior attention and records a stopped process, rather than successful completion or a new failure alert.
+
+After replacing a preview, restart the daemon and create a new Codex Session. In that Session, open `/hooks`, review the SylvOps handlers, and press `t` on each handler until all eight show **Active**. A changed hook command has a new source hash and needs fresh review; SylvOps never copies approvals to a changed command. Preview.13 corrects Windows PowerShell hook invocation and uses a private Codex runtime when the installed CLI supports it. Existing sessions do not acquire the new launch configuration.
+
+The Settings notification test checks presentation only. Session alerts and Conversation identity capture require working Provider callbacks. If the missing-callback warning remains, inspect hook execution errors and refresh Provider health before starting another Session. Resume requires a verified Conversation identity; the preview does not repair old Session records that never captured one.
+
 ## Install on Windows
 
 For this unsigned preview, download `sylvops-windows-x86_64.zip` and `SHA256SUMS` from the same preview release. Verify the ZIP before extracting it; the portable instructions below include the commands. The preview includes `UNSIGNED-PREVIEW.txt`, does not create a Start Menu entry or uninstall registration, and does not receive signed in-app updates. Do not bypass operating-system security warnings.
@@ -183,7 +191,7 @@ macOS archives are not included in this preview. If a later release publishes `s
 
 The setup order is `Workspace -> Project/root Worktree -> Session`. Follow the getting-started steps above, or run `sylvops up .` in an existing repository. This opens the native desktop and does not start a provider automatically. Choose **Start shell** or **Start Codex** explicitly, then **Open terminal**. **Leave terminal** only detaches; **Stop session** terminates its process tree. **Delete checkout** is a separate, guarded action that requires a clean managed checkout.
 
-Preview.12 adds an uppercase ASCII startup banner to both clients, theme-bound default terminal colors, preserved modified-arrow shortcuts, safer multiline TUI drafts and paste, and terminal-column preservation around Unicode symbols. It also carries notification-delivery and Codex resume-identity fixes.
+Preview.13 adds PowerShell-compatible Codex hook commands, private-runtime launch and resume when supported, pending-attention colors in desktop Session rows, provider-specific callback guidance, and preservation of bounded Codex model preferences in managed hook profiles. It retains preview.12's startup, terminal theme, modified-key, multiline-draft, and Unicode-column fixes. Real-account completion and resume verification is opt-in and requires user review of the corrected hook source; it is not established by the Settings notification test.
 
 While attached, Shift+Enter adds a draft newline when supported by the host terminal, and multiline paste respects the provider's requested paste mode. Explicit program colors remain intact. Provider shortcuts retain their native meaning: in Codex, Tab queues a follow-up for the next turn and Enter steers the current turn. Escape is not rebound to queue. `Ctrl+]` detaches the TUI without stopping the Session.
 
