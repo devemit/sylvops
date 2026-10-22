@@ -47,7 +47,7 @@ use input_pump::InputPump;
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use reducer::{Effect, reduce};
 use sylvops_core::{
-    domain::{AttachmentRole, DaemonSnapshot},
+    domain::{AttachmentRole, DaemonSnapshot, ProviderKind},
     github::{
         GitHubItemIdentity, GitHubItemKind, GitHubItemNumber, StartWorkFailure,
         StartWorkFailureKind, StartWorkOutcome,
@@ -191,10 +191,26 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                     .await
             {
                 app.lifecycle_health = Some((session_id, health));
+                let provider = app
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .map_or(ProviderKind::Shell, |session| session.provider_kind);
                 if health == sylvops_core::attention::LifecycleHealth::Missing {
-                    app.flash = Some(Flash::error(health.guidance()));
+                    app.flash = Some(Flash::error(health.guidance_for(provider)));
                 } else if app.flash.as_ref().is_some_and(|flash| {
-                    flash.text == sylvops_core::attention::LifecycleHealth::Missing.guidance()
+                    [
+                        ProviderKind::Codex,
+                        ProviderKind::Claude,
+                        ProviderKind::Shell,
+                    ]
+                    .iter()
+                    .any(|provider| {
+                        flash.text
+                            == sylvops_core::attention::LifecycleHealth::Missing
+                                .guidance_for(*provider)
+                    })
                 }) {
                     app.flash = None;
                 }

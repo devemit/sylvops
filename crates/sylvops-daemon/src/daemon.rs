@@ -2985,6 +2985,14 @@ async fn handle_request(
         ClientRequest::StopSession { session_id } => {
             let managed = required_session(state, session_id).await?;
             managed.handle.stop().await?;
+            state
+                .database
+                .audit(
+                    "session_stop_requested",
+                    "succeeded",
+                    &serde_json::json!({"session_id": session_id}).to_string(),
+                )
+                .await?;
             let mut completed = managed.completed.clone();
             while !*completed.borrow() && completed.changed().await.is_ok() {}
             send_response_queue(outgoing, request_id, &DaemonResponse::Acknowledged).await
