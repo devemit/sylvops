@@ -43,7 +43,17 @@ jobs:
       - name: Run fake Claude acceptance
         run: cargo test -p sylvops-test-support --test claude_health --test claude_sessions -- --nocapture
       - name: Run workspace tests
+        env:
+          SYLVOPS_EXPORT_VISUALS: "1"
         run: cargo test --workspace --all-targets
+      - name: Upload desktop visual diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-visuals-${{ matrix.os }}-${{ github.sha }}
+          path: target/notification-visuals/*.png
+          if-no-files-found: ignore
+          retention-days: 7
 
   windows-installer:
     needs: release-sources

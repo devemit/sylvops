@@ -10594,22 +10594,23 @@ mod tests {
         1_823_448_962_296_347_469,
         4_916_797_884_967_723_132,
     ];
+    // Details includes the neutral explorer rows; attention tint belongs to Active cards.
     #[cfg(windows)]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        16_850_133_588_157_823_503,
-        3_366_520_005_307_173_480,
+        11_267_227_927_640_578_236,
+        2_288_841_217_740_526_230,
         7_906_719_033_538_619_956,
     ];
     #[cfg(target_os = "macos")]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        9_826_994_657_255_967_038,
-        14_029_487_624_762_147_333,
+        1_568_505_827_430_022_249,
+        18_187_322_926_052_470_107,
         7_906_719_033_538_619_956,
     ];
     #[cfg(all(not(windows), not(target_os = "macos")))]
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        15_427_713_509_785_186_983,
-        6_375_957_450_473_272_004,
+        3_531_260_100_584_050_384,
+        5_336_465_448_168_751_238,
         7_906_719_033_538_619_956,
     ];
     const APPROVED_NAVIGATOR_EDGE_CHECKSUMS: [u64; 6] = [
