@@ -30,7 +30,7 @@ SylvOps uses your installed `git` executable. Registering a repository does not 
 
 ### 2. Install SylvOps
 
-The current public version is [`0.1.0-preview.10`](https://github.com/devemit/sylvops/releases/tag/v0.1.0-preview.10). Choose the appropriate installation path:
+The current preview is [`0.1.0-preview.12`](https://github.com/devemit/sylvops/releases/tag/v0.1.0-preview.12). Choose the appropriate installation path:
 
 - [Windows x86_64 preview](https://devemit.github.io/sylvops-docs/installation#windows-preview)
 - [Linux Debian or Ubuntu](https://devemit.github.io/sylvops-docs/installation#debian-or-ubuntu)
@@ -117,6 +117,112 @@ See [GitHub Issues and Pull Requests](https://devemit.github.io/sylvops-docs/git
 Run `sylvops` or `sylvops up [PATH]` for the native desktop client. Run `sylvops tui` for the keyboard-first terminal client. Both connect to the same local daemon and show the same workspace, project, checkout, provider, and session state.
 
 The daemon owns every mutable PTY session. Clients attach and detach; they do not adopt agent processes or mutate Git directly. Terminal scrollback and IPC messages are bounded, and unknown protocol, hook, and approval types fail closed.
+
+## Install on Windows
+
+For this unsigned preview, download `sylvops-windows-x86_64.zip` and `SHA256SUMS` from the same preview release. Verify the ZIP before extracting it; the portable instructions below include the commands. The preview includes `UNSIGNED-PREVIEW.txt`, does not create a Start Menu entry or uninstall registration, and does not receive signed in-app updates. Do not bypass operating-system security warnings.
+
+The source also supports a future official signed `sylvops-windows-x86_64-setup.exe`, but that installer is not part of this preview. For a published signed installer, require both the matching checksum and a `Valid` Authenticode signature before opening it. That per-user installer uses `%LOCALAPPDATA%\Programs\SylvOps`, registers uninstall and App Paths, and adds a Start Menu entry. These signed-installation instructions do not apply to an unsigned ZIP.
+
+With that signed App Paths registration, PowerShell can run `Start-Process sylvops -ArgumentList 'doctor'`. For the current unsigned preview, invoke the installed or extracted executable by its explicit path instead.
+
+## Install on macOS
+
+This unsigned preview has no macOS downloads. Build from source on macOS or wait for a published signed application release.
+
+The official packaging path produces `sylvops-macos-x86_64.dmg` for Intel and `sylvops-macos-aarch64.dmg` for Apple silicon. Only use those files when actually published with matching `SHA256SUMS`, Developer ID signatures, and stapled notarization tickets. Verify with `codesign`, `xcrun stapler validate`, and Gatekeeper before copying SylvOps to `/Applications` or another Applications location you control. The bundled guide is at `SylvOps.app/Contents/Resources/README.md`.
+
+## Install on Linux
+
+For Debian or Ubuntu, download `sylvops-linux-x86_64.deb` and its `SHA256SUMS`, then run:
+
+```sh
+grep 'sylvops-linux-x86_64.deb$' SHA256SUMS | sha256sum --check -
+sudo apt install ./sylvops-linux-x86_64.deb
+```
+
+Launch SylvOps from the application menu or run `sylvops`. The package installs the CLI, desktop integration, and this guide at `/usr/lib/sylvops/README.md`.
+
+For a no-installation alternative, download `sylvops-linux-x86_64.AppImage` and its checksum file:
+
+```sh
+grep 'sylvops-linux-x86_64.AppImage$' SHA256SUMS | sha256sum --check -
+chmod +x sylvops-linux-x86_64.AppImage
+./sylvops-linux-x86_64.AppImage
+```
+
+The AppImage does not add desktop integration or edit `PATH`. Linux packages have no platform package signature; verify the exact checksum and GitHub build-provenance attestation.
+
+## Portable fallback
+
+Portable archives do not register an application or edit `PATH`. Download the archive and `SHA256SUMS` from the same release, verify, then extract to a directory you control.
+
+On Windows:
+
+```powershell
+$archive = 'sylvops-windows-x86_64.zip'
+$expected = (Select-String -Path .\SHA256SUMS -Pattern "$archive$").Line.Split()[0]
+$actual = (Get-FileHash ".\$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw 'SylvOps archive checksum mismatch' }
+Expand-Archive -LiteralPath ".\$archive" -DestinationPath .\sylvops-portable
+.\sylvops-portable\sylvops.exe up C:\path\to\repository
+```
+
+On Linux:
+
+```sh
+grep 'sylvops-linux-x86_64.tar.gz$' SHA256SUMS | sha256sum --check -
+mkdir -p sylvops-portable
+tar -xzf sylvops-linux-x86_64.tar.gz -C sylvops-portable
+./sylvops-portable/sylvops up /path/to/repository
+```
+
+macOS archives are not included in this preview. If a later release publishes `sylvops-macos-aarch64.tar.gz` or `sylvops-macos-x86_64.tar.gz`, verify the matching checksum before extracting. The Apple-silicon extraction command is `tar -xzf sylvops-macos-aarch64.tar.gz -C sylvops-portable`; then invoke `./sylvops-portable/sylvops up /path/to/repository`.
+
+## First run
+
+The setup order is `Workspace -> Project/root Worktree -> Session`. Follow the getting-started steps above, or run `sylvops up .` in an existing repository. This opens the native desktop and does not start a provider automatically. Choose **Start shell** or **Start Codex** explicitly, then **Open terminal**. **Leave terminal** only detaches; **Stop session** terminates its process tree. **Delete checkout** is a separate, guarded action that requires a clean managed checkout.
+
+Preview.12 adds an uppercase ASCII startup banner to both clients, theme-bound default terminal colors, preserved modified-arrow shortcuts, safer multiline TUI drafts and paste, and terminal-column preservation around Unicode symbols. It also carries notification-delivery and Codex resume-identity fixes.
+
+While attached, Shift+Enter adds a draft newline when supported by the host terminal, and multiline paste respects the provider's requested paste mode. Explicit program colors remain intact. Provider shortcuts retain their native meaning: in Codex, Tab queues a follow-up for the next turn and Enter steers the current turn. Escape is not rebound to queue. `Ctrl+]` detaches the TUI without stopping the Session.
+
+## Updates and rollback
+
+Unsigned previews must be replaced manually with a verified newer preview. They do not receive signed in-app updates. Before replacing application files, finish or explicitly stop active Sessions, stop the daemon, and launch the new executable explicitly so an older copy on `PATH` is not selected.
+
+The source supports signed-update controls for future official signed releases. In **Settings -> Updates**, those controls are **Check again**, **Download verified upgrade**, and **Install update**. **Periodic checks: Off** disables scheduled checks. The corresponding commands include `sylvops update check` and `sylvops update status`. These controls fail closed without signed official-release metadata and are not an update path for this preview.
+
+For a signed installation, replacement defers while Sessions are active unless every named Session is explicitly confirmed. The detached helper retains the old package and a compatible database snapshot, checks the replacement's health and identity, and attempts one rollback if health fails or the helper is interrupted. There is no separate manual rollback command.
+
+## Uninstall and remove user data
+
+Normal uninstall preserves configuration, session data, repositories, worktrees, and branches:
+
+- Windows preview: stop SylvOps, then remove the extracted application files or `%LOCALAPPDATA%\SylvOps\bin\sylvops.exe`. Do not delete the parent data directory as an uninstall shortcut.
+- Signed Windows installation, when available: use **Installed apps** or `%LOCALAPPDATA%\Programs\SylvOps\uninstall.exe`.
+- Debian or Ubuntu: run `sudo apt remove sylvops`.
+- AppImage or portable archive: remove the downloaded file or extracted application directory.
+- macOS application, when available: remove the application from its Applications location.
+
+Windows data and runtime live under `%LOCALAPPDATA%\SylvOps`; configuration lives under `%APPDATA%\SylvOps`. On Unix, data uses `$XDG_DATA_HOME/sylvops` or `~/.local/share/sylvops`; configuration uses `$XDG_CONFIG_HOME/sylvops` or `~/.config/sylvops`.
+
+To remove SylvOps-owned data deliberately, stop every Session, then choose **Settings -> Advanced -> Safety and data -> Remove SylvOps user data**, or run:
+
+```text
+sylvops data remove --confirm "DELETE SYLVOPS USER DATA"
+```
+
+The exact phrase is required. The daemon refuses removal while Sessions are active and preserves repositories, Worktrees, and Git branches. Partial removal can be retried.
+
+## Troubleshooting
+
+- Run `sylvops doctor` and `sylvops daemon status` from the intended installation to check daemon version, protocol, database, Git, and provider health.
+- Use `sylvops provider probe codex` or `sylvops provider probe claude` to distinguish missing, outdated, or unauthenticated provider CLIs. Install and authenticate them outside SylvOps.
+- If client and daemon versions differ, stop the daemon and reopen the intended executable. Closing a client alone leaves the daemon and Sessions running.
+- Stop if a download fails `SHA256SUMS`. Do not override a platform security warning; build from source or wait for a signed package if trust cannot be established.
+- Rebuild or install the new preview and restart the client to receive the terminal fixes. An existing client process does not change when source is pushed.
+- Share only versions, platform details, categorical status, and redacted diagnostics. Never share credentials or environment values.
 
 ## Build from source
 
