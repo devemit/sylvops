@@ -169,6 +169,17 @@ pub(crate) fn is_detach_key(key: KeyEvent) -> bool {
     key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+pub(crate) fn encode_paste(contents: &str, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return contents.as_bytes().to_vec();
+    }
+    let normalized = contents.replace("\r\n", "\n").replace('\r', "\n");
+    let mut bytes = b"\x1b[200~".to_vec();
+    bytes.extend_from_slice(normalized.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
 pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     // Pending-question navigation uses modified arrows; plain arrows are different actions.
     let modifier = 1
@@ -190,6 +201,7 @@ pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
             vec![byte & 0x1f]
         }
         KeyCode::Char(character) => character.to_string().into_bytes(),
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => vec![b'\n'],
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
@@ -213,6 +225,35 @@ pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_newline_is_distinct_from_submit_and_queue() {
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(vec![b'\n'])
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(vec![0x1b])
+        );
+    }
+
+    #[test]
+    fn draft_paste_keeps_newlines_inside_provider_paste_boundaries() {
+        assert_eq!(
+            encode_paste("one\r\ntwo\n", true),
+            b"\x1b[200~one\ntwo\n\x1b[201~"
+        );
+        assert_eq!(encode_paste("one\rtwo", false), b"one\rtwo");
+    }
 
     fn attached_terminal(role: AttachmentRole, rows: u16, columns: u16) -> AttachedTerminal {
         AttachedTerminal {

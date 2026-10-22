@@ -25,8 +25,9 @@ use app::{
 };
 use crossterm::{
     event::{
-        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
     },
     execute,
     style::Print,
@@ -63,8 +64,8 @@ use sylvops_core::{
 };
 use sylvops_daemon::{DaemonError, client::DaemonClient, runtime::RuntimePaths};
 use terminal::{
-    AttachedTerminal, TERMINAL_SCROLLBACK_ROWS, TerminalWheelAction, encode_key, history_action,
-    is_detach_key,
+    AttachedTerminal, TERMINAL_SCROLLBACK_ROWS, TerminalWheelAction, encode_key, encode_paste,
+    history_action, is_detach_key,
 };
 use theme::terminal_background_rgb;
 
@@ -3831,10 +3832,14 @@ async fn handle_terminal(
             Ok(())
         }
         Event::Paste(text) if role == AttachmentRole::Controller => {
+            let bracketed = app
+                .attached
+                .as_ref()
+                .is_some_and(|terminal| terminal.parser.screen().bracketed_paste());
             if let Some(terminal) = app.attached.as_mut() {
                 terminal.scroll_to_latest();
             }
-            enqueue_terminal_input(app, input_pump.as_ref(), text.into_bytes());
+            enqueue_terminal_input(app, input_pump.as_ref(), encode_paste(&text, bracketed));
             Ok(())
         }
         _ => Ok(()),
@@ -4173,7 +4178,8 @@ impl TerminalGuard {
             stdout(),
             EnterAlternateScreen,
             EnableMouseCapture,
-            EnableFocusChange
+            EnableFocusChange,
+            EnableBracketedPaste
         ) {
             let _ = disable_raw_mode();
             return Err(DaemonError::Lifecycle(error.to_string()));
@@ -4194,6 +4200,7 @@ impl Drop for TerminalGuard {
             stdout(),
             EndSynchronizedUpdate,
             Print(RESET_TERMINAL_BACKGROUND),
+            DisableBracketedPaste,
             DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
