@@ -6,8 +6,22 @@ on:
   pull_request:
   workflow_call:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
 jobs:
+  release-sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate bundled lifecycle guidance and release sources
+        shell: pwsh
+        run: ./scripts/validate-release.ps1
+
   test:
+    needs: release-sources
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -32,6 +46,7 @@ jobs:
         run: cargo test --workspace --all-targets
 
   windows-installer:
+    needs: release-sources
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -68,6 +83,7 @@ jobs:
           }
 
   linux-package:
+    needs: release-sources
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -96,6 +112,7 @@ jobs:
             --expected-version "$expected_version"
 
   macos-package:
+    needs: release-sources
     strategy:
       fail-fast: false
       matrix:
