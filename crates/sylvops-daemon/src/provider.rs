@@ -1151,6 +1151,7 @@ fn parse_claude_version(output: &[u8]) -> Option<Version> {
 struct CodexDiscovery {
     executable: Option<PathBuf>,
     error: Option<String>,
+    supports_no_daemon: bool,
 }
 
 #[derive(Debug)]
@@ -1183,6 +1184,7 @@ impl CodexAdapter {
             discovery: RwLock::new(CodexDiscovery {
                 executable: Some(executable),
                 error: None,
+                supports_no_daemon: false,
             }),
             hook_relay: None,
             hook_directory: None,
@@ -1201,6 +1203,7 @@ impl CodexAdapter {
             discovery: RwLock::new(CodexDiscovery {
                 executable: Some(executable),
                 error: None,
+                supports_no_daemon: false,
             }),
             hook_relay: Some(hook_relay),
             hook_directory: Some(hook_directory),
@@ -1212,9 +1215,11 @@ impl CodexAdapter {
             Ok(path) => CodexDiscovery {
                 executable: Some(path),
                 error: None,
+                supports_no_daemon: false,
             },
             Err(_) => CodexDiscovery {
                 executable: None,
+                supports_no_daemon: false,
                 error: Some(
                     "Codex is not installed as a supported native CLI. Install Codex, then refresh Provider health."
                         .into(),
@@ -1278,12 +1283,30 @@ impl CodexAdapter {
             ));
         }
         let command = hook_command(relay)?;
-        let source = hook_profile_source(&command);
+        let private_runtime = self.discovery().map_err(provider_error)?.supports_no_daemon;
+        // Modern Codex uses the selected execution shell for hooks. On Windows
+        // that is PowerShell, where a quoted executable needs the call operator.
+        let windows_command = if cfg!(windows) && private_runtime {
+            // The executable is double-quoted; prevent expansion of otherwise
+            // valid Windows path characters without changing its identity.
+            format!("& {}", command.replace('`', "``").replace('$', "`$"))
+        } else {
+            command.clone()
+        };
+        let source = hook_profile_source_with_windows(&command, &windows_command);
         let profile_name = install_stable_hook_profile(&revalidated_directory, &source)?;
 
         launch
             .arguments
             .prepend_persisted([OsString::from("--profile"), OsString::from(profile_name)]);
+        // A shared Codex server cannot inherit this Session's credentials and
+        // escapes its owned PTY process tree. Keep managed work in this process.
+        // Older CLIs without a shared-server mode do not advertise this flag.
+        if private_runtime {
+            launch
+                .arguments
+                .prepend_persisted([OsString::from("--no-daemon")]);
+        }
         launch.environment.insert(
             OsString::from("SYLVOPS_HOOK_ENDPOINT"),
             OsString::from(endpoint.url()),
@@ -1354,6 +1377,23 @@ impl CodexAdapter {
                 checked_at: now_millis(),
             };
         };
+        let Ok(supports_no_daemon) = codex_supports_private_runtime(&executable).await else {
+            return ProviderHealth {
+                kind: ProviderKind::Codex,
+                available: false,
+                authenticated: false,
+                executable_path: path_text(&executable).ok(),
+                version: Some(version),
+                diagnostic: Some("Codex runtime options could not be verified. Refresh Provider health before starting a Session.".into()),
+                capabilities,
+                checked_at: now_millis(),
+            };
+        };
+        if let Ok(mut current) = self.discovery.write()
+            && current.executable.as_ref() == Some(&executable)
+        {
+            current.supports_no_daemon = supports_no_daemon;
+        }
         let (authenticated, diagnostic) =
             match run_probe(&executable, &["login", "status"]).await {
                 Ok(_) => (true, None),
@@ -1673,8 +1713,14 @@ fn bounded_payload_field(payload: &serde_json::Value, name: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn hook_profile_source(command: &str) -> String {
+    hook_profile_source_with_windows(command, command)
+}
+
+fn hook_profile_source_with_windows(command: &str, windows_command: &str) -> String {
     let command = toml::Value::String(command.to_owned()).to_string();
+    let windows_command = toml::Value::String(windows_command.to_owned()).to_string();
     let mut body = String::from("[features]\nhooks = true\n");
     for event in [
         "SessionStart",
@@ -1688,7 +1734,7 @@ fn hook_profile_source(command: &str) -> String {
     ] {
         let _ = write!(
             body,
-            "\n[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command}\ncommand_windows = {command}\nasync = {}\ntimeout = 2\n",
+            "\n[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command}\ncommand_windows = {windows_command}\nasync = {}\ntimeout = 2\n",
             event != "SessionEnd"
         );
     }
@@ -1744,8 +1790,11 @@ fn install_stable_hook_profile(directory: &Path, source: &str) -> sylvops_core::
     file.take(64 * 1024 + 1)
         .read_to_string(&mut existing)
         .map_err(|_| provider_error("cannot read Codex hook profile"))?;
+    // Codex can insert UI preferences before the ownership comment. Compare
+    // against the regenerated immutable definition, not a byte-prefix checksum.
+    let marker = source.lines().next().unwrap_or_default();
     if existing.len() > 64 * 1024
-        || !owned_profile_checksum_is_valid(&existing, &canonical)
+        || existing.lines().filter(|line| *line == marker).count() != 1
         || (existing != source && !codex_trust_metadata_is_valid(source, &existing, &canonical))
         || same_file::Handle::from_path(&path).ok().as_ref() != Some(&identity)
     {
@@ -1789,6 +1838,17 @@ fn codex_trust_metadata_is_valid(owned: &str, body: &str, profile_path: &Path) -
     else {
         return false;
     };
+    // These are the only top-level fields Codex's model picker writes. They
+    // cannot alter hook execution; all immutable hook settings still match.
+    for key in ["model", "model_reasoning_effort"] {
+        if let Some(value) = document.remove(key)
+            && !value.as_str().is_some_and(|value| {
+                !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+            })
+        {
+            return false;
+        }
+    }
     if let Some(projects) = document.remove("projects")
         && !project_trust_metadata_is_valid(&projects)
     {
@@ -1925,6 +1985,24 @@ fn codex_home() -> sylvops_core::Result<PathBuf> {
     home.map(PathBuf::from)
         .map(|path| path.join(".codex"))
         .ok_or_else(|| provider_error("cannot locate Codex configuration directory"))
+}
+
+async fn codex_supports_private_runtime(executable: &Path) -> std::result::Result<bool, ()> {
+    let output = run_bounded_probe(executable, &["--help"], true)
+        .await
+        .map_err(|_| ())?;
+    if !output.status.success() {
+        return Err(());
+    }
+    let bytes = if output.stdout.is_empty() {
+        output.stderr
+    } else {
+        output.stdout
+    };
+    // Parse the full bounded output: display diagnostics truncate at 512 characters.
+    Ok(String::from_utf8_lossy(&bytes)
+        .split_whitespace()
+        .any(|word| word == "--no-daemon"))
 }
 
 async fn run_probe(executable: &Path, arguments: &[&str]) -> std::result::Result<String, String> {
@@ -2599,6 +2677,14 @@ mod tests {
             name
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), combined);
+        let preferences =
+            format!("model = 'gpt-test'\nmodel_reasoning_effort = 'medium'\n{combined}");
+        std::fs::write(&path, &preferences).unwrap();
+        assert_eq!(
+            install_stable_hook_profile(&directory, &source).unwrap(),
+            name
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), preferences);
         for invalid in [
             trusted.replace(&hash, "invalid"),
             trusted.replace(":session_start:0:0", ":unknown:0:0"),
@@ -2608,6 +2694,9 @@ mod tests {
             trusted.replace("hook emit", "hook other"),
             format!("{trusted}\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ncommand='injected'\n"),
             format!("{trusted}#{}", "x".repeat(65_536)),
+            format!("model = {{ command = 'injected' }}\n{trusted}"),
+            format!("model = '{}'\n{trusted}", "x".repeat(129)),
+            format!("shell = 'unreviewed-shell'\n{trusted}"),
         ] {
             std::fs::write(&path, &invalid).unwrap();
             assert!(install_stable_hook_profile(&directory, &source).is_err());

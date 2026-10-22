@@ -1914,6 +1914,9 @@ impl DesktopApp {
         let density = self.presentation().density;
         let is_selected = row.selected;
         let is_hovered = self.hovered_navigator_node == Some(row.id);
+        let attention = matches!(row.id, NavigatorNodeId::Session(_))
+            .then_some(row.attention)
+            .flatten();
         let name = text(row.label.clone())
             .font(if is_selected { UI_SEMIBOLD } else { UI_MEDIUM })
             .size(UI_TEXT_SIZE)
@@ -1944,8 +1947,12 @@ impl DesktopApp {
             title = title.push(space::horizontal());
             let detail = text(row.detail.clone())
                 .size(UI_META_SIZE)
-                .style(text::secondary)
                 .wrapping(text::Wrapping::None);
+            let detail = if attention.is_some() {
+                detail
+            } else {
+                detail.style(text::secondary)
+            };
             let detail: Element<'static, Message> =
                 if row.indicator == Some(presentation::SessionIndicator::Working) {
                     row![running_ring(12, self.status_animation_angle()), detail]
@@ -1962,7 +1969,9 @@ impl DesktopApp {
             .height(density.control_height + 14)
             .padding([4, 6])
             .clip(true)
-            .style(move |theme| navigator_row_container_style(theme, is_selected, is_hovered));
+            .style(move |theme| {
+                navigator_row_container_style(theme, is_selected, is_hovered, attention)
+            });
         let select = match row.id {
             NavigatorNodeId::Repository(id) => Message::SelectProject(id),
             NavigatorNodeId::Checkout(id) => Message::SelectWorktree(id),
@@ -2090,7 +2099,7 @@ impl DesktopApp {
             && self.active_session_id == Some(id)
             && health == sylvops_core::attention::LifecycleHealth::Missing
         {
-            body = body.push(text(health.guidance()).size(UI_META_SIZE));
+            body = body.push(text(self.lifecycle_guidance(id, health)).size(UI_META_SIZE));
         }
         container(body.push(content))
             .width(Fill)
@@ -2108,6 +2117,17 @@ impl DesktopApp {
             return None;
         }
         sylvops_core::attention::conversation_identity_guidance(session)
+    }
+
+    fn lifecycle_guidance(
+        &self,
+        id: SessionId,
+        health: sylvops_core::attention::LifecycleHealth,
+    ) -> &'static str {
+        health.guidance_for(
+            self.session(id)
+                .map_or(ProviderKind::Shell, |session| session.provider_kind),
+        )
     }
 
     fn github_context_header(&self) -> Element<'_, Message> {
@@ -3053,7 +3073,7 @@ impl DesktopApp {
         if let Some((id, health)) = self.lifecycle_health
             && self.active_session_id == Some(id)
         {
-            content = content.push(text(health.guidance()).size(UI_META_SIZE));
+            content = content.push(text(self.lifecycle_guidance(id, health)).size(UI_META_SIZE));
         }
         let mut technical = column![].spacing(8);
         let mut has_technical_details = false;
@@ -9587,8 +9607,29 @@ fn list_item_container_style(theme: &Theme, selected: bool, hovered: bool) -> co
     }
 }
 
-fn navigator_row_container_style(theme: &Theme, selected: bool, hovered: bool) -> container::Style {
-    list_item_container_style(theme, selected, hovered)
+fn navigator_row_container_style(
+    theme: &Theme,
+    selected: bool,
+    hovered: bool,
+    attention: Option<NavigatorAttention>,
+) -> container::Style {
+    let mut style = list_item_container_style(theme, selected, hovered);
+    if let Some(attention) = attention {
+        let palette = theme.extended_palette();
+        let pair = match attention {
+            NavigatorAttention::NeedsFeedback => palette.warning.weak,
+            NavigatorAttention::Finished => palette.success.weak,
+            NavigatorAttention::Failed => palette.danger.weak,
+        };
+        style.background = Some(Background::Color(pair.color));
+        style.text_color = Some(contrast_safe_text(pair.color, pair.text));
+        // Selection stays explicit without erasing the pending attention surface.
+        if hovered && !selected {
+            style.border.width = 1.0;
+            style.border.color = pair.text;
+        }
+    }
+    style
 }
 
 fn navigator_badge_style(theme: &Theme) -> container::Style {
@@ -10543,75 +10584,28 @@ mod tests {
         checksum: u64,
     }
 
-    #[cfg(windows)]
+    // Bundled fonts and the headless renderer keep these workflows identical across platforms.
     const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        14_536_029_247_521_509_305,
+        14_411_716_778_925_671_729,
         12_365_258_274_555_457_046,
         11_704_634_815_454_000_937,
-        7_948_722_545_032_471_940,
-        18_332_765_517_874_962_912,
+        17_732_859_424_370_243_582,
+        6_387_303_985_738_252_548,
         3_418_532_975_102_054_885,
-        573_190_509_987_984_074,
-        5_558_003_353_688_268_661,
+        13_372_692_605_195_473_834,
+        15_453_704_153_979_111_261,
         10_103_567_952_100_179_337,
-        15_479_219_696_005_556_702,
+        17_921_599_019_395_180_662,
         3_979_220_309_231_598_554,
-        9_850_678_726_175_224_460,
+        10_552_251_326_341_320_036,
         1_823_448_962_296_347_469,
-        4_916_797_884_967_723_132,
+        4_757_816_196_288_805_032,
     ];
-    #[cfg(target_os = "macos")]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        14_536_029_247_521_509_305,
-        12_365_258_274_555_457_046,
-        11_704_634_815_454_000_937,
-        7_948_722_545_032_471_940,
-        18_332_765_517_874_962_912,
-        3_418_532_975_102_054_885,
-        573_190_509_987_984_074,
-        5_558_003_353_688_268_661,
-        10_103_567_952_100_179_337,
-        15_479_219_696_005_556_702,
-        3_979_220_309_231_598_554,
-        9_850_678_726_175_224_460,
-        1_823_448_962_296_347_469,
-        4_916_797_884_967_723_132,
-    ];
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        14_536_029_247_521_509_305,
-        12_365_258_274_555_457_046,
-        11_704_634_815_454_000_937,
-        7_948_722_545_032_471_940,
-        18_332_765_517_874_962_912,
-        3_418_532_975_102_054_885,
-        573_190_509_987_984_074,
-        5_558_003_353_688_268_661,
-        10_103_567_952_100_179_337,
-        15_479_219_696_005_556_702,
-        3_979_220_309_231_598_554,
-        9_850_678_726_175_224_460,
-        1_823_448_962_296_347_469,
-        4_916_797_884_967_723_132,
-    ];
-    // Details includes the neutral explorer rows; attention tint belongs to Active cards.
-    #[cfg(windows)]
+    // Isolate the Details pane from navigator attention and platform chrome.
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        11_267_227_927_640_578_236,
-        2_288_841_217_740_526_230,
-        7_906_719_033_538_619_956,
-    ];
-    #[cfg(target_os = "macos")]
-    const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        1_568_505_827_430_022_249,
-        18_187_322_926_052_470_107,
-        7_906_719_033_538_619_956,
-    ];
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
-        3_531_260_100_584_050_384,
-        5_336_465_448_168_751_238,
-        7_906_719_033_538_619_956,
+        7_508_747_145_481_884_463,
+        13_219_727_301_890_377_677,
+        7_039_369_861_275_448_040,
     ];
     const APPROVED_NAVIGATOR_EDGE_CHECKSUMS: [u64; 6] = [
         6_476_433_378_350_038_089,
@@ -10649,6 +10643,19 @@ mod tests {
     ) -> RenderedBaseline {
         let theme = app.theme();
         render_element_baseline(app.view(), &theme, width, height).await
+    }
+
+    async fn render_details_baseline(
+        app: &DesktopApp,
+        width: u16,
+        height: u16,
+    ) -> RenderedBaseline {
+        let theme = app.theme();
+        let content = container(app.details_view()).style(|theme: &Theme| container::Style {
+            text_color: Some(theme.palette().text),
+            ..container::Style::default()
+        });
+        render_element_baseline(content.into(), &theme, width, height).await
     }
 
     async fn render_github_responsive_baselines(app: &mut DesktopApp) -> [RenderedBaseline; 3] {
@@ -11395,6 +11402,61 @@ mod tests {
 
         app.select_main_tab(MainTab::Changes);
         assert_eq!(app.active_session_id, Some(second_id));
+    }
+
+    #[tokio::test]
+    async fn navigator_attention_changes_the_rendered_session_surface() {
+        let (app, _, _, _, _) = desktop_hierarchy();
+        let theme = app.theme();
+        let mut row = app.presentation().navigator.sessions[0].clone();
+        row.selected = true;
+        row.attention = None;
+        let neutral = render_element_baseline(app.navigator_row(&row), &theme, 320, 60).await;
+        for attention in [
+            NavigatorAttention::NeedsFeedback,
+            NavigatorAttention::Finished,
+            NavigatorAttention::Failed,
+        ] {
+            row.attention = Some(attention);
+            let pending = render_element_baseline(app.navigator_row(&row), &theme, 320, 60).await;
+            assert_ne!(
+                neutral.checksum, pending.checksum,
+                "attention must tint the selected row"
+            );
+        }
+    }
+
+    #[test]
+    fn attention_surfaces_preserve_selection_and_readability_in_every_theme() {
+        for choice in DesktopTheme::ALL {
+            let theme = theme::resolve(PresentationTheme::resolve(choice, SystemAppearance::Dark));
+            for attention in [
+                NavigatorAttention::NeedsFeedback,
+                NavigatorAttention::Finished,
+                NavigatorAttention::Failed,
+            ] {
+                for selected in [false, true] {
+                    for hovered in [false, true] {
+                        let style = navigator_row_container_style(
+                            &theme,
+                            selected,
+                            hovered,
+                            Some(attention),
+                        );
+                        let Some(Background::Color(background)) = style.background else {
+                            panic!("attention surface must be visible")
+                        };
+                        assert!(background.relative_contrast(style.text_color.unwrap()) >= 4.5);
+                        if selected {
+                            assert_eq!(
+                                style.border.color,
+                                theme.extended_palette().primary.base.color
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -12368,20 +12430,28 @@ mod tests {
         }
         assert!(details_text.iter().all(|value| !value.contains('\u{fffd}')));
 
+        // Raw technical fields above include generated IDs. Snapshot the default
+        // collapsed state so pixel checks do not depend on random fixture IDs.
+        app.disclosures.technical_details = false;
         app.desktop_state.window_width = 1_440;
         app.desktop_state.window_height = 900;
-        let wide = render_desktop_baseline(&app, 1_440, 900).await;
+        // Keep pixel baselines on bundled-font glyphs; CJK path round-tripping
+        // is asserted above without depending on the operating system's fallback font.
+        app.snapshot.worktrees[0].canonical_path =
+            r"\\?\UNC\server\share\Пројект\managed-checkout".into();
+        let _warmup = render_details_baseline(&app, 1_440, 900).await;
+        let wide = render_details_baseline(&app, 1_440, 900).await;
         app.desktop_state.window_width = 900;
         app.desktop_state.window_height = 700;
-        let compact = render_desktop_baseline(&app, 900, 700).await;
+        let compact = render_details_baseline(&app, 900, 700).await;
         app.desktop_state.window_width = 680;
         app.desktop_state.window_height = 480;
         app.narrow_main = true;
-        let narrow = render_desktop_baseline(&app, 680, 480).await;
+        let narrow = render_details_baseline(&app, 680, 480).await;
 
         assert_eq!(
             [wide.layout_nodes, compact.layout_nodes, narrow.layout_nodes],
-            [345, 288, 245],
+            [63, 63, 63],
             "Details layout changed at a representative width"
         );
         assert!(wide.distinct_colors >= 8, "{wide:?}");

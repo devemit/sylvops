@@ -53,13 +53,24 @@ impl LifecycleHealth {
     pub const fn guidance(self) -> &'static str {
         match self {
             Self::NotApplicable => "Lifecycle monitoring is not applicable.",
-            Self::Waiting => {
-                "Waiting for provider lifecycle callbacks. Review Codex hooks with /hooks if prompted."
-            }
+            Self::Waiting => "Waiting for provider lifecycle callbacks.",
             Self::Ready => "Provider lifecycle callbacks received.",
             Self::Missing => {
-                "Provider lifecycle callbacks are missing; attention and notifications may be incomplete. In Codex, open /hooks, review SylvOps hooks, press t to trust them and verify they are Active; then submit a prompt. Check provider hook configuration if this persists."
+                "Provider lifecycle callbacks are missing; attention and notifications may be incomplete."
             }
+        }
+    }
+
+    pub const fn guidance_for(self, provider: crate::domain::ProviderKind) -> &'static str {
+        use crate::domain::ProviderKind;
+        match (self, provider) {
+            (Self::Missing, ProviderKind::Codex) => {
+                "Provider lifecycle callbacks are missing; attention, notifications, and resume may be incomplete. In Codex, open /hooks and verify SylvOps hooks are Active. If already trusted, check hook execution errors and start a new managed Session after refreshing Provider health."
+            }
+            (Self::Missing, ProviderKind::Claude) => {
+                "Provider lifecycle callbacks are missing; attention, notifications, and resume may be incomplete. Check Claude Code hook configuration and execution errors, then start a new managed Session."
+            }
+            _ => self.guidance(),
         }
     }
 }
@@ -185,5 +196,24 @@ fn safe_label(label: &str) -> String {
         "A session".into()
     } else {
         label
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::ProviderKind;
+
+    #[test]
+    fn missing_callback_guidance_is_provider_specific_and_observational() {
+        let codex = LifecycleHealth::Missing.guidance_for(ProviderKind::Codex);
+        let claude = LifecycleHealth::Missing.guidance_for(ProviderKind::Claude);
+        assert!(codex.contains("/hooks") && codex.contains("already trusted"));
+        assert!(claude.contains("Claude Code") && !claude.contains("Codex"));
+        assert!(!claude.contains("failed"));
+        assert_eq!(
+            LifecycleHealth::Ready.guidance_for(ProviderKind::Claude),
+            LifecycleHealth::Ready.guidance()
+        );
     }
 }

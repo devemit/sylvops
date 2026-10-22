@@ -8,6 +8,171 @@ use sylvops_core::{
 use sylvops_daemon::{client::DaemonClient, runtime::RuntimePaths};
 use sylvops_test_support::{TemporaryRepository, bounded};
 
+/// Uses an explicitly chosen, already trusted production relay and repository.
+/// Does not change trust, user configuration, or the installed application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opt-in real account: set SYLVOPS_REAL_RELAY_PATH and SYLVOPS_REAL_CODEX_REPOSITORY"]
+#[allow(clippy::too_many_lines)] // Fresh launch and exact-conversation resume share one bounded fixture.
+async fn real_codex_private_runtime_uses_the_production_relay() {
+    use sylvops_core::{
+        provider::{LaunchContext, ResumeContext},
+        status::NormalizedProviderEvent,
+    };
+    use sylvops_daemon::{
+        hook::HookReceiver,
+        provider::ProviderRegistry,
+        session::{SessionHandle, SessionSpec},
+    };
+    let relay = std::path::PathBuf::from(
+        std::env::var_os("SYLVOPS_REAL_RELAY_PATH").expect("explicit production relay"),
+    );
+    let cwd = std::path::PathBuf::from(
+        std::env::var_os("SYLVOPS_REAL_CODEX_REPOSITORY").expect("explicit trusted repository"),
+    );
+    assert!(relay.is_absolute() && relay.is_file() && cwd.is_absolute() && cwd.is_dir());
+    let mut receiver = HookReceiver::bind(relay.clone(), 64 * 1024, 600)
+        .await
+        .unwrap();
+    let mut deliveries = receiver.take_deliveries();
+    let registry = ProviderRegistry::new(Some(&relay), &[ProviderKind::Codex]).unwrap();
+    let health = registry.probe(ProviderKind::Codex).await.unwrap();
+    assert!(
+        health.available && health.authenticated,
+        "real Codex must be installed and logged in"
+    );
+    let worktree_id = sylvops_core::ids::WorktreeId::new();
+    let mut conversation = None;
+    for resumed in [false, true] {
+        let session_id = SessionId::new();
+        let endpoint = receiver
+            .register(ProviderKind::Codex, session_id, worktree_id)
+            .unwrap();
+        let mut runtime = if resumed {
+            registry
+                .resume(
+                    ProviderKind::Codex,
+                    ResumeContext {
+                        session_id,
+                        worktree_id,
+                        cwd: cwd.clone(),
+                        model: None,
+                        effort: None,
+                        external_session_id: conversation
+                            .clone()
+                            .expect("identity from fresh Session"),
+                        lifecycle_endpoint: Some(endpoint),
+                    },
+                )
+                .unwrap()
+        } else {
+            registry
+                .launch(
+                    ProviderKind::Codex,
+                    LaunchContext {
+                        session_id,
+                        worktree_id,
+                        cwd: cwd.clone(),
+                        model: None,
+                        effort: None,
+                        initial_prompt: Some(
+                            "Reply with exactly OK. Do not use tools or change files.".into(),
+                        ),
+                        lifecycle_endpoint: Some(endpoint),
+                    },
+                )
+                .unwrap()
+        };
+        // The noninteractive test runner exports TERM=dumb; the owned PTY is VT-capable.
+        runtime
+            .launch
+            .environment
+            .insert("TERM".into(), "xterm-256color".into());
+        // Avoid interactive upgrade prompts; this does not modify saved settings.
+        runtime.launch.arguments.prepend_persisted([
+            "--config".into(),
+            "check_for_update_on_startup=false".into(),
+        ]);
+        assert!(
+            runtime
+                .launch
+                .arguments
+                .all()
+                .iter()
+                .any(|argument| argument == "--no-daemon"),
+            "installed Codex must advertise private runtime support"
+        );
+        let mut handle = SessionHandle::spawn_sanitized(
+            &SessionSpec {
+                program: runtime.launch.executable,
+                arguments: runtime.launch.arguments.all().to_vec(),
+                cwd: cwd.clone(),
+                columns: 100,
+                rows: 30,
+                scrollback_bytes: 64 * 1024,
+            },
+            &runtime.launch.environment,
+        )
+        .unwrap();
+        let mut callback_count = 0_usize;
+        let delivered = tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                let delivery = deliveries.recv().await.expect("hook receiver open");
+                if delivery.session_id != session_id {
+                    continue;
+                }
+                callback_count += 1;
+                let normalized = registry
+                    .normalize_lifecycle_event(ProviderKind::Codex, &delivery.payload)
+                    .unwrap();
+                if let Some(identity) = normalized.conversation_id {
+                    if resumed {
+                        assert!(
+                            conversation.as_ref() == Some(&identity),
+                            "resumed runtime must keep the verified Conversation identity"
+                        );
+                    }
+                    conversation = Some(identity);
+                }
+                if matches!(
+                    normalized.event,
+                    Some(NormalizedProviderEvent::TurnStopped { .. })
+                ) || (resumed
+                    && conversation.is_some()
+                    && matches!(
+                        normalized.event,
+                        Some(NormalizedProviderEvent::TurnStarted { .. })
+                    ))
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        let stopped = bounded(handle.stop())
+            .await
+            .expect("real provider stop timeout");
+        let exit = bounded(handle.wait())
+            .await
+            .expect("real provider exit timeout");
+        receiver.invalidate(session_id);
+        assert!(
+            stopped.is_ok() && exit.is_ok_and(|exit| exit.stop_requested),
+            "owned provider process must stop"
+        );
+        assert!(
+            delivered.is_ok(),
+            "real callback missing ({callback_count} callbacks); verify repository and hook trust manually; no trust was bypassed"
+        );
+        assert!(
+            conversation.is_some(),
+            "real callback must capture Conversation identity"
+        );
+    }
+    bounded(receiver.shutdown())
+        .await
+        .expect("hook receiver shutdown timeout");
+}
+
 /// Requires an existing real Codex login and prior /hooks approval of the stable
 /// hook-daemon source. Never approves hooks, bypasses trust, or prints PTY contents.
 #[tokio::test]
@@ -116,6 +281,17 @@ async fn generated_codex_hook_refuses_environment_expansion_in_relay_paths() {
     .expect("unsafe hook path scenario timed out");
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn generated_powershell_hook_preserves_literal_path_characters() {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        exercise_generated_hook("SylvOps $missing `literal é Ж", false),
+    )
+    .await
+    .expect("PowerShell literal relay path scenario timed out");
+}
+
 #[allow(clippy::too_many_lines)]
 async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
     let repository = TemporaryRepository::initialize().await.unwrap();
@@ -130,6 +306,7 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
     let codex_home = repository.root().join("codex home é Ж");
     std::fs::create_dir(&codex_home).unwrap();
     std::fs::write(codex_home.join(".fake-codex-execute-hooks"), b"").unwrap();
+    std::fs::write(codex_home.join(".fake-codex-shared-daemon"), b"").unwrap();
     let state_root = repository.root().join("state");
     let paths = RuntimePaths::discover(Some(&state_root)).unwrap();
 
@@ -203,6 +380,74 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
     .await
     .expect("generated command did not deliver verified Conversation identity");
 
+    assert!(matches!(
+        client
+            .request(&ClientRequest::GetSessionLifecycleHealth { session_id })
+            .await
+            .unwrap(),
+        DaemonResponse::SessionLifecycleHealth {
+            health: sylvops_core::attention::LifecycleHealth::Ready,
+            ..
+        }
+    ));
+    let attached = client
+        .request(&ClientRequest::AttachSession {
+            session_id,
+            from_sequence: 0,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    assert!(!matches!(attached, DaemonResponse::Error(_)));
+    client
+        .request(&ClientRequest::ReportAttentionFocus {
+            session_id: Some(session_id),
+        })
+        .await
+        .unwrap();
+    input(&client, session_id, "permission").await;
+    let input_event = wait_for_attention(
+        &client,
+        session_id,
+        sylvops_core::session_state::AttentionReason::InputRequested,
+    )
+    .await;
+    assert_eq!(
+        input_event.acknowledgement,
+        sylvops_core::session_state::AttentionAcknowledgement::Pending
+    );
+    assert!(matches!(
+        client
+            .request(&ClientRequest::ClaimAttentionNotification)
+            .await
+            .unwrap(),
+        DaemonResponse::AttentionNotificationClaim(None)
+    ));
+    client
+        .request(&ClientRequest::ReportAttentionFocus { session_id: None })
+        .await
+        .unwrap();
+    input(&client, session_id, "complete-live").await;
+    let completion = wait_for_attention(
+        &client,
+        session_id,
+        sylvops_core::session_state::AttentionReason::SuccessfulCompletion,
+    )
+    .await;
+    assert_ne!(completion.id, input_event.id);
+    assert!(
+        matches!(client.request(&ClientRequest::ClaimAttentionNotification).await.unwrap(),
+        DaemonResponse::AttentionNotificationClaim(Some(claim)) if claim.attention_id == completion.id)
+    );
+    assert!(matches!(
+        client
+            .request(&ClientRequest::ClaimAttentionNotification)
+            .await
+            .unwrap(),
+        DaemonResponse::AttentionNotificationClaim(None)
+    ));
+
     client
         .request(&ClientRequest::StopSession { session_id })
         .await
@@ -219,6 +464,22 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
     })
     .await
     .unwrap();
+    let stopped = session(&client, session_id).await;
+    assert!(stopped.failure_reason.is_none());
+    assert!(
+        stopped
+            .status
+            .attention
+            .is_none_or(|event| event.acknowledgement
+                == sylvops_core::session_state::AttentionAcknowledgement::Resolved)
+    );
+    assert!(matches!(
+        client
+            .request(&ClientRequest::ClaimAttentionNotification)
+            .await
+            .unwrap(),
+        DaemonResponse::AttentionNotificationClaim(None)
+    ));
     client
         .request(&ClientRequest::ShutdownDaemon)
         .await
@@ -355,6 +616,41 @@ async fn resume_and_stop(client: &DaemonClient, source_id: SessionId) {
     })
     .await
     .unwrap();
+}
+
+async fn input(client: &DaemonClient, session_id: SessionId, line: &str) {
+    let newline = if cfg!(windows) { "\r" } else { "\n" };
+    assert!(matches!(
+        client
+            .request(&ClientRequest::SessionInput {
+                session_id,
+                bytes: format!("{line}{newline}").into_bytes(),
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::Acknowledged
+    ));
+}
+
+async fn wait_for_attention(
+    client: &DaemonClient,
+    session_id: SessionId,
+    reason: sylvops_core::session_state::AttentionReason,
+) -> sylvops_core::session_state::AttentionEvent {
+    bounded(async {
+        loop {
+            if let Some(event) = session(client, session_id).await.status.attention
+                && event.reason == reason
+                && event.acknowledgement
+                    == sylvops_core::session_state::AttentionAcknowledgement::Pending
+            {
+                return event;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("generated hook did not create pending attention")
 }
 
 fn start_daemon(relay: &Path, codex_home: &Path, state_root: &Path) -> tokio::process::Child {

@@ -685,6 +685,38 @@ mod tests {
     }
 
     #[test]
+    fn explicit_stop_resolves_every_live_condition_and_ignores_late_completion() {
+        for event in [
+            NormalizedProviderEvent::PromptSubmitted,
+            NormalizedProviderEvent::PermissionRequested,
+            NormalizedProviderEvent::TurnStopped {
+                remaining_work: RemainingWork::default(),
+            },
+            NormalizedProviderEvent::TurnFailed {
+                category: TurnFailureCategory::new("network").unwrap(),
+            },
+        ] {
+            for exit_code in [Some(0), Some(1), None] {
+                let mut machine = SessionStatusMachine::new(SessionLifecycle::Running);
+                machine.apply(&event, 10).unwrap();
+                let stopped = machine
+                    .apply_process_exit(false, exit_code, true, 11)
+                    .unwrap();
+                assert_eq!(stopped.status.lifecycle, SessionLifecycle::Terminated);
+                assert_eq!(stopped.status.activity, ProviderActivity::None);
+                assert!(stopped.failure_category.is_none());
+                assert!(stopped.status.attention.is_none_or(
+                    |event| event.acknowledgement == AttentionAcknowledgement::Resolved
+                ));
+                let late = machine
+                    .apply(&NormalizedProviderEvent::SessionEnded, 12)
+                    .unwrap();
+                assert_eq!(late, stopped);
+            }
+        }
+    }
+
+    #[test]
     fn recoverable_failure_categories_deduplicate_only_unchanged_conditions() {
         let mut machine = SessionStatusMachine::new(SessionLifecycle::Running);
         let rate_limit = NormalizedProviderEvent::TurnFailed {
