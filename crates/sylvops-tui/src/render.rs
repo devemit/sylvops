@@ -1,4 +1,4 @@
-use std::fmt::Write as _;
+use std::{borrow::Cow, fmt::Write as _};
 
 use ratatui::{
     Frame,
@@ -1095,13 +1095,11 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     }
 }
 
-fn terminal_text(screen: &vt100::Screen, defaults: Style) -> Text<'static> {
+fn terminal_text(screen: &vt100::Screen, defaults: Style) -> Text<'_> {
     let (rows, columns) = screen.size();
     let mut lines = Vec::with_capacity(usize::from(rows));
     for row in 0..rows {
-        let mut spans = Vec::new();
-        let mut current_style = None;
-        let mut current = String::new();
+        let mut spans = Vec::with_capacity(usize::from(columns));
         for column in 0..columns {
             let Some(cell) = screen.cell(row, column) else {
                 continue;
@@ -1109,26 +1107,46 @@ fn terminal_text(screen: &vt100::Screen, defaults: Style) -> Text<'static> {
             if cell.is_wide_continuation() {
                 continue;
             }
-            let style = terminal_cell_style(cell, defaults);
-            if current_style.is_some_and(|existing| existing != style) {
-                spans.push(Span::styled(
-                    std::mem::take(&mut current),
-                    current_style.unwrap(),
-                ));
-            }
-            current_style = Some(style);
-            if cell.has_contents() {
-                current.push_str(cell.contents());
-            } else {
-                current.push(' ');
-            }
-        }
-        if let Some(style) = current_style {
-            spans.push(Span::styled(current, style));
+            // Keep cell boundaries: combining neighboring cells into one span can
+            // create a new grapheme and move subsequent letters to different columns.
+            spans.push(Span::styled(
+                terminal_cell_text(cell),
+                terminal_cell_style(cell, defaults),
+            ));
         }
         lines.push(Line::from(spans));
     }
     Text::from(lines)
+}
+
+fn terminal_cell_text(cell: &vt100::Cell) -> Cow<'_, str> {
+    if !cell.has_contents() {
+        return Cow::Borrowed(" ");
+    }
+    let contents = cell.contents();
+    let width = if cell.is_wide() { 2 } else { 1 };
+    if !contents.contains('\u{200d}') && Span::raw(contents).width() == width {
+        return Cow::Borrowed(contents);
+    }
+
+    // The VT grid is authoritative. A presentation selector must not widen a
+    // one-column cell, and a trailing joiner must not join a different VT cell.
+    let mut text = contents.replace('\u{200d}', "");
+    if Span::raw(text.as_str()).width() != width {
+        text.retain(|character| !matches!(character, '\u{fe0e}' | '\u{fe0f}' | '\u{20e3}'));
+    }
+    if Span::raw(text.as_str()).width() == width {
+        return Cow::Owned(text);
+    }
+    let base = contents
+        .chars()
+        .next()
+        .expect("occupied VT cell has content")
+        .to_string();
+    if Span::raw(base.as_str()).width() == width {
+        return Cow::Owned(base);
+    }
+    Cow::Owned("�".repeat(width))
 }
 
 fn terminal_cell_style(cell: &vt100::Cell, defaults: Style) -> Style {
@@ -3803,6 +3821,53 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_redraw_preserves_columns_after_unicode_symbols() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 2)).unwrap();
+        let mut parser = vt100::Parser::new(2, 40, 0);
+        for prefix in [
+            "plain ",
+            "› ",
+            "界 ",
+            "🙂 ",
+            "⚠️ ",
+            "❤️ ",
+            "👩‍💻 ",
+            "🇲🇰 ",
+            "1️⃣ ",
+            "plain ",
+        ] {
+            parser.process(format!("\r\x1b[2K{prefix}TAIL").as_bytes());
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        Paragraph::new(terminal_text(
+                            parser.screen(),
+                            Theme::resolve(TuiTheme::Nord).text,
+                        )),
+                        frame.area(),
+                    );
+                })
+                .unwrap();
+            for symbol in ["T", "A", "I", "L"] {
+                let expected = (0..40)
+                    .find(|column| {
+                        parser
+                            .screen()
+                            .cell(0, *column)
+                            .is_some_and(|cell| cell.contents() == symbol)
+                    })
+                    .unwrap();
+                let actual = terminal.backend().buffer()[(expected, 0)].symbol();
+                assert_eq!(
+                    actual, symbol,
+                    "{prefix:?}: {symbol} moved during rendering"
+                );
+            }
+        }
+    }
 
     #[test]
     fn startup_wordmark_fits_large_and_small_terminals() {
