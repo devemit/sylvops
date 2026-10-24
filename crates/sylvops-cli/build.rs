@@ -1,6 +1,7 @@
 use std::{env, error::Error, path::PathBuf};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../../packaging/icons/sylvops.ico");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
