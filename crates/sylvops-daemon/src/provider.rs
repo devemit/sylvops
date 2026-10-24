@@ -1767,10 +1767,13 @@ fn install_stable_hook_profile(directory: &Path, source: &str) -> sylvops_core::
     }
     let metadata = std::fs::symlink_metadata(&path)
         .map_err(|_| provider_error("cannot validate Codex hook profile"))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(provider_error(
             "Codex hook profile is not an owned regular file",
         ));
+    }
+    if metadata.len() > 64 * 1024 {
+        return Err(provider_error("Codex hook profile exceeds the size limit"));
     }
     let canonical = std::fs::canonicalize(&path)
         .map_err(|_| provider_error("cannot canonicalize Codex hook profile"))?;
@@ -1789,22 +1792,81 @@ fn install_stable_hook_profile(directory: &Path, source: &str) -> sylvops_core::
     let mut existing = String::new();
     file.take(64 * 1024 + 1)
         .read_to_string(&mut existing)
-        .map_err(|_| provider_error("cannot read Codex hook profile"))?;
-    // Codex can insert UI preferences before the ownership comment. Compare
-    // against the regenerated immutable definition, not a byte-prefix checksum.
+        .map_err(|error| {
+            provider_error(if error.kind() == std::io::ErrorKind::InvalidData {
+                "Codex hook profile configuration is malformed"
+            } else {
+                "cannot read Codex hook profile"
+            })
+        })?;
+    if existing.len() > 64 * 1024 {
+        return Err(provider_error("Codex hook profile exceeds the size limit"));
+    }
+    // Keep the stable source path and all provider-written preferences/approvals.
+    // Only SylvOps's hook configuration is immutable; Codex validates other settings.
     let marker = source.lines().next().unwrap_or_default();
-    if existing.len() > 64 * 1024
-        || existing.lines().filter(|line| *line == marker).count() != 1
-        || (existing != source && !codex_trust_metadata_is_valid(source, &existing, &canonical))
-        || same_file::Handle::from_path(&path).ok().as_ref() != Some(&identity)
-    {
+    if existing.lines().filter(|line| *line == marker).count() != 1 {
         return Err(provider_error(
-            "Codex hook profile was modified; refusing to overwrite it",
+            "Codex hook profile ownership marker is invalid",
         ));
+    }
+    validate_codex_profile_settings(source, &existing, &canonical).map_err(provider_error)?;
+    if !codex_profile_identity_matches(&path, directory, &identity) {
+        return Err(provider_error("Codex hook profile file identity changed"));
     }
     Ok(name)
 }
 
+fn codex_profile_identity_matches(
+    path: &Path,
+    directory: &Path,
+    identity: &same_file::Handle,
+) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        && std::fs::canonicalize(path).is_ok_and(|canonical| canonical.parent() == Some(directory))
+        && same_file::Handle::from_path(path).ok().as_ref() == Some(identity)
+}
+
+fn validate_codex_profile_settings(
+    owned: &str,
+    source: &str,
+    profile_path: &Path,
+) -> std::result::Result<(), &'static str> {
+    let owned = owned
+        .parse::<toml::Table>()
+        .map_err(|_| "cannot validate generated Codex hook definition")?;
+    let mut document = source
+        .parse::<toml::Table>()
+        .map_err(|_| "Codex hook profile configuration is malformed")?;
+    if let Some(projects) = document.get("projects")
+        && !project_trust_metadata_is_valid(projects)
+    {
+        return Err("Codex hook profile Project trust metadata is invalid");
+    }
+    if let Some(state) = document
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|hooks| hooks.remove("state"))
+        && !hook_trust_metadata_is_valid(&state, profile_path)
+    {
+        return Err("Codex hook profile hook approval metadata is invalid");
+    }
+    // Compare the complete parsed hook registry, including array ordering and every
+    // execution option. Unknown handlers/types cannot hide in dotted or inline tables.
+    let hooks_enabled = document
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .and_then(|features| features.get("hooks"))
+        .and_then(toml::Value::as_bool);
+    if hooks_enabled != Some(true) || document.get("hooks") != owned.get("hooks") {
+        return Err("Codex hook profile protected hook configuration was modified");
+    }
+    Ok(())
+}
+
+// Cleanup deliberately retains strict whole-document validation. Launch acceptance
+// of provider-owned preferences does not grant ownership to delete those files.
 fn owned_profile_checksum_is_valid(source: &str, profile_path: &Path) -> bool {
     if source.len() > 64 * 1024 {
         return false;
@@ -2685,6 +2747,15 @@ mod tests {
             name
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), preferences);
+        let status_line = format!(
+            "{preferences}\n[tui]\nstatus_line = ['model-name', 'context-remaining']\nstatus_line_use_colors = true\n"
+        );
+        std::fs::write(&path, &status_line).unwrap();
+        assert_eq!(
+            install_stable_hook_profile(&directory, &source).unwrap(),
+            name
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), status_line);
         for invalid in [
             trusted.replace(&hash, "invalid"),
             trusted.replace(":session_start:0:0", ":unknown:0:0"),
@@ -2694,14 +2765,113 @@ mod tests {
             trusted.replace("hook emit", "hook other"),
             format!("{trusted}\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ncommand='injected'\n"),
             format!("{trusted}#{}", "x".repeat(65_536)),
-            format!("model = {{ command = 'injected' }}\n{trusted}"),
-            format!("model = '{}'\n{trusted}", "x".repeat(129)),
-            format!("shell = 'unreviewed-shell'\n{trusted}"),
+            trusted.replace("hooks = true", "hooks = false"),
+            trusted.replace("type = \"command\"", "type = \"unknown\""),
+            trusted.replace("timeout = 2", "timeout = 20"),
+            trusted.replace("async = true", "async = false"),
+            trusted.replace("command_windows =", "other_command ="),
+            format!("{trusted}\n[[hooks.FutureEvent]]\ncommand='injected'\n"),
+            format!("{trusted}\n[tui\n"),
         ] {
             std::fs::write(&path, &invalid).unwrap();
             assert!(install_stable_hook_profile(&directory, &source).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
         }
+    }
+
+    #[test]
+    fn stable_hook_profile_preserves_provider_owned_settings() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temporary.path()).unwrap();
+        let source = hook_profile_source("sylvops hook emit");
+        let name = install_stable_hook_profile(&directory, &source).unwrap();
+        let path = directory.join(format!("{name}.config.toml"));
+        for settings in [
+            "[tui]\ntheme = 'example'\nterminal_title = ['model']\n[tui.keymap.global]\ncopy = ['ctrl-y']\n",
+            "[future_preferences]\nunknown = { enabled = true, items = [1, 2] }\n",
+            "model = { invalid_provider_value = true }\nmodel_reasoning_effort = 'future-value'\n",
+            "approval_policy = 'on-request'\nsandbox_mode = 'workspace-write'\nshell = 'user-shell'\n",
+        ] {
+            // Values outside the owned hooks are Codex's responsibility, including
+            // settings that this SylvOps build cannot recognize or validate.
+            let preferences = format!("{settings}\n{source}");
+            std::fs::write(&path, &preferences).unwrap();
+            assert_eq!(
+                install_stable_hook_profile(&directory, &source).unwrap(),
+                name
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), preferences);
+        }
+        let preferences = source.replace("[features]\n", "[features]\nfuture_feature = true\n");
+        std::fs::write(&path, &preferences).unwrap();
+        assert_eq!(
+            install_stable_hook_profile(&directory, &source).unwrap(),
+            name
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), preferences);
+    }
+
+    #[test]
+    fn stable_hook_profile_errors_distinguish_malformed_settings_and_hook_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temporary.path()).unwrap();
+        let source = hook_profile_source("sylvops hook emit");
+        let name = install_stable_hook_profile(&directory, &source).unwrap();
+        let path = directory.join(format!("{name}.config.toml"));
+        for (contents, diagnostic) in [
+            (
+                format!("{source}\n[tui\nsecret_value"),
+                "configuration is malformed",
+            ),
+            (
+                source.replace("hook emit", "secret_value"),
+                "protected hook configuration was modified",
+            ),
+            (
+                source.replace("hooks = true", "hooks = 'secret_value'"),
+                "protected hook configuration was modified",
+            ),
+            (
+                format!("{source}\n[projects.relative]\ntrust_level = 'secret_value'\n"),
+                "Project trust metadata is invalid",
+            ),
+            (
+                format!("{source}\n[hooks.state.secret_value]\ntrusted_hash = 'invalid'\n"),
+                "hook approval metadata is invalid",
+            ),
+            (
+                format!("{source}{}", source.lines().next().unwrap()),
+                "ownership marker is invalid",
+            ),
+            (
+                format!("{source}#{}", "x".repeat(65_536)),
+                "exceeds the size limit",
+            ),
+        ] {
+            std::fs::write(&path, &contents).unwrap();
+            let error = install_stable_hook_profile(&directory, &source)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(diagnostic), "{error}");
+            assert!(!error.contains("secret_value"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn stable_hook_profile_revalidation_rejects_replaced_file_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temporary.path()).unwrap();
+        let path = directory.join("profile.config.toml");
+        std::fs::write(&path, "original").unwrap();
+        let identity = same_file::Handle::from_path(&path).unwrap();
+        assert!(codex_profile_identity_matches(&path, &directory, &identity));
+        std::fs::rename(&path, directory.join("original.config.toml")).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        assert!(!codex_profile_identity_matches(
+            &path, &directory, &identity
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
     }
 
     #[test]
@@ -3036,6 +3206,7 @@ mod tests {
                 false,
             ),
             ("\n[notice]\nhide_warning = true\n".into(), false),
+            ("\n[tui]\nstatus_line = ['model-name']\n".into(), false),
             ("\n[projects.\"unterminated]\n".into(), false),
         ] {
             std::fs::write(&path, format!("{source}{suffix}")).expect("mutated profile");
@@ -3122,25 +3293,31 @@ mod tests {
         );
         assert!(intact_path.exists());
 
-        let trusted = configure(sylvops_core::ids::SessionId::new());
-        assert_eq!(
-            intact.launch.arguments.all()[1],
-            trusted.launch.arguments.all()[1]
-        );
         let trusted_path = &intact_path;
         let source = std::fs::read_to_string(trusted_path).expect("managed profile");
         let project = toml::Value::String(temporary.path().to_string_lossy().into_owned());
-        std::fs::write(
-            trusted_path,
-            format!("{source}\n[projects.{project}]\ntrust_level = \"trusted\"\n"),
-        )
-        .expect("Codex trust mutation");
+        let preferences = format!(
+            "model = 'gpt-test'\n{source}\n[projects.{project}]\ntrust_level = 'trusted'\n[tui]\nstatus_line = ['model-name']\n[future_preferences]\nvalue = 1\n"
+        );
+        std::fs::write(trusted_path, &preferences).expect("Codex trust mutation");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| configure(sylvops_core::ids::SessionId::new())))
+                .collect();
+            for handle in handles {
+                assert_eq!(
+                    handle.join().unwrap().launch.arguments.all()[1],
+                    profile.as_str()
+                );
+            }
+        });
+        assert_eq!(std::fs::read_to_string(trusted_path).unwrap(), preferences);
         registry
-            .cleanup_runtime_paths_checked(ProviderKind::Codex, &trusted.owned_paths)
+            .cleanup_runtime_paths_checked(ProviderKind::Codex, &intact.owned_paths)
             .expect("Codex trust metadata preserves ownership");
         assert!(trusted_path.exists());
         registry
-            .cleanup_runtime_paths_checked(ProviderKind::Codex, &trusted.owned_paths)
+            .cleanup_runtime_paths_checked(ProviderKind::Codex, &intact.owned_paths)
             .expect("repeated cleanup succeeds");
 
         let restarted = CodexAdapter::from_executable_with_hooks(
@@ -3154,6 +3331,7 @@ mod tests {
             install_stable_hook_profile(&directory, &source).unwrap(),
             profile
         );
+        assert_eq!(std::fs::read_to_string(trusted_path).unwrap(), preferences);
         drop(restarted);
         std::fs::write(trusted_path, "user-owned replacement").expect("replace managed profile");
         assert!(install_stable_hook_profile(&directory, &source).is_err());
