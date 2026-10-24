@@ -231,7 +231,7 @@ async fn real_codex_delivers_completion_across_sessions_and_daemon_restart() {
             assert!(matches!(client.request(&ClientRequest::GetSessionLifecycleHealth { session_id: id }).await.unwrap(),
                 DaemonResponse::SessionLifecycleHealth { health: sylvops_core::attention::LifecycleHealth::Ready, .. }));
             assert!(session(&client, id).await.external_session_id.is_some(), "completion must capture Conversation identity");
-            resume_and_stop(&client, id).await;
+            resume_and_stop(&client, id, false).await;
         }
         client.request(&ClientRequest::ShutdownDaemon).await.unwrap();
         assert!(bounded(daemon.wait()).await.unwrap().unwrap().success());
@@ -253,7 +253,7 @@ async fn real_codex_delivers_completion_across_sessions_and_daemon_restart() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }).await.expect("completion callback missing after daemon restart");
-        resume_and_stop(&restarted, id).await;
+        resume_and_stop(&restarted, id, false).await;
         restarted.request(&ClientRequest::ShutdownDaemon).await.unwrap();
         assert!(bounded(daemon.wait()).await.unwrap().unwrap().success());
     }).await.expect("bounded real Codex smoke timeout");
@@ -503,7 +503,7 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
         toml::Value::String(format!("{}:session_start:0:0", profile.to_string_lossy()));
     let original = std::fs::read_to_string(&profile).unwrap();
     let approved = format!(
-        "{original}\n[hooks.state.{profile_key}]\ntrusted_hash = 'sha256:{}'\n",
+        "model = 'gpt-test'\nmodel_reasoning_effort = 'medium'\n{original}\n[hooks.state.{profile_key}]\ntrusted_hash = 'sha256:{}'\n[tui]\nstatus_line = ['model-name', 'context-remaining']\nstatus_line_use_colors = true\ntheme = 'example'\n[future_preferences]\nunknown = true\n",
         "a".repeat(64)
     );
     std::fs::write(&profile, &approved).unwrap();
@@ -516,7 +516,36 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
             .as_deref(),
         Some(expected_id.as_str())
     );
-    resume_and_stop(&client, session_id).await;
+    resume_and_stop(&client, session_id, true).await;
+    let fresh = match client
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Codex,
+            display_name: Some("after preferences".into()),
+            model: None,
+            effort: None,
+            initial_prompt: None,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap()
+    {
+        DaemonResponse::SessionCreated { session, .. } => session.id,
+        response => panic!("preferences prevented a fresh Session: {response:?}"),
+    };
+    bounded(async {
+        while session(&client, fresh).await.external_session_id.is_none() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_fake_hook_notifications(&client, fresh).await;
+    client
+        .request(&ClientRequest::StopSession { session_id: fresh })
+        .await
+        .unwrap();
     assert_eq!(std::fs::read_to_string(&profile).unwrap(), approved);
     client
         .request(&ClientRequest::ShutdownDaemon)
@@ -525,7 +554,11 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
     assert!(bounded(restarted.wait()).await.unwrap().unwrap().success());
 }
 
-async fn resume_and_stop(client: &DaemonClient, source_id: SessionId) {
+async fn resume_and_stop(
+    client: &DaemonClient,
+    source_id: SessionId,
+    verify_fake_notifications: bool,
+) {
     let identity = session(client, source_id)
         .await
         .external_session_id
@@ -603,6 +636,9 @@ async fn resume_and_stop(client: &DaemonClient, source_id: SessionId) {
     })
     .await
     .expect("resumed Provider did not deliver a lifecycle callback");
+    if verify_fake_notifications {
+        assert_fake_hook_notifications(client, successor.id).await;
+    }
     client
         .request(&ClientRequest::StopSession {
             session_id: successor.id,
@@ -616,6 +652,73 @@ async fn resume_and_stop(client: &DaemonClient, source_id: SessionId) {
     })
     .await
     .unwrap();
+}
+
+async fn assert_fake_hook_notifications(client: &DaemonClient, session_id: SessionId) {
+    let attached = client
+        .request(&ClientRequest::AttachSession {
+            session_id,
+            from_sequence: 0,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+    assert!(!matches!(attached, DaemonResponse::Error(_)));
+    assert!(matches!(
+        client
+            .request(&ClientRequest::GetSessionLifecycleHealth { session_id })
+            .await
+            .unwrap(),
+        DaemonResponse::SessionLifecycleHealth {
+            health: sylvops_core::attention::LifecycleHealth::Ready,
+            ..
+        }
+    ));
+    client
+        .request(&ClientRequest::ReportAttentionFocus {
+            session_id: Some(session_id),
+        })
+        .await
+        .unwrap();
+    input(client, session_id, "permission").await;
+    let requested = wait_for_attention(
+        client,
+        session_id,
+        sylvops_core::session_state::AttentionReason::InputRequested,
+    )
+    .await;
+    assert!(matches!(
+        client
+            .request(&ClientRequest::ClaimAttentionNotification)
+            .await
+            .unwrap(),
+        DaemonResponse::AttentionNotificationClaim(None)
+    ));
+    client
+        .request(&ClientRequest::ReportAttentionFocus { session_id: None })
+        .await
+        .unwrap();
+    input(client, session_id, "complete-live").await;
+    let completed = wait_for_attention(
+        client,
+        session_id,
+        sylvops_core::session_state::AttentionReason::SuccessfulCompletion,
+    )
+    .await;
+    assert_ne!(requested.id, completed.id);
+    assert!(matches!(
+        client.request(&ClientRequest::ClaimAttentionNotification).await.unwrap(),
+        DaemonResponse::AttentionNotificationClaim(Some(claim))
+            if claim.session_id == session_id && claim.attention_id == completed.id
+    ));
+    assert!(matches!(
+        client
+            .request(&ClientRequest::ClaimAttentionNotification)
+            .await
+            .unwrap(),
+        DaemonResponse::AttentionNotificationClaim(None)
+    ));
 }
 
 async fn input(client: &DaemonClient, session_id: SessionId, line: &str) {
