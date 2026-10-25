@@ -364,7 +364,7 @@ async fn exercise_persistent_session() {
                 && session_id == session.id
             {
                 assert_eq!((columns, rows), (44, 12));
-                assert!(!terminal_snapshot.is_empty());
+                assert_ne!(terminal_snapshot, Vec::<u8>::new());
                 break;
             }
         }
