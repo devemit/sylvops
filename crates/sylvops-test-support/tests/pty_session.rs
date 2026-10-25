@@ -24,6 +24,67 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TAGGED_ECHO_BUFFER_BYTES: usize = 4 * 1024;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resize_reflows_retained_output_and_orders_snapshots_before_new_output() {
+    tokio::time::timeout(TEST_TIMEOUT, exercise_terminal_reflow())
+        .await
+        .unwrap();
+}
+
+async fn exercise_terminal_reflow() {
+    use sylvops_daemon::session::TerminalEvent;
+    let mut session = SessionHandle::spawn(&spec(["reflow"], 64 * 1024)).unwrap();
+    wait_for_output(&session, "FAKE_AGENT_READY").await;
+    let controller = uuid::Uuid::now_v7();
+    let observer = uuid::Uuid::now_v7();
+    let mut first = session.attach(controller, 0, 44, 12).await.unwrap();
+    let mut second = session.attach(observer, 0, 150, 50).await.unwrap();
+    assert_eq!((first.columns, first.rows), (44, 12));
+    assert_eq!((second.columns, second.rows), (44, 12));
+    assert_eq!(second.scrollback_capacity_bytes, 64 * 1024);
+    assert!(session.resize_from(observer, 32, 12).await.is_err());
+    assert!(session.resize_from(controller, 0, 12).await.is_err());
+    let (_, columns, rows, _) = session.terminal_snapshot().await.unwrap();
+    assert_eq!((columns, rows), (44, 12));
+    session.resize_from(controller, 32, 12).await.unwrap();
+    for events in [&mut first.live_output, &mut second.live_output] {
+        loop {
+            if let TerminalEvent::Resized {
+                columns,
+                rows,
+                snapshot,
+                ..
+            } = events.recv().await.unwrap()
+            {
+                assert_eq!((columns, rows), (32, 12));
+                let mut parser = vt100::Parser::new(rows, columns, 0);
+                parser.process(&snapshot);
+                assert!(parser.screen().contents().contains("MARKER"));
+                break;
+            }
+        }
+    }
+    session
+        .input_from(controller, input_line("after-resize"))
+        .await
+        .unwrap();
+    loop {
+        if let TerminalEvent::Output(chunk) = first.live_output.recv().await.unwrap()
+            && String::from_utf8_lossy(&chunk.bytes).contains("after-resize")
+        {
+            break;
+        }
+    }
+    session
+        .input_from(controller, input_line("exit"))
+        .await
+        .unwrap();
+    session.wait().await.unwrap();
+    session.detach(controller).await.unwrap();
+    let completed = session.attach(controller, 0, 100, 40).await.unwrap();
+    assert_eq!((completed.columns, completed.rows), (32, 12));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_spawns_under_process_tree_control() {
     let mut session = match SessionHandle::spawn(&spec(["interactive"], 64 * 1024)) {
         Ok(session) => session,

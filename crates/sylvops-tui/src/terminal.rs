@@ -26,23 +26,41 @@ pub(crate) struct AttachedTerminal {
     pub role: AttachmentRole,
     pub parser: vt100::Parser,
     pub last_sequence: u64,
+    pub terminal_revision: u64,
     pub columns: u16,
     pub rows: u16,
+    pub scrollback_capacity_bytes: usize,
+}
+
+impl AttachedTerminal {
+    pub fn apply_snapshot(
+        &mut self,
+        revision: u64,
+        sequence: u64,
+        rows: u16,
+        columns: u16,
+        snapshot: &[u8],
+    ) {
+        if revision < self.terminal_revision || sequence < self.last_sequence {
+            return;
+        }
+        self.parser.screen_mut().set_scrollback(0);
+        self.resize(rows, columns);
+        self.parser
+            .process_snapshot(snapshot, sequence == self.last_sequence);
+        self.last_sequence = sequence;
+        self.terminal_revision = revision;
+        self.rows = rows;
+        self.columns = columns;
+    }
 }
 
 impl AttachedTerminal {
     pub fn resize(&mut self, rows: u16, columns: u16) {
         self.clear_selection();
-        self.parser.screen_mut().set_size(rows, columns);
-        self.columns = columns;
-        self.rows = rows;
-    }
-
-    pub fn apply_snapshot(&mut self, rows: u16, columns: u16, sequence: u64, snapshot: &[u8]) {
-        self.clear_selection();
-        self.parser = vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS);
-        self.parser.process(snapshot);
-        self.last_sequence = sequence;
+        self.parser
+            .screen_mut()
+            .set_size_reflow(rows, columns, self.scrollback_capacity_bytes);
         self.columns = columns;
         self.rows = rows;
     }
@@ -300,6 +318,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selection_copies_the_complete_sentence_after_reflow() {
+        let mut terminal = attached_terminal(AttachmentRole::Controller, 8, 80);
+        let expected = "Sentence begins here and continues to the very end MARKER";
+        terminal.parser.process(expected.as_bytes());
+        terminal.resize(8, 20);
+        let last = u16::try_from(expected.len() - 1).unwrap();
+        terminal.begin_selection(0, 0, 8, 20).unwrap();
+        terminal.update_selection(last / 20, last % 20);
+        terminal.finish_selection();
+        assert_eq!(terminal.selected_text().as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn stale_snapshot_keeps_selection_and_current_resize_clears_it() {
+        let mut terminal = attached_terminal(AttachmentRole::Observer, 8, 20);
+        terminal.parser.process(b"before");
+        terminal.last_sequence = 10;
+        terminal.terminal_revision = 2;
+        terminal.begin_selection(0, 0, 8, 20).unwrap();
+        terminal.update_selection(0, 5);
+        terminal.finish_selection();
+        terminal.apply_snapshot(1, 10, 8, 12, b"stale");
+        assert_eq!(terminal.selected_text().as_deref(), Some("before"));
+        let mut replacement = vt100::Parser::new(8, 12, 0);
+        replacement.process(b"new");
+        terminal.apply_snapshot(3, 10, 8, 12, &replacement.screen().state_formatted());
+        assert!(terminal.selection.is_none());
+        assert_eq!(terminal.columns, 12);
+        assert_eq!(terminal.parser.screen().contents(), "new");
+    }
+
+    #[test]
     fn copy_shortcut_is_not_encoded_as_provider_interrupt() {
         assert_eq!(
             encode_key(KeyEvent::new(
@@ -350,6 +400,8 @@ mod tests {
             role,
             parser: vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS),
             last_sequence: 0,
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             columns,
             rows,
         }
@@ -438,7 +490,7 @@ mod tests {
         assert!(terminal.selection.is_none());
         terminal.begin_selection(0, 0, 4, 16).unwrap();
         terminal.update_selection(1, 2);
-        terminal.apply_snapshot(3, 10, 42, b"replacement");
+        terminal.apply_snapshot(1, 42, 3, 10, b"replacement");
         assert!(terminal.selection.is_none());
         assert_eq!(terminal.last_sequence, 42);
         assert_eq!((terminal.rows, terminal.columns), (3, 10));

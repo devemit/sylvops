@@ -1713,6 +1713,10 @@ async fn attach_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_
     let DaemonResponse::Attached {
         session,
         role,
+        columns,
+        rows,
+        scrollback_capacity_bytes,
+        mut terminal_revision,
         replay_through_sequence,
         terminal_snapshot,
         ..
@@ -1723,6 +1727,9 @@ async fn attach_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_
 
     let _terminal = TerminalGuard::enter()?;
     let mut parser = vt100::Parser::new(rows, columns, 0);
+    parser
+        .screen_mut()
+        .set_size_reflow(rows, columns, scrollback_capacity_bytes);
     let restored_snapshot = terminal_snapshot.is_some();
     if let Some(snapshot) = terminal_snapshot {
         parser.process(&snapshot);
@@ -1794,7 +1801,6 @@ async fn attach_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_
                     }
                     Event::Resize(columns, rows) if role == sylvops_core::domain::AttachmentRole::Controller => {
                         let (columns, rows) = bounded_dimensions(columns, rows);
-                        parser.screen_mut().set_size(rows, columns);
                         ensure_ack(client.request(&ClientRequest::ResizeSession {
                             session_id, columns, rows,
                         }).await?, "terminal resize")?;
@@ -1811,11 +1817,12 @@ async fn attach_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_
                     if initially_finished && last_sequence >= replay_through_sequence { break; }
                 }
                 Ok(DaemonEvent::ResynchronizationRequired {
-                    session_id: id, snapshot_sequence, columns, rows, terminal_snapshot,
-                }) if id == session_id => {
-                    parser = vt100::Parser::new(rows, columns, 0);
-                    parser.process(&terminal_snapshot);
+                    session_id: id, snapshot_sequence, terminal_revision: revision, columns, rows, terminal_snapshot,
+                }) if id == session_id && snapshot_sequence >= last_sequence && revision >= terminal_revision => {
+                    parser.screen_mut().set_size_reflow(rows, columns, scrollback_capacity_bytes);
+                    parser.process_snapshot(&terminal_snapshot, snapshot_sequence == last_sequence);
                     last_sequence = snapshot_sequence;
+                    terminal_revision = revision;
                     render_terminal(&parser)?;
                     if initially_finished && last_sequence >= replay_through_sequence { break; }
                 }
@@ -1828,6 +1835,9 @@ async fn attach_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_
                     let (columns, rows) = bounded_terminal_size();
                     if let DaemonResponse::Attached {
                         replay_through_sequence,
+                        terminal_revision: revision,
+                        columns,
+                        rows,
                         terminal_snapshot: Some(snapshot),
                         ..
                     } = client.request(&ClientRequest::AttachSession {
@@ -1838,9 +1848,10 @@ async fn attach_session(paths: &RuntimePaths, session_id: SessionId) -> sylvops_
                         columns,
                         rows,
                     }).await? {
-                        parser = vt100::Parser::new(rows, columns, 0);
-                        parser.process(&snapshot);
+                        parser.screen_mut().set_size_reflow(rows, columns, scrollback_capacity_bytes);
+                        parser.process_snapshot(&snapshot, false);
                         last_sequence = replay_through_sequence;
+                        terminal_revision = revision;
                         render_terminal(&parser)?;
                     }
                 }

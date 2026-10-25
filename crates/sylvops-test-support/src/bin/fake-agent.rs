@@ -26,6 +26,11 @@ fn run() -> io::Result<u8> {
 
     match scenario.as_str() {
         "interactive" => interactive(),
+        "reflow" => {
+            print!("\x1b[2J\x1b[HSentence begins here and continues to the very end MARKER\r\n");
+            io::stdout().flush()?;
+            interactive()
+        }
         "burst" => {
             let count = arguments
                 .next()

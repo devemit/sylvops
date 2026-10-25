@@ -258,6 +258,8 @@ mod tests {
         let mut parser = vt100::Parser::new(6, 40, 100);
         parser.process(b"hello\r\nworld");
         app.attached = Some(AttachedTerminal {
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             selection: None,
             session_id: SessionId::new(),
             role,
