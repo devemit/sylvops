@@ -23,8 +23,35 @@ pub(crate) struct AttachedTerminal {
     pub role: AttachmentRole,
     pub parser: vt100::Parser,
     pub last_sequence: u64,
+    pub terminal_revision: u64,
     pub columns: u16,
     pub rows: u16,
+    pub scrollback_capacity_bytes: usize,
+}
+
+impl AttachedTerminal {
+    pub fn apply_snapshot(
+        &mut self,
+        revision: u64,
+        sequence: u64,
+        rows: u16,
+        columns: u16,
+        snapshot: &[u8],
+    ) {
+        if revision < self.terminal_revision || sequence < self.last_sequence {
+            return;
+        }
+        self.parser.screen_mut().set_scrollback(0);
+        self.parser
+            .screen_mut()
+            .set_size_reflow(rows, columns, self.scrollback_capacity_bytes);
+        self.parser
+            .process_snapshot(snapshot, sequence == self.last_sequence);
+        self.last_sequence = sequence;
+        self.terminal_revision = revision;
+        self.rows = rows;
+        self.columns = columns;
+    }
 }
 
 impl AttachedTerminal {
@@ -261,6 +288,8 @@ mod tests {
             role,
             parser: vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS),
             last_sequence: 0,
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             columns,
             rows,
         }
