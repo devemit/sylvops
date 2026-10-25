@@ -90,6 +90,10 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         .map_err(|error| DaemonError::Lifecycle(format!("cannot initialize TUI: {error}")))?;
 
     loop {
+        let size = terminal
+            .size()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        app.viewport = Rect::new(0, 0, size.width, size.height);
         app.expire_flash();
         let mut refresh = false;
         for _ in 0..512 {
@@ -111,6 +115,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 Ok(DaemonEvent::ResynchronizationRequired {
                     session_id,
                     snapshot_sequence,
+                    terminal_revision,
                     columns,
                     rows,
                     terminal_snapshot,
@@ -118,11 +123,13 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                     if let Some(attached) = app.attached.as_mut()
                         && attached.session_id == session_id
                     {
-                        attached.parser = vt100::Parser::new(rows, columns, 0);
-                        attached.parser.process(&terminal_snapshot);
-                        attached.last_sequence = snapshot_sequence;
-                        attached.columns = columns;
-                        attached.rows = rows;
+                        attached.apply_snapshot(
+                            terminal_revision,
+                            snapshot_sequence,
+                            rows,
+                            columns,
+                            &terminal_snapshot,
+                        );
                     }
                 }
                 Ok(DaemonEvent::UpgradeProgress {
@@ -145,17 +152,11 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             app.restore_selection();
         }
         save_debounced(&client, &mut app).await?;
-        if matches!(app.mode, Mode::TerminalAttached) {
-            let size = terminal
-                .size()
-                .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-            let focus = app.focus;
-            resize_attached(
-                &client,
-                &mut app,
-                terminal_content_area(Rect::new(0, 0, size.width, size.height), focus),
-            )
-            .await?;
+        if matches!(app.mode, Mode::TerminalAttached)
+            && let Some(area) =
+                render::terminal_content_area(app.viewport, app.focus, app.attention_count() > 0)
+        {
+            resize_attached(&client, &mut app, area).await?;
         }
         terminal
             .draw(|frame| render::draw(frame, &mut app))
@@ -909,7 +910,10 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
         app.flash = Some(Flash::error("Select a session first."));
         return Ok(());
     };
-    let (columns, rows) = (80, 24);
+    app.focus = app::FocusZone::Main;
+    let area = render::terminal_content_area(app.viewport, app.focus, app.attention_count() > 0)
+        .ok_or_else(|| DaemonError::Lifecycle("Terminal pane is not visible".into()))?;
+    let (columns, rows) = terminal_dimensions(area);
     match client
         .request(&ClientRequest::AttachSession {
             session_id,
@@ -921,22 +925,31 @@ async fn attach_selected(client: &DaemonClient, app: &mut App) -> Result<(), Dae
     {
         DaemonResponse::Attached {
             role,
+            terminal_revision,
+            columns,
+            rows,
+            scrollback_capacity_bytes,
             replay_through_sequence,
             terminal_snapshot,
             ..
         } => {
             let restored = terminal_snapshot.is_some();
             let mut parser = vt100::Parser::new(rows, columns, 0);
+            parser
+                .screen_mut()
+                .set_size_reflow(rows, columns, scrollback_capacity_bytes);
             if let Some(snapshot) = terminal_snapshot {
                 parser.process(&snapshot);
             }
             app.attached = Some(AttachedTerminal {
                 session_id,
                 role,
+                terminal_revision,
                 parser,
                 last_sequence: if restored { replay_through_sequence } else { 0 },
                 columns,
                 rows,
+                scrollback_capacity_bytes,
             });
             app.main_tab = MainTab::Terminal;
             app.mode = Mode::TerminalAttached;
@@ -1033,7 +1046,42 @@ async fn handle_terminal(
     match input {
         Event::Key(key) if is_detach_key(key) => detach(client, app, session_id).await,
         Event::Mouse(_) if clicked_detach => detach(client, app, session_id).await,
+        Event::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) =>
+        {
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                3
+            } else {
+                -3
+            };
+            if let Some(attached) = app.attached.as_mut() {
+                attached.scroll(delta);
+            }
+            Ok(())
+        }
+        Event::Key(key)
+            if key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) =>
+        {
+            if let Some(attached) = app.attached.as_mut() {
+                let page = i32::from(attached.rows.saturating_sub(1).max(1));
+                attached.scroll(if key.code == KeyCode::PageUp {
+                    page
+                } else {
+                    -page
+                });
+            }
+            Ok(())
+        }
         Event::Key(key) if role == AttachmentRole::Controller => {
+            if let Some(attached) = app.attached.as_mut() {
+                attached.parser.screen_mut().set_scrollback(0);
+            }
             if let Some(bytes) = encode_key(key) {
                 let response = client
                     .request(&ClientRequest::SessionInput { session_id, bytes })
@@ -1045,6 +1093,9 @@ async fn handle_terminal(
             Ok(())
         }
         Event::Paste(text) if role == AttachmentRole::Controller => {
+            if let Some(attached) = app.attached.as_mut() {
+                attached.parser.screen_mut().set_scrollback(0);
+            }
             for bytes in text.as_bytes().chunks(MAX_PTY_CHUNK_SIZE) {
                 let response = client
                     .request(&ClientRequest::SessionInput {
@@ -1085,23 +1136,13 @@ async fn resize_attached(
     app: &mut App,
     area: Rect,
 ) -> Result<(), DaemonError> {
-    let columns = area
-        .width
-        .saturating_sub(2)
-        .clamp(MIN_TERMINAL_COLUMNS, MAX_TERMINAL_COLUMNS);
-    let rows = area
-        .height
-        .saturating_sub(2)
-        .clamp(MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS);
+    let (columns, rows) = terminal_dimensions(area);
     let Some(attached) = app.attached.as_mut() else {
         return Ok(());
     };
     if attached.columns == columns && attached.rows == rows {
         return Ok(());
     }
-    attached.parser.screen_mut().set_size(rows, columns);
-    attached.columns = columns;
-    attached.rows = rows;
     if attached.role == AttachmentRole::Controller {
         let response = client
             .request(&ClientRequest::ResizeSession {
@@ -1112,9 +1153,17 @@ async fn resize_attached(
             .await?;
         if !matches!(response, DaemonResponse::Acknowledged) {
             app.flash = Some(Flash::error(response_message("terminal resize", response)));
+            return Ok(());
         }
+        // Apply the size with its ordered snapshot, after all preceding output.
     }
     Ok(())
+}
+fn terminal_dimensions(area: Rect) -> (u16, u16) {
+    (
+        area.width.clamp(MIN_TERMINAL_COLUMNS, MAX_TERMINAL_COLUMNS),
+        area.height.clamp(MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS),
+    )
 }
 
 async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
@@ -1123,6 +1172,9 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
     };
     if let DaemonResponse::Attached {
         replay_through_sequence,
+        terminal_revision,
+        columns,
+        rows,
         terminal_snapshot: Some(snapshot),
         ..
     } = client
@@ -1134,27 +1186,15 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
         })
         .await?
     {
-        attached.parser = vt100::Parser::new(attached.rows, attached.columns, 0);
-        attached.parser.process(&snapshot);
-        attached.last_sequence = replay_through_sequence;
+        attached.apply_snapshot(
+            terminal_revision,
+            replay_through_sequence,
+            rows,
+            columns,
+            &snapshot,
+        );
     }
     Ok(())
-}
-
-fn terminal_content_area(area: Rect, focus: app::FocusZone) -> Rect {
-    let body = Rect::new(
-        area.x,
-        area.y.saturating_add(2),
-        area.width,
-        area.height.saturating_sub(4),
-    );
-    let main = render::view_areas(body, focus).main.unwrap_or(body);
-    Rect::new(
-        main.x,
-        main.y.saturating_add(3),
-        main.width,
-        main.height.saturating_sub(4),
-    )
 }
 
 async fn snapshot(client: &DaemonClient) -> Result<DaemonSnapshot, DaemonError> {
@@ -1416,6 +1456,62 @@ mod tests {
         );
         assert_eq!(app.selected_session_id, Some(expected));
         assert_eq!(app.main_tab, MainTab::Details);
+    }
+
+    #[test]
+    fn terminal_dimensions_match_rendered_cells_in_all_layouts() {
+        for (width, height) in [
+            (120, 32),
+            (96, 24),
+            (84, 24),
+            (72, 20),
+            (60, 20),
+            (40, 8),
+            (1, 1),
+        ] {
+            for attention in [false, true] {
+                let mut app = App::new(populated_snapshot(), Vec::new(), None);
+                app.focus = app::FocusZone::Main;
+                for session in &mut app.snapshot.sessions {
+                    session.state = if attention {
+                        SessionState::NeedsFeedback
+                    } else {
+                        SessionState::Running
+                    };
+                }
+                let area = render::terminal_content_area(
+                    Rect::new(0, 0, width, height),
+                    app.focus,
+                    app.attention_count() > 0,
+                )
+                .unwrap();
+                let (columns, rows) = terminal_dimensions(area);
+                let mut parser = vt100::Parser::new(rows, columns, 0);
+                parser.process(format!("\x1b[{rows};{columns}HZ").as_bytes());
+                app.attached = Some(AttachedTerminal {
+                    session_id: app.snapshot.sessions[0].id,
+                    role: AttachmentRole::Controller,
+                    parser,
+                    last_sequence: 0,
+                    terminal_revision: 0,
+                    columns,
+                    rows,
+                    scrollback_capacity_bytes: 64 * 1024,
+                });
+                let backend = ratatui::backend::TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| render::draw(frame, &mut app))
+                    .unwrap();
+                if area.width > 0 && area.height > 0 {
+                    assert_eq!(
+                        terminal.backend().buffer()[(area.right() - 1, area.bottom() - 1)].symbol(),
+                        "Z",
+                        "{width}x{height}, attention={attention}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

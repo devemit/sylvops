@@ -33,6 +33,7 @@ tempfile = "3"
 tokio.workspace = true
 
 [dev-dependencies]
+vt100.workspace = true
 async-trait.workspace = true
 rusqlite.workspace = true
 sylvops-daemon = { path = "../sylvops-daemon" }

@@ -170,6 +170,7 @@ pub(crate) struct App {
     pub attached: Option<AttachedTerminal>,
     pub resume_pending: Option<SessionId>,
     pub hit_map: HitMap,
+    pub viewport: Rect,
     pub navigation_dirty_at: Option<Instant>,
 }
 
@@ -207,6 +208,7 @@ impl App {
             attached: None,
             resume_pending: None,
             hit_map: HitMap::default(),
+            viewport: Rect::default(),
             navigation_dirty_at: None,
         };
         app.restore_selection();

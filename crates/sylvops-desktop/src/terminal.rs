@@ -41,7 +41,9 @@ pub(crate) struct DisplayRun {
 pub(crate) struct TerminalState {
     pub role: AttachmentRole,
     pub parser: vt100::Parser,
+    pub scrollback_capacity_bytes: usize,
     pub last_sequence: u64,
+    pub terminal_revision: u64,
     pub attached: bool,
     pub columns: u16,
     pub rows: u16,
@@ -61,7 +63,9 @@ impl TerminalState {
         Self {
             role,
             parser: vt100::Parser::new(rows, columns, scrollback_rows),
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             last_sequence: 0,
+            terminal_revision: 0,
             attached: true,
             columns,
             rows,
@@ -78,7 +82,9 @@ impl TerminalState {
     }
 
     pub(crate) fn resize(&mut self, rows: u16, columns: u16) {
-        self.parser.screen_mut().set_size(rows, columns);
+        self.parser
+            .screen_mut()
+            .set_size_reflow(rows, columns, self.scrollback_capacity_bytes);
         self.rows = rows;
         self.columns = columns;
         self.refresh_scrollback_extent();
@@ -587,6 +593,16 @@ mod tests {
             run.text == "error" && run.style.bold && run.style.foreground == vt100::Color::Idx(1)
         }));
         assert!(runs.iter().any(|run| run.text.contains("plain")));
+    }
+
+    #[test]
+    fn shrinking_the_desktop_grid_keeps_the_sentence_end() {
+        let mut terminal = TerminalState::new(AttachmentRole::Controller, 8, 80, 100);
+        terminal.process(b"Sentence begins here and continues to the very end MARKER");
+        terminal.resize(8, 44);
+        assert!(terminal.parser.screen().contents().contains("MARKER"));
+        terminal.resize(8, 80);
+        assert!(terminal.parser.screen().contents().ends_with("MARKER"));
     }
 
     #[test]

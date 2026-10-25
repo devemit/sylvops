@@ -26,16 +26,8 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.hit_map = HitMap::default();
     let theme = Theme::default();
     let area = frame.area();
-    let attention_height = u16::from(app.attention_count() > 0);
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(attention_height),
-            Constraint::Min(3),
-            Constraint::Length(2),
-        ])
-        .split(area);
+    let vertical = shell_areas(area, app.attention_count() > 0);
+    let attention_height = vertical[1].height;
     draw_header(frame, app, vertical[0], theme);
     if attention_height > 0 {
         draw_attention(frame, app, vertical[1], theme);
@@ -59,6 +51,31 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Mode::CommandPalette(palette) => draw_palette(frame, app, &palette, theme),
         Mode::Navigation | Mode::TerminalAttached => {}
     }
+}
+
+pub(crate) fn shell_areas(area: Rect, attention: bool) -> [Rect; 4] {
+    let areas = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(u16::from(attention)),
+        Constraint::Min(3),
+        Constraint::Length(2),
+    ])
+    .split(area);
+    [areas[0], areas[1], areas[2], areas[3]]
+}
+fn main_areas(area: Rect) -> [Rect; 2] {
+    let areas = Layout::vertical([Constraint::Length(3), Constraint::Min(2)]).split(area);
+    [areas[0], areas[1]]
+}
+fn terminal_areas(area: Rect) -> [Rect; 2] {
+    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    [areas[0], areas[1]]
+}
+pub(crate) fn terminal_content_area(area: Rect, focus: FocusZone, attention: bool) -> Option<Rect> {
+    let body = shell_areas(area, attention)[2];
+    let main = view_areas(body, focus).main?;
+    let pane = terminal_areas(main_areas(main)[1])[0];
+    Some(Block::default().borders(Borders::ALL).inner(pane))
 }
 
 pub(crate) fn view_areas(area: Rect, focus: FocusZone) -> ViewAreas {
@@ -255,10 +272,7 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
 
 fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     app.hit_map.push(area, HitTarget::FocusMain);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(2)])
-        .split(area);
+    let chunks = main_areas(area);
     let titles: Vec<_> = ["1 Terminal", "2 Changes", "3 Details"]
         .into_iter()
         .map(Line::from)
@@ -317,7 +331,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         };
         (
             format!(" Terminal · attached as {role} "),
-            attached.parser.screen().contents(),
+            String::new(),
             Some(("[ Detach · Ctrl+] ]", HitTarget::Detach)),
         )
     } else if let Some(session) = app.selected_session() {
@@ -347,16 +361,20 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             Some(("[ New session · n ]", HitTarget::New)),
         )
     };
-    let inner = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-    frame.render_widget(
-        Paragraph::new(content)
-            .block(Block::default().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
-        inner[0],
-    );
+    let inner = terminal_areas(area);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let content_area = block.inner(inner[0]);
+    if let Some(attached) = app.attached.as_ref() {
+        frame.render_widget(block, inner[0]);
+        crate::terminal::draw_screen(frame, attached.parser.screen(), content_area);
+    } else {
+        frame.render_widget(
+            Paragraph::new(content)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            inner[0],
+        );
+    }
     if let Some((label, target)) = action {
         frame.render_widget(
             Paragraph::new(label)
@@ -523,7 +541,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy\n← →: collapse / expand\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\n/: commands and entity search\nShift+A: next attention item\nCtrl+] while attached: detach\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
+    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Explorer ↔ Main\n↑ ↓ or j k: navigate hierarchy\n← →: collapse / expand\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nr: rename metadata\nd: stop session or remove clean worktree\ng: bounded read-only Git diff\n/: commands and entity search\nShift+A: next attention item\nCtrl+] while attached: detach\nMouse wheel / Ctrl+Shift+PgUp/PgDn: terminal history\nq: close UI; sessions continue\nMouse: select rows, tabs, actions, controls, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL)).wrap(Wrap { trim: false }), popup);
 }
 

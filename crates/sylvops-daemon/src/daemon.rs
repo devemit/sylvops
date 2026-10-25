@@ -51,7 +51,7 @@ use crate::{
     ipc::{BoxStream, LocalListener},
     provider::ProviderRegistry,
     runtime::{AuthenticationToken, RuntimePaths},
-    session::{Attachment, SessionHandle, SessionSpec},
+    session::{Attachment, SessionHandle, SessionSpec, TerminalEvent},
     upgrade::{
         HttpReleaseSource, UpgradeCoordinator, current_release_target, embedded_verifying_key,
         manifest_url,
@@ -2096,6 +2096,10 @@ async fn send_attachment(
         &DaemonResponse::Attached {
             session,
             role: attachment.role,
+            terminal_revision: attachment.terminal_revision,
+            columns: attachment.columns,
+            rows: attachment.rows,
+            scrollback_capacity_bytes: attachment.scrollback_capacity_bytes,
             earliest_sequence: attachment.replay.earliest_sequence,
             replay_through_sequence: attachment.replay.latest_sequence,
             output_gap: attachment.replay.output_gap,
@@ -2122,12 +2126,28 @@ async fn send_attachment(
         let mut resync_pending = false;
         loop {
             match live.recv().await {
-                Ok(chunk) => {
-                    let event = DaemonEvent::SessionOutput {
-                        session_id,
-                        sequence: chunk.sequence,
-                        bytes: chunk.bytes.to_vec(),
-                        replay: false,
+                Ok(update) => {
+                    let event = match update {
+                        TerminalEvent::Output(chunk) => DaemonEvent::SessionOutput {
+                            session_id,
+                            sequence: chunk.sequence,
+                            bytes: chunk.bytes.to_vec(),
+                            replay: false,
+                        },
+                        TerminalEvent::Resized {
+                            revision,
+                            sequence,
+                            columns,
+                            rows,
+                            snapshot,
+                        } => DaemonEvent::ResynchronizationRequired {
+                            session_id,
+                            snapshot_sequence: sequence,
+                            terminal_revision: revision,
+                            columns,
+                            rows,
+                            terminal_snapshot: snapshot.to_vec(),
+                        },
                     };
                     let Ok(frame) = Frame::message(MessageClass::Event, EVENT_OPCODE, &event)
                     else {
@@ -2168,15 +2188,16 @@ async fn send_resync(
     session_id: SessionId,
     handle: &SessionHandle,
 ) -> Result<()> {
-    let (snapshot_sequence, columns, rows, terminal_snapshot) = handle.terminal_snapshot().await?;
+    let checkpoint = handle.terminal_checkpoint().await?;
     send_event(
         outgoing,
         &DaemonEvent::ResynchronizationRequired {
             session_id,
-            snapshot_sequence,
-            columns,
-            rows,
-            terminal_snapshot,
+            snapshot_sequence: checkpoint.sequence,
+            terminal_revision: checkpoint.revision,
+            columns: checkpoint.columns,
+            rows: checkpoint.rows,
+            terminal_snapshot: checkpoint.snapshot,
         },
     )
     .await

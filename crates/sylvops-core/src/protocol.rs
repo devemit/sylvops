@@ -17,7 +17,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 10;
+pub const PROTOCOL_MINOR: u16 = 11;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -523,6 +523,10 @@ pub enum DaemonResponse {
     Attached {
         session: Session,
         role: AttachmentRole,
+        terminal_revision: u64,
+        columns: u16,
+        rows: u16,
+        scrollback_capacity_bytes: usize,
         earliest_sequence: Option<u64>,
         replay_through_sequence: u64,
         output_gap: bool,
@@ -608,6 +612,7 @@ pub enum DaemonEvent {
     ResynchronizationRequired {
         session_id: SessionId,
         snapshot_sequence: u64,
+        terminal_revision: u64,
         columns: u16,
         rows: u16,
         terminal_snapshot: Vec<u8>,
@@ -707,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_10_ui_state_and_upgrade_confirmation_round_trip() {
+    fn protocol_1_11_ui_state_and_upgrade_confirmation_round_trip() {
         let request = ClientRequest::SaveTuiState {
             state: TuiState {
                 selected_project_id: Some(crate::ids::ProjectId::new()),
@@ -719,7 +724,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 10);
+        assert_eq!(PROTOCOL_MINOR, 11);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),

@@ -125,6 +125,27 @@ pub struct OutputChunk {
     pub bytes: Arc<[u8]>,
 }
 
+#[derive(Clone, Debug)]
+pub enum TerminalEvent {
+    Output(OutputChunk),
+    Resized {
+        revision: u64,
+        sequence: u64,
+        columns: u16,
+        rows: u16,
+        snapshot: Arc<[u8]>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct TerminalCheckpoint {
+    pub revision: u64,
+    pub sequence: u64,
+    pub columns: u16,
+    pub rows: u16,
+    pub snapshot: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Replay {
     pub earliest_sequence: Option<u64>,
@@ -145,8 +166,12 @@ pub struct SessionExit {
 pub struct Attachment {
     pub role: sylvops_core::domain::AttachmentRole,
     pub replay: Replay,
-    pub live_output: broadcast::Receiver<OutputChunk>,
+    pub live_output: broadcast::Receiver<TerminalEvent>,
+    pub columns: u16,
+    pub rows: u16,
+    pub scrollback_capacity_bytes: usize,
     pub completion_published: bool,
+    pub(crate) terminal_revision: u64,
 }
 
 #[derive(Debug)]
@@ -270,6 +295,7 @@ impl SessionHandle {
         let (commands, command_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
         let (actor_events, actor_event_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
         let (live_output, _) = broadcast::channel(LIVE_OUTPUT_CAPACITY);
+        let (terminal_events, _) = broadcast::channel(LIVE_OUTPUT_CAPACITY);
         let (exit_tx, exit) = watch::channel(None);
 
         spawn_reader(spawned.reader, actor_events.clone());
@@ -280,7 +306,16 @@ impl SessionHandle {
                 writer: Some(writer),
                 process_tree: spawned.process_tree,
                 scrollback: Scrollback::new(spec.scrollback_bytes),
-                terminal: vt100::Parser::new(spec.rows, spec.columns, 0),
+                terminal: {
+                    let mut parser = vt100::Parser::new(spec.rows, spec.columns, 0);
+                    parser.screen_mut().set_size_reflow(
+                        spec.rows,
+                        spec.columns,
+                        spec.scrollback_bytes,
+                    );
+                    parser
+                },
+                terminal_revision: 0,
                 columns: spec.columns,
                 rows: spec.rows,
                 controller: None,
@@ -291,6 +326,7 @@ impl SessionHandle {
                 events: actor_event_rx,
                 events_tx: actor_events,
                 live_output: live_output.clone(),
+                terminal_events,
                 exit: exit_tx,
             }
             .run(),
@@ -418,6 +454,16 @@ impl SessionHandle {
     ///
     /// Returns an error if the session actor has stopped.
     pub async fn terminal_snapshot(&self) -> Result<(u64, u16, u16, Vec<u8>)> {
+        let checkpoint = self.terminal_checkpoint().await?;
+        Ok((
+            checkpoint.sequence,
+            checkpoint.columns,
+            checkpoint.rows,
+            checkpoint.snapshot,
+        ))
+    }
+
+    pub(crate) async fn terminal_checkpoint(&self) -> Result<TerminalCheckpoint> {
         let (reply, receive) = oneshot::channel();
         self.commands
             .send(Command::Snapshot { reply })
@@ -535,7 +581,7 @@ enum Command {
         reply: oneshot::Sender<Replay>,
     },
     Snapshot {
-        reply: oneshot::Sender<(u64, u16, u16, Vec<u8>)>,
+        reply: oneshot::Sender<TerminalCheckpoint>,
     },
     Stop {
         reply: oneshot::Sender<Result<()>>,
@@ -566,6 +612,7 @@ struct Actor {
     process_tree: process_tree::ProcessTree,
     scrollback: Scrollback,
     terminal: vt100::Parser,
+    terminal_revision: u64,
     columns: u16,
     rows: u16,
     controller: Option<Uuid>,
@@ -576,6 +623,7 @@ struct Actor {
     events: mpsc::Receiver<ActorEvent>,
     events_tx: mpsc::Sender<ActorEvent>,
     live_output: broadcast::Sender<OutputChunk>,
+    terminal_events: broadcast::Sender<TerminalEvent>,
     exit: watch::Sender<Option<SessionExit>>,
 }
 
@@ -622,8 +670,12 @@ impl Actor {
                                 Ok(Attachment {
                                     role,
                                     replay,
-                                    live_output: self.live_output.subscribe(),
+                                    live_output: self.terminal_events.subscribe(),
+                                    columns: self.columns,
+                                    rows: self.rows,
+                                    scrollback_capacity_bytes: self.scrollback.capacity_bytes,
                                     completion_published: exit_published,
+                                    terminal_revision: self.terminal_revision,
                                 })
                             }
                             Err(error) => {
@@ -671,12 +723,12 @@ impl Actor {
                         let _ = reply.send(self.scrollback.replay_after(from_sequence));
                     }
                     Command::Snapshot { reply } => {
-                        let _ = reply.send((
-                            self.scrollback.latest_sequence,
-                            self.columns,
-                            self.rows,
-                            terminal_snapshot(&self.terminal),
-                        ));
+                        let _ = reply.send(TerminalCheckpoint {
+                            revision: self.terminal_revision,
+                            sequence: self.scrollback.latest_sequence,
+                            columns: self.columns, rows: self.rows,
+                            snapshot: terminal_snapshot(&self.terminal),
+                        });
                     }
                     Command::Stop { reply } => {
                         if exit_published {
@@ -706,6 +758,7 @@ impl Actor {
                     ActorEvent::Output(bytes) => {
                         self.terminal.process(&bytes);
                         let chunk = self.scrollback.push(Arc::<[u8]>::from(bytes));
+                        let _ = self.terminal_events.send(TerminalEvent::Output(chunk.clone()));
                         let _ = self.live_output.send(chunk);
                     }
                     ActorEvent::ReaderClosed => {
@@ -780,10 +833,23 @@ impl Actor {
 
     fn resize_terminal(&mut self, columns: u16, rows: u16) -> Result<()> {
         validate_dimensions(columns, rows)?;
+        if (columns, rows) == (self.columns, self.rows) {
+            return Ok(());
+        }
         self.master.resize(columns, rows)?;
-        self.terminal.screen_mut().set_size(rows, columns);
+        self.terminal
+            .screen_mut()
+            .set_size_reflow(rows, columns, self.scrollback.capacity_bytes);
         self.columns = columns;
         self.rows = rows;
+        self.terminal_revision = self.terminal_revision.saturating_add(1);
+        let _ = self.terminal_events.send(TerminalEvent::Resized {
+            revision: self.terminal_revision,
+            sequence: self.scrollback.latest_sequence,
+            columns,
+            rows,
+            snapshot: terminal_snapshot(&self.terminal).into(),
+        });
         Ok(())
     }
 }
@@ -813,11 +879,26 @@ fn validate_dimensions(columns: u16, rows: u16) -> Result<()> {
 }
 
 fn terminal_snapshot(parser: &vt100::Parser) -> Vec<u8> {
-    let formatted = parser.screen().contents_formatted();
-    if formatted.len() <= 512 * 1024 {
+    const LIMIT: usize = 512 * 1024;
+    let mut formatted = if parser.screen().alternate_screen() {
+        b"\x1b[?47h".to_vec()
+    } else {
+        b"\x1b[?47l".to_vec()
+    };
+    formatted.extend(parser.screen().state_formatted());
+    if formatted.len() <= LIMIT {
         formatted
     } else {
-        parser.screen().contents().into_bytes()
+        // Pathological per-cell styles/combining characters can exceed a frame.
+        // Keep a UTF-8-safe, visibly marked suffix rather than an oversized frame.
+        let mut bounded = b"\x1b[0m\x1b[2J\x1b[H[terminal snapshot truncated]\r\n".to_vec();
+        let text = parser.screen().contents().replace('\n', "\r\n");
+        let mut start = text.len().saturating_sub(LIMIT - bounded.len());
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        bounded.extend_from_slice(&text.as_bytes()[start..]);
+        bounded
     }
 }
 
@@ -950,5 +1031,33 @@ mod tests {
         let snapshot = String::from_utf8_lossy(&terminal_snapshot(&parser)).into_owned();
         assert!(snapshot.contains("main"));
         assert!(!snapshot.contains("alt"));
+    }
+
+    #[test]
+    fn snapshot_restores_alternate_screen_and_input_modes() {
+        let mut parser = vt100::Parser::new(8, 44, 0);
+        parser.process(b"normal\x1b[?1049h\x1b[?2004halt");
+        let snapshot = terminal_snapshot(&parser);
+        let mut restored = vt100::Parser::new(8, 44, 0);
+        restored.process_snapshot(&snapshot, false);
+        assert!(restored.screen().alternate_screen());
+        assert!(restored.screen().bracketed_paste());
+        assert_eq!(restored.screen().contents(), "alt");
+    }
+
+    #[test]
+    fn pathological_snapshot_is_utf8_safe_and_within_the_frame_budget() {
+        let mut parser = vt100::Parser::new(200, 500, 0);
+        for index in 0..100_000 {
+            parser.process(if index % 2 == 0 {
+                b"\x1b[31mx"
+            } else {
+                b"\x1b[32mx"
+            });
+        }
+        let snapshot = terminal_snapshot(&parser);
+        assert!(snapshot.len() <= 512 * 1024);
+        let text = std::str::from_utf8(&snapshot).unwrap();
+        assert!(text.contains("terminal snapshot truncated"));
     }
 }
