@@ -47,6 +47,19 @@ struct Palette {
 }
 
 impl Theme {
+    pub fn terminal_selection(self) -> Style {
+        let background = match self.focus.fg {
+            Some(color @ Color::Rgb(..)) => color,
+            _ => Color::Rgb(0, 180, 210),
+        };
+        let foreground = if contrast(Color::Rgb(0, 0, 0), background) >= 4.5 {
+            Color::Rgb(0, 0, 0)
+        } else {
+            Color::Rgb(255, 255, 255)
+        };
+        Style::default().fg(foreground).bg(background)
+    }
+
     pub fn resolve(choice: TuiTheme) -> Self {
         let palette = match choice {
             TuiTheme::TerminalDefault => {

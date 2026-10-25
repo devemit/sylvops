@@ -210,6 +210,7 @@ pub(crate) enum HitTarget {
     FocusExplorer,
     FocusMain,
     TerminalViewport,
+    TerminalCopy,
     TerminalHistory(crate::terminal::TerminalHistoryAction),
     DismissNotice,
     Attach,
@@ -806,6 +807,7 @@ impl App {
     }
 
     pub fn select_explorer_index(&mut self, index: usize) {
+        let previous_session = self.selected_session_id;
         let rows = self.explorer_rows();
         let Some(row) = rows.get(index.min(rows.len().saturating_sub(1))) else {
             return;
@@ -854,6 +856,11 @@ impl App {
                         .map(|item| item.project_id);
                 }
             }
+        }
+        if self.selected_session_id != previous_session
+            && let Some(terminal) = self.attached.as_mut()
+        {
+            terminal.clear_selection();
         }
         self.mark_navigation_dirty();
     }
@@ -1184,6 +1191,9 @@ impl App {
     }
 
     pub fn set_tab(&mut self, tab: TuiContentView) {
+        if let Some(terminal) = self.attached.as_mut() {
+            terminal.clear_selection();
+        }
         self.main_tab = if tab == TuiContentView::Sessions {
             TuiContentView::Terminal
         } else {
