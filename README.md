@@ -191,7 +191,11 @@ macOS archives are not included in this preview. If a later release publishes `s
 
 The setup order is `Workspace -> Project/root Worktree -> Session`. Follow the getting-started steps above, or run `sylvops up .` in an existing repository. This opens the native desktop and does not start a provider automatically. Choose **Start shell** or **Start Codex** explicitly, then **Open terminal**. **Leave terminal** only detaches; **Stop session** terminates its process tree. **Delete checkout** is a separate, guarded action that requires a clean managed checkout.
 
-Preview.13 adds PowerShell-compatible Codex hook commands, private-runtime launch and resume when supported, pending-attention colors in desktop Session rows, provider-specific callback guidance, and preservation of bounded Codex model preferences in managed hook profiles. It retains preview.12's startup, terminal theme, modified-key, multiline-draft, and Unicode-column fixes. Real-account completion and resume verification is opt-in and requires user review of the corrected hook source; it is not established by the Settings notification test.
+Preview.15 adds local terminal text selection and copying: left-drag to select, then use Copy in the terminal border or Ctrl+Shift+C. Ctrl+C remains the provider interrupt. Selection stays still while output continues, and copying keeps Unicode, indentation, and line breaks.
+
+It also retains preview.14’s actual terminal pane sizing, bounded normal-screen reflow, and snapshot recovery that preserves full-screen and mouse-input modes.
+
+It includes PowerShell-compatible Codex hook commands, private-runtime launch and resume when supported, pending-attention colors in desktop Session rows, provider-specific callback guidance, and preservation of bounded Codex model preferences in managed hook profiles. It retains preview.12's startup, terminal theme, modified-key, multiline-draft, and Unicode-column fixes. Real-account completion and resume verification is opt-in and requires user review of the corrected hook source; it is not established by the Settings notification test.
 
 While attached, Shift+Enter adds a draft newline when supported by the host terminal, and multiline paste respects the provider's requested paste mode. Explicit program colors remain intact. Provider shortcuts retain their native meaning: in Codex, Tab queues a follow-up for the next turn and Enter steers the current turn. Escape is not rebound to queue. `Ctrl+]` detaches the TUI without stopping the Session.
 
