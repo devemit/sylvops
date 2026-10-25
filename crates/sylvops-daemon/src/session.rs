@@ -945,24 +945,30 @@ fn validate_dimensions(columns: u16, rows: u16) -> Result<()> {
 
 fn terminal_snapshot(parser: &vt100::Parser) -> Vec<u8> {
     const LIMIT: usize = 512 * 1024;
-    let mut formatted = if parser.screen().alternate_screen() {
-        b"\x1b[?47h".to_vec()
+    let grid_mode = if parser.screen().alternate_screen() {
+        b"\x1b[?47h"
     } else {
-        b"\x1b[?47l".to_vec()
+        b"\x1b[?47l"
     };
+    let mut formatted = grid_mode.to_vec();
     formatted.extend(parser.screen().state_formatted());
     if formatted.len() <= LIMIT {
         formatted
     } else {
         // Pathological per-cell styles/combining characters can exceed a frame.
         // Keep a UTF-8-safe, visibly marked suffix rather than an oversized frame.
-        let mut bounded = b"\x1b[0m\x1b[2J\x1b[H[terminal snapshot truncated]\r\n".to_vec();
+        let mut bounded = grid_mode.to_vec();
+        bounded.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H[terminal snapshot truncated]\r\n");
+        let input_modes = parser.screen().input_mode_formatted();
         let text = parser.screen().contents().replace('\n', "\r\n");
-        let mut start = text.len().saturating_sub(LIMIT - bounded.len());
+        let mut start = text
+            .len()
+            .saturating_sub(LIMIT - bounded.len() - input_modes.len());
         while !text.is_char_boundary(start) {
             start += 1;
         }
         bounded.extend_from_slice(&text.as_bytes()[start..]);
+        bounded.extend_from_slice(&input_modes);
         bounded
     }
 }
@@ -1114,5 +1120,31 @@ mod tests {
             source.screen().mouse_protocol_encoding()
         );
         assert_eq!(restored.screen().contents(), source.screen().contents());
+    }
+    #[test]
+    fn bounded_snapshot_fallback_retains_application_input_modes() {
+        let mut source = vt100::Parser::new(200, 500, 0);
+        source.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        for index in 0..100_000 {
+            source.process(if index % 2 == 0 {
+                b"\x1b[31mx"
+            } else {
+                b"\x1b[32mx"
+            });
+        }
+        let snapshot = terminal_snapshot(&source);
+        assert!(snapshot.len() <= 512 * 1024);
+        assert!(String::from_utf8_lossy(&snapshot).contains("terminal snapshot truncated"));
+        let mut restored = vt100::Parser::new(200, 500, 0);
+        restored.process_snapshot(&snapshot, false);
+        assert!(restored.screen().alternate_screen());
+        assert_eq!(
+            restored.screen().mouse_protocol_mode(),
+            source.screen().mouse_protocol_mode()
+        );
+        assert_eq!(
+            restored.screen().mouse_protocol_encoding(),
+            source.screen().mouse_protocol_encoding()
+        );
     }
 }
