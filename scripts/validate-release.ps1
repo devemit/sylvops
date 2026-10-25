@@ -498,7 +498,7 @@ foreach ($requiredText in @('-preview\.', 'Get-AuthenticodeSignature', 'unsigned
 
 $unixInstallScriptText = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\install.sh')
 Assert-ReleaseCondition ($unixInstallScriptText.Contains("SYLVOPS_VERSION:-$version")) "Unix install script default does not match workspace version $version."
-foreach ($requiredText in @('-preview\.', 'sha256sum', 'macOS packages are not published for unsigned previews', 'sylvops up .')) {
+foreach ($requiredText in @('-preview\.', 'sha256sum', 'macOS previews use DMGs', 'installation#macos-preview', 'sylvops up .')) {
     Assert-ReleaseCondition ($unixInstallScriptText.Contains($requiredText)) "Unix install script is missing preview-aware installation guidance: $requiredText"
 }
 
@@ -686,6 +686,17 @@ foreach ($requiredText in @(
     'scripts/package-windows-preview.ps1',
     'scripts/package-linux.sh --skip-build',
     'scripts/test-linux-packages.sh',
+    'scripts/package-macos.sh',
+    'scripts/test-macos-package.sh',
+    'macos-15-intel',
+    'aarch64-apple-darwin',
+    'x86_64-apple-darwin',
+    '--signing-identity -',
+    '--require-ad-hoc',
+    '--expected-preview-tag "$PREVIEW_TAG"',
+    'needs: [package-windows, package-linux, package-macos]',
+    'sylvops-macos-x86_64.dmg',
+    'sylvops-macos-aarch64.dmg',
     'sylvops-windows-x86_64.zip',
     'sylvops-linux-x86_64.tar.gz',
     'sylvops-linux-x86_64.AppImage',
@@ -699,7 +710,8 @@ foreach ($requiredText in @(
 }
 Assert-ReleaseCondition ($previewWorkflow -notmatch '(?m)^\s*environment:\s*release\s*$') "Unsigned previews must not read the protected release environment."
 Assert-ReleaseCondition ($previewWorkflow -notmatch 'secrets\.') "Unsigned previews must not read protected secrets."
-Assert-ReleaseCondition ($previewWorkflow -notmatch 'sylvops-macos-|package-macos|MACOS_') "Unsigned previews must not publish macOS packages."
+Assert-ReleaseCondition ($previewWorkflow -notmatch 'MACOS_SIGNING_|MACOS_NOTARY_|--require-developer-id|--notary-key|--require-notarization') "Unsigned previews must not use Apple publisher credentials or notarization."
+Assert-ReleaseCondition ($previewWorkflow -notmatch 'sylvops-macos-.*\.tar\.gz') "macOS previews provide DMGs only."
 Assert-ReleaseCondition ($previewWorkflow -notmatch 'sylvops-windows-x86_64-setup\.exe|package-windows-installer|WINDOWS_SIGNING_') "Unsigned previews must not publish the native Windows installer."
 Assert-ReleaseCondition ($previewWorkflow -notmatch 'sylvops-update-|UPDATE_SIGNING_') "Unsigned previews must not publish signed-update metadata."
 $previewPackageScriptPath = Join-Path $root 'scripts\package-windows-preview.ps1'

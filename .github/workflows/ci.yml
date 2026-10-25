@@ -155,4 +155,5 @@ jobs:
           ./scripts/test-macos-package.sh \
             --dmg 'dist/sylvops-macos-${{ matrix.architecture }}.dmg' \
             --architecture '${{ matrix.architecture }}' \
-            --expected-version "$expected_version"
+            --expected-version "$expected_version" \
+            --require-ad-hoc

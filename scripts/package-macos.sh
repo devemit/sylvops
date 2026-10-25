@@ -103,7 +103,7 @@ else
 fi
 
 if [[ -z "$signing_identity" ]]; then
-  echo "A code-signing identity is required, using '-' only for isolated CI packages." >&2
+  echo "A code-signing identity is required; use '-' for ad-hoc CI and unsigned-preview packages." >&2
   exit 1
 fi
 if $require_developer_id && [[ "$signing_identity" != "Developer ID Application:"* ]]; then

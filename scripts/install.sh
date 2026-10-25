@@ -14,11 +14,11 @@ install_dir="${SYLVOPS_INSTALL_DIR:-$HOME/.local/bin}"
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) asset="sylvops-linux-x86_64.tar.gz" ;;
   Darwin-x86_64)
-    $is_unsigned_preview && { echo "macOS packages are not published for unsigned previews." >&2; exit 1; }
+    $is_unsigned_preview && { echo "macOS previews use DMGs, not this portable installer. See https://devemit.github.io/sylvops-docs/installation#macos-preview" >&2; exit 1; }
     asset="sylvops-macos-x86_64.tar.gz"
     ;;
   Darwin-arm64)
-    $is_unsigned_preview && { echo "macOS packages are not published for unsigned previews." >&2; exit 1; }
+    $is_unsigned_preview && { echo "macOS previews use DMGs, not this portable installer. See https://devemit.github.io/sylvops-docs/installation#macos-preview" >&2; exit 1; }
     asset="sylvops-macos-aarch64.tar.gz"
     ;;
   *) echo "Unsupported SylvOps platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
