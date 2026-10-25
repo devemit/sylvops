@@ -1,6 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sylvops_core::{domain::AttachmentRole, ids::SessionId};
 
+use crate::terminal_selection::TerminalSelection;
+
 pub(crate) const TERMINAL_SCROLLBACK_ROWS: usize = 10_000;
 const WHEEL_SCROLL_LINES: isize = 3;
 
@@ -19,6 +21,7 @@ pub(crate) enum TerminalHistoryAction {
 }
 
 pub(crate) struct AttachedTerminal {
+    pub selection: Option<TerminalSelection>,
     pub session_id: SessionId,
     pub role: AttachmentRole,
     pub parser: vt100::Parser,
@@ -42,9 +45,7 @@ impl AttachedTerminal {
             return;
         }
         self.parser.screen_mut().set_scrollback(0);
-        self.parser
-            .screen_mut()
-            .set_size_reflow(rows, columns, self.scrollback_capacity_bytes);
+        self.resize(rows, columns);
         self.parser
             .process_snapshot(snapshot, sequence == self.last_sequence);
         self.last_sequence = sequence;
@@ -55,13 +56,65 @@ impl AttachedTerminal {
 }
 
 impl AttachedTerminal {
+    pub fn resize(&mut self, rows: u16, columns: u16) {
+        self.clear_selection();
+        self.parser
+            .screen_mut()
+            .set_size_reflow(rows, columns, self.scrollback_capacity_bytes);
+        self.columns = columns;
+        self.rows = rows;
+    }
+
+    pub fn begin_selection(
+        &mut self,
+        row: u16,
+        column: u16,
+        rows: u16,
+        columns: u16,
+    ) -> Result<(), &'static str> {
+        self.selection = None;
+        self.selection = Some(TerminalSelection::capture(
+            self.parser.screen(),
+            rows,
+            columns,
+            row,
+            column,
+        )?);
+        Ok(())
+    }
+
+    pub fn update_selection(&mut self, row: u16, column: u16) {
+        if let Some(selection) = &mut self.selection {
+            selection.update(row, column);
+        }
+    }
+
+    pub fn finish_selection(&mut self) {
+        if let Some(selection) = &mut self.selection {
+            selection.dragging = false;
+            if selection.selected_text().is_none() {
+                self.clear_selection();
+            }
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        self.selection.as_ref()?.selected_text()
+    }
+
     pub fn scroll_lines(&mut self, lines: isize) {
+        self.clear_selection();
         let current = self.parser.screen().scrollback();
         let next = current.saturating_add_signed(lines);
         self.parser.screen_mut().set_scrollback(next);
     }
 
     pub fn scroll_to_latest(&mut self) {
+        self.clear_selection();
         self.parser.screen_mut().set_scrollback(0);
     }
 
@@ -73,6 +126,7 @@ impl AttachedTerminal {
     }
 
     pub fn scroll_to_oldest(&mut self) {
+        self.clear_selection();
         self.parser.screen_mut().set_scrollback(usize::MAX);
     }
 
@@ -81,6 +135,7 @@ impl AttachedTerminal {
     }
 
     pub fn apply_history_action(&mut self, action: TerminalHistoryAction) -> TerminalWheelAction {
+        self.clear_selection();
         let application_page = self.parser.screen().alternate_screen()
             || (!self.is_scrolled_back()
                 && self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None);
@@ -105,6 +160,7 @@ impl AttachedTerminal {
     }
 
     pub fn wheel_action(&mut self, scroll_up: bool, row: u16, column: u16) -> TerminalWheelAction {
+        self.clear_selection();
         let (alternate_screen, mouse_mode, mouse_encoding) = {
             let screen = self.parser.screen();
             (
@@ -208,6 +264,9 @@ pub(crate) fn encode_paste(contents: &str, bracketed: bool) -> Vec<u8> {
 }
 
 pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
+    if is_copy_key(key) {
+        return None;
+    }
     // Pending-question navigation uses modified arrows; plain arrows are different actions.
     let modifier = 1
         + u8::from(key.modifiers.contains(KeyModifiers::SHIFT))
@@ -249,9 +308,61 @@ pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+pub(crate) fn is_copy_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c' | 'C'))
+        && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_copies_the_complete_sentence_after_reflow() {
+        let mut terminal = attached_terminal(AttachmentRole::Controller, 8, 80);
+        let expected = "Sentence begins here and continues to the very end MARKER";
+        terminal.parser.process(expected.as_bytes());
+        terminal.resize(8, 20);
+        let last = u16::try_from(expected.len() - 1).unwrap();
+        terminal.begin_selection(0, 0, 8, 20).unwrap();
+        terminal.update_selection(last / 20, last % 20);
+        terminal.finish_selection();
+        assert_eq!(terminal.selected_text().as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn stale_snapshot_keeps_selection_and_current_resize_clears_it() {
+        let mut terminal = attached_terminal(AttachmentRole::Observer, 8, 20);
+        terminal.parser.process(b"before");
+        terminal.last_sequence = 10;
+        terminal.terminal_revision = 2;
+        terminal.begin_selection(0, 0, 8, 20).unwrap();
+        terminal.update_selection(0, 5);
+        terminal.finish_selection();
+        terminal.apply_snapshot(1, 10, 8, 12, b"stale");
+        assert_eq!(terminal.selected_text().as_deref(), Some("before"));
+        let mut replacement = vt100::Parser::new(8, 12, 0);
+        replacement.process(b"new");
+        terminal.apply_snapshot(3, 10, 8, 12, &replacement.screen().state_formatted());
+        assert!(terminal.selection.is_none());
+        assert_eq!(terminal.columns, 12);
+        assert_eq!(terminal.parser.screen().contents(), "new");
+    }
+
+    #[test]
+    fn copy_shortcut_is_not_encoded_as_provider_interrupt() {
+        assert_eq!(
+            encode_key(KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            None
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(vec![3])
+        );
+    }
 
     #[test]
     fn draft_newline_is_distinct_from_submit_and_queue() {
@@ -284,6 +395,7 @@ mod tests {
 
     fn attached_terminal(role: AttachmentRole, rows: u16, columns: u16) -> AttachedTerminal {
         AttachedTerminal {
+            selection: None,
             session_id: SessionId::new(),
             role,
             parser: vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS),
@@ -293,6 +405,105 @@ mod tests {
             columns,
             rows,
         }
+    }
+
+    #[test]
+    fn selecting_output_preserves_text_while_the_agent_continues() {
+        let mut terminal = attached_terminal(AttachmentRole::Observer, 3, 16);
+        terminal.parser.process(b"hello\r\nworld");
+        terminal.begin_selection(0, 0, 3, 16).unwrap();
+        terminal.update_selection(1, 4);
+        terminal.finish_selection();
+        terminal.parser.process(b"\x1b[2J\x1b[Hnew output");
+        assert_eq!(terminal.selected_text().as_deref(), Some("hello\nworld"));
+        terminal.clear_selection();
+        assert_eq!(terminal.selected_text(), None);
+        assert!(terminal.parser.screen().contents().contains("new output"));
+    }
+
+    #[test]
+    fn selection_copies_unicode_indentation_and_intentional_line_breaks() {
+        let mut terminal = attached_terminal(AttachmentRole::Controller, 4, 20);
+        terminal
+            .parser
+            .process("\x1b[31m  A界e\u{301}B\x1b[0m\r\n\r\n y".as_bytes());
+        terminal.begin_selection(2, 1, 4, 20).unwrap();
+        terminal.update_selection(0, 0);
+        terminal.finish_selection();
+        assert_eq!(
+            terminal.selected_text().as_deref(),
+            Some("  A界e\u{301}B\n\n y")
+        );
+        terminal.begin_selection(0, 4, 4, 20).unwrap(); // Wide continuation snaps to its glyph.
+        terminal.update_selection(0, 6);
+        terminal.finish_selection();
+        assert_eq!(terminal.selected_text().as_deref(), Some("界e\u{301}B"));
+    }
+
+    #[test]
+    fn selection_joins_soft_wrapped_rows_and_reads_scrollback() {
+        let mut terminal = attached_terminal(AttachmentRole::Observer, 3, 6);
+        terminal.parser.process(b"abcdefgh");
+        terminal.begin_selection(0, 0, 3, 6).unwrap();
+        terminal.update_selection(1, 1);
+        terminal.finish_selection();
+        assert_eq!(terminal.selected_text().as_deref(), Some("abcdefgh"));
+        terminal.clear_selection();
+        terminal.parser.process(b"\r\nthird\r\nfourth\r\nfifth");
+        terminal.scroll_to_oldest();
+        terminal.begin_selection(0, 0, 3, 6).unwrap();
+        terminal.update_selection(1, 1);
+        terminal.finish_selection();
+        assert_eq!(terminal.selected_text().as_deref(), Some("abcdefgh"));
+    }
+
+    #[test]
+    fn selection_is_empty_on_click_and_clears_before_scrolling() {
+        let mut terminal = attached_terminal(AttachmentRole::Observer, 3, 12);
+        terminal.parser.process(b"one\r\ntwo");
+        terminal.begin_selection(0, 0, 3, 12).unwrap();
+        terminal.finish_selection();
+        assert!(terminal.selection.is_none());
+        for action in [
+            TerminalHistoryAction::PageUp,
+            TerminalHistoryAction::PageDown,
+            TerminalHistoryAction::Oldest,
+            TerminalHistoryAction::Latest,
+        ] {
+            terminal.begin_selection(0, 0, 3, 12).unwrap();
+            terminal.update_selection(1, 2);
+            terminal.apply_history_action(action);
+            assert!(terminal.selection.is_none());
+        }
+        terminal.begin_selection(0, 0, 3, 12).unwrap();
+        terminal.wheel_action(true, 0, 0);
+        assert!(terminal.selection.is_none());
+    }
+
+    #[test]
+    fn resizing_and_resynchronizing_discard_stale_selection_snapshots() {
+        let mut terminal = attached_terminal(AttachmentRole::Observer, 3, 12);
+        terminal.parser.process(b"one\r\ntwo");
+        terminal.begin_selection(0, 0, 3, 12).unwrap();
+        terminal.update_selection(1, 2);
+        terminal.resize(4, 16);
+        assert!(terminal.selection.is_none());
+        terminal.begin_selection(0, 0, 4, 16).unwrap();
+        terminal.update_selection(1, 2);
+        terminal.apply_snapshot(1, 42, 3, 10, b"replacement");
+        assert!(terminal.selection.is_none());
+        assert_eq!(terminal.last_sequence, 42);
+        assert_eq!((terminal.rows, terminal.columns), (3, 10));
+    }
+
+    #[test]
+    fn selection_snapshot_refuses_oversized_text_without_partial_selection() {
+        let mut terminal = attached_terminal(AttachmentRole::Observer, 200, 500);
+        let contents = "a\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}".repeat(200 * 500);
+        terminal.parser.process(contents.as_bytes());
+        assert!(terminal.begin_selection(0, 0, 200, 500).is_err());
+        assert!(terminal.selection.is_none());
+        assert!(terminal.begin_selection(0, 0, 0, 500).is_err());
     }
 
     #[test]

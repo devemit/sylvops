@@ -1,6 +1,7 @@
 //! Hierarchical, keyboard-and-mouse mission control backed exclusively by daemon IPC.
 
 mod app;
+mod clipboard;
 mod directory_browser;
 mod forms;
 mod github_modal;
@@ -11,6 +12,7 @@ mod reducer;
 mod removal_notice;
 mod render;
 mod terminal;
+mod terminal_selection;
 mod theme;
 
 use std::{
@@ -172,6 +174,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
     let mut pending_event = None;
     let mut input_pump: Option<InputPump> = None;
     let mut input_failed = false;
+    let mut clipboard = clipboard::ClipboardService::system().ok();
     let mut maintenance = tokio::time::interval(TICK);
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
@@ -240,6 +243,16 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         app.viewport = Rect::new(0, 0, size.width, size.height);
         app.expire_flash();
+        if let Some(result) = clipboard
+            .as_mut()
+            .and_then(clipboard::ClipboardService::poll)
+        {
+            app.flash = Some(match result {
+                Ok(()) => Flash::transient(FlashKind::Success, "Selection copied."),
+                Err(error) => Flash::error(error.message()),
+            });
+            dirty = true;
+        }
         if notification_presenter.take_native_failure() {
             app.flash = Some(Flash::transient(
                 FlashKind::Error,
@@ -437,6 +450,10 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             }
             Event::FocusLost => {
                 terminal_focused = false;
+                if let Some(attached) = app.attached.as_mut() {
+                    attached.finish_selection();
+                    dirty = true;
+                }
                 continue;
             }
             _ => {}
@@ -447,6 +464,23 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             continue;
         }
         dirty = true;
+        if matches!(app.mode, Mode::TerminalAttached) {
+            match terminal_selection::handle_input(&mut app, &input) {
+                terminal_selection::SelectionAction::Handled => continue,
+                terminal_selection::SelectionAction::Copy(text) => {
+                    let result = clipboard
+                        .as_mut()
+                        .ok_or(clipboard::CopyFailure::Unavailable)
+                        .and_then(|clipboard| clipboard.copy(text));
+                    app.flash = Some(match result {
+                        Ok(()) => Flash::transient(FlashKind::Info, "Copying selection…"),
+                        Err(error) => Flash::error(error.message()),
+                    });
+                    continue;
+                }
+                terminal_selection::SelectionAction::Unhandled => {}
+            }
+        }
         let quit = match app.mode {
             Mode::Navigation => {
                 handle_navigation(
@@ -3626,6 +3660,7 @@ async fn attach_selected_process(client: &DaemonClient, app: &mut App) -> Result
                 parser.process(&snapshot);
             }
             app.attached = Some(AttachedTerminal {
+                selection: None,
                 session_id,
                 role,
                 terminal_revision,
@@ -4001,6 +4036,7 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
     let Some(attached) = app.attached.as_mut() else {
         return Ok(());
     };
+    attached.clear_selection();
     if let DaemonResponse::Attached {
         replay_through_sequence,
         terminal_revision,
@@ -5584,6 +5620,7 @@ mod tests {
                 let mut parser = vt100::Parser::new(rows, columns, 0);
                 parser.process(format!("\x1b[{rows};{columns}HZ").as_bytes());
                 app.attached = Some(AttachedTerminal {
+                    selection: None,
                     session_id: app.snapshot.sessions[0].id,
                     role: AttachmentRole::Controller,
                     parser,
@@ -5817,6 +5854,7 @@ mod tests {
         let session_id = app.snapshot.sessions[0].id;
         app.cancel_settings();
         app.attached = Some(AttachedTerminal {
+            selection: None,
             terminal_revision: 0,
             scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id,
@@ -5840,6 +5878,41 @@ mod tests {
             app.hit_map.target_at(detach.area.x, detach.area.y),
             Some(HitTarget::Detach)
         );
+    }
+
+    #[test]
+    fn changing_sessions_or_tabs_discards_terminal_selection() {
+        let mut app = App::new(populated_snapshot(), Vec::new(), None);
+        let first = app.snapshot.sessions[0].id;
+        let mut next = app.snapshot.sessions[0].clone();
+        next.id = SessionId::new();
+        let second = next.id;
+        app.snapshot.sessions.push(next);
+        app.reveal_and_select(ExplorerNode::Session(first));
+        let mut parser = vt100::Parser::new(3, 12, 0);
+        parser.process(b"selected text");
+        app.attached = Some(AttachedTerminal {
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
+            selection: None,
+            session_id: first,
+            role: AttachmentRole::Observer,
+            parser,
+            last_sequence: 1,
+            columns: 12,
+            rows: 3,
+        });
+        let attached = app.attached.as_mut().unwrap();
+        attached.begin_selection(0, 0, 3, 12).unwrap();
+        attached.update_selection(0, 3);
+        app.set_tab(TuiContentView::Details);
+        assert!(app.attached.as_ref().unwrap().selection.is_none());
+        let attached = app.attached.as_mut().unwrap();
+        attached.begin_selection(0, 0, 3, 12).unwrap();
+        attached.update_selection(0, 3);
+        app.reveal_and_select(ExplorerNode::Session(second));
+        assert_eq!(app.selected_session_id, Some(second));
+        assert!(app.attached.as_ref().unwrap().selection.is_none());
     }
 
     #[test]
@@ -6273,6 +6346,7 @@ mod tests {
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(b"\x1b[0mD\x1b[31mI\x1b[38;2;12;34;56;48;2;65;43;21mT\x1b[39;49;7mV\x1b[0m");
         app.attached = Some(AttachedTerminal {
+            selection: None,
             terminal_revision: 0,
             scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id: app.snapshot.sessions[0].id,
@@ -6343,6 +6417,7 @@ mod tests {
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(b"\x1b[31mR\x1b[0m");
         app.attached = Some(AttachedTerminal {
+            selection: None,
             terminal_revision: 0,
             scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id,
@@ -6691,6 +6766,7 @@ mod tests {
         app.focus = app::FocusZone::Main;
         app.main_tab = TuiContentView::Terminal;
         app.attached = Some(AttachedTerminal {
+            selection: None,
             terminal_revision: 0,
             scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id,
@@ -7307,6 +7383,7 @@ mod tests {
         let mut app = App::new(snapshot.clone(), Vec::new(), None);
         app.select_node(ExplorerNode::Session(removed_session_id));
         app.attached = Some(AttachedTerminal {
+            selection: None,
             terminal_revision: 0,
             scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id: removed_session_id,
@@ -7398,6 +7475,7 @@ mod tests {
         snapshot.sessions[0].process_id = None;
         let mut app = App::new(snapshot.clone(), Vec::new(), None);
         app.attached = Some(AttachedTerminal {
+            selection: None,
             terminal_revision: 0,
             scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id,

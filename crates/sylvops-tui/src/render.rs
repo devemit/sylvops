@@ -1006,18 +1006,10 @@ fn relative_activity(captured_at: i64, activity_at: i64) -> String {
 fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let provider_owned = app.attached.is_some();
     let (title, content) = if let Some(attached) = app.attached.as_ref() {
-        let role = if attached.role == sylvops_core::domain::AttachmentRole::Controller {
-            "controller"
-        } else {
-            "read-only observer"
-        };
-        let history = attached.parser.screen().scrollback();
-        let title = if attached.is_scrolled_back() {
-            format!(" Terminal · {role} · history {history} rows · Shift+End latest ")
-        } else {
-            format!(" Terminal · attached as {role} · wheel scrolls history ")
-        };
-        (title, terminal_text(attached.parser.screen(), theme.text))
+        (
+            terminal_title(attached),
+            terminal_display_text(attached, theme),
+        )
     } else if let Some(session) = app.selected_session() {
         (
             " Terminal · detached ".into(),
@@ -1048,6 +1040,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         terminal = terminal.style(theme.text).wrap(Wrap { trim: false });
     }
     frame.render_widget(terminal, area);
+    draw_terminal_copy(frame, app, area, theme);
     if let Some(session) = app
         .attached
         .as_ref()
@@ -1089,6 +1082,7 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     if let Some(screen) = app
         .attached
         .as_ref()
+        .filter(|attached| attached.selection.is_none())
         .map(|attached| attached.parser.screen())
         && !screen.hide_cursor()
         && screen.scrollback() == 0
@@ -1103,6 +1097,70 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             ));
         }
     }
+}
+
+fn terminal_title(attached: &crate::terminal::AttachedTerminal) -> String {
+    let role = if attached.role == sylvops_core::domain::AttachmentRole::Controller {
+        "controller"
+    } else {
+        "read-only observer"
+    };
+    let history = attached.parser.screen().scrollback();
+    if attached.selection.is_some() {
+        " Terminal · selection paused · Esc returns to live ".into()
+    } else if attached.is_scrolled_back() {
+        format!(" Terminal · {role} · history {history} rows · Shift+End latest ")
+    } else {
+        format!(" Terminal · attached as {role} · wheel scrolls history ")
+    }
+}
+
+fn draw_terminal_copy(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let Some(attached) = app.attached.as_ref() else {
+        return;
+    };
+    if area.width < 10 || area.height == 0 {
+        return;
+    }
+    let enabled = attached
+        .selection
+        .as_ref()
+        .is_some_and(crate::terminal_selection::TerminalSelection::has_range);
+    let button = Rect::new(area.right().saturating_sub(9), area.y, 8, 1);
+    frame.render_widget(
+        Paragraph::new("[ Copy ]").style(if enabled { theme.focus } else { theme.muted }),
+        button,
+    );
+    if enabled {
+        app.hit_map.push(button, HitTarget::TerminalCopy);
+    }
+}
+
+fn terminal_display_text(attached: &crate::terminal::AttachedTerminal, theme: Theme) -> Text<'_> {
+    let Some(selection) = attached.selection.as_ref() else {
+        return terminal_text(attached.parser.screen(), theme.text);
+    };
+    let selection_style = theme.terminal_selection();
+    let mut lines = Vec::with_capacity(usize::from(selection.rows));
+    for row in 0..selection.rows {
+        let mut spans = Vec::with_capacity(usize::from(selection.columns));
+        for column in 0..selection.columns {
+            let Some(cell) = selection.cell(row, column) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let style = if selection.is_selected(row, column) {
+                selection_style
+            } else {
+                terminal_cell_style(cell, theme.text)
+            };
+            spans.push(Span::styled(terminal_cell_text(cell), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    Text::from(lines)
 }
 
 fn terminal_text(screen: &vt100::Screen, defaults: Style) -> Text<'_> {
@@ -1908,7 +1966,7 @@ fn footer_areas(area: Rect, version: &str) -> (Rect, Option<Rect>) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 78, 70);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new("Tab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Sessions navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: dismiss recoverable attention, stop a Session, or remove a clean Worktree\ng: bounded read-only Git diff\nChanges: ↑/↓, j/k, Page Up/Page Down, or mouse wheel to scroll\nAttached terminal: wheel or Shift+PageUp/PageDown scrolls; Shift+Home oldest; Shift+End latest\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; Sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
+    frame.render_widget(Paragraph::new("Terminal: drag to select visible text; click Copy or Ctrl+Shift+C to copy\nSelection pauses the view only; Esc returns to live output\nScroll before selecting; clipboard availability depends on your desktop\n\nTab / Shift+Tab: Navigator ↔ Main\ne / a: Explorer / Sessions navigator view\n↑ ↓ or j k: navigate the selected navigator view\nAlt+← / Alt+→ or drag divider: resize navigator\n1 / 2 / 3: Terminal / Changes / Details\nEnter: explicit primary action\nu: resume eligible session\nn: create in context\nw: create a Worktree for the selected Project\nr: rename metadata\nd: dismiss recoverable attention, stop a Session, or remove a clean Worktree\ng: bounded read-only Git diff\nChanges: ↑/↓, j/k, Page Up/Page Down, or mouse wheel to scroll\nAttached terminal: wheel or Shift+PageUp/PageDown scrolls; Shift+Home oldest; Shift+End latest\nG: browse the selected Project's GitHub Repository\ns: TUI settings\n/: commands and entity search\nShift+A: next attention item\nProject form: Ctrl+B browse; type to filter; Enter open/select; Esc cancel\nCtrl+] while attached: detach\nq: close UI; Sessions continue\nMouse: select rows, tabs, actions, controls, drag divider, and scroll")
         .block(Block::default().title(" Shortcuts ").borders(Borders::ALL).border_style(theme.border)).style(theme.text).wrap(Wrap { trim: false }), popup);
 }
 
