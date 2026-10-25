@@ -5,7 +5,7 @@ SylvOps is a local-first mission control for supervising interactive coding-agen
 [Documentation](https://devemit.github.io/sylvops-docs/) · [Getting started](https://devemit.github.io/sylvops-docs/getting-started) · [Installation](https://devemit.github.io/sylvops-docs/installation) · [CLI reference](https://devemit.github.io/sylvops-docs/cli-reference) · [Releases](https://github.com/devemit/sylvops/releases)
 
 > [!WARNING]
-> The current public build is an unsigned testing preview. Windows and Linux x86_64 packages are available; macOS packages are not included. Read the [installation guide](https://devemit.github.io/sylvops-docs/installation) before downloading.
+> Public builds are free unsigned testing previews. New previews provide Windows and Linux x86_64 packages plus macOS Intel and Apple silicon DMGs with ad-hoc signatures, without Apple notarization. Older previews omit macOS. Read the [installation guide](https://devemit.github.io/sylvops-docs/installation) and check the selected release's assets before downloading.
 
 ## What SylvOps does
 
@@ -33,6 +33,7 @@ SylvOps uses your installed `git` executable. Registering a repository does not 
 Choose a published unsigned testing preview from [GitHub Releases](https://github.com/devemit/sylvops/releases). The public installation guide identifies the current preview and its exact assets:
 
 - [Windows x86_64 preview](https://devemit.github.io/sylvops-docs/installation#windows-preview)
+- [macOS Intel or Apple silicon preview](https://devemit.github.io/sylvops-docs/installation#macos-preview)
 - [Linux Debian or Ubuntu](https://devemit.github.io/sylvops-docs/installation#debian-or-ubuntu)
 - [Linux AppImage](https://devemit.github.io/sylvops-docs/installation#appimage)
 - [Portable Linux archive](https://devemit.github.io/sylvops-docs/installation#portable-linux-archive)
@@ -136,9 +137,29 @@ With that signed App Paths registration, PowerShell can run `Start-Process sylvo
 
 ## Install on macOS
 
-This unsigned preview has no macOS downloads. Build from source on macOS or wait for a published signed application release.
+macOS previews support macOS 13 or newer. In **Apple menu -> About This Mac**, an Apple M-series chip means Apple silicon; an Intel processor means Intel. Download `sylvops-macos-aarch64.dmg` for Apple silicon or `sylvops-macos-x86_64.dmg` for Intel, plus `SHA256SUMS` from the same preview release. Older previews have no Mac assets.
 
-The official packaging path produces `sylvops-macos-x86_64.dmg` for Intel and `sylvops-macos-aarch64.dmg` for Apple silicon. Only use those files when actually published with matching `SHA256SUMS`, Developer ID signatures, and stapled notarization tickets. Verify with `codesign`, `xcrun stapler validate`, and Gatekeeper before copying SylvOps to `/Applications` or another Applications location you control. The bundled guide is at `SylvOps.app/Contents/Resources/README.md`.
+Verify the exact downloaded DMG before opening it. For Apple silicon:
+
+```sh
+awk '$2 == "sylvops-macos-aarch64.dmg" { print }' SHA256SUMS > macos-checksum.txt
+test -s macos-checksum.txt && shasum -a 256 --check macos-checksum.txt
+```
+
+For Intel, replace `sylvops-macos-aarch64.dmg` with `sylvops-macos-x86_64.dmg`. Stop if the checksum is missing or verification fails. Checksums and GitHub provenance identify release bytes; they do not establish Apple publisher trust.
+
+Open the verified DMG, drag **SylvOps** into **Applications** (or an Applications folder you control), eject the disk image, then open the installed app. These free previews have ad-hoc signatures, not Developer ID signatures, and are not notarized by Apple. No paid Apple account is needed to run them.
+
+If macOS blocks the trusted app because its developer cannot be verified or Apple cannot check it, first try opening the installed app, then choose **System Settings -> Privacy & Security -> Open Anyway**, authenticate if requested, and confirm **Open**. This creates an exception for this app. Follow [Apple's instructions](https://support.apple.com/en-us/102445). Managed Macs may prohibit this exception. Do not disable Gatekeeper, remove quarantine attributes, or override alerts that the app is damaged or contains malware. Build from source when the exception is unavailable or trust cannot be established.
+
+The desktop starts from Applications without editing `PATH`. Optional CLI and TUI commands use the installed bundle's executable:
+
+```sh
+/Applications/SylvOps.app/Contents/MacOS/sylvops doctor
+/Applications/SylvOps.app/Contents/MacOS/sylvops tui
+```
+
+Adjust the path if you chose another Applications folder. The bundled guide is at `SylvOps.app/Contents/Resources/README.md`. Future official signed releases require Developer ID signatures, stapled notarization tickets, and Gatekeeper verification; those requirements do not describe unsigned previews.
 
 ## Install on Linux
 
@@ -203,6 +224,8 @@ While attached, Shift+Enter adds a draft newline when supported by the host term
 
 Unsigned previews must be replaced manually with a verified newer preview. They do not receive signed in-app updates. Before replacing application files, finish or explicitly stop active Sessions, stop the daemon, and launch the new executable explicitly so an older copy on `PATH` is not selected.
 
+On macOS, stop the daemon using `/Applications/SylvOps.app/Contents/MacOS/sylvops daemon stop`, close desktop/TUI clients, replace the app from the verified newer DMG, and launch the installed app again. The new preview may need its own app-specific first-launch exception. User data remains separate from the app bundle.
+
 The source supports signed-update controls for future official signed releases. In **Settings -> Updates**, those controls are **Check again**, **Download verified upgrade**, and **Install update**. **Periodic checks: Off** disables scheduled checks. The corresponding commands include `sylvops update check` and `sylvops update status`. These controls fail closed without signed official-release metadata and are not an update path for this preview.
 
 For a signed installation, replacement defers while Sessions are active unless every named Session is explicitly confirmed. The detached helper retains the old package and a compatible database snapshot, checks the replacement's health and identity, and attempts one rollback if health fails or the helper is interrupted. There is no separate manual rollback command.
@@ -215,7 +238,7 @@ Normal uninstall preserves configuration, session data, repositories, worktrees,
 - Signed Windows installation, when available: use **Installed apps** or `%LOCALAPPDATA%\Programs\SylvOps\uninstall.exe`.
 - Debian or Ubuntu: run `sudo apt remove sylvops`.
 - AppImage or portable archive: remove the downloaded file or extracted application directory.
-- macOS application, when available: remove the application from its Applications location.
+- macOS preview: stop Sessions and the daemon, close clients, then remove `SylvOps.app` from its Applications location. Preserve the separate configuration and data directories.
 
 Windows data and runtime live under `%LOCALAPPDATA%\SylvOps`; configuration lives under `%APPDATA%\SylvOps`. On Unix, data uses `$XDG_DATA_HOME/sylvops` or `~/.local/share/sylvops`; configuration uses `$XDG_CONFIG_HOME/sylvops` or `~/.config/sylvops`.
 
@@ -232,7 +255,7 @@ The exact phrase is required. The daemon refuses removal while Sessions are acti
 - Run `sylvops doctor` and `sylvops daemon status` from the intended installation to check daemon version, protocol, database, Git, and provider health.
 - Use `sylvops provider probe codex` or `sylvops provider probe claude` to distinguish missing, outdated, or unauthenticated provider CLIs. Install and authenticate them outside SylvOps.
 - If client and daemon versions differ, stop the daemon and reopen the intended executable. Closing a client alone leaves the daemon and Sessions running.
-- Stop if a download fails `SHA256SUMS`. Do not override a platform security warning; build from source or wait for a signed package if trust cannot be established.
+- Stop if a download fails `SHA256SUMS`. For a verified macOS preview, use only the app-specific exception described above for unidentified-developer or unnotarized-app alerts. Never ignore malware or damaged-app alerts. Build from source if trust cannot be established; do not bypass Windows security warnings.
 - Rebuild or install the new preview and restart the client to receive the terminal fixes. An existing client process does not change when source is pushed.
 - Share only versions, platform details, categorical status, and redacted diagnostics. Never share credentials or environment values.
 

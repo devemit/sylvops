@@ -123,8 +123,49 @@ jobs:
             dist/sylvops-linux-x86_64.deb
           if-no-files-found: error
 
+  package-macos:
+    needs: validate-preview
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            architecture: x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            architecture: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install pinned cargo-packager
+        run: |
+          packager_version="$(cat packaging/cargo-packager.version)"
+          cargo install cargo-packager --version "$packager_version" --locked
+      - name: Build ad-hoc signed preview DMG without Apple credentials
+        run: ./scripts/package-macos.sh --target '${{ matrix.target }}' --architecture '${{ matrix.architecture }}' --signing-identity -
+      - name: Verify preview identity, install, launch, and remove
+        run: |
+          version="${PREVIEW_TAG#v}"
+          version="${version%-preview.*}"
+          ./scripts/test-macos-package.sh \
+            --dmg 'dist/sylvops-macos-${{ matrix.architecture }}.dmg' \
+            --architecture '${{ matrix.architecture }}' \
+            --expected-version "$version" \
+            --expected-preview-tag "$PREVIEW_TAG" \
+            --require-ad-hoc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-preview-macos-${{ matrix.architecture }}-${{ github.sha }}
+          path: dist/sylvops-macos-${{ matrix.architecture }}.dmg
+          if-no-files-found: error
+
   stage-preview:
-    needs: [package-windows, package-linux]
+    needs: [package-windows, package-linux, package-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -141,6 +182,8 @@ jobs:
             sylvops-linux-x86_64.AppImage
             sylvops-linux-x86_64.deb
             sylvops-linux-x86_64.tar.gz
+            sylvops-macos-x86_64.dmg
+            sylvops-macos-aarch64.dmg
             sylvops-windows-x86_64.zip
           )
           printf '%s\n' "${expected[@]}" | sort > "$RUNNER_TEMP/expected-preview-files.txt"
@@ -149,9 +192,10 @@ jobs:
           cat > dist/UNSIGNED-PREVIEW.txt <<EOF
           SylvOps ${PREVIEW_TAG} is an unsigned testing preview, not an official signed application release.
 
-          Included: Windows x86_64 portable ZIP, Linux x86_64 portable archive, AppImage, and Debian package.
-          Excluded: macOS packages and the signed native Windows installer.
-          Windows may identify the executable as an unknown publisher. Do not bypass operating-system security warnings.
+          Included: Windows x86_64 portable ZIP; Linux x86_64 portable archive, AppImage, and Debian package; macOS Intel and Apple silicon DMGs.
+          Excluded: the signed native Windows installer and macOS portable archives.
+          macOS DMGs use free ad-hoc signatures, not Developer ID signing or Apple notarization. Verify the matching SHA256SUMS entry before opening. For a trusted download, follow Apple's app-specific Privacy & Security > Open Anyway instructions in the bundled README or https://devemit.github.io/sylvops-docs/installation#macos-preview. Managed Macs may prohibit this exception. Never disable Gatekeeper or ignore malware or damaged-app alerts.
+          Windows may identify the executable as an unknown publisher. Do not bypass Windows security warnings.
           Preview builds do not receive signed in-app updates. Install a later preview explicitly or build from source.
           EOF
           (

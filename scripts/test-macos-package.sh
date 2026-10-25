@@ -25,13 +25,15 @@ run_with_timeout() {
 }
 
 usage() {
-  echo "usage: $0 --dmg <path> --architecture <x86_64|aarch64> --expected-version <version> [--previous-dmg <path>] [--require-developer-id] [--require-notarization]" >&2
+  echo "usage: $0 --dmg <path> --architecture <x86_64|aarch64> --expected-version <version> [--expected-preview-tag <tag>] [--previous-dmg <path>] [--require-ad-hoc | --require-developer-id] [--require-notarization]" >&2
 }
 
 dmg_path=""
 architecture=""
 expected_version=""
+expected_preview_tag=""
 previous_dmg=""
+require_ad_hoc=false
 require_developer_id=false
 require_notarization=false
 
@@ -48,6 +50,14 @@ while [[ $# -gt 0 ]]; do
     --expected-version)
       expected_version="${2:-}"
       shift 2
+      ;;
+    --expected-preview-tag)
+      expected_preview_tag="${2:-}"
+      shift 2
+      ;;
+    --require-ad-hoc)
+      require_ad_hoc=true
+      shift
       ;;
     --previous-dmg)
       previous_dmg="${2:-}"
@@ -68,6 +78,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if $require_ad_hoc && { $require_developer_id || $require_notarization; }; then
+  echo "Ad-hoc previews cannot require Developer ID signing or notarization." >&2
+  exit 2
+fi
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "The SylvOps macOS package smoke test must run on a native macOS host." >&2
   exit 1
@@ -152,6 +166,10 @@ run_with_timeout 60 git -C "$repository_dir" worktree add --quiet -b macos-packa
 printf '%s\n' "preserve worktree content" > "$worktree_dir/package-preserve.txt"
 
 run_with_timeout 120 codesign --verify --verbose=2 "$dmg_path"
+if $require_ad_hoc; then
+  run_with_timeout 120 codesign --display --verbose=4 "$dmg_path" 2> "$test_root/dmg-codesign-details.txt"
+  grep -Fxq 'Signature=adhoc' "$test_root/dmg-codesign-details.txt"
+fi
 if $require_notarization; then
   run_with_timeout 120 xcrun stapler validate "$dmg_path"
   run_with_timeout 120 spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
@@ -202,10 +220,19 @@ icon_name="$(run_with_timeout 30 plutil -extract CFBundleIconFile raw -o - "$inf
 
 installed_architectures="$(run_with_timeout 30 lipo -archs "$installed_binary")"
 [[ "$installed_architectures" == "$lipo_architecture" ]] || { echo "Unexpected installed architecture: $installed_architectures" >&2; exit 1; }
+[[ "$(run_with_timeout 30 "$installed_binary" --version)" == "sylvops $expected_version" ]] || { echo "The installed executable version does not match the bundle." >&2; exit 1; }
+if [[ -n "$expected_preview_tag" ]]; then
+  # The desktop and TUI embed PREVIEW_TAG at compile time; --version reports the base version.
+  LC_ALL=C run_with_timeout 30 grep -aFq -- "$expected_preview_tag" "$installed_binary"
+fi
 run_with_timeout 120 codesign --verify --deep --strict --verbose=2 "$installed_app"
 codesign_details="$test_root/codesign-details.txt"
 run_with_timeout 120 codesign --display --verbose=4 "$installed_app" 2> "$codesign_details"
 grep -Eq 'flags=.*runtime' "$codesign_details"
+if $require_ad_hoc; then
+  grep -Fxq 'Signature=adhoc' "$codesign_details"
+  grep -Fxq 'TeamIdentifier=not set' "$codesign_details"
+fi
 if $require_developer_id; then
   grep -Fq 'Authority=Developer ID Application:' "$codesign_details"
   grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' "$codesign_details"
@@ -260,4 +287,4 @@ rm -rf "$installed_app"
 [[ -f "$worktree_dir/package-preserve.txt" ]] || { echo "Removing the app deleted worktree content." >&2; exit 1; }
 run_with_timeout 30 git -C "$repository_dir" show-ref --verify --quiet refs/heads/macos-package-smoke-branch
 
-echo "[ok] signed macOS $architecture app installed, upgraded, rolled back when applicable, and was removed without deleting user content"
+echo "[ok] macOS $architecture package signature verified; app installed, launched, and removed without deleting user content; upgrade and rollback checked when applicable"
