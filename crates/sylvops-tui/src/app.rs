@@ -335,6 +335,7 @@ pub(crate) struct App {
         >,
     >,
     pub hit_map: HitMap,
+    pub viewport: Rect,
     pub navigation_dirty_at: Option<Instant>,
     pub invocation_directory: PathBuf,
     pub pending_form: Option<
@@ -401,6 +402,7 @@ impl App {
             resume_pending: None,
             resume_response: None,
             hit_map: HitMap::default(),
+            viewport: Rect::default(),
             navigation_dirty_at: None,
             invocation_directory,
             pending_form: None,

@@ -49,6 +49,7 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 nix = { version = "0.30", features = ["signal"] }
 
 [dev-dependencies]
+vt100.workspace = true
 async-trait.workspace = true
 rusqlite.workspace = true
 uuid.workspace = true

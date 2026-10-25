@@ -189,6 +189,16 @@ pub(crate) fn terminal_panel_area(
     main_areas(main).workspace
 }
 
+pub(crate) fn terminal_content_area(
+    area: Rect,
+    focus: FocusZone,
+    requested_width: u16,
+    attention_visible: bool,
+) -> Rect {
+    let pane = terminal_panel_area(area, focus, requested_width, attention_visible);
+    Block::default().borders(Borders::ALL).inner(pane)
+}
+
 pub(crate) fn view_areas(area: Rect, focus: FocusZone, requested_width: u16) -> ViewAreas {
     if area.width < 72 {
         return match focus {

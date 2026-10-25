@@ -4537,14 +4537,23 @@ impl DesktopApp {
             DaemonEvent::ResynchronizationRequired {
                 session_id,
                 snapshot_sequence,
+                terminal_revision,
                 columns,
                 rows,
                 terminal_snapshot,
             } => {
-                if let Some(terminal) = self.terminals.get_mut(&session_id) {
-                    terminal.parser = vt100::Parser::new(rows, columns, 10_000);
-                    terminal.process(&terminal_snapshot);
+                if let Some(terminal) = self.terminals.get_mut(&session_id)
+                    && snapshot_sequence >= terminal.last_sequence
+                    && terminal_revision >= terminal.terminal_revision
+                {
+                    terminal.resize(rows, columns);
+                    terminal.parser.screen_mut().set_scrollback(0);
+                    terminal.process_snapshot(
+                        &terminal_snapshot,
+                        snapshot_sequence == terminal.last_sequence,
+                    );
                     terminal.last_sequence = snapshot_sequence;
+                    terminal.terminal_revision = terminal_revision;
                     terminal.columns = columns;
                     terminal.rows = rows;
                     terminal.prepare_for_input();
@@ -4956,23 +4965,30 @@ impl DesktopApp {
                 Operation::Attach(session_id),
                 DaemonResponse::Attached {
                     role,
+                    terminal_revision,
+                    columns,
+                    rows,
+                    scrollback_capacity_bytes,
                     replay_through_sequence,
                     terminal_snapshot,
                     ..
                 },
             ) => {
-                let (columns, rows) = self.terminal_dimensions();
                 let terminal = self
                     .terminals
                     .entry(session_id)
                     .or_insert_with(|| TerminalState::new(role, rows, columns, 10_000));
+                terminal.scrollback_capacity_bytes = scrollback_capacity_bytes;
+                terminal.resize(rows, columns);
+                terminal.terminal_revision = terminal_revision;
                 terminal.role = role;
                 terminal.attached = true;
                 terminal.columns = columns;
                 terminal.rows = rows;
                 if let Some(snapshot) = terminal_snapshot {
-                    terminal.parser = vt100::Parser::new(rows, columns, 10_000);
-                    terminal.process(&snapshot);
+                    terminal.resize(rows, columns);
+                    terminal.parser.screen_mut().set_scrollback(0);
+                    terminal.process_snapshot(&snapshot, false);
                     terminal.last_sequence = replay_through_sequence;
                 }
                 terminal.prepare_for_input();
@@ -7607,7 +7623,6 @@ impl DesktopApp {
             if terminal.columns == columns && terminal.rows == rows {
                 return;
             }
-            terminal.resize(rows, columns);
             terminal.prepare_for_input();
         }
         self.pending_resize = Some((session_id, columns, rows, Instant::now()));

@@ -235,6 +235,10 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         }
         guard.sync_theme(app.theme);
         let had_flash = app.flash.is_some();
+        let size = terminal
+            .size()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        app.viewport = Rect::new(0, 0, size.width, size.height);
         app.expire_flash();
         if notification_presenter.take_native_failure() {
             app.flash = Some(Flash::transient(
@@ -288,6 +292,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 Ok(DaemonEvent::ResynchronizationRequired {
                     session_id,
                     snapshot_sequence,
+                    terminal_revision,
                     columns,
                     rows,
                     terminal_snapshot,
@@ -295,12 +300,13 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                     if let Some(attached) = app.attached.as_mut()
                         && attached.session_id == session_id
                     {
-                        attached.parser =
-                            vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS);
-                        attached.parser.process(&terminal_snapshot);
-                        attached.last_sequence = snapshot_sequence;
-                        attached.columns = columns;
-                        attached.rows = rows;
+                        attached.apply_snapshot(
+                            terminal_revision,
+                            snapshot_sequence,
+                            rows,
+                            columns,
+                            &terminal_snapshot,
+                        );
                         dirty = true;
                     }
                 }
@@ -358,7 +364,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             resize_attached(
                 &client,
                 &mut app,
-                render::terminal_panel_area(
+                render::terminal_content_area(
                     Rect::new(0, 0, size.width, size.height),
                     focus,
                     navigator_width,
@@ -3584,7 +3590,14 @@ async fn attach_selected_process(client: &DaemonClient, app: &mut App) -> Result
         app.flash = Some(Flash::error("Select a session first."));
         return Ok(());
     };
-    let (columns, rows) = (80, 24);
+    app.focus = app::FocusZone::Main;
+    let area = render::terminal_content_area(
+        app.viewport,
+        app.focus,
+        app.navigator_width,
+        app.attention_count() > 0,
+    );
+    let (columns, rows) = terminal_dimensions(area);
     match client
         .request(&ClientRequest::AttachSession {
             session_id,
@@ -3596,22 +3609,31 @@ async fn attach_selected_process(client: &DaemonClient, app: &mut App) -> Result
     {
         DaemonResponse::Attached {
             role,
+            terminal_revision,
+            columns,
+            rows,
+            scrollback_capacity_bytes,
             replay_through_sequence,
             terminal_snapshot,
             ..
         } => {
             let restored = terminal_snapshot.is_some();
             let mut parser = vt100::Parser::new(rows, columns, TERMINAL_SCROLLBACK_ROWS);
+            parser
+                .screen_mut()
+                .set_size_reflow(rows, columns, scrollback_capacity_bytes);
             if let Some(snapshot) = terminal_snapshot {
                 parser.process(&snapshot);
             }
             app.attached = Some(AttachedTerminal {
                 session_id,
                 role,
+                terminal_revision,
                 parser,
                 last_sequence: if restored { replay_through_sequence } else { 0 },
                 columns,
                 rows,
+                scrollback_capacity_bytes,
             });
             app.main_tab = TuiContentView::Terminal;
             app.mode = Mode::TerminalAttached;
@@ -3945,23 +3967,13 @@ async fn resize_attached(
     app: &mut App,
     area: Rect,
 ) -> Result<(), DaemonError> {
-    let columns = area
-        .width
-        .saturating_sub(2)
-        .clamp(MIN_TERMINAL_COLUMNS, MAX_TERMINAL_COLUMNS);
-    let rows = area
-        .height
-        .saturating_sub(2)
-        .clamp(MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS);
+    let (columns, rows) = terminal_dimensions(area);
     let Some(attached) = app.attached.as_mut() else {
         return Ok(());
     };
     if attached.columns == columns && attached.rows == rows {
         return Ok(());
     }
-    attached.parser.screen_mut().set_size(rows, columns);
-    attached.columns = columns;
-    attached.rows = rows;
     if attached.role == AttachmentRole::Controller {
         let response = client
             .request(&ClientRequest::ResizeSession {
@@ -3972,9 +3984,17 @@ async fn resize_attached(
             .await?;
         if !matches!(response, DaemonResponse::Acknowledged) {
             app.flash = Some(Flash::error(response_message("terminal resize", response)));
+            return Ok(());
         }
+        // Apply the size with its ordered snapshot, after all preceding output.
     }
     Ok(())
+}
+fn terminal_dimensions(area: Rect) -> (u16, u16) {
+    (
+        area.width.clamp(MIN_TERMINAL_COLUMNS, MAX_TERMINAL_COLUMNS),
+        area.height.clamp(MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS),
+    )
 }
 
 async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
@@ -3983,6 +4003,9 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
     };
     if let DaemonResponse::Attached {
         replay_through_sequence,
+        terminal_revision,
+        columns,
+        rows,
         terminal_snapshot: Some(snapshot),
         ..
     } = client
@@ -3994,10 +4017,13 @@ async fn resynchronize_terminal(client: &DaemonClient, app: &mut App) -> Result<
         })
         .await?
     {
-        attached.parser =
-            vt100::Parser::new(attached.rows, attached.columns, TERMINAL_SCROLLBACK_ROWS);
-        attached.parser.process(&snapshot);
-        attached.last_sequence = replay_through_sequence;
+        attached.apply_snapshot(
+            terminal_revision,
+            replay_through_sequence,
+            rows,
+            columns,
+            &snapshot,
+        );
     }
     Ok(())
 }
@@ -5525,6 +5551,65 @@ mod tests {
     }
 
     #[test]
+    fn terminal_dimensions_match_rendered_cells_in_all_layouts() {
+        for (width, height) in [
+            (120, 32),
+            (96, 24),
+            (84, 24),
+            (72, 20),
+            (60, 20),
+            (40, 8),
+            (1, 1),
+        ] {
+            for attention in [false, true] {
+                let mut app = App::new(populated_snapshot(), Vec::new(), None);
+                app.focus = app::FocusZone::Main;
+                app.main_tab = TuiContentView::Terminal;
+                if attention {
+                    app.snapshot.sessions[0] = with_pending_attention(
+                        app.snapshot.sessions[0].clone(),
+                        "attention",
+                        AttentionReason::InputRequested,
+                        1,
+                        1,
+                    );
+                }
+                let area = render::terminal_content_area(
+                    Rect::new(0, 0, width, height),
+                    app.focus,
+                    app.navigator_width,
+                    app.attention_count() > 0,
+                );
+                let (columns, rows) = terminal_dimensions(area);
+                let mut parser = vt100::Parser::new(rows, columns, 0);
+                parser.process(format!("\x1b[{rows};{columns}HZ").as_bytes());
+                app.attached = Some(AttachedTerminal {
+                    session_id: app.snapshot.sessions[0].id,
+                    role: AttachmentRole::Controller,
+                    parser,
+                    last_sequence: 0,
+                    terminal_revision: 0,
+                    columns,
+                    rows,
+                    scrollback_capacity_bytes: 64 * 1024,
+                });
+                let backend = ratatui::backend::TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| render::draw(frame, &mut app))
+                    .unwrap();
+                if area.width > 0 && area.height > 0 {
+                    assert_eq!(
+                        terminal.backend().buffer()[(area.right() - 1, area.bottom() - 1)].symbol(),
+                        "Z",
+                        "{width}x{height}, attention={attention}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hierarchy_renders_wide_medium_narrow_and_short() {
         for (width, height) in [(120, 32), (84, 24), (60, 20), (40, 8)] {
             let backend = ratatui::backend::TestBackend::new(width, height);
@@ -5732,6 +5817,8 @@ mod tests {
         let session_id = app.snapshot.sessions[0].id;
         app.cancel_settings();
         app.attached = Some(AttachedTerminal {
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id,
             role: AttachmentRole::Controller,
             parser: vt100::Parser::new(24, 80, 0),
@@ -6186,6 +6273,8 @@ mod tests {
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(b"\x1b[0mD\x1b[31mI\x1b[38;2;12;34;56;48;2;65;43;21mT\x1b[39;49;7mV\x1b[0m");
         app.attached = Some(AttachedTerminal {
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id: app.snapshot.sessions[0].id,
             role: AttachmentRole::Controller,
             parser,
@@ -6254,6 +6343,8 @@ mod tests {
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(b"\x1b[31mR\x1b[0m");
         app.attached = Some(AttachedTerminal {
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id,
             role: AttachmentRole::Controller,
             parser,
@@ -6600,6 +6691,8 @@ mod tests {
         app.focus = app::FocusZone::Main;
         app.main_tab = TuiContentView::Terminal;
         app.attached = Some(AttachedTerminal {
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id,
             role: AttachmentRole::Controller,
             parser,
@@ -7214,6 +7307,8 @@ mod tests {
         let mut app = App::new(snapshot.clone(), Vec::new(), None);
         app.select_node(ExplorerNode::Session(removed_session_id));
         app.attached = Some(AttachedTerminal {
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id: removed_session_id,
             role: AttachmentRole::Observer,
             parser: vt100::Parser::new(24, 80, 0),
@@ -7303,6 +7398,8 @@ mod tests {
         snapshot.sessions[0].process_id = None;
         let mut app = App::new(snapshot.clone(), Vec::new(), None);
         app.attached = Some(AttachedTerminal {
+            terminal_revision: 0,
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
             session_id,
             role: AttachmentRole::Observer,
             parser: vt100::Parser::new(24, 80, 0),

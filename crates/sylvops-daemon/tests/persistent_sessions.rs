@@ -295,7 +295,11 @@ async fn exercise_persistent_session() {
             })
             .await
             .unwrap(),
-        DaemonResponse::Attached { .. }
+        DaemonResponse::Attached {
+            columns: 80,
+            rows: 24,
+            ..
+        }
     ));
     first
         .request(&ClientRequest::SessionInput {
@@ -306,6 +310,72 @@ async fn exercise_persistent_session() {
         .unwrap();
     let first_output = collect_until(&mut events, session.id, "SYLVOPS_E2E").await;
     assert_ne!(first_output, Vec::<u8>::new());
+
+    let observer = connect_eventually(&paths).await;
+    let mut observer_events = observer.subscribe();
+    assert!(matches!(
+        observer
+            .request(&ClientRequest::AttachSession {
+                session_id: session.id,
+                from_sequence: 0,
+                columns: 150,
+                rows: 50,
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::Attached {
+            role: sylvops_core::domain::AttachmentRole::Observer,
+            columns: 80,
+            rows: 24,
+            ..
+        }
+    ));
+    assert!(matches!(
+        observer
+            .request(&ClientRequest::ResizeSession {
+                session_id: session.id,
+                columns: 44,
+                rows: 12,
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::Error(_)
+    ));
+    assert!(matches!(
+        first
+            .request(&ClientRequest::ResizeSession {
+                session_id: session.id,
+                columns: 44,
+                rows: 12,
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::Acknowledged
+    ));
+    for stream in [&mut events, &mut observer_events] {
+        loop {
+            if let DaemonEvent::ResynchronizationRequired {
+                session_id,
+                columns,
+                rows,
+                terminal_snapshot,
+                ..
+            } = stream.recv().await.unwrap()
+                && session_id == session.id
+            {
+                assert_eq!((columns, rows), (44, 12));
+                assert_ne!(terminal_snapshot, Vec::<u8>::new());
+                break;
+            }
+        }
+    }
+    observer
+        .request(&ClientRequest::DetachSession {
+            session_id: session.id,
+        })
+        .await
+        .unwrap();
+    drop(observer);
     first
         .request(&ClientRequest::DetachSession {
             session_id: session.id,
