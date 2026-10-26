@@ -6,12 +6,14 @@ Managed Codex launches and resumes probe `--help` and select `--no-daemon` when 
 
 The daemon hook receiver binds only to IPv4 loopback and selects an ephemeral port. Every hook-capable managed Session receives its own high-entropy ephemeral bearer token, bound to its Provider, Session, and Worktree and injected only into that child environment. Headers, body size, global and per-Session rate, content type, connection concurrency, request duration, and identifier relationships are bounded or validated. Raw hook bodies are not persisted.
 
-Provider payloads normalize to `PromptSubmitted`, `TurnStarted`, `PermissionRequested`, `UserInputRequested`, `SubagentStarted`, `SubagentStopped`, `TurnStopped`, `TurnInterrupted`, `TurnFailed`, and `SessionEnded`. Exact duplicate payloads and events arriving for a closed turn are ignored through bounded in-memory tracking. Unknown or malformed events are audited with a bounded refusal reason without persisting raw payloads.
+Provider payloads normalize to `PromptSubmitted`, `TurnStarted`, `PermissionRequested`, `UserInputRequested`, `ToolStarted`, `ToolCompleted`, `SubagentStarted`, `SubagentStopped`, `TurnStopped`, `TurnInterrupted`, `TurnFailed`, and `SessionEnded`. Exact duplicate payloads and events arriving for a closed turn are ignored through bounded in-memory tracking. Unknown or malformed events are audited with a bounded refusal reason without persisting raw payloads.
 
 Deterministic transitions:
 
 - prompt/turn start → working, resolving obsolete attention;
 - permission/user input request → awaiting input with pending input attention;
+- explicit successful opening/review of input → acknowledged attention while still awaiting input;
+- completion of all unambiguously correlated Codex permission-requested tools → working, resolving input attention;
 - turn stop with active subagents, background tasks, scheduled work, or exhausted tracking capacity → working without completion;
 - turn stop without remaining work → completed with one pending successful-completion event while the Provider process remains live;
 - user interruption → interrupted without successful-completion attention while the Provider process remains live;

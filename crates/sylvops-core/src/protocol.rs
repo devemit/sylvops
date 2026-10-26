@@ -25,7 +25,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 32;
+pub const PROTOCOL_MINOR: u16 = 33;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -931,6 +931,8 @@ pub enum DaemonResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DaemonEvent {
+    /// Delayed live notification candidates are ready to be claimed.
+    AttentionNotificationAvailable,
     WorkspaceAdded {
         revision: u64,
         workspace: Workspace,
@@ -1172,7 +1174,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 32);
+        assert_eq!(PROTOCOL_MINOR, 33);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1190,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_30_attention_coordination_contract_round_trips() {
+    fn protocol_1_33_attention_coordination_contract_round_trips() {
         let preferences = AttentionNotificationPreferences {
             native_notifications_enabled: false,
             sound_enabled: true,
@@ -1231,7 +1233,10 @@ mod tests {
             let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
             assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
         }
-        assert_eq!(PROTOCOL_MINOR, 32);
+        assert_eq!(PROTOCOL_MINOR, 33);
+        let event = DaemonEvent::AttentionNotificationAvailable;
+        let frame = Frame::message(MessageClass::Event, 11, &event).unwrap();
+        assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
     }
 
     #[test]
@@ -1335,7 +1340,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 32);
+        assert_eq!(PROTOCOL_MINOR, 33);
     }
 
     #[test]
@@ -1375,7 +1380,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 32);
+        assert_eq!(PROTOCOL_MINOR, 33);
     }
 
     #[test]
@@ -1447,7 +1452,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 32);
+        assert_eq!(PROTOCOL_MINOR, 33);
     }
 
     #[test]
@@ -1641,7 +1646,7 @@ mod tests {
             let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
         }
-        assert_eq!(PROTOCOL_MINOR, 32);
+        assert_eq!(PROTOCOL_MINOR, 33);
     }
 
     #[test]

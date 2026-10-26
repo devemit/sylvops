@@ -4501,6 +4501,11 @@ impl DesktopApp {
 
     fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
+            DaemonEvent::AttentionNotificationAvailable => {
+                self.sync_attention_focus();
+                self.attention_claim = AttentionClaimState::Due;
+                self.request_attention_notification_claim();
+            }
             DaemonEvent::SessionStatusChanged { session, .. } => {
                 if let Some(existing) = self
                     .snapshot
@@ -4609,6 +4614,19 @@ impl DesktopApp {
                 let Some(claim) = claim else {
                     return;
                 };
+                let pending = self.session(claim.session_id).is_some_and(|session| {
+                    session.status.attention.is_some_and(|event| {
+                        event.id == claim.attention_id
+                            && event.reason == claim.reason
+                            && event.acknowledgement
+                                == sylvops_core::session_state::AttentionAcknowledgement::Pending
+                    })
+                });
+                if !pending || self.visible_attention_session() == Some(claim.session_id) {
+                    self.attention_claim = AttentionClaimState::Due;
+                    self.request_attention_notification_claim();
+                    return;
+                }
                 if let notifications::NotificationDelivery::InClient(notification) =
                     self.attention_notifications.deliver(&claim)
                 {
@@ -7944,11 +7962,8 @@ impl DesktopApp {
         }
     }
 
-    fn sync_attention_focus(&mut self) {
-        if !matches!(self.connection, ConnectionState::Connected) {
-            return;
-        }
-        let session_id = (self.startup_started_at.is_none()
+    fn visible_attention_session(&self) -> Option<SessionId> {
+        (self.startup_started_at.is_none()
             && self.window_attention_state == WindowAttentionState::Foreground
             && self.content_surface == ContentSurface::Session
             && self.modal.is_none()
@@ -7958,7 +7973,14 @@ impl DesktopApp {
                         .active_session_id
                         .is_some_and(|id| self.terminals.contains_key(&id)))))
         .then_some(self.active_session_id)
-        .flatten();
+        .flatten()
+    }
+
+    fn sync_attention_focus(&mut self) {
+        if !matches!(self.connection, ConnectionState::Connected) {
+            return;
+        }
+        let session_id = self.visible_attention_session();
         let report = ReportedAttentionFocus::from(session_id);
         if report == ReportedAttentionFocus::Background
             && self.reported_attention_focus == ReportedAttentionFocus::Unknown
@@ -10601,20 +10623,20 @@ mod tests {
 
     // Bundled fonts and the headless renderer keep these workflows identical across platforms.
     const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        14_411_716_778_925_671_729,
+        9_277_820_374_399_336_076,
         12_365_258_274_555_457_046,
         11_704_634_815_454_000_937,
-        17_732_859_424_370_243_582,
-        6_387_303_985_738_252_548,
+        5_440_786_141_461_063_655,
+        11_875_048_350_757_688_465,
         3_418_532_975_102_054_885,
-        13_372_692_605_195_473_834,
-        15_453_704_153_979_111_261,
+        8_503_466_275_920_392_275,
+        12_281_769_398_527_565_244,
         10_103_567_952_100_179_337,
-        17_921_599_019_395_180_662,
+        6_067_048_144_675_722_875,
         3_979_220_309_231_598_554,
-        10_552_251_326_341_320_036,
+        4_004_422_546_722_634_968,
         1_823_448_962_296_347_469,
-        4_757_816_196_288_805_032,
+        13_411_881_869_734_911_873,
     ];
     // Isolate the Details pane from navigator attention and platform chrome.
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
@@ -11612,7 +11634,27 @@ mod tests {
 
     #[test]
     fn native_notification_failure_falls_back_without_changing_session_state() {
-        let (template, _, _, first_id, second_id) = desktop_hierarchy();
+        let (mut template, _, _, first_id, second_id) = desktop_hierarchy();
+        let mut machine =
+            sylvops_core::status::SessionStatusMachine::new(SessionLifecycle::Running);
+        template
+            .snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == second_id)
+            .unwrap()
+            .status = machine
+            .apply(
+                &sylvops_core::status::NormalizedProviderEvent::TurnFailed {
+                    category: sylvops_core::status::TurnFailureCategory::new(
+                        "provider_unavailable",
+                    )
+                    .unwrap(),
+                },
+                1,
+            )
+            .unwrap()
+            .status;
         let original_sessions = template.snapshot.sessions.clone();
         let (bridge, mut harness) = Bridge::harness();
         let channels = Arc::new(RecordingNotificationChannels::default());
@@ -11725,6 +11767,54 @@ mod tests {
             Some(&newer),
             "a delayed review response must preserve the newer event"
         );
+    }
+
+    #[test]
+    fn reviewed_replaced_and_foreground_claims_are_not_presented() {
+        for scenario in 0..3 {
+            let (bridge, _harness) = Bridge::harness();
+            let channels = Arc::new(RecordingNotificationChannels::default());
+            let mut app = DesktopApp::with_bridge_and_notifications(bridge, channels.clone());
+            let mut session = session(SessionLifecycle::Running, Some("conversation"));
+            let mut machine =
+                sylvops_core::status::SessionStatusMachine::new(SessionLifecycle::Running);
+            session.status = machine
+                .apply(
+                    &sylvops_core::status::NormalizedProviderEvent::PermissionRequested,
+                    1,
+                )
+                .unwrap()
+                .status;
+            let event = session.status.attention.unwrap();
+            let claim = AttentionNotificationClaim::new(
+                session.id,
+                "request",
+                event,
+                AttentionNotificationPreferences::default(),
+            );
+            if scenario == 0 {
+                session.status.attention.as_mut().unwrap().acknowledgement =
+                    sylvops_core::session_state::AttentionAcknowledgement::Acknowledged;
+            } else if scenario == 1 {
+                session.status.attention.as_mut().unwrap().id =
+                    AttentionEventId::try_from(2).unwrap();
+            } else {
+                app.startup_started_at = None;
+                app.window_attention_state = WindowAttentionState::Foreground;
+                app.content_surface = ContentSurface::Session;
+                app.main_tab = MainTab::Details;
+            }
+            app.connection = ConnectionState::Connected;
+            app.active_session_id = Some(session.id);
+            app.snapshot.sessions.push(session);
+            app.handle_response(
+                Operation::ClaimAttentionNotification,
+                DaemonResponse::AttentionNotificationClaim(Some(claim)),
+            );
+            assert!(channels.payloads.lock().unwrap().is_empty());
+            assert_eq!(*channels.sounds.lock().unwrap(), 0);
+            assert!(app.success.is_none());
+        }
     }
 
     #[test]
@@ -12378,12 +12468,11 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique_checksums.len(), baselines.len());
-        if std::env::var_os("CI").is_some() {
-            assert_eq!(
-                baselines.map(|baseline| baseline.checksum),
-                APPROVED_VISUAL_CHECKSUMS
-            );
-        }
+        assert_eq!(
+            baselines.map(|baseline| baseline.checksum),
+            APPROVED_VISUAL_CHECKSUMS,
+            "reviewed visual baselines must also match in local test runs"
+        );
     }
 
     #[tokio::test]

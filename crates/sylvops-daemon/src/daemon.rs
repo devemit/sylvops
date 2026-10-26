@@ -61,7 +61,9 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    DaemonError, Result, config_store,
+    DaemonError, Result,
+    codex_input::{InputChange, InputTracking},
+    config_store,
     data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan},
     database::{
         DatabaseHandle, NewSession, NewWorkSource, ProjectRemovalState,
@@ -96,8 +98,9 @@ const UPGRADE_HANDOFF_FILE: &str = "handoff.json";
 struct PendingAttentionNotificationClaim {
     sequence: u64,
     session_id: SessionId,
-    session_display_name: String,
     event: AttentionEvent,
+    ready_at: Instant,
+    announced: bool,
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +145,10 @@ impl AttentionNotificationClaims {
     }
 
     fn record(&mut self, session: &Session) -> bool {
+        self.record_at(session, Instant::now())
+    }
+
+    fn record_at(&mut self, session: &Session, now: Instant) -> bool {
         self.cancel(session.id);
         let Some(event) = session.status.attention else {
             return false;
@@ -165,19 +172,44 @@ impl AttentionNotificationClaims {
         self.pending.push_back(PendingAttentionNotificationClaim {
             sequence: self.sequence,
             session_id: session.id,
-            session_display_name: session.display_name.clone(),
             event,
+            ready_at: now
+                + if event.reason == sylvops_core::session_state::AttentionReason::InputRequested {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::ZERO
+                },
+            announced: false,
         });
         false
     }
 
     fn claim(&mut self, client_id: Uuid) -> Option<PendingAttentionNotificationClaim> {
+        self.claim_at(client_id, Instant::now())
+    }
+
+    fn claim_at(
+        &mut self,
+        client_id: Uuid,
+        now: Instant,
+    ) -> Option<PendingAttentionNotificationClaim> {
         let watermark = *self.client_watermarks.get(&client_id)?;
         let index = self
             .pending
             .iter()
-            .position(|candidate| candidate.sequence > watermark)?;
+            .position(|candidate| candidate.sequence > watermark && candidate.ready_at <= now)?;
         self.pending.remove(index)
+    }
+
+    fn announce_due(&mut self, now: Instant) -> bool {
+        let mut available = false;
+        for candidate in &mut self.pending {
+            if !candidate.announced && candidate.ready_at <= now {
+                candidate.announced = true;
+                available = true;
+            }
+        }
+        available
     }
 
     fn prune_unclaimable(&mut self) {
@@ -477,6 +509,7 @@ struct DaemonState {
 
 #[derive(Clone, Debug, Default)]
 struct HookTracking {
+    input: InputTracking,
     callback_received: bool,
     fingerprints: HashSet<String>,
     stopped_turns: HashSet<String>,
@@ -750,8 +783,16 @@ pub async fn run_with_handoff_launchers(
             Duration::from_secs(u64::from(config.update_check_interval_hours) * 60 * 60),
         ));
     }
+    let mut notification_tick = tokio::time::interval(Duration::from_millis(60));
+    notification_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let serving_result = loop {
         tokio::select! {
+            _ = notification_tick.tick() => {
+                let available = state.attention_notification_claims.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .announce_due(Instant::now());
+                if available { let _ = state.events.send(DaemonEvent::AttentionNotificationAvailable); }
+            }
             accepted = listener.accept() => {
                 let stream = match accepted { Ok(stream) => stream, Err(error) => break Err(error) };
                 let connection_state = state.clone();
@@ -1343,22 +1384,7 @@ async fn handle_request(
             .await
         }
         ClientRequest::ClaimAttentionNotification => {
-            let pending = state
-                .attention_notification_claims
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .claim(client_id);
-            let claim = if let Some(pending) = pending {
-                let preferences = state.database.attention_notification_preferences().await?;
-                Some(AttentionNotificationClaim::new(
-                    pending.session_id,
-                    &pending.session_display_name,
-                    pending.event,
-                    preferences,
-                ))
-            } else {
-                None
-            };
+            let claim = claim_attention_notification(state, client_id).await?;
             send_response_queue(
                 outgoing,
                 request_id,
@@ -3067,10 +3093,7 @@ async fn handle_request(
                 .acknowledge_opened_attention(session_id, attention_id)
                 .await?
                 .ok_or_else(|| {
-                    DaemonError::InvalidSession(
-                        "completion or terminal-failure attention is stale or cannot be acknowledged"
-                            .into(),
-                    )
+                    DaemonError::InvalidSession("attention is stale or cannot be reviewed".into())
                 })?;
             if let Some(managed) = state.sessions.read().await.get(&session_id).cloned() {
                 *managed.record.write().await = session.clone();
@@ -4221,22 +4244,38 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
                 conversation: Some(_)
             }
         );
-    let (disposition, session_start_missing) = {
+    let (disposition, session_start_missing, mut next_tracking, input_change) = {
         // Stage accepted tracking changes until persistence succeeds. The daemon run loop awaits
         // each delivery to completion, so classification and commit remain serialized without
         // holding this global lock across the database await.
         let mut tracking = state.hook_tracking.lock().await;
         let tracking = tracking.entry(delivery.session_id).or_default();
         let mut candidate = tracking.clone();
-        let disposition = candidate.classify(
-            delivery.fingerprint.clone(),
-            &event,
-            normalized.turn_id.as_deref(),
-        );
-        if disposition.is_some() {
-            *tracking = candidate;
+        let input_change = if delivery.provider == ProviderKind::Codex {
+            candidate.input.observe(delivery.payload.as_bytes(), &event)
+        } else {
+            InputChange::None
+        };
+        let fingerprint = if input_change == InputChange::NewRequest {
+            format!("{}:{}", delivery.fingerprint, candidate.input.generation())
+        } else {
+            delivery.fingerprint.clone()
+        };
+        let disposition = candidate
+            .classify(fingerprint, &event, normalized.turn_id.as_deref())
+            .or_else(|| {
+                (input_change == InputChange::Ignore).then_some("duplicate_or_stale_input")
+            });
+        if disposition == Some("duplicate_or_stale_input") {
+            // Keep conservative uncertainty discovered in a conflicting duplicate.
+            tracking.input = candidate.input.clone();
         }
-        (disposition, tracking.session_start_missing)
+        (
+            disposition,
+            tracking.session_start_missing,
+            candidate,
+            input_change,
+        )
     };
     if let Some(disposition) = disposition {
         state
@@ -4291,9 +4330,26 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             .get(&delivery.session_id)
             .cloned()
             .unwrap_or_else(|| status_machine_from_session(&persisted));
-        let transition = machine
+        machine
             .apply(&event, status_timestamp())
             .map_err(|message| DaemonError::Database(message.into()))?;
+        if input_change == InputChange::NewRequest
+            && persisted.status.attention.is_some_and(|attention| {
+                attention.reason == sylvops_core::session_state::AttentionReason::InputRequested
+                    && attention.acknowledgement != AttentionAcknowledgement::Resolved
+            })
+        {
+            machine
+                .renew_input_attention(status_timestamp())
+                .map_err(|message| DaemonError::Database(message.into()))?;
+        } else if input_change == InputChange::Resolved
+            && let Some(attention) = persisted.status.attention
+        {
+            machine
+                .resolve_input_attention(attention.id, status_timestamp())
+                .map_err(|message| DaemonError::Database(message.into()))?;
+        }
+        let transition = machine.transition();
         (transition, machine)
     };
     let status_update = state
@@ -4333,15 +4389,12 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
         .insert(delivery.session_id, next_machine);
     {
         let mut tracking = state.hook_tracking.lock().await;
-        let tracking = tracking.entry(delivery.session_id).or_default();
-        let classification =
-            tracking.classify(delivery.fingerprint, &event, normalized.turn_id.as_deref());
-        debug_assert!(classification.is_none());
-        tracking.record_applied(&event, transition.status.activity);
-        tracking.callback_received = true;
+        next_tracking.record_applied(&event, transition.status.activity);
+        next_tracking.callback_received = true;
         if is_claude_session_start || recovers_claude_lifecycle {
-            tracking.session_start_missing = false;
+            next_tracking.session_start_missing = false;
         }
+        tracking.insert(delivery.session_id, next_tracking);
     }
     if let Some(managed) = get_managed_session(state, delivery.session_id).await {
         *managed.record.write().await = session.clone();
@@ -4509,6 +4562,52 @@ fn status_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+async fn claim_attention_notification(
+    state: &DaemonState,
+    client_id: Uuid,
+) -> Result<Option<AttentionNotificationClaim>> {
+    for _ in 0..ATTENTION_NOTIFICATION_CLAIM_CAPACITY {
+        let pending = state
+            .attention_notification_claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim(client_id);
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        let operation_lock = session_operation_lock(state, pending.session_id).await;
+        let _operation_guard = operation_lock.lock().await;
+        let Ok(latest) = state.database.session(pending.session_id).await else {
+            continue;
+        };
+        if !latest.status.attention.is_some_and(|event| {
+            event.id == pending.event.id
+                && event.reason == pending.event.reason
+                && event.acknowledgement == AttentionAcknowledgement::Pending
+        }) {
+            continue;
+        }
+        let preferences = state.database.attention_notification_preferences().await?;
+        if state
+            .attention_notification_claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .foreground_sessions
+            .values()
+            .any(|id| *id == pending.session_id)
+        {
+            continue;
+        }
+        return Ok(Some(AttentionNotificationClaim::new(
+            pending.session_id,
+            &latest.display_name,
+            pending.event,
+            preferences,
+        )));
+    }
+    Ok(None)
 }
 
 fn coordinate_attention_notification(
@@ -5321,6 +5420,7 @@ impl Drop for ClientGuard {
 
 #[cfg(test)]
 mod tests {
+    use super::AttentionNotificationClaims;
     use super::{
         ApplicationMutationCoordinator, CONTROL_OPCODE, HookTracking, LifecycleCoordinator,
         decode_request, provider_external_id_update, release_work_source_capacity,
@@ -5335,6 +5435,121 @@ mod tests {
         status::{ConversationIdentityTransition, NormalizedProviderEvent, ProviderConversationId},
     };
     use tokio::sync::Semaphore;
+
+    fn input_session() -> sylvops_core::domain::Session {
+        let mut machine = sylvops_core::status::SessionStatusMachine::new(
+            sylvops_core::session_state::SessionLifecycle::Running,
+        );
+        let status = machine
+            .apply(&NormalizedProviderEvent::PermissionRequested, 1)
+            .unwrap()
+            .status;
+        sylvops_core::domain::Session {
+            id: sylvops_core::ids::SessionId::new(),
+            worktree_id: sylvops_core::ids::WorktreeId::new(),
+            provider_profile_id: None,
+            provider_kind: sylvops_core::domain::ProviderKind::Codex,
+            display_name: "input".into(),
+            status,
+            process_id: Some(1),
+            external_session_id: None,
+            command: "codex".into(),
+            arguments_json: "[]".into(),
+            cwd: "repo".into(),
+            created_at: 0,
+            started_at: Some(0),
+            ended_at: None,
+            last_activity_at: 1,
+            last_seen_output_sequence: 0,
+            exit_code: None,
+            failure_reason: None,
+        }
+    }
+
+    #[test]
+    fn input_claim_waits_one_second_and_wakes_without_another_provider_event() {
+        let mut claims = AttentionNotificationClaims::default();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        claims.register(first);
+        claims.register(second);
+        let now = std::time::Instant::now();
+        let session = input_session();
+        claims.record_at(&session, now);
+        assert!(
+            claims
+                .claim_at(first, now + std::time::Duration::from_millis(999))
+                .is_none()
+        );
+        assert!(!claims.announce_due(now));
+        assert!(claims.announce_due(now + std::time::Duration::from_secs(1)));
+        assert!(!claims.announce_due(now + std::time::Duration::from_secs(2)));
+        assert_eq!(
+            claims
+                .claim_at(first, now + std::time::Duration::from_secs(1))
+                .unwrap()
+                .session_id,
+            session.id
+        );
+        assert!(
+            claims
+                .claim_at(second, now + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn input_claim_cancellation_focus_and_reconnect_do_not_replay_notifications() {
+        let mut claims = AttentionNotificationClaims::default();
+        let client = uuid::Uuid::new_v4();
+        claims.register(client);
+        let now = std::time::Instant::now();
+        let session = input_session();
+        claims.record_at(&session, now);
+        claims.cancel(session.id);
+        assert!(!claims.announce_due(now + std::time::Duration::from_secs(2)));
+        claims.record_at(&session, now);
+        claims.report_focus(client, Some(session.id));
+        assert!(
+            claims
+                .claim_at(client, now + std::time::Duration::from_secs(2))
+                .is_none()
+        );
+        claims.report_focus(client, None);
+        claims.record_at(&session, now);
+        let late = uuid::Uuid::new_v4();
+        claims.register(late);
+        assert!(
+            claims
+                .claim_at(late, now + std::time::Duration::from_secs(2))
+                .is_none()
+        );
+        assert!(
+            claims
+                .claim_at(client, now + std::time::Duration::from_secs(2))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delayed_input_does_not_block_immediate_completion() {
+        let mut claims = AttentionNotificationClaims::default();
+        let client = uuid::Uuid::new_v4();
+        claims.register(client);
+        let now = std::time::Instant::now();
+        let input = input_session();
+        claims.record_at(&input, now);
+        let mut completed = input_session();
+        completed.status.activity = sylvops_core::session_state::ProviderActivity::Completed;
+        completed.status.attention.as_mut().unwrap().reason =
+            sylvops_core::session_state::AttentionReason::SuccessfulCompletion;
+        claims.record_at(&completed, now);
+        assert_eq!(
+            claims.claim_at(client, now).unwrap().session_id,
+            completed.id
+        );
+        assert!(claims.claim_at(client, now).is_none());
+    }
 
     #[test]
     fn persisted_capacity_excess_is_paid_down_before_a_slot_is_released() {

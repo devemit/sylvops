@@ -1682,6 +1682,8 @@ impl ProviderRuntime for CodexAdapter {
             Some("SessionEnd") => Some(NormalizedProviderEvent::SessionEnded),
             Some("UserPromptSubmit") => Some(NormalizedProviderEvent::PromptSubmitted),
             Some("PermissionRequest") => Some(NormalizedProviderEvent::PermissionRequested),
+            Some("PreToolUse") => Some(NormalizedProviderEvent::ToolStarted),
+            Some("PostToolUse") => Some(NormalizedProviderEvent::ToolCompleted),
             Some("SubagentStart") => Some(NormalizedProviderEvent::SubagentStarted {
                 agent_id: bounded_payload_field(&payload, "agent_id"),
             }),
@@ -1727,6 +1729,8 @@ fn hook_profile_source_with_windows(command: &str, windows_command: &str) -> Str
         "SessionEnd",
         "UserPromptSubmit",
         "PermissionRequest",
+        "PreToolUse",
+        "PostToolUse",
         "SubagentStart",
         "SubagentStop",
         "Stop",
@@ -1735,7 +1739,7 @@ fn hook_profile_source_with_windows(command: &str, windows_command: &str) -> Str
         let _ = write!(
             body,
             "\n[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command}\ncommand_windows = {windows_command}\nasync = {}\ntimeout = 2\n",
-            event != "SessionEnd"
+            matches!(event, "SubagentStart" | "SubagentStop")
         );
     }
     let checksum = format!("{:x}", Sha256::digest(body.as_bytes()));
@@ -2930,6 +2934,13 @@ mod tests {
             Path::new("unused")
         ));
         assert!(source.contains("hooks.PermissionRequest"));
+        for event in ["PreToolUse", "PermissionRequest", "PostToolUse"] {
+            let document: toml::Value = toml::from_str(&source).unwrap();
+            assert_eq!(
+                document["hooks"][event][0]["hooks"][0]["async"].as_bool(),
+                Some(false)
+            );
+        }
         assert!(source.contains("hooks.SubagentStop"));
         assert!(!source.contains("behavior = \"allow\""));
     }

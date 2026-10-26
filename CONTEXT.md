@@ -65,6 +65,10 @@ _Avoid_: Session state, notification channel, raw provider error
 The set of Sessions with pending Attention Events, including Sessions that are no longer active.
 _Avoid_: Active Sessions, notification queue
 
+**Review Attention**:
+Acknowledge that a particular Attention Event has been seen. Reviewing an input request does not answer it or end the Provider's waiting condition.
+_Avoid_: Resolve input, approve request
+
 **Attention Notification**:
 The live, system-coordinated announcement of an Attention Event through native, sound, or in-client channels. It is presentation rather than durable Session state and is not replayed at client startup.
 _Avoid_: Attention Event, Session status, notification queue
