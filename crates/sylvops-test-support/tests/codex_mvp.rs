@@ -86,6 +86,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         } => (project.id, root_worktree.id),
         response => panic!("unexpected project response: {response:?}"),
     };
+    exercise_input_review_and_resolution(&client, worktree_id).await;
     let shell_session_id = create_shell_session(&client, worktree_id).await;
     match client
         .request(&ClientRequest::ResumeSession {
@@ -1241,6 +1242,128 @@ fn owned_hook_profile_count(codex_home: &Path) -> usize {
             name.starts_with("sylvops-") && name.ends_with(".config.toml")
         })
         .count()
+}
+
+async fn input_command(
+    client: &DaemonClient,
+    session_id: SessionId,
+    command: &str,
+    expected: sylvops_core::status::NormalizedProviderEvent,
+) {
+    let mut events = client.subscribe();
+    client
+        .request(&ClientRequest::SessionInput {
+            session_id,
+            bytes: input_line(command),
+        })
+        .await
+        .unwrap();
+    loop {
+        if let sylvops_core::protocol::DaemonEvent::ProviderEvent {
+            session_id: received,
+            event,
+            ..
+        } = events.recv().await.unwrap()
+            && received == session_id
+            && event == expected
+        {
+            return;
+        }
+    }
+}
+
+async fn exercise_input_review_and_resolution(client: &DaemonClient, worktree_id: WorktreeId) {
+    use sylvops_core::status::NormalizedProviderEvent;
+    let id = create_codex_session(client, worktree_id).await;
+    attach(client, id).await;
+    wait_for_session(client, id, |session| session.external_session_id.is_some()).await;
+    input_command(
+        client,
+        id,
+        "permission-auto",
+        NormalizedProviderEvent::ToolCompleted,
+    )
+    .await;
+    wait_for_session(client, id, |session| {
+        session.status.activity == ProviderActivity::Working
+            && session
+                .status
+                .attention
+                .is_some_and(|event| event.acknowledgement == AttentionAcknowledgement::Resolved)
+    })
+    .await;
+    input_command(
+        client,
+        id,
+        "permission-wait",
+        NormalizedProviderEvent::PermissionRequested,
+    )
+    .await;
+    let waiting = wait_for_session(client, id, |session| {
+        session.status.activity == ProviderActivity::AwaitingInput
+    })
+    .await;
+    let first = waiting.status.attention.unwrap();
+    let reviewed = match client
+        .request(&ClientRequest::AcknowledgeAttention {
+            session_id: id,
+            attention_id: first.id,
+        })
+        .await
+        .unwrap()
+    {
+        DaemonResponse::SessionAttentionAcknowledged { session, .. } => session,
+        response => panic!("input review refused: {response:?}"),
+    };
+    assert_eq!(reviewed.status.activity, ProviderActivity::AwaitingInput);
+    assert_eq!(
+        reviewed.status.attention.unwrap().acknowledgement,
+        AttentionAcknowledgement::Acknowledged
+    );
+    input_command(
+        client,
+        id,
+        "permission-second",
+        NormalizedProviderEvent::PermissionRequested,
+    )
+    .await;
+    let second = wait_for_session(client, id, |session| {
+        session
+            .status
+            .attention
+            .is_some_and(|event| event.id != first.id)
+    })
+    .await;
+    assert_eq!(
+        second.status.attention.unwrap().acknowledgement,
+        AttentionAcknowledgement::Pending
+    );
+    input_command(
+        client,
+        id,
+        "permission-first-done",
+        NormalizedProviderEvent::ToolCompleted,
+    )
+    .await;
+    let waiting = wait_for_session(client, id, |_| true).await;
+    assert_eq!(waiting.status.activity, ProviderActivity::AwaitingInput);
+    assert_eq!(waiting.status.attention, second.status.attention);
+    input_command(
+        client,
+        id,
+        "permission-second-done",
+        NormalizedProviderEvent::ToolCompleted,
+    )
+    .await;
+    wait_for_session(client, id, |session| {
+        session.status.activity == ProviderActivity::Working
+    })
+    .await;
+    client
+        .request(&ClientRequest::StopSession { session_id: id })
+        .await
+        .unwrap();
+    wait_for_session(client, id, |session| session.process_id.is_none()).await;
 }
 
 async fn create_codex_session(client: &DaemonClient, worktree_id: WorktreeId) -> SessionId {

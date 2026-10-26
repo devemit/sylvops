@@ -363,7 +363,9 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
                 &mut reported_attention_focus,
             )
             .await?;
-            deliver_attention_notifications(&client, &mut app, &notification_presenter).await?;
+            let visible = visible_attention_session(&app, terminal_focused);
+            deliver_attention_notifications(&client, &mut app, &notification_presenter, visible)
+                .await?;
             dirty = true;
         }
         save_debounced(&client, &mut app).await?;
@@ -458,6 +460,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
             }
             _ => {}
         }
+        terminal_focused = focus_after_input(terminal_focused, &input);
         if let Event::Key(key) = &input
             && key.kind == KeyEventKind::Release
         {
@@ -621,6 +624,15 @@ async fn sync_attention_focus(
     }
 }
 
+fn focus_after_input(current: bool, input: &Event) -> bool {
+    match input {
+        Event::FocusLost => false,
+        Event::FocusGained | Event::Mouse(_) | Event::Paste(_) => true,
+        Event::Key(key) if key.kind != KeyEventKind::Release => true,
+        _ => current,
+    }
+}
+
 fn visible_attention_session(app: &App, terminal_focused: bool) -> Option<SessionId> {
     if !terminal_focused {
         None
@@ -758,10 +770,7 @@ async fn open_attention(
     use sylvops_core::session_state::{AttentionReason, SessionLifecycle};
 
     app.reveal_and_select(ExplorerNode::Session(session_id));
-    if matches!(
-        reason,
-        AttentionReason::InputRequested | AttentionReason::RecoverableFailure
-    ) {
+    if matches!(reason, AttentionReason::RecoverableFailure) {
         return attach_selected_process(client, app).await;
     }
     let live = app
@@ -4134,6 +4143,7 @@ async fn deliver_attention_notifications<C: notifications::NotificationChannels>
     client: &DaemonClient,
     app: &mut App,
     presenter: &notifications::NotificationPresenter<C>,
+    visible_session: Option<SessionId>,
 ) -> Result<(), DaemonError> {
     for _ in 0..256 {
         let claim = match client
@@ -4151,6 +4161,29 @@ async fn deliver_attention_notifications<C: notifications::NotificationChannels>
         let Some(claim) = claim else {
             return Ok(());
         };
+        if visible_session == Some(claim.session_id) {
+            continue;
+        }
+        // A claim may have been resolved while its response was in flight.
+        let latest = snapshot(client).await?;
+        if latest.revision >= app.snapshot.revision {
+            app.replace_snapshot(latest);
+        }
+        let current = app
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == claim.session_id);
+        if !current.is_some_and(|session| {
+            session.status.attention.is_some_and(|event| {
+                event.id == claim.attention_id
+                    && event.reason == claim.reason
+                    && event.acknowledgement
+                        == sylvops_core::session_state::AttentionAcknowledgement::Pending
+            })
+        }) {
+            continue;
+        }
         if let Some(notification) = presenter.present(&claim) {
             let kind = match notification.reason {
                 sylvops_core::session_state::AttentionReason::InputRequested => FlashKind::Info,
@@ -5000,7 +5033,7 @@ mod tests {
 
         for text in [&cards, &list] {
             assert!(text.contains("feedback codex"));
-            assert!(text.contains("Needs input"));
+            assert!(text.contains("Waiting for input"));
         }
         assert!(cards.contains("Provider: Shell"));
         assert!(cards.contains("Project: repo"));
@@ -5203,6 +5236,66 @@ mod tests {
             github_remote_index: 0,
         });
         assert_eq!(visible_attention_session(&app, true), None);
+    }
+
+    #[test]
+    fn input_establishes_focus_without_an_initial_terminal_focus_event() {
+        let key = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert!(focus_after_input(false, &key));
+        assert!(!focus_after_input(true, &Event::FocusLost));
+        assert!(!focus_after_input(false, &Event::Resize(80, 24)));
+        assert!(focus_after_input(false, &Event::Paste("text".into())));
+    }
+
+    #[test]
+    fn reviewed_input_has_neutral_cards_but_keeps_waiting_label() {
+        let mut snapshot = populated_snapshot();
+        let session = with_pending_attention(
+            snapshot.sessions[0].clone(),
+            "waiting",
+            AttentionReason::InputRequested,
+            1,
+            4,
+        );
+        let id = session.id;
+        snapshot.sessions = vec![session.clone()];
+        let mut app = App::new(snapshot, Vec::new(), None);
+        let mut reviewed = session.clone();
+        reviewed.status.attention.as_mut().unwrap().acknowledgement =
+            sylvops_core::session_state::AttentionAcknowledgement::Acknowledged;
+        replace_session_snapshot(&mut app, 1, &reviewed);
+        assert_eq!(app.attention_count(), 0);
+        assert_eq!(
+            app.snapshot.sessions[0].status.activity,
+            ProviderActivity::AwaitingInput
+        );
+        for presentation in [TuiSessionPresentation::Cards, TuiSessionPresentation::List] {
+            app.session_presentation = presentation;
+            app.navigator_view = TuiNavigatorView::Active;
+            app.set_tab(TuiContentView::Sessions);
+            let backend = ratatui::backend::TestBackend::new(120, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render::draw(frame, &mut app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(text.contains("Waiting for input"));
+            assert!(
+                app.hit_map
+                    .0
+                    .iter()
+                    .any(|region| region.target == HitTarget::SessionOverview(id))
+            );
+        }
     }
 
     #[test]
@@ -7629,7 +7722,7 @@ mod tests {
             attention: None,
         };
         assert_eq!(render::status_symbol(needs_input, 0), "!");
-        assert_eq!(render::status_label(needs_input), "Needs input");
+        assert_eq!(render::status_label(needs_input), "Waiting for input");
         let disconnected = SessionStatus {
             lifecycle: SessionLifecycle::Disconnected,
             ..SessionStatus::default()

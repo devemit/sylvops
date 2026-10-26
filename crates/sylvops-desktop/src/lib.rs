@@ -4501,6 +4501,11 @@ impl DesktopApp {
 
     fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
+            DaemonEvent::AttentionNotificationAvailable => {
+                self.sync_attention_focus();
+                self.attention_claim = AttentionClaimState::Due;
+                self.request_attention_notification_claim();
+            }
             DaemonEvent::SessionStatusChanged { session, .. } => {
                 if let Some(existing) = self
                     .snapshot
@@ -4609,6 +4614,19 @@ impl DesktopApp {
                 let Some(claim) = claim else {
                     return;
                 };
+                let pending = self.session(claim.session_id).is_some_and(|session| {
+                    session.status.attention.is_some_and(|event| {
+                        event.id == claim.attention_id
+                            && event.reason == claim.reason
+                            && event.acknowledgement
+                                == sylvops_core::session_state::AttentionAcknowledgement::Pending
+                    })
+                });
+                if !pending || self.visible_attention_session() == Some(claim.session_id) {
+                    self.attention_claim = AttentionClaimState::Due;
+                    self.request_attention_notification_claim();
+                    return;
+                }
                 if let notifications::NotificationDelivery::InClient(notification) =
                     self.attention_notifications.deliver(&claim)
                 {
@@ -7944,11 +7962,8 @@ impl DesktopApp {
         }
     }
 
-    fn sync_attention_focus(&mut self) {
-        if !matches!(self.connection, ConnectionState::Connected) {
-            return;
-        }
-        let session_id = (self.startup_started_at.is_none()
+    fn visible_attention_session(&self) -> Option<SessionId> {
+        (self.startup_started_at.is_none()
             && self.window_attention_state == WindowAttentionState::Foreground
             && self.content_surface == ContentSurface::Session
             && self.modal.is_none()
@@ -7958,7 +7973,14 @@ impl DesktopApp {
                         .active_session_id
                         .is_some_and(|id| self.terminals.contains_key(&id)))))
         .then_some(self.active_session_id)
-        .flatten();
+        .flatten()
+    }
+
+    fn sync_attention_focus(&mut self) {
+        if !matches!(self.connection, ConnectionState::Connected) {
+            return;
+        }
+        let session_id = self.visible_attention_session();
         let report = ReportedAttentionFocus::from(session_id);
         if report == ReportedAttentionFocus::Background
             && self.reported_attention_focus == ReportedAttentionFocus::Unknown
@@ -11612,7 +11634,27 @@ mod tests {
 
     #[test]
     fn native_notification_failure_falls_back_without_changing_session_state() {
-        let (template, _, _, first_id, second_id) = desktop_hierarchy();
+        let (mut template, _, _, first_id, second_id) = desktop_hierarchy();
+        let mut machine =
+            sylvops_core::status::SessionStatusMachine::new(SessionLifecycle::Running);
+        template
+            .snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == second_id)
+            .unwrap()
+            .status = machine
+            .apply(
+                &sylvops_core::status::NormalizedProviderEvent::TurnFailed {
+                    category: sylvops_core::status::TurnFailureCategory::new(
+                        "provider_unavailable",
+                    )
+                    .unwrap(),
+                },
+                1,
+            )
+            .unwrap()
+            .status;
         let original_sessions = template.snapshot.sessions.clone();
         let (bridge, mut harness) = Bridge::harness();
         let channels = Arc::new(RecordingNotificationChannels::default());
@@ -11725,6 +11767,54 @@ mod tests {
             Some(&newer),
             "a delayed review response must preserve the newer event"
         );
+    }
+
+    #[test]
+    fn reviewed_replaced_and_foreground_claims_are_not_presented() {
+        for scenario in 0..3 {
+            let (bridge, _harness) = Bridge::harness();
+            let channels = Arc::new(RecordingNotificationChannels::default());
+            let mut app = DesktopApp::with_bridge_and_notifications(bridge, channels.clone());
+            let mut session = session(SessionLifecycle::Running, Some("conversation"));
+            let mut machine =
+                sylvops_core::status::SessionStatusMachine::new(SessionLifecycle::Running);
+            session.status = machine
+                .apply(
+                    &sylvops_core::status::NormalizedProviderEvent::PermissionRequested,
+                    1,
+                )
+                .unwrap()
+                .status;
+            let event = session.status.attention.unwrap();
+            let claim = AttentionNotificationClaim::new(
+                session.id,
+                "request",
+                event,
+                AttentionNotificationPreferences::default(),
+            );
+            if scenario == 0 {
+                session.status.attention.as_mut().unwrap().acknowledgement =
+                    sylvops_core::session_state::AttentionAcknowledgement::Acknowledged;
+            } else if scenario == 1 {
+                session.status.attention.as_mut().unwrap().id =
+                    AttentionEventId::try_from(2).unwrap();
+            } else {
+                app.startup_started_at = None;
+                app.window_attention_state = WindowAttentionState::Foreground;
+                app.content_surface = ContentSurface::Session;
+                app.main_tab = MainTab::Details;
+            }
+            app.connection = ConnectionState::Connected;
+            app.active_session_id = Some(session.id);
+            app.snapshot.sessions.push(session);
+            app.handle_response(
+                Operation::ClaimAttentionNotification,
+                DaemonResponse::AttentionNotificationClaim(Some(claim)),
+            );
+            assert!(channels.payloads.lock().unwrap().is_empty());
+            assert_eq!(*channels.sounds.lock().unwrap(), 0);
+            assert!(app.success.is_none());
+        }
     }
 
     #[test]

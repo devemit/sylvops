@@ -96,6 +96,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "contract_session_status",
         include_str!("../migrations/0010_contract_session_status.sql"),
     ),
+    (
+        11,
+        "reviewable_input_attention",
+        include_str!("../migrations/0011_reviewable_input_attention.sql"),
+    ),
 ];
 
 #[derive(Clone, Debug)]
@@ -1036,7 +1041,7 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Acknowledges the exact completion or terminal-failure event whose history was opened.
+    /// Reviews the exact input, completion, or terminal-failure event that was opened.
     ///
     /// # Errors
     ///
@@ -2834,7 +2839,9 @@ fn acknowledge_attention(
     let allowed = match action {
         AttentionAcknowledgementAction::Opened => matches!(
             event.reason,
-            AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
+            AttentionReason::InputRequested
+                | AttentionReason::SuccessfulCompletion
+                | AttentionReason::TerminalFailure
         ),
         AttentionAcknowledgementAction::Dismissed => {
             event.reason == AttentionReason::RecoverableFailure

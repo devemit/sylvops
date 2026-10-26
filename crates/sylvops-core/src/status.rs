@@ -153,6 +153,9 @@ pub enum NormalizedProviderEvent {
     },
     PermissionRequested,
     UserInputRequested,
+    /// Observational tool execution; correlation remains daemon-owned.
+    ToolStarted,
+    ToolCompleted,
     SubagentStarted {
         agent_id: String,
     },
@@ -234,7 +237,6 @@ impl SessionStatusMachine {
         if event.id != event_id
             || event.reason != reason
             || event.acknowledgement != AttentionAcknowledgement::Pending
-            || reason == AttentionReason::InputRequested
         {
             return false;
         }
@@ -262,6 +264,7 @@ impl SessionStatusMachine {
         }
         self.status.lifecycle = SessionLifecycle::Running;
         match event {
+            NormalizedProviderEvent::ToolStarted | NormalizedProviderEvent::ToolCompleted => {}
             NormalizedProviderEvent::PromptSubmitted
             | NormalizedProviderEvent::TurnStarted { .. } => {
                 self.active_subagents.clear();
@@ -299,7 +302,9 @@ impl SessionStatusMachine {
                         self.subagent_capacity_exhausted = true;
                     }
                 }
-                self.set_live_condition(ProviderActivity::Working, None, occurred_at)?;
+                if self.status.activity != ProviderActivity::AwaitingInput {
+                    self.set_live_condition(ProviderActivity::Working, None, occurred_at)?;
+                }
             }
             NormalizedProviderEvent::SubagentStopped { agent_id } => {
                 self.active_subagents.remove(agent_id);
@@ -396,6 +401,39 @@ impl SessionStatusMachine {
         Ok(self.transition())
     }
 
+    /// A distinct, correlated request replaces even a reviewed input event.
+    ///
+    /// # Errors
+    /// Returns an error for an inactive Session, exhausted event identity, or invalid status.
+    pub fn renew_input_attention(&mut self, occurred_at: i64) -> Result<(), &'static str> {
+        if self.status.lifecycle != SessionLifecycle::Running {
+            return Err("input requires a running Session");
+        }
+        self.status.activity = ProviderActivity::AwaitingInput;
+        self.set_attention_condition(AttentionReason::InputRequested, occurred_at, true)?;
+        self.status.validate()
+    }
+
+    /// Confirmed completion resolves only the exact currently observed input event.
+    ///
+    /// # Errors
+    /// Returns an error if the resulting status is invalid.
+    pub fn resolve_input_attention(
+        &mut self,
+        event_id: AttentionEventId,
+        occurred_at: i64,
+    ) -> Result<(), &'static str> {
+        if self.status.activity == ProviderActivity::AwaitingInput
+            && self
+                .status
+                .attention
+                .is_some_and(|event| event.id == event_id)
+        {
+            self.set_live_condition(ProviderActivity::Working, None, occurred_at)?;
+        }
+        Ok(())
+    }
+
     fn set_live_condition(
         &mut self,
         activity: ProviderActivity,
@@ -456,7 +494,9 @@ impl SessionStatusMachine {
         }
     }
 
-    fn transition(&self) -> SessionStatusTransition {
+    /// Captures status and failure metadata without applying another provider event.
+    #[must_use]
+    pub fn transition(&self) -> SessionStatusTransition {
         SessionStatusTransition {
             status: self.status,
             failure_category: self.failure_category.clone(),
@@ -523,6 +563,32 @@ mod tests {
     }
 
     #[test]
+    fn reviewing_input_preserves_waiting_and_does_not_restore_unread_on_refresh() {
+        let mut machine = SessionStatusMachine::new(SessionLifecycle::Running);
+        let requested = apply(&mut machine, &NormalizedProviderEvent::PermissionRequested);
+        let event = requested.pending_review().expect("input can be reviewed");
+        assert!(machine.acknowledge_attention(event.id, event.reason));
+        let reviewed = machine.status();
+        assert_eq!(reviewed.activity, ProviderActivity::AwaitingInput);
+        assert_eq!(
+            reviewed.attention.unwrap().acknowledgement,
+            AttentionAcknowledgement::Acknowledged
+        );
+        reviewed.validate().unwrap();
+        let encoded = serde_json::to_vec(&reviewed).unwrap();
+        let decoded: SessionStatus = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, reviewed);
+        assert!(decoded.pending_review().is_none());
+        assert_eq!(
+            apply(&mut machine, &NormalizedProviderEvent::PermissionRequested),
+            reviewed
+        );
+        let mut client = requested;
+        assert!(client.apply_attention_acknowledgement(reviewed));
+        assert_eq!(client, reviewed);
+    }
+
+    #[test]
     fn duplicate_subagent_events_are_idempotent() {
         let mut machine = SessionStatusMachine::new(SessionLifecycle::Running);
         let started = NormalizedProviderEvent::SubagentStarted {
@@ -543,6 +609,21 @@ mod tests {
             },
         );
         assert_eq!(status.activity, ProviderActivity::Completed);
+    }
+
+    #[test]
+    fn other_work_does_not_clear_an_outstanding_input_request() {
+        let mut machine = SessionStatusMachine::new(SessionLifecycle::Running);
+        let requested = apply(&mut machine, &NormalizedProviderEvent::PermissionRequested);
+        for event in [
+            NormalizedProviderEvent::ToolStarted,
+            NormalizedProviderEvent::ToolCompleted,
+            NormalizedProviderEvent::SubagentStarted {
+                agent_id: "parallel".into(),
+            },
+        ] {
+            assert_eq!(apply(&mut machine, &event), requested);
+        }
     }
 
     #[test]

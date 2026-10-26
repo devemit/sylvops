@@ -926,7 +926,7 @@ pub(crate) const fn session_status_label(status: SessionStatus) -> &'static str 
         SessionLifecycle::Fresh => "Ready",
         SessionLifecycle::Starting => "Starting",
         SessionLifecycle::Running => match status.activity {
-            ProviderActivity::AwaitingInput => "Needs input",
+            ProviderActivity::AwaitingInput => "Waiting for input",
             ProviderActivity::Completed => "Completed",
             ProviderActivity::Interrupted => "Interrupted",
             ProviderActivity::RecoverableFailure => "Recoverable failure",

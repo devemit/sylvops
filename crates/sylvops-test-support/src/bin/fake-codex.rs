@@ -58,15 +58,11 @@ fn run() -> io::Result<()> {
             emit_hook(
                 "UserPromptSubmit",
                 &external_id,
-                Some(json!({"turn_id": "turn-initial"})),
+                Some(json!({"turn_id": "turn-1"})),
             )?;
         }
         if prompt == Some("SYLVOPS_TEST_AUTO_FINISH") {
-            emit_hook(
-                "Stop",
-                &external_id,
-                Some(json!({"turn_id": "turn-initial"})),
-            )?;
+            emit_hook("Stop", &external_id, Some(json!({"turn_id": "turn-1"})))?;
             emit_hook("SessionEnd", &external_id, None)?;
             println!("FAKE_CODEX_FINISHED");
             io::stdout().flush()?;
@@ -75,43 +71,47 @@ fn run() -> io::Result<()> {
     }
     io::stdout().flush()?;
 
+    run_interactive(&external_id)
+}
+
+fn run_interactive(external_id: &str) -> io::Result<()> {
     for line in io::stdin().lock().lines() {
-        match line?.trim() {
+        let line = line?;
+        if emit_permission_fixture(line.trim(), external_id)? {
+            continue;
+        }
+        match line.trim() {
             "permission" => {
                 emit_hook(
                     "PermissionRequest",
-                    &external_id,
+                    external_id,
                     Some(json!({"turn_id": "turn-1", "tool_name": "Bash"})),
                 )?;
                 println!("FAKE_CODEX_PERMISSION");
             }
             "interrupt" => {
-                emit_hook(
-                    "Interrupt",
-                    &external_id,
-                    Some(json!({"turn_id": "turn-1"})),
-                )?;
+                emit_hook("Interrupt", external_id, Some(json!({"turn_id": "turn-1"})))?;
                 println!("FAKE_CODEX_INTERRUPTED");
             }
             "complete-live" => {
                 emit_hook(
                     "UserPromptSubmit",
-                    &external_id,
+                    external_id,
                     Some(json!({"turn_id": "turn-2"})),
                 )?;
-                emit_hook("Stop", &external_id, Some(json!({"turn_id": "turn-2"})))?;
+                emit_hook("Stop", external_id, Some(json!({"turn_id": "turn-2"})))?;
                 println!("FAKE_CODEX_COMPLETED_LIVE");
             }
             "end-session" => {
-                emit_hook("SessionEnd", &external_id, None)?;
+                emit_hook("SessionEnd", external_id, None)?;
                 println!("FAKE_CODEX_SESSION_ENDED");
                 io::stdout().flush()?;
                 return Ok(());
             }
             "clean-exit" => return Ok(()),
             "finish" => {
-                emit_hook("Stop", &external_id, Some(json!({"turn_id": "turn-1"})))?;
-                emit_hook("SessionEnd", &external_id, None)?;
+                emit_hook("Stop", external_id, Some(json!({"turn_id": "turn-1"})))?;
+                emit_hook("SessionEnd", external_id, None)?;
                 println!("FAKE_CODEX_FINISHED");
                 io::stdout().flush()?;
                 return Ok(());
@@ -188,6 +188,70 @@ fn initial_prompt(arguments: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+fn emit_permission_fixture(command: &str, external_id: &str) -> io::Result<bool> {
+    match command {
+        "permission-auto" => {
+            emit_hook(
+                "UserPromptSubmit",
+                external_id,
+                Some(json!({"turn_id": "turn-auto"})),
+            )?;
+            for event in ["PreToolUse", "PermissionRequest", "PostToolUse"] {
+                emit_tool_hook(event, external_id, "turn-auto", "auto", "automatic")?;
+            }
+        }
+        "permission-wait" => {
+            emit_hook(
+                "UserPromptSubmit",
+                external_id,
+                Some(json!({"turn_id": "turn-wait"})),
+            )?;
+            emit_tool_hook("PreToolUse", external_id, "turn-wait", "first", "first")?;
+            emit_tool_hook(
+                "PermissionRequest",
+                external_id,
+                "turn-wait",
+                "first",
+                "first",
+            )?;
+        }
+        "permission-second" => {
+            emit_tool_hook("PreToolUse", external_id, "turn-wait", "second", "second")?;
+            emit_tool_hook(
+                "PermissionRequest",
+                external_id,
+                "turn-wait",
+                "second",
+                "second",
+            )?;
+        }
+        "permission-first-done" => {
+            emit_tool_hook("PostToolUse", external_id, "turn-wait", "first", "first")?;
+        }
+        "permission-second-done" => {
+            emit_tool_hook("PostToolUse", external_id, "turn-wait", "second", "second")?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn emit_tool_hook(
+    event: &str,
+    external_id: &str,
+    turn: &str,
+    call: &str,
+    command: &str,
+) -> io::Result<()> {
+    let mut extra =
+        json!({"turn_id": turn, "tool_name": "Bash", "tool_input": {"command": command}});
+    // The documented PermissionRequest payload does not carry tool_use_id.
+    if event != "PermissionRequest" {
+        extra["tool_use_id"] = json!(call);
+    }
+    emit_hook(event, external_id, Some(extra))
 }
 
 fn emit_hook(event: &str, external_id: &str, extra: Option<Value>) -> io::Result<()> {

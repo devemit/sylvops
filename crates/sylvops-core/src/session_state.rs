@@ -145,7 +145,6 @@ impl SessionStatus {
             return false;
         };
         if event.acknowledgement != AttentionAcknowledgement::Acknowledged
-            || event.reason == AttentionReason::InputRequested
             || !self.attention.is_some_and(|current| {
                 current.id == event.id
                     && current.reason == event.reason
@@ -159,13 +158,15 @@ impl SessionStatus {
     }
 
     /// Returns the exact pending event that an explicit history-open/review may acknowledge.
-    /// Input and recoverable failures have separate resolution/dismissal policies.
+    /// Review never resolves input; recoverable failures have a separate dismissal policy.
     pub fn pending_review(self) -> Option<AttentionEvent> {
         self.attention.filter(|event| {
             event.acknowledgement == AttentionAcknowledgement::Pending
                 && matches!(
                     event.reason,
-                    AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
+                    AttentionReason::InputRequested
+                        | AttentionReason::SuccessfulCompletion
+                        | AttentionReason::TerminalFailure
                 )
         })
     }
@@ -203,11 +204,6 @@ impl SessionStatus {
                 return Err("invalid attention timestamp");
             }
             if event.acknowledgement != AttentionAcknowledgement::Resolved {
-                if event.reason == AttentionReason::InputRequested
-                    && event.acknowledgement == AttentionAcknowledgement::Acknowledged
-                {
-                    return Err("input attention remains pending until resolved");
-                }
                 let valid = match event.reason {
                     AttentionReason::InputRequested => {
                         self.activity == ProviderActivity::AwaitingInput

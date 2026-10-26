@@ -1055,7 +1055,9 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         && event.acknowledgement == sylvops_core::session_state::AttentionAcknowledgement::Pending
         && matches!(
             event.reason,
-            AttentionReason::SuccessfulCompletion | AttentionReason::TerminalFailure
+            AttentionReason::InputRequested
+                | AttentionReason::SuccessfulCompletion
+                | AttentionReason::TerminalFailure
         )
         && area.width >= 20
         && area.height >= 2
@@ -3828,7 +3830,7 @@ pub(crate) fn status_label(status: SessionStatus) -> &'static str {
         SessionLifecycle::Fresh => "Fresh",
         SessionLifecycle::Starting => "Starting",
         SessionLifecycle::Running => match status.activity {
-            ProviderActivity::AwaitingInput => "Needs input",
+            ProviderActivity::AwaitingInput => "Waiting for input",
             ProviderActivity::Completed => "Completed",
             ProviderActivity::Interrupted => "Interrupted",
             ProviderActivity::RecoverableFailure => "Recoverable failure",
