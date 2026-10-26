@@ -10623,20 +10623,20 @@ mod tests {
 
     // Bundled fonts and the headless renderer keep these workflows identical across platforms.
     const APPROVED_VISUAL_CHECKSUMS: [u64; 14] = [
-        14_411_716_778_925_671_729,
+        9_277_820_374_399_336_076,
         12_365_258_274_555_457_046,
         11_704_634_815_454_000_937,
-        17_732_859_424_370_243_582,
-        6_387_303_985_738_252_548,
+        5_440_786_141_461_063_655,
+        11_875_048_350_757_688_465,
         3_418_532_975_102_054_885,
-        13_372_692_605_195_473_834,
-        15_453_704_153_979_111_261,
+        8_503_466_275_920_392_275,
+        12_281_769_398_527_565_244,
         10_103_567_952_100_179_337,
-        17_921_599_019_395_180_662,
+        6_067_048_144_675_722_875,
         3_979_220_309_231_598_554,
-        10_552_251_326_341_320_036,
+        4_004_422_546_722_634_968,
         1_823_448_962_296_347_469,
-        4_757_816_196_288_805_032,
+        13_411_881_869_734_911_873,
     ];
     // Isolate the Details pane from navigator attention and platform chrome.
     const APPROVED_DETAILS_VISUAL_CHECKSUMS: [u64; 3] = [
@@ -12468,12 +12468,11 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique_checksums.len(), baselines.len());
-        if std::env::var_os("CI").is_some() {
-            assert_eq!(
-                baselines.map(|baseline| baseline.checksum),
-                APPROVED_VISUAL_CHECKSUMS
-            );
-        }
+        assert_eq!(
+            baselines.map(|baseline| baseline.checksum),
+            APPROVED_VISUAL_CHECKSUMS,
+            "reviewed visual baselines must also match in local test runs"
+        );
     }
 
     #[tokio::test]
