@@ -24,9 +24,38 @@ run_with_timeout() {
   return "$status"
 }
 
+create_dmg() {
+  local attempt status log
+  log="$(mktemp)"
+  for attempt in 1 2 3; do
+    if run_with_timeout 600 hdiutil create -volname SylvOps -srcfolder "$1" -ov -format UDZO "$2" > "$log" 2>&1; then
+      cat "$log"
+      rm -f "$log"
+      return 0
+    else
+      status=$?
+    fi
+    cat "$log" >&2
+    if [[ "$status" -ne 1 || "$attempt" -eq 3 ]] || ! grep -Fq 'hdiutil: create failed - Resource busy' "$log"; then
+      rm -f "$log"
+      return "$status"
+    fi
+    # Disk-image services can briefly retain a busy resource on hosted macOS.
+    # Remove only this generated image before retrying the unchanged staging tree.
+    rm -f "$2" || { rm -f "$log"; return 1; }
+    echo "Disk image creation is busy; retrying ($attempt/3)." >&2
+    sleep 5
+  done
+}
+
 usage() {
   echo "usage: $0 --target <triple> --architecture <x86_64|aarch64> --signing-identity <identity> [--keychain <path>] [--notary-key <path> --notary-key-id <id> --notary-issuer-id <id>] [--require-developer-id] [--skip-build]" >&2
 }
+
+# Allow the packaging helpers to be exercised without running a native build.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 target=""
 architecture=""
@@ -201,7 +230,7 @@ run_with_timeout 120 codesign --verify --deep --strict --verbose=2 "$app_path"
 
 run_with_timeout 120 ditto "$app_path" "$staging_dir/SylvOps.app"
 ln -s /Applications "$staging_dir/Applications"
-run_with_timeout 600 hdiutil create -volname SylvOps -srcfolder "$staging_dir" -ov -format UDZO "$dmg_path"
+create_dmg "$staging_dir" "$dmg_path"
 run_with_timeout 120 codesign "${dmg_sign_args[@]}" "$dmg_path"
 run_with_timeout 120 codesign --verify --verbose=2 "$dmg_path"
 
