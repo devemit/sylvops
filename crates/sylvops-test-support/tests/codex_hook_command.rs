@@ -1,4 +1,4 @@
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{fmt::Write as _, path::Path, process::Stdio, time::Duration};
 
 use sylvops_core::{
     domain::{ProviderKind, Session},
@@ -499,12 +499,30 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
                 .starts_with("sylvops-hooks-v1-")
         })
         .unwrap();
-    let profile_key =
-        toml::Value::String(format!("{}:session_start:0:0", profile.to_string_lossy()));
     let original = std::fs::read_to_string(&profile).unwrap();
+    let mut approvals = String::new();
+    for event in [
+        "session_start",
+        "session_end",
+        "user_prompt_submit",
+        "permission_request",
+        "pre_tool_use",
+        "post_tool_use",
+        "subagent_start",
+        "subagent_stop",
+        "stop",
+        "interrupt",
+    ] {
+        let profile_key = toml::Value::String(format!("{}:{event}:0:0", profile.to_string_lossy()));
+        write!(
+            approvals,
+            "\n[hooks.state.{profile_key}]\ntrusted_hash = 'sha256:{}'\n",
+            "a".repeat(64)
+        )
+        .unwrap();
+    }
     let approved = format!(
-        "model = 'gpt-test'\nmodel_reasoning_effort = 'medium'\n{original}\n[hooks.state.{profile_key}]\ntrusted_hash = 'sha256:{}'\n[tui]\nstatus_line = ['model-name', 'context-remaining']\nstatus_line_use_colors = true\ntheme = 'example'\n[future_preferences]\nunknown = true\n",
-        "a".repeat(64)
+        "model = 'gpt-test'\nmodel_reasoning_effort = 'medium'\n{original}{approvals}\n[tui]\nstatus_line = ['model-name', 'context-remaining']\nstatus_line_use_colors = true\ntheme = 'example'\n[future_preferences]\nunknown = true\n"
     );
     std::fs::write(&profile, &approved).unwrap();
     let mut restarted = start_daemon(&relay, &codex_home, &state_root);
