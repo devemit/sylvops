@@ -1715,6 +1715,22 @@ fn bounded_payload_field(payload: &serde_json::Value, name: &str) -> String {
         .collect()
 }
 
+// Codex uses PascalCase registry names and snake_case approval keys for the same hooks.
+// Keep generation and approval validation together so adding a hook cannot invalidate
+// the approval metadata Codex writes back to an existing stable profile.
+const CODEX_HOOK_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session_start"),
+    ("SessionEnd", "session_end"),
+    ("UserPromptSubmit", "user_prompt_submit"),
+    ("PermissionRequest", "permission_request"),
+    ("PreToolUse", "pre_tool_use"),
+    ("PostToolUse", "post_tool_use"),
+    ("SubagentStart", "subagent_start"),
+    ("SubagentStop", "subagent_stop"),
+    ("Stop", "stop"),
+    ("Interrupt", "interrupt"),
+];
+
 #[cfg(test)]
 fn hook_profile_source(command: &str) -> String {
     hook_profile_source_with_windows(command, command)
@@ -1724,18 +1740,7 @@ fn hook_profile_source_with_windows(command: &str, windows_command: &str) -> Str
     let command = toml::Value::String(command.to_owned()).to_string();
     let windows_command = toml::Value::String(windows_command.to_owned()).to_string();
     let mut body = String::from("[features]\nhooks = true\n");
-    for event in [
-        "SessionStart",
-        "SessionEnd",
-        "UserPromptSubmit",
-        "PermissionRequest",
-        "PreToolUse",
-        "PostToolUse",
-        "SubagentStart",
-        "SubagentStop",
-        "Stop",
-        "Interrupt",
-    ] {
+    for &(event, _) in CODEX_HOOK_EVENTS {
         let _ = write!(
             body,
             "\n[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command}\ncommand_windows = {windows_command}\nasync = {}\ntimeout = 2\n",
@@ -1954,21 +1959,11 @@ fn project_trust_metadata_is_valid(projects: &toml::Value) -> bool {
 }
 
 fn hook_trust_metadata_is_valid(state: &toml::Value, profile_path: &Path) -> bool {
-    const EVENTS: &[&str] = &[
-        "session_start",
-        "session_end",
-        "user_prompt_submit",
-        "permission_request",
-        "subagent_start",
-        "subagent_stop",
-        "stop",
-        "interrupt",
-    ];
     let Some(state) = state.as_table() else {
         return false;
     };
     !state.is_empty()
-        && state.len() <= EVENTS.len()
+        && state.len() <= CODEX_HOOK_EVENTS.len()
         && state.iter().all(|(key, metadata)| {
             let Some((path, event)) = key
                 .strip_suffix(":0:0")
@@ -1976,7 +1971,7 @@ fn hook_trust_metadata_is_valid(state: &toml::Value, profile_path: &Path) -> boo
             else {
                 return false;
             };
-            EVENTS.contains(&event)
+            CODEX_HOOK_EVENTS.iter().any(|&(_, key)| key == event)
                 && !path.chars().any(char::is_control)
                 && Path::new(path).is_absolute()
                 && std::fs::canonicalize(path).ok().as_deref() == Some(profile_path)
@@ -2781,6 +2776,55 @@ mod tests {
             assert!(install_stable_hook_profile(&directory, &source).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
         }
+    }
+
+    #[test]
+    fn stable_hook_profile_preserves_all_generated_hook_approvals() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temporary.path()).unwrap();
+        let source = hook_profile_source("sylvops hook emit");
+        let name = install_stable_hook_profile(&directory, &source).unwrap();
+        let path = directory.join(format!("{name}.config.toml"));
+        let ordinary = path
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_owned();
+        let mut approvals = String::new();
+        for event in [
+            "session_start",
+            "session_end",
+            "user_prompt_submit",
+            "permission_request",
+            "pre_tool_use",
+            "post_tool_use",
+            "subagent_start",
+            "subagent_stop",
+            "stop",
+            "interrupt",
+        ] {
+            let key = toml::Value::String(format!("{ordinary}:{event}:0:0"));
+            let approval = format!(
+                "\n[hooks.state.{key}]\ntrusted_hash = 'sha256:{}'\n",
+                "a".repeat(64)
+            );
+            let trusted = format!("{source}{approval}");
+            std::fs::write(&path, &trusted).unwrap();
+            assert_eq!(
+                install_stable_hook_profile(&directory, &source).unwrap(),
+                name,
+                "{event}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), trusted);
+            approvals.push_str(&approval);
+        }
+        let trusted = format!("{source}{approvals}");
+        std::fs::write(&path, &trusted).unwrap();
+        assert_eq!(
+            install_stable_hook_profile(&directory, &source).unwrap(),
+            name
+        );
+        assert!(owned_profile_checksum_is_valid(&trusted, &path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), trusted);
     }
 
     #[test]
