@@ -19,6 +19,9 @@ jobs:
       - name: Validate bundled lifecycle guidance and release sources
         shell: pwsh
         run: ./scripts/validate-release.ps1
+      - name: Verify bounded macOS disk image retries
+        shell: bash
+        run: bash scripts/test-macos-dmg-retry.sh
 
   test:
     needs: release-sources
