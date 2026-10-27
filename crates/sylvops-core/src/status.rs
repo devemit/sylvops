@@ -152,8 +152,10 @@ pub enum NormalizedProviderEvent {
         conversation: Option<ConversationIdentity>,
     },
     PermissionRequested,
+    /// A provider permission check, which may be decided automatically without user input.
+    PermissionCheckStarted,
     UserInputRequested,
-    /// Observational tool execution; correlation remains daemon-owned.
+    /// Observational tool execution; does not imply a user-input request.
     ToolStarted,
     ToolCompleted,
     SubagentStarted {
@@ -265,6 +267,9 @@ impl SessionStatusMachine {
         self.status.lifecycle = SessionLifecycle::Running;
         match event {
             NormalizedProviderEvent::ToolStarted | NormalizedProviderEvent::ToolCompleted => {}
+            NormalizedProviderEvent::PermissionCheckStarted => {
+                self.set_live_condition(ProviderActivity::Working, None, occurred_at)?;
+            }
             NormalizedProviderEvent::PromptSubmitted
             | NormalizedProviderEvent::TurnStarted { .. } => {
                 self.active_subagents.clear();
@@ -551,6 +556,31 @@ mod tests {
         assert_eq!(
             completed.attention.unwrap().reason,
             AttentionReason::SuccessfulCompletion
+        );
+    }
+
+    #[test]
+    fn permission_checks_are_neutral_and_clear_legacy_input_attention() {
+        let mut machine = SessionStatusMachine::new(SessionLifecycle::Running);
+        let old = apply(&mut machine, &NormalizedProviderEvent::PermissionRequested);
+        for _ in 0..2 {
+            let checked = apply(
+                &mut machine,
+                &NormalizedProviderEvent::PermissionCheckStarted,
+            );
+            assert_eq!(checked.lifecycle, SessionLifecycle::Running);
+            assert_eq!(checked.activity, ProviderActivity::Working);
+            assert_eq!(checked.attention.unwrap().id, old.attention.unwrap().id);
+            assert_eq!(
+                checked.attention.unwrap().acknowledgement,
+                AttentionAcknowledgement::Resolved
+            );
+        }
+        let event = NormalizedProviderEvent::PermissionCheckStarted;
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            serde_json::from_str::<NormalizedProviderEvent>(&encoded).unwrap(),
+            event
         );
     }
 

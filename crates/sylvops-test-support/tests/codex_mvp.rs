@@ -86,7 +86,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         } => (project.id, root_worktree.id),
         response => panic!("unexpected project response: {response:?}"),
     };
-    exercise_input_review_and_resolution(&client, worktree_id).await;
+    exercise_neutral_permission_checks(&client, worktree_id).await;
     let shell_session_id = create_shell_session(&client, worktree_id).await;
     match client
         .request(&ClientRequest::ResumeSession {
@@ -149,18 +149,16 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     let terminated_profile_source =
         std::fs::read_to_string(&terminated_profile).expect("read owned Codex profile");
     attach(&client, terminated_session_id).await;
-    client
-        .request(&ClientRequest::SessionInput {
-            session_id: terminated_session_id,
-            bytes: input_line("permission"),
-        })
-        .await
-        .expect("terminated-session permission input");
+    input_command(
+        &client,
+        terminated_session_id,
+        "permission",
+        sylvops_core::status::NormalizedProviderEvent::PermissionCheckStarted,
+    )
+    .await;
     wait_for_session(&client, terminated_session_id, |session| {
-        matches!(
-            session.status.activity,
-            ProviderActivity::AwaitingInput | ProviderActivity::RecoverableFailure
-        ) && session.external_session_id.is_some()
+        session.status.activity == ProviderActivity::Working
+            && session.external_session_id.is_some()
     })
     .await;
     std::fs::write(
@@ -351,18 +349,16 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
 
     let source_session_id = create_codex_session(&client, worktree_id).await;
     attach(&client, source_session_id).await;
-    client
-        .request(&ClientRequest::SessionInput {
-            session_id: source_session_id,
-            bytes: input_line("permission"),
-        })
-        .await
-        .expect("permission input");
+    input_command(
+        &client,
+        source_session_id,
+        "permission",
+        sylvops_core::status::NormalizedProviderEvent::PermissionCheckStarted,
+    )
+    .await;
     let waiting = wait_for_session(&client, source_session_id, |session| {
-        matches!(
-            session.status.activity,
-            ProviderActivity::AwaitingInput | ProviderActivity::RecoverableFailure
-        ) && session.external_session_id.is_some()
+        session.status.activity == ProviderActivity::Working
+            && session.external_session_id.is_some()
     })
     .await;
     let external_id = waiting.external_session_id.expect("external Codex ID");
@@ -386,13 +382,8 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     )
     .expect("Codex adds trust before successful exit");
     assert_eq!(waiting.status.lifecycle, SessionLifecycle::Running);
-    assert_eq!(waiting.status.activity, ProviderActivity::AwaitingInput);
-    let input_event = waiting.status.attention.expect("input attention");
-    assert_eq!(input_event.reason, AttentionReason::InputRequested);
-    assert_eq!(
-        input_event.acknowledgement,
-        AttentionAcknowledgement::Pending
-    );
+    assert_eq!(waiting.status.activity, ProviderActivity::Working);
+    assert!(waiting.status.attention.is_none());
 
     client
         .request(&ClientRequest::SessionInput {
@@ -407,13 +398,7 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
     .await;
     assert_eq!(interrupted.status.lifecycle, SessionLifecycle::Running);
     assert!(interrupted.process_id.is_some());
-    assert_eq!(
-        interrupted
-            .status
-            .attention
-            .map(|event| event.acknowledgement),
-        Some(AttentionAcknowledgement::Resolved)
-    );
+    assert!(interrupted.status.attention.is_none());
 
     client
         .request(&ClientRequest::SessionInput {
@@ -550,7 +535,6 @@ async fn fake_codex_hooks_attention_and_resume_inner() {
         AttentionReason::SuccessfulCompletion
     );
     assert_eq!(completion_event.id, live_completion_event.id);
-    assert!(u64::from(completion_event.id) > u64::from(input_event.id));
     assert_eq!(source_history.status.lifecycle, SessionLifecycle::Exited);
     assert_eq!(
         source_history.external_session_id.as_deref(),
@@ -1272,93 +1256,48 @@ async fn input_command(
     }
 }
 
-async fn exercise_input_review_and_resolution(client: &DaemonClient, worktree_id: WorktreeId) {
+async fn exercise_neutral_permission_checks(client: &DaemonClient, worktree_id: WorktreeId) {
     use sylvops_core::status::NormalizedProviderEvent;
     let id = create_codex_session(client, worktree_id).await;
     attach(client, id).await;
     wait_for_session(client, id, |session| session.external_session_id.is_some()).await;
-    input_command(
-        client,
-        id,
-        "permission-auto",
-        NormalizedProviderEvent::ToolCompleted,
-    )
-    .await;
-    wait_for_session(client, id, |session| {
-        session.status.activity == ProviderActivity::Working
-            && session
-                .status
-                .attention
-                .is_some_and(|event| event.acknowledgement == AttentionAcknowledgement::Resolved)
-    })
-    .await;
-    input_command(
-        client,
-        id,
-        "permission-wait",
-        NormalizedProviderEvent::PermissionRequested,
-    )
-    .await;
-    let waiting = wait_for_session(client, id, |session| {
-        session.status.activity == ProviderActivity::AwaitingInput
-    })
-    .await;
-    let first = waiting.status.attention.unwrap();
-    let reviewed = match client
-        .request(&ClientRequest::AcknowledgeAttention {
-            session_id: id,
-            attention_id: first.id,
-        })
-        .await
-        .unwrap()
-    {
-        DaemonResponse::SessionAttentionAcknowledged { session, .. } => session,
-        response => panic!("input review refused: {response:?}"),
-    };
-    assert_eq!(reviewed.status.activity, ProviderActivity::AwaitingInput);
-    assert_eq!(
-        reviewed.status.attention.unwrap().acknowledgement,
-        AttentionAcknowledgement::Acknowledged
-    );
-    input_command(
-        client,
-        id,
-        "permission-second",
-        NormalizedProviderEvent::PermissionRequested,
-    )
-    .await;
-    let second = wait_for_session(client, id, |session| {
-        session
-            .status
-            .attention
-            .is_some_and(|event| event.id != first.id)
-    })
-    .await;
-    assert_eq!(
-        second.status.attention.unwrap().acknowledgement,
-        AttentionAcknowledgement::Pending
-    );
-    input_command(
-        client,
-        id,
-        "permission-first-done",
-        NormalizedProviderEvent::ToolCompleted,
-    )
-    .await;
-    let waiting = wait_for_session(client, id, |_| true).await;
-    assert_eq!(waiting.status.activity, ProviderActivity::AwaitingInput);
-    assert_eq!(waiting.status.attention, second.status.attention);
-    input_command(
-        client,
-        id,
-        "permission-second-done",
-        NormalizedProviderEvent::ToolCompleted,
-    )
-    .await;
-    wait_for_session(client, id, |session| {
-        session.status.activity == ProviderActivity::Working
-    })
-    .await;
+    for (command, expected) in [
+        ("permission-auto", NormalizedProviderEvent::ToolCompleted),
+        (
+            "permission-wait",
+            NormalizedProviderEvent::PermissionCheckStarted,
+        ),
+        (
+            "permission-second",
+            NormalizedProviderEvent::PermissionCheckStarted,
+        ),
+        (
+            "permission-first-done",
+            NormalizedProviderEvent::ToolCompleted,
+        ),
+        (
+            "permission-second-done",
+            NormalizedProviderEvent::ToolCompleted,
+        ),
+    ] {
+        input_command(client, id, command, expected).await;
+        let current = wait_for_session(client, id, |_| true).await;
+        assert_eq!(current.status.activity, ProviderActivity::Working);
+        assert!(
+            current.status.attention.is_none(),
+            "false attention for {command}"
+        );
+        // Remain neutral beyond the old notification debounce, including checks whose
+        // tool completion has not arrived and overlapping permission checks.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(matches!(
+            client
+                .request(&ClientRequest::ClaimAttentionNotification)
+                .await
+                .unwrap(),
+            DaemonResponse::AttentionNotificationClaim(None)
+        ));
+    }
     client
         .request(&ClientRequest::StopSession { session_id: id })
         .await

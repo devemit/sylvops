@@ -61,9 +61,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    DaemonError, Result,
-    codex_input::{InputChange, InputTracking},
-    config_store,
+    DaemonError, Result, config_store,
     data_removal::{DATA_REMOVAL_CONFIRMATION, DataRemovalPlan},
     database::{
         DatabaseHandle, NewSession, NewWorkSource, ProjectRemovalState,
@@ -509,7 +507,6 @@ struct DaemonState {
 
 #[derive(Clone, Debug, Default)]
 struct HookTracking {
-    input: InputTracking,
     callback_received: bool,
     fingerprints: HashSet<String>,
     stopped_turns: HashSet<String>,
@@ -4265,38 +4262,19 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
                 conversation: Some(_)
             }
         );
-    let (disposition, session_start_missing, mut next_tracking, input_change) = {
+    let (disposition, session_start_missing, mut next_tracking) = {
         // Stage accepted tracking changes until persistence succeeds. The daemon run loop awaits
         // each delivery to completion, so classification and commit remain serialized without
         // holding this global lock across the database await.
         let mut tracking = state.hook_tracking.lock().await;
         let tracking = tracking.entry(delivery.session_id).or_default();
         let mut candidate = tracking.clone();
-        let input_change = if delivery.provider == ProviderKind::Codex {
-            candidate.input.observe(delivery.payload.as_bytes(), &event)
-        } else {
-            InputChange::None
-        };
-        let fingerprint = if input_change == InputChange::NewRequest {
-            format!("{}:{}", delivery.fingerprint, candidate.input.generation())
-        } else {
-            delivery.fingerprint.clone()
-        };
-        let disposition = candidate
-            .classify(fingerprint, &event, normalized.turn_id.as_deref())
-            .or_else(|| {
-                (input_change == InputChange::Ignore).then_some("duplicate_or_stale_input")
-            });
-        if disposition == Some("duplicate_or_stale_input") {
-            // Keep conservative uncertainty discovered in a conflicting duplicate.
-            tracking.input = candidate.input.clone();
-        }
-        (
-            disposition,
-            tracking.session_start_missing,
-            candidate,
-            input_change,
-        )
+        let disposition = candidate.classify(
+            delivery.fingerprint.clone(),
+            &event,
+            normalized.turn_id.as_deref(),
+        );
+        (disposition, tracking.session_start_missing, candidate)
     };
     if let Some(disposition) = disposition {
         state
@@ -4354,22 +4332,6 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
         machine
             .apply(&event, status_timestamp())
             .map_err(|message| DaemonError::Database(message.into()))?;
-        if input_change == InputChange::NewRequest
-            && persisted.status.attention.is_some_and(|attention| {
-                attention.reason == sylvops_core::session_state::AttentionReason::InputRequested
-                    && attention.acknowledgement != AttentionAcknowledgement::Resolved
-            })
-        {
-            machine
-                .renew_input_attention(status_timestamp())
-                .map_err(|message| DaemonError::Database(message.into()))?;
-        } else if input_change == InputChange::Resolved
-            && let Some(attention) = persisted.status.attention
-        {
-            machine
-                .resolve_input_attention(attention.id, status_timestamp())
-                .map_err(|message| DaemonError::Database(message.into()))?;
-        }
         let transition = machine.transition();
         (transition, machine)
     };
