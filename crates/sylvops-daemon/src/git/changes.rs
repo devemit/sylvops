@@ -620,7 +620,7 @@ mod tests {
         };
         let file = load_file_change(&worktree, &key).await.unwrap();
         assert!(file.notice.is_some());
-        assert!(file.lines.is_empty());
+        assert_eq!(file.lines, Vec::new());
         let fifo = repo.path().join("pipe");
         nix::unistd::mkfifo(
             &fifo,

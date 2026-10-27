@@ -12896,7 +12896,7 @@ mod tests {
                 truncated: false,
             }),
         );
-        assert!(app.review.state.files.is_empty());
+        assert_eq!(app.review.state.files, Vec::new());
         assert!(app.review.state.paused);
     }
 
