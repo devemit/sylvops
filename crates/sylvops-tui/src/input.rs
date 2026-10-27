@@ -17,6 +17,12 @@ pub(crate) fn navigation_action(app: &App, event: &Event) -> Option<Action> {
 }
 
 fn key_action(app: &App, key: &KeyEvent) -> Option<Action> {
+    if app.main_tab == TuiContentView::Changes
+        && app.focus == crate::app::FocusZone::Main
+        && let Some(action) = crate::changes::key_action(&app.review, key)
+    {
+        return Some(Action::Review(action));
+    }
     if let KeyCode::Char(shortcut) = key.code
         && let Some(view) = match shortcut {
             '1' => Some(TuiContentView::Terminal),
@@ -101,6 +107,29 @@ fn key_action(app: &App, key: &KeyEvent) -> Option<Action> {
 }
 
 fn mouse_action(app: &App, mouse: MouseEvent) -> Option<Action> {
+    if app.main_tab == TuiContentView::Changes
+        && app.review.state.checkout.is_some()
+        && let MouseEventKind::ScrollDown | MouseEventKind::ScrollUp = mouse.kind
+    {
+        let target = app.hit_map.target_at(mouse.column, mouse.row);
+        let files = matches!(
+            target,
+            Some(
+                HitTarget::ReviewFile(_)
+                    | HitTarget::ReviewAction(crate::changes::Action::Group(_))
+            )
+        );
+        if files || matches!(target, Some(HitTarget::FocusMain)) {
+            return Some(Action::Review(crate::changes::Action::Wheel(
+                if mouse.kind == MouseEventKind::ScrollDown {
+                    3
+                } else {
+                    -3
+                },
+                files,
+            )));
+        }
+    }
     match mouse.kind {
         MouseEventKind::Drag(MouseButton::Left)
             if app.navigator_resizing == NavigatorResizeState::Dragging =>
@@ -187,6 +216,8 @@ fn explorer_target(target: Option<HitTarget>) -> bool {
 
 fn target_action(target: HitTarget) -> Option<Action> {
     match target {
+        HitTarget::ReviewFile(index) => Some(Action::Review(crate::changes::Action::Select(index))),
+        HitTarget::ReviewAction(action) => Some(Action::Review(action)),
         HitTarget::ExplorerRow(index) => Some(Action::SelectExplorer(index)),
         HitTarget::Tab(tab) => Some(Action::SelectTab(tab)),
         HitTarget::SessionOverview(session_id) => Some(Action::SelectOverviewSession(session_id)),

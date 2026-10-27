@@ -15,6 +15,7 @@ SylvOps is a local-first mission control for supervising interactive coding-agen
 - Provides a native desktop client and a keyboard-first TUI over the same authenticated local IPC boundary.
 - Can associate a project with a validated GitHub remote to browse Issues and Pull Requests and start isolated work from an Issue.
 - Keeps credentials outside SylvOps. Provider CLIs and GitHub CLI are installed and authenticated separately.
+- Reviews local changes by file in Desktop and TUI, with separate staged, unstaged, and untracked groups, numbered diffs, search, syntax colors, and pausable refresh. Desktop also offers side-by-side diffs. See [reviewing changes](docs/product/changes.md).
 
 ## Getting started
 

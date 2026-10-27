@@ -7,8 +7,9 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
+#[cfg(test)]
+use sylvops_core::diff::{self, DiffLineKind};
 use sylvops_core::{
-    diff::{self, DiffLineKind},
     domain::{Session, WorktreeStatus},
     github::{
         GitHubBrowseFailure, GitHubBrowseFailureKind, GitHubCheckState, GitHubItemKind,
@@ -568,7 +569,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
         TuiContentView::Terminal | TuiContentView::Sessions => {
             draw_terminal(frame, app, areas.workspace, theme);
         }
-        TuiContentView::Changes => draw_changes(frame, app, areas.workspace, theme),
+        TuiContentView::Changes => crate::changes::draw(frame, app, areas.workspace, theme),
         TuiContentView::Details => draw_details(frame, app, areas.workspace, theme),
     }
 }
@@ -1259,26 +1260,7 @@ const fn terminal_color(color: vt100::Color, fallback: Color) -> Color {
     }
 }
 
-fn draw_changes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let content = app
-        .diff
-        .as_deref()
-        .unwrap_or("Press g to load the bounded daemon-owned diff for this worktree.");
-    let block = Block::default()
-        .title(" Changes · read-only · ↑/↓ PgUp/PgDn ")
-        .borders(Borders::ALL)
-        .border_style(theme.border);
-    let inner_width = block.inner(area).width;
-    frame.render_widget(
-        Paragraph::new(styled_diff_lines(content, inner_width, theme))
-            .block(block)
-            .style(theme.text)
-            .scroll((app.diff_scroll, 0))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
+#[cfg(test)]
 fn styled_diff_lines(content: &str, width: u16, theme: Theme) -> Vec<Line<'static>> {
     diff::lines(content)
         .map(|line| {

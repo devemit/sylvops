@@ -198,6 +198,8 @@ pub(crate) struct ExplorerRow {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HitTarget {
+    ReviewFile(usize),
+    ReviewAction(crate::changes::Action),
     ExplorerRow(usize),
     Tab(TuiContentView),
     SessionOverview(SessionId),
@@ -326,6 +328,7 @@ pub(crate) struct App {
     pub expanded_worktrees: HashSet<WorktreeId>,
     pub diff: Option<String>,
     pub diff_scroll: u16,
+    pub review: crate::changes::Review,
     pub flash: Option<Flash>,
     pub help: bool,
     pub attached: Option<AttachedTerminal>,
@@ -397,6 +400,7 @@ impl App {
             expanded_worktrees: HashSet::new(),
             diff: None,
             diff_scroll: 0,
+            review: crate::changes::Review::default(),
             flash: None,
             help: false,
             attached: None,

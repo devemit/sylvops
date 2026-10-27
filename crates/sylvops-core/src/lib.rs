@@ -9,6 +9,7 @@ pub const LINUX_DESKTOP_ID: &str = "sylvops";
 pub const APPLICATION_PUBLISHER: &str = "devemit";
 
 pub mod attention;
+pub mod changes;
 pub mod config;
 pub mod diff;
 pub mod domain;

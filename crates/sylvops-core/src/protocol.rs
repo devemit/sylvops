@@ -25,7 +25,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 33;
+pub const PROTOCOL_MINOR: u16 = 34;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -724,6 +724,13 @@ pub enum ClientRequest {
     GetDiff {
         worktree_id: WorktreeId,
     },
+    ListCheckoutChanges {
+        worktree_id: WorktreeId,
+    },
+    LoadFileChange {
+        worktree_id: WorktreeId,
+        key: crate::changes::ChangeKey,
+    },
     ShutdownDaemon,
 }
 
@@ -867,6 +874,8 @@ pub enum DaemonResponse {
     },
     WorktreeStatus(GitWorktreeState),
     Diff(GitDiff),
+    CheckoutChanges(crate::changes::CheckoutChanges),
+    FileChange(crate::changes::FileChange),
     WorktreeRemoved {
         revision: u64,
         worktree: Worktree,
@@ -1174,7 +1183,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 33);
+        assert_eq!(PROTOCOL_MINOR, 34);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1233,7 +1242,7 @@ mod tests {
             let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
             assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
         }
-        assert_eq!(PROTOCOL_MINOR, 33);
+        assert_eq!(PROTOCOL_MINOR, 34);
         let event = DaemonEvent::AttentionNotificationAvailable;
         let frame = Frame::message(MessageClass::Event, 11, &event).unwrap();
         assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
@@ -1340,7 +1349,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 33);
+        assert_eq!(PROTOCOL_MINOR, 34);
     }
 
     #[test]
@@ -1380,7 +1389,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 33);
+        assert_eq!(PROTOCOL_MINOR, 34);
     }
 
     #[test]
@@ -1452,7 +1461,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 33);
+        assert_eq!(PROTOCOL_MINOR, 34);
     }
 
     #[test]
@@ -1646,7 +1655,7 @@ mod tests {
             let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
         }
-        assert_eq!(PROTOCOL_MINOR, 33);
+        assert_eq!(PROTOCOL_MINOR, 34);
     }
 
     #[test]

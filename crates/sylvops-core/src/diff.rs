@@ -1,7 +1,7 @@
 //! Platform-neutral classification of bounded unified-diff text for replaceable clients.
 
 /// The semantic role of one line in a unified diff.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DiffLineKind {
     /// A `diff --git`, `---`, or `+++` file header.
     FileHeader,

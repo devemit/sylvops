@@ -57,6 +57,9 @@ sylvops-test-support = { path = "../sylvops-test-support" }
 [target.'cfg(windows)'.dev-dependencies]
 junction = "2"
 
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.30", features = ["fs"] }
+
 [lints.rust]
 unsafe_code = "warn"
 missing_debug_implementations = "warn"
