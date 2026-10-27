@@ -2,6 +2,8 @@
 
 ## Transport
 
+The current protocol is 1.34. It adds `ListCheckoutChanges` and `LoadFileChange` for grouped local file review, returning typed status, lossless relative identity, numbered diff lines, and explicit incomplete/unsupported states. The existing `GetDiff` operation remains available. Each review response fits the existing 1 MiB frame; clients and daemon must restart together when upgrading from 1.33. No database migration is introduced. See [Changes](../product/changes.md) for comparisons and resource limits.
+
 - Unix: a mode-`0600` Unix-domain socket below the user runtime directory, with peer credential validation where available.
 - Windows: a named pipe with a DACL restricted to the current user SID and client-token validation where practical.
 

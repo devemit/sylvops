@@ -84,7 +84,8 @@ pub(crate) enum Operation {
     Detach(SessionId),
     Stop(SessionId),
     Resize,
-    LoadDiff(WorktreeId),
+    ReviewList(WorktreeId, u64),
+    ReviewFile(WorktreeId, u64),
     Input(SessionId),
     SaveDesktopState,
     CheckForUpdate,
@@ -148,6 +149,10 @@ impl TerminalInputTransport for DaemonClient {
 
 #[derive(Clone, Debug)]
 pub(crate) enum BridgeEvent {
+    ReviewPrepared {
+        operation: Operation,
+        prepared: sylvops_core::changes::PreparedFile,
+    },
     Connected {
         snapshot: DaemonSnapshot,
         providers: Vec<ProviderHealth>,
@@ -525,6 +530,25 @@ async fn run_worker_async(
                     let request_events = events.clone();
                     tokio::spawn(async move {
                         let event = match request_client.request(&request).await {
+                            Ok(DaemonResponse::FileChange(file))
+                                if matches!(operation, Operation::ReviewFile(_, _)) =>
+                            {
+                                match tokio::task::spawn_blocking(move || {
+                                    sylvops_core::changes::PreparedFile::new(file)
+                                })
+                                .await
+                                {
+                                    Ok(prepared) => BridgeEvent::ReviewPrepared {
+                                        operation,
+                                        prepared,
+                                    },
+                                    Err(_) => BridgeEvent::Error {
+                                        operation: Some(operation),
+                                        message: "Cannot prepare file review. Refresh to retry."
+                                            .into(),
+                                    },
+                                }
+                            }
                             Ok(response) => BridgeEvent::Response {
                                 operation,
                                 response,

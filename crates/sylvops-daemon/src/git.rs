@@ -1,5 +1,8 @@
 //! Bounded, structured Git repository and managed-worktree operations.
 
+mod changes;
+pub use changes::{list_checkout_changes, load_file_change};
+
 use std::{
     ffi::OsString,
     fs,

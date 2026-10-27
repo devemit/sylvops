@@ -1,6 +1,7 @@
 //! Native, mouse-first `SylvOps` client backed exclusively by authenticated daemon IPC.
 
 mod bridge;
+mod changes;
 mod forms;
 mod github_surface;
 mod icons;
@@ -54,7 +55,7 @@ use presentation::{
     session_status_label,
 };
 use sylvops_core::{
-    diff::{self as diff_view, DiffLineKind},
+    diff::DiffLineKind,
     domain::{
         AttachmentRole, DaemonSnapshot, Project, ProviderKind, Session, Workspace, Worktree,
         WorktreeStatus,
@@ -251,7 +252,7 @@ struct DesktopApp {
     active_session_id: Option<SessionId>,
     main_tab: MainTab,
     terminals: HashMap<SessionId, TerminalState>,
-    diff: Option<String>,
+    review: changes::Review,
     error: Option<String>,
     snapshot_pending: bool,
     modal: Option<Modal>,
@@ -609,6 +610,7 @@ impl TerminalFocus {
 
 #[derive(Clone, Debug)]
 enum Message {
+    Review(changes::Action),
     Tick,
     BridgeReady,
     Keyboard(keyboard::Event),
@@ -788,7 +790,7 @@ impl DesktopApp {
             active_session_id: None,
             main_tab: MainTab::Terminal,
             terminals: HashMap::new(),
-            diff: None,
+            review: changes::Review::default(),
             error: None,
             snapshot_pending: false,
             modal: None,
@@ -837,7 +839,12 @@ impl DesktopApp {
     fn update(&mut self, message: Message) -> Task<Message> {
         self.advance_startup(Instant::now());
         match message {
+            Message::Review(action) => return self.update_review(action),
             Message::Tick => {
+                self.poll_review();
+                if let Some(task) = self.review_scroll_task() {
+                    return task;
+                }
                 self.status_animation_phase = self
                     .status_animation_started_at
                     .elapsed()
@@ -2463,49 +2470,7 @@ impl DesktopApp {
     }
 
     fn changes_view(&self) -> Element<'_, Message> {
-        let body = self.diff.as_deref().unwrap_or(
-            "Select a checkout and open Changes to load its bounded, read-only Git diff.",
-        );
-        let font = terminal_font(self.desktop_state.terminal_font);
-        let font_size = u32::from(self.desktop_state.terminal_font_size);
-        let mut diff = column![].spacing(0).width(Fill);
-        for line in diff_view::lines(body) {
-            let kind = line.kind;
-            let content = if line.text.is_empty() { " " } else { line.text };
-            diff = diff.push(
-                container(
-                    text(content)
-                        .font(font)
-                        .size(font_size)
-                        .wrapping(text::Wrapping::None),
-                )
-                .padding([2, 8])
-                .width(Fill)
-                .style(move |theme| diff_line_style(theme, kind)),
-            );
-        }
-        container(column![
-            container(
-                text("Read-only Git changes · running sessions continue, but terminal input is disabled in this tab")
-                    .font(UI_MEDIUM)
-                    .size(UI_META_SIZE)
-                    .style(text::secondary)
-            )
-            .height(28)
-            .align_y(Vertical::Center),
-            scrollable(diff)
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::default(),
-                horizontal: scrollable::Scrollbar::default(),
-            })
-            .width(Fill)
-            .height(Fill),
-        ].spacing(6))
-        .padding(14)
-        .width(Fill)
-        .height(Fill)
-        .style(workspace_surface)
-        .into()
+        self.review_view()
     }
 
     fn github_view(&self) -> Element<'_, Message> {
@@ -4365,8 +4330,15 @@ impl DesktopApp {
             } => {
                 self.handle_response(operation, response);
             }
+            BridgeEvent::ReviewPrepared {
+                operation,
+                prepared,
+            } => self.review_prepared(operation, prepared),
             BridgeEvent::Error { operation, message } => {
                 let message = bounded_redacted_diagnostic(&message);
+                if self.review_failure(operation, &message) {
+                    return;
+                }
                 if matches!(operation, Some(Operation::Input(session_id)) if self.active_session_id == Some(session_id))
                 {
                     self.terminal_focus = TerminalFocus::Unfocused;
@@ -5025,17 +4997,8 @@ impl DesktopApp {
                     self.terminal_focus = TerminalFocus::Unfocused;
                 }
             }
-            (Operation::LoadDiff(worktree_id), DaemonResponse::Diff(diff)) => {
-                if self.selected_worktree_id != Some(worktree_id) {
-                    return;
-                }
-                self.diff = Some(if diff.text.is_empty() {
-                    "Working tree is clean.".into()
-                } else if diff.truncated {
-                    format!("{}\n\n[Diff truncated by daemon limits]", diff.text)
-                } else {
-                    diff.text
-                });
+            (operation @ (Operation::ReviewList(_, _) | Operation::ReviewFile(_, _)), response) => {
+                self.review_response(operation, response);
             }
             (
                 Operation::ReviewAttention(id),
@@ -7513,13 +7476,7 @@ impl DesktopApp {
     }
 
     fn load_diff(&mut self) {
-        if let Some(worktree_id) = self.selected_worktree_id {
-            self.diff = Some("Loading diff…".into());
-            self.send_request(
-                Operation::LoadDiff(worktree_id),
-                ClientRequest::GetDiff { worktree_id },
-            );
-        }
+        self.refresh_review();
     }
 
     fn persisted_state(&self) -> DesktopState {
@@ -7721,7 +7678,6 @@ impl DesktopApp {
             self.selected_session_id =
                 replacement.and_then(|id| self.sessions_for(id).first().map(|session| session.id));
         }
-        self.diff = None;
         self.mark_state_dirty();
     }
 
@@ -7762,7 +7718,6 @@ impl DesktopApp {
                 .selected_worktree_id
                 .and_then(|id| self.sessions_for(id).first().map(|session| session.id));
         }
-        self.diff = None;
         self.mark_state_dirty();
     }
 
@@ -7808,7 +7763,6 @@ impl DesktopApp {
         self.selected_project_id = None;
         self.selected_worktree_id = None;
         self.selected_session_id = None;
-        self.diff = None;
         self.restore_selection();
         if opened_workspace_id.is_none() {
             self.modal = Some(Modal::Form(FormModal::first_run(Form::workspace())));
@@ -7910,7 +7864,6 @@ impl DesktopApp {
         self.selected_session_id = self
             .selected_worktree_id
             .and_then(|id| self.sessions_for(id).first().map(|item| item.id));
-        self.diff = None;
         self.github_status = None;
         if self.content_surface == ContentSurface::GitHub {
             let kind = self.github_surface.kind();
@@ -7940,7 +7893,6 @@ impl DesktopApp {
             .find(|item| item.id == worktree_id)
             .map(|item| item.project_id);
         self.selected_session_id = self.sessions_for(worktree_id).first().map(|item| item.id);
-        self.diff = None;
         self.mark_state_dirty();
     }
 
@@ -8467,7 +8419,7 @@ const fn operation_error_context(operation: Operation) -> &'static str {
         Operation::Detach(_) => "Leave terminal",
         Operation::Stop(_) => "Stop session",
         Operation::Resize => "Resize terminal",
-        Operation::LoadDiff(_) => "Load changes",
+        Operation::ReviewList(_, _) | Operation::ReviewFile(_, _) => "Load changes",
         Operation::Input(_) => "Terminal input",
         Operation::SaveDesktopState => "Save desktop preferences",
         Operation::CheckForUpdate => "Check for updates",
@@ -11014,6 +10966,59 @@ mod tests {
         viewport: Option<(iced::Rectangle, iced::Rectangle, iced::Vector)>,
     }
 
+    #[derive(Default)]
+    struct ChangesGeometry {
+        viewport: Option<iced::Rectangle>,
+        code_row: Option<iced::Rectangle>,
+    }
+
+    impl WidgetOperation for ChangesGeometry {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+            operate(self);
+        }
+        fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+            if id == Some(&widget::Id::from("changes-line-6-false")) {
+                self.code_row = Some(bounds);
+            }
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            _content: iced::Rectangle,
+            _translation: iced::Vector,
+            _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+        ) {
+            if id == Some(&widget::Id::from("changes-diff")) {
+                self.viewport = Some(bounds);
+            }
+        }
+    }
+
+    async fn assert_changes_code_is_visible(app: &DesktopApp, width: u16, height: u16) {
+        let size = iced::Size::new(f32::from(width), f32::from(height));
+        let (mut element, renderer, mut tree, node) =
+            layout_test_element(app.changes_view(), Limits::new(size, size)).await;
+        let mut geometry = ChangesGeometry::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut geometry);
+        let viewport = geometry.viewport.expect("diff viewport");
+        let code = geometry.code_row.expect("actual numbered code row");
+        assert!(
+            viewport.width > 200.0 && viewport.height > 100.0,
+            "diff viewport is collapsed: {viewport:?}"
+        );
+        assert!(
+            code.width > 200.0 && code.height >= 20.0,
+            "code row is collapsed: {code:?}"
+        );
+        assert!(
+            viewport.contains(code.center()),
+            "code row must be visible in its viewport: {code:?} inside {viewport:?}"
+        );
+    }
+
     impl WidgetOperation for ScrollableSnapshot {
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn WidgetOperation)) {
             operate(self);
@@ -12866,16 +12871,198 @@ mod tests {
 
     #[test]
     fn changes_view_preserves_lines_and_scrolls_in_both_directions() {
-        let source = include_str!("lib.rs");
-        let changes_view = source
-            .split_once("    fn changes_view(&self)")
-            .and_then(|(_, tail)| tail.split_once("    fn github_view(&self)"))
-            .map(|(body, _)| body)
-            .expect("changes view source");
+        let (mut app, mut harness, id) = changes_fixture();
+        let original = app.review.state.file.clone();
+        app.load_diff();
+        let (operation, _) = harness.take_request();
+        let _ = app.update(Message::Review(changes::Action::Pause));
+        app.handle_response(
+            operation,
+            DaemonResponse::CheckoutChanges(sylvops_core::changes::CheckoutChanges {
+                worktree_id: id,
+                files: Vec::new(),
+                truncated: false,
+            }),
+        );
+        assert_eq!(app.review.state.file, original);
+        assert!(app.review.state.paused);
+        let _ = app.update(Message::Review(changes::Action::Refresh));
+        let (operation, _) = harness.take_request();
+        app.handle_response(
+            operation,
+            DaemonResponse::CheckoutChanges(sylvops_core::changes::CheckoutChanges {
+                worktree_id: id,
+                files: Vec::new(),
+                truncated: false,
+            }),
+        );
+        assert_eq!(app.review.state.files, Vec::new());
+        assert!(app.review.state.paused);
+    }
 
-        assert!(changes_view.contains("diff_view::lines(body)"));
-        assert!(changes_view.contains("Wrapping::None"));
-        assert!(changes_view.contains("scrollable::Direction::Both"));
+    fn changes_fixture() -> (DesktopApp, bridge::BridgeHarness, WorktreeId) {
+        use sylvops_core::changes::{
+            ChangeGroup, ChangeKey, ChangeStatus, ChangedFile, CheckoutChanges, FileChange,
+        };
+        let (mut app, _, id, _, _) = desktop_hierarchy();
+        let (bridge, mut harness) = Bridge::harness();
+        app.bridge = bridge;
+        app.main_tab = MainTab::Changes;
+        app.load_diff();
+        let key = ChangeKey {
+            group: ChangeGroup::Unstaged,
+            path: b"src/main.rs".to_vec(),
+        };
+        let files = vec![
+            ChangedFile {
+                key: key.clone(),
+                status: ChangeStatus::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                key: ChangeKey {
+                    group: ChangeGroup::Staged,
+                    path: b"src/main.rs".to_vec(),
+                },
+                status: ChangeStatus::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                key: ChangeKey {
+                    group: ChangeGroup::Untracked,
+                    path: b"docs/new-guide.md".to_vec(),
+                },
+                status: ChangeStatus::Untracked,
+                old_path: None,
+            },
+        ];
+        let (operation, request) = harness.take_request();
+        assert!(matches!(request, ClientRequest::ListCheckoutChanges { .. }));
+        app.handle_response(
+            operation,
+            DaemonResponse::CheckoutChanges(CheckoutChanges {
+                worktree_id: id,
+                files,
+                truncated: false,
+            }),
+        );
+        let (operation, request) = harness.take_request();
+        assert!(matches!(request, ClientRequest::LoadFileChange { .. }));
+        app.handle_response(operation,DaemonResponse::FileChange(FileChange::from_patch(id,key,"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n fn main() {\n-    let count = 1;\n+    let count = 2;\n+    println!(\"review complete\");\n }\n",false)));
+        (app, harness, id)
+    }
+
+    #[test]
+    fn changes_filter_search_and_stale_file_responses_preserve_identity() {
+        use sylvops_core::changes::{ChangeGroup, ChangeKey, FileChange};
+        let (mut app, mut harness, id) = changes_fixture();
+        let _ = app.update(Message::Review(changes::Action::Search("COUNT".into())));
+        assert_eq!(app.review.state.matches().len(), 2);
+        app.load_diff();
+        let (old_operation, _) = harness.take_request();
+        let _ = app.update(Message::Review(changes::Action::Filter("new-guide".into())));
+        let key = ChangeKey {
+            group: ChangeGroup::Untracked,
+            path: b"docs/new-guide.md".to_vec(),
+        };
+        assert_eq!(app.review.state.selected, Some(key.clone()));
+        app.handle_response(
+            old_operation,
+            DaemonResponse::FileChange(FileChange::from_patch(
+                id,
+                key.clone(),
+                "@@ -0,0 +1 @@\n+obsolete\n",
+                false,
+            )),
+        );
+        assert!(app.review.state.file.is_none());
+        let (operation, _) = harness.take_request();
+        app.handle_response(
+            operation,
+            DaemonResponse::Error(sylvops_core::protocol::ProtocolFailure {
+                code: "git".into(),
+                message: "file changed; refresh".into(),
+                retryable: true,
+            }),
+        );
+        assert!(app.review.state.error.is_some());
+        assert_eq!(app.review.state.selected, Some(key));
+    }
+
+    #[test]
+    fn changes_paused_selection_loads_the_chosen_file_without_refreshing_the_list() {
+        use sylvops_core::changes::{ChangeGroup, ChangeKey, CheckoutChanges};
+        let (mut app, mut harness, id) = changes_fixture();
+        let previous_list = app.review.state.files.clone();
+        app.load_diff();
+        let (operation, _) = harness.take_request();
+        let _ = app.update(Message::Review(changes::Action::Pause));
+        let key = ChangeKey {
+            group: ChangeGroup::Untracked,
+            path: b"docs/new-guide.md".to_vec(),
+        };
+        let _ = app.update(Message::Review(changes::Action::Select(key.clone())));
+        app.handle_response(
+            operation,
+            DaemonResponse::CheckoutChanges(CheckoutChanges {
+                worktree_id: id,
+                files: Vec::new(),
+                truncated: false,
+            }),
+        );
+        let (_, request) = harness.take_request();
+        assert_eq!(
+            request,
+            ClientRequest::LoadFileChange {
+                worktree_id: id,
+                key
+            }
+        );
+        assert_eq!(app.review.state.files, previous_list);
+        assert!(app.review.state.paused);
+    }
+
+    #[tokio::test]
+    async fn changes_layouts_render_unified_split_narrow_and_failure_in_both_themes() {
+        let (mut app, _harness, _id) = changes_fixture();
+        for choice in [DesktopTheme::Canopy, DesktopTheme::Grove] {
+            app.desktop_state.theme = choice;
+            let theme = app.theme();
+            app.review.state.split = false;
+            assert_changes_code_is_visible(&app, 1440, 900).await;
+            let unified = render_element_baseline(app.changes_view(), &theme, 1440, 900).await;
+            app.review.state.split = true;
+            assert_changes_code_is_visible(&app, 1440, 900).await;
+            let split = render_element_baseline(app.changes_view(), &theme, 1440, 900).await;
+            assert_ne!(unified.checksum, split.checksum);
+            assert!(split.distinct_colors > 20);
+            app.review.state.detail = false;
+            let list = render_element_baseline(app.changes_view(), &theme, 680, 480).await;
+            app.review.state.detail = true;
+            assert_changes_code_is_visible(&app, 680, 480).await;
+            let detail = render_element_baseline(app.changes_view(), &theme, 680, 480).await;
+            assert_ne!(list.checksum, detail.checksum);
+            app.review.state.error = Some("Checkout changed. Refresh to retry.".into());
+            let error = render_element_baseline(app.changes_view(), &theme, 680, 480).await;
+            assert_ne!(error.checksum, detail.checksum);
+            app.review.state.error = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_split_keeps_both_sides_visible_with_long_source_lines() {
+        let (mut app, mut harness, id) = changes_fixture();
+        let mut file = app.review.state.file.clone().unwrap();
+        file.lines[4].text = format!(" {}", "x".repeat(4_000));
+        let key = file.key.clone();
+        let _ = app.update(Message::Review(changes::Action::Select(key)));
+        let (operation, _) = harness.take_request();
+        assert!(matches!(operation,Operation::ReviewFile(worktree,_) if worktree == id));
+        app.handle_response(operation, DaemonResponse::FileChange(file));
+        app.review.state.split = true;
+        assert_changes_code_is_visible(&app, 1440, 900).await;
+        let _ = app.update(Message::Review(changes::Action::Horizontal(3000.0)));
+        assert_changes_code_is_visible(&app, 1440, 900).await;
     }
 
     #[test]

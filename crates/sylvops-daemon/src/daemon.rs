@@ -2750,6 +2750,27 @@ async fn handle_request(
                 .send(DaemonEvent::GitStateChanged { worktree: status });
             Ok(())
         }
+        ClientRequest::ListCheckoutChanges { worktree_id } => {
+            state.database.worktree(worktree_id).await?;
+            let lock = worktree_operation_lock(state, worktree_id).await;
+            let _guard = lock.lock().await;
+            let worktree = state.database.worktree(worktree_id).await?;
+            let changes = git::list_checkout_changes(&worktree).await?;
+            send_response_queue(
+                outgoing,
+                request_id,
+                &DaemonResponse::CheckoutChanges(changes),
+            )
+            .await
+        }
+        ClientRequest::LoadFileChange { worktree_id, key } => {
+            state.database.worktree(worktree_id).await?;
+            let lock = worktree_operation_lock(state, worktree_id).await;
+            let _guard = lock.lock().await;
+            let worktree = state.database.worktree(worktree_id).await?;
+            let change = git::load_file_change(&worktree, &key).await?;
+            send_response_queue(outgoing, request_id, &DaemonResponse::FileChange(change)).await
+        }
         ClientRequest::GetDiff { worktree_id } => {
             let worktree = state.database.worktree(worktree_id).await?;
             let diff = git::worktree_diff(&worktree).await?;

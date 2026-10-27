@@ -12,6 +12,7 @@ use crate::app::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
+    Review(crate::changes::Action),
     ToggleFocus,
     Focus(FocusZone),
     Move(isize),
@@ -71,6 +72,7 @@ pub(crate) enum Effect {
 #[allow(clippy::too_many_lines)]
 pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
     match action {
+        Action::Review(action) => crate::changes::update(app, action),
         Action::ToggleFocus => {
             app.focus = if app.focus == FocusZone::Explorer {
                 FocusZone::Main
@@ -169,7 +171,13 @@ pub(crate) fn reduce(app: &mut App, action: Action) -> Vec<Effect> {
             app.set_tab(TuiContentView::Changes);
             return vec![Effect::LoadDiff];
         }
-        Action::ScrollDiff(delta) => app.scroll_diff(delta),
+        Action::ScrollDiff(delta) => {
+            if app.review.state.checkout.is_some() {
+                crate::changes::update(app, crate::changes::Action::Move(delta));
+            } else {
+                app.scroll_diff(delta);
+            }
+        }
         Action::GitHub => return vec![Effect::OpenGitHub],
         Action::Attention => {
             app.flash = Some(match app.select_attention() {

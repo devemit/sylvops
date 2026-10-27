@@ -1,6 +1,7 @@
 //! Hierarchical, keyboard-and-mouse mission control backed exclusively by daemon IPC.
 
 mod app;
+mod changes;
 mod clipboard;
 mod directory_browser;
 mod forms;
@@ -186,6 +187,7 @@ pub async fn run(paths: &RuntimePaths) -> Result<TuiExit, DaemonError> {
         .unwrap_or_else(Instant::now);
 
     loop {
+        dirty |= changes::poll(&client, &mut app);
         if health_checked_at.elapsed() >= Duration::from_secs(5) {
             health_checked_at = Instant::now();
             if let Some(session_id) = app.selected_session_id
@@ -718,7 +720,9 @@ async fn execute_effects(
             }
             Effect::OpenRename => open_rename_form(app),
             Effect::OpenDelete => open_destructive_confirmation(client, app).await?,
-            Effect::LoadDiff => show_diff(client, app).await?,
+            Effect::LoadDiff => {
+                app.review.refresh = true;
+            }
             Effect::LoadGitHubStatus => refresh_github_status(client, app).await?,
             Effect::OpenGitHub => {
                 refresh_github_status(client, app).await?;
@@ -3582,35 +3586,6 @@ async fn execute_palette_item(
             app.select_node(ExplorerNode::Session(id));
         }
     }
-    Ok(())
-}
-
-async fn show_diff(client: &DaemonClient, app: &mut App) -> Result<(), DaemonError> {
-    app.diff_scroll = 0;
-    let Some(worktree_id) = app.selected_worktree_id else {
-        app.flash = Some(Flash::error("Select a worktree or session first."));
-        return Ok(());
-    };
-    match client
-        .request(&ClientRequest::GetDiff { worktree_id })
-        .await?
-    {
-        DaemonResponse::Diff(diff) if diff.text.is_empty() => {
-            app.diff = Some("Clean worktree — no tracked changes.".into());
-        }
-        DaemonResponse::Diff(diff) => {
-            app.diff = Some(if diff.truncated {
-                format!(
-                    "{}\n\n[Diff truncated at the configured safety limit]",
-                    diff.text
-                )
-            } else {
-                diff.text
-            });
-        }
-        response => app.diff = Some(response_message("Git diff", response)),
-    }
-    app.set_tab(TuiContentView::Changes);
     Ok(())
 }
 

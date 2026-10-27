@@ -1,0 +1,10 @@
+%YAML 1.2
+---
+name: TypeScript
+file_extensions: [ts, tsx]
+scope: source.ts
+contexts:
+  main:
+    - match: '\b(interface|type|enum|implements|declare|namespace|abstract|readonly|keyof|as|satisfies|infer|never|unknown)\b'
+      scope: storage.type.ts
+    - include: scope:source.js

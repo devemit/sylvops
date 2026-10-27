@@ -45,6 +45,10 @@ First-run guidance names both the user-facing and domain terms where that distin
 - The footer presents the actual build identity (including an unsigned-preview or release tag when supplied at build time), local-daemon health beside the version, responsive Workspace/Repository/Checkout/Session context, the active content view, and essential shortcuts. Internal enum names and keyboard-panel debug state are not user-facing status.
 - Navigator rows reserve density-aware two-line height, so selection tint, one-pixel outline, stronger type, and hover never change their bounds or title/detail coordinates. Every visible navigator panel reserves a fixed-height contextual action strip directly below its header, even when the current selection has no actions; narrow action contents scroll horizontally without wrapping or compressing the tree. Selection automatically reveals the complete row, including the bottom-most item. Footer context remains one line and uses a horizontally scrollable natural-width strip so complete Workspace, Repository, Checkout, and Session names remain available without pushing View and shortcuts off the right edge.
 
+## Local change review
+
+The Changes tab follows the selected Checkout and provides grouped file navigation, lazy per-file diffs, Unified/Split modes, line selection and copying, syntax colors, path filtering, text search, and hunk navigation. Visible reviews refresh automatically with Pause and Refresh now; failures retain stale content explicitly. The shared [Changes contract](changes.md) defines comparisons, responsive layouts, safety limits, and TUI behavior.
+
 ## Embedded terminal baseline
 
 The desktop terminal renders the daemon-owned VT screen; it does not print raw provider escape sequences into a host shell. The embedded terminal supports:
