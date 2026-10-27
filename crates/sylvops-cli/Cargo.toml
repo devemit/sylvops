@@ -10,7 +10,7 @@ build = "build.rs"
 [package.metadata.winresource]
 ProductName = "SylvOps"
 CompanyName = "devemit"
-FileDescription = "Local-first mission control for coding-agent sessions"
+FileDescription = "SylvOps"
 InternalName = "sylvops"
 OriginalFilename = "sylvops.exe"
 LegalCopyright = "Copyright 2026 devemit"
