@@ -2991,6 +2991,35 @@ mod tests {
 
     #[test]
     fn codex_launch_uses_structured_arguments() {
+        use sylvops_core::github::{
+            GitHubBody, GitHubBrowserTarget, GitHubHost, GitHubItemIdentity, GitHubItemKind,
+            GitHubItemNumber, GitHubOwner, GitHubRepositoryIdentity, GitHubRepositoryName,
+            GitHubTimestamp, GitHubTitle, StartWorkIssueContext, build_task_bootstrap_prompt,
+        };
+
+        let prompt = build_task_bootstrap_prompt(
+            &StartWorkIssueContext {
+                identity: GitHubItemIdentity::new(
+                    GitHubRepositoryIdentity::new(
+                        GitHubHost::new("github.com").unwrap(),
+                        GitHubOwner::new("acme").unwrap(),
+                        GitHubRepositoryName::new("widgets").unwrap(),
+                    ),
+                    GitHubItemKind::Issue,
+                    GitHubItemNumber::new(127).unwrap(),
+                ),
+                title: GitHubTitle::new("Fix the parser").unwrap(),
+                body: GitHubBody::new("Use `a < b`.\nDo not invoke a shell; keep spaces.").unwrap(),
+                labels: vec![],
+                assignees: vec![],
+                updated_at: GitHubTimestamp::new("2026-10-13T12:00:00Z").unwrap(),
+                canonical_url: GitHubBrowserTarget::try_from(
+                    "https://github.com/acme/widgets/issues/127".to_owned(),
+                )
+                .unwrap(),
+            },
+            None,
+        );
         let adapter = CodexAdapter::from_executable(PathBuf::from(if cfg!(windows) {
             r"C:\Program Files\Codex\codex.exe"
         } else {
@@ -3008,7 +3037,7 @@ mod tests {
                 cwd: worktree.clone(),
                 model: Some("gpt-test".into()),
                 effort: Some("high".into()),
-                initial_prompt: Some("fix the parser; do not invoke a shell".into()),
+                initial_prompt: Some(prompt.clone()),
                 lifecycle_endpoint: None,
             })
             .expect("launch specification")
@@ -3017,15 +3046,14 @@ mod tests {
         assert_eq!(spec.arguments.all()[1], worktree.into_os_string());
         assert_eq!(spec.arguments.all()[2], OsString::from("--model"));
         assert_eq!(spec.arguments.all()[3], OsString::from("gpt-test"));
-        assert_eq!(
-            spec.arguments.all().last(),
-            Some(&OsString::from("fix the parser; do not invoke a shell"))
-        );
+        assert_eq!(spec.arguments.all().last(), Some(&OsString::from(&prompt)));
+        assert_eq!(spec.arguments.all().len(), 7);
+        assert_eq!(spec.arguments.persisted_values().len(), 6);
         assert!(
             !spec
                 .arguments
                 .persisted_values()
-                .contains(&OsString::from("fix the parser; do not invoke a shell"))
+                .contains(&OsString::from(prompt))
         );
     }
 
