@@ -1681,7 +1681,7 @@ impl ProviderRuntime for CodexAdapter {
             }
             Some("SessionEnd") => Some(NormalizedProviderEvent::SessionEnded),
             Some("UserPromptSubmit") => Some(NormalizedProviderEvent::PromptSubmitted),
-            Some("PermissionRequest") => Some(NormalizedProviderEvent::PermissionRequested),
+            Some("PermissionRequest") => Some(NormalizedProviderEvent::PermissionCheckStarted),
             Some("PreToolUse") => Some(NormalizedProviderEvent::ToolStarted),
             Some("PostToolUse") => Some(NormalizedProviderEvent::ToolCompleted),
             Some("SubagentStart") => Some(NormalizedProviderEvent::SubagentStarted {
@@ -3078,6 +3078,49 @@ mod tests {
     }
 
     #[test]
+    fn codex_permission_checks_do_not_request_user_attention() {
+        let runtime = CodexAdapter::from_executable(PathBuf::from(if cfg!(windows) {
+            r"C:\Codex\codex.exe"
+        } else {
+            "/usr/bin/codex"
+        }));
+        let mut machine = sylvops_core::status::SessionStatusMachine::new(
+            sylvops_core::session_state::SessionLifecycle::Running,
+        );
+        for (index, name) in ["PreToolUse", "PermissionRequest", "PostToolUse"]
+            .into_iter()
+            .enumerate()
+        {
+            let payload = ProviderLifecyclePayload::new(
+                serde_json::to_vec(&serde_json::json!({
+                    "hook_event_name": name,
+                    "session_id": "conversation",
+                    "turn_id": "turn",
+                    "tool_use_id": "search",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "rg --files"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let event = runtime
+                .normalize_lifecycle_event(&payload)
+                .unwrap()
+                .event
+                .unwrap();
+            let status = machine
+                .apply(&event, i64::try_from(index).unwrap())
+                .unwrap()
+                .status;
+            assert_ne!(
+                status.activity,
+                sylvops_core::session_state::ProviderActivity::AwaitingInput
+            );
+            assert!(status.attention.is_none(), "{name} created false attention");
+        }
+    }
+
+    #[test]
     fn codex_runtime_owns_lifecycle_event_normalization() {
         let runtime = CodexAdapter::from_executable(PathBuf::from(if cfg!(windows) {
             r"C:\Codex\codex.exe"
@@ -3093,7 +3136,7 @@ mod tests {
             .expect("known event");
         assert_eq!(
             normalized_permission.event,
-            Some(NormalizedProviderEvent::PermissionRequested)
+            Some(NormalizedProviderEvent::PermissionCheckStarted)
         );
         assert_eq!(
             normalized_permission

@@ -406,17 +406,7 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
         })
         .await
         .unwrap();
-    input(&client, session_id, "permission").await;
-    let input_event = wait_for_attention(
-        &client,
-        session_id,
-        sylvops_core::session_state::AttentionReason::InputRequested,
-    )
-    .await;
-    assert_eq!(
-        input_event.acknowledgement,
-        sylvops_core::session_state::AttentionAcknowledgement::Pending
-    );
+    permission_check(&client, session_id).await;
     assert!(matches!(
         client
             .request(&ClientRequest::ClaimAttentionNotification)
@@ -435,7 +425,6 @@ async fn exercise_generated_hook(directory: &str, expect_refusal: bool) {
         sylvops_core::session_state::AttentionReason::SuccessfulCompletion,
     )
     .await;
-    assert_ne!(completion.id, input_event.id);
     assert!(
         matches!(client.request(&ClientRequest::ClaimAttentionNotification).await.unwrap(),
         DaemonResponse::AttentionNotificationClaim(Some(claim)) if claim.attention_id == completion.id)
@@ -699,13 +688,7 @@ async fn assert_fake_hook_notifications(client: &DaemonClient, session_id: Sessi
         })
         .await
         .unwrap();
-    input(client, session_id, "permission").await;
-    let requested = wait_for_attention(
-        client,
-        session_id,
-        sylvops_core::session_state::AttentionReason::InputRequested,
-    )
-    .await;
+    permission_check(client, session_id).await;
     assert!(matches!(
         client
             .request(&ClientRequest::ClaimAttentionNotification)
@@ -724,7 +707,6 @@ async fn assert_fake_hook_notifications(client: &DaemonClient, session_id: Sessi
         sylvops_core::session_state::AttentionReason::SuccessfulCompletion,
     )
     .await;
-    assert_ne!(requested.id, completed.id);
     assert!(matches!(
         client.request(&ClientRequest::ClaimAttentionNotification).await.unwrap(),
         DaemonResponse::AttentionNotificationClaim(Some(claim))
@@ -737,6 +719,38 @@ async fn assert_fake_hook_notifications(client: &DaemonClient, session_id: Sessi
             .unwrap(),
         DaemonResponse::AttentionNotificationClaim(None)
     ));
+}
+
+async fn permission_check(client: &DaemonClient, session_id: SessionId) {
+    let mut events = client.subscribe();
+    input(client, session_id, "permission").await;
+    bounded(async {
+        loop {
+            if let sylvops_core::protocol::DaemonEvent::ProviderEvent {
+                session_id: received,
+                event: sylvops_core::status::NormalizedProviderEvent::PermissionCheckStarted,
+                ..
+            } = events.recv().await.unwrap()
+                && received == session_id
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let current = session(client, session_id).await;
+    assert_eq!(
+        current.status.activity,
+        sylvops_core::session_state::ProviderActivity::Working
+    );
+    assert!(
+        current
+            .status
+            .attention
+            .is_none_or(|event| event.acknowledgement
+                == sylvops_core::session_state::AttentionAcknowledgement::Resolved)
+    );
 }
 
 async fn input(client: &DaemonClient, session_id: SessionId, line: &str) {

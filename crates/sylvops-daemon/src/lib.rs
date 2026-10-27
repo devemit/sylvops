@@ -6,7 +6,6 @@ mod browser;
 mod claude_discovery;
 pub mod client;
 mod codex_discovery;
-mod codex_input;
 pub mod config_store;
 pub mod daemon;
 pub mod data_removal;
