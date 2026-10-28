@@ -656,11 +656,11 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
+        assert_eq!(
             tracker
                 .server_message(&request("item/tool/requestUserInput", json!(1)))
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            []
         );
         tracker
             .server_message(&request(
@@ -668,41 +668,26 @@ mod tests {
                 json!("1"),
             ))
             .unwrap();
-        assert!(
-            tracker
-                .server_message(&resolved(json!(99)))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(tracker.server_message(&json!({"method":"item/agentMessage/delta","params":{"threadId":"conversation","delta":"Working?"}})).unwrap().is_empty());
-        assert!(
-            tracker
-                .server_message(&resolved(json!(1)))
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(tracker.server_message(&resolved(json!(99))).unwrap(), []);
+        assert_eq!(tracker.server_message(&json!({"method":"item/agentMessage/delta","params":{"threadId":"conversation","delta":"Working?"}})).unwrap(), []);
+        assert_eq!(tracker.server_message(&resolved(json!(1))).unwrap(), []);
         assert_eq!(tracker.pending.len(), 1);
         assert_eq!(
             tracker.server_message(&resolved(json!("1"))).unwrap().len(),
             1
         );
-        assert!(
-            tracker
-                .server_message(&resolved(json!("1")))
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(tracker.server_message(&resolved(json!("1"))).unwrap(), []);
     }
 
     #[test]
     fn ordinary_tool_activity_never_creates_input_attention() {
         let mut tracker = tracker();
         for method in ["item/started", "item/completed", "thread/status/changed"] {
-            assert!(
+            assert_eq!(
                 tracker
                     .server_message(&json!({"method":method,"params":{"threadId":"conversation"}}))
-                    .unwrap()
-                    .is_empty()
+                    .unwrap(),
+                []
             );
         }
         assert!(tracker.pending.is_empty());
@@ -786,8 +771,8 @@ mod tests {
             tracker.pause_request.as_ref().unwrap()["method"],
             "turn/interrupt"
         );
-        assert!(tracker.server_message(&question).unwrap().is_empty());
-        assert!(tracker.server_message(&json!({"method":"turn/completed","params":{"threadId":"conversation","turn":{"id":"turn","status":"interrupted"}}})).unwrap().is_empty());
+        assert_eq!(tracker.server_message(&question).unwrap(), []);
+        assert_eq!(tracker.server_message(&json!({"method":"turn/completed","params":{"threadId":"conversation","turn":{"id":"turn","status":"interrupted"}}})).unwrap(), []);
         assert_eq!(tracker.question.as_deref(), Some("question"));
         assert!(
             tracker
