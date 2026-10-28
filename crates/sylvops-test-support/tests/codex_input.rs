@@ -178,6 +178,7 @@ async fn scenario() {
         std::fs::read(&heartbeat).unwrap(),
         "backend descendant survived Stop Session"
     );
+    backend_failure_retains_cleanup_confirmation(&client, worktree_id).await;
     client
         .request(&ClientRequest::ShutdownDaemon)
         .await
@@ -187,6 +188,74 @@ async fn scenario() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+async fn backend_failure_retains_cleanup_confirmation(
+    client: &DaemonClient,
+    worktree_id: sylvops_core::ids::WorktreeId,
+) {
+    let session_id = match client
+        .request(&ClientRequest::CreateSession {
+            worktree_id,
+            provider: ProviderKind::Codex,
+            display_name: Some("Backend failure".into()),
+            model: None,
+            effort: None,
+            initial_prompt: None,
+            columns: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap()
+    {
+        DaemonResponse::SessionCreated { session, .. } => session.id,
+        response => panic!("session: {response:?}"),
+    };
+    assert!(matches!(
+        client
+            .request(&ClientRequest::AttachSession {
+                session_id,
+                from_sequence: 0,
+                columns: 80,
+                rows: 24,
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::Attached { .. }
+    ));
+    wait_status(client, session_id, |session| {
+        session.external_session_id.is_some()
+    })
+    .await;
+    input(client, session_id, "backend-exit").await;
+    wait_status(client, session_id, |session| session.process_id.is_none()).await;
+    let authorization_token = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = client
+                .request(&ClientRequest::InspectSessionDeletion { session_id })
+                .await
+                .unwrap();
+            let DaemonResponse::SessionDeletionInspected(inspection) = response else {
+                panic!("deletion inspection: {response:?}");
+            };
+            if let Some(token) = inspection.authorization_token {
+                break token;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("backend failure must retain proof of empty process trees");
+    assert!(matches!(
+        client
+            .request(&ClientRequest::DeleteSession {
+                session_id,
+                authorization_token,
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::SessionDeleted { .. }
+    ));
 }
 
 async fn input(client: &DaemonClient, session_id: SessionId, text: &str) {

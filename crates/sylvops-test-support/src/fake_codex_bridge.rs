@@ -60,6 +60,10 @@ impl Terminal {
     }
 
     pub fn input(&mut self, line: &str, external_id: &str) -> io::Result<bool> {
+        if line == "backend-exit" {
+            self.send(&json!({"method":"fixture/backendExit"}))?;
+            return Ok(true);
+        }
         if let Some(id) = self.pending.clone() {
             if matches!(line, "answer" | "deny" | "cancel") {
                 if id.is_null() {
@@ -161,6 +165,7 @@ pub fn server() -> io::Result<()> {
         let message: Value = serde_json::from_str(&line?).map_err(|_| error())?;
         let id = &message["id"];
         match message["method"].as_str() {
+            Some("fixture/backendExit") => return Ok(()),
             Some("initialize") => emit(&json!({"id":id,"result":{"userAgent":"fake-codex"}}))?,
             Some("thread/resume") => {
                 thread = message["params"]["threadId"]
