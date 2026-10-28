@@ -37,7 +37,9 @@ use crate::{
     runtime::AuthenticationToken,
 };
 
-const MESSAGE_LIMIT: usize = 1024 * 1024;
+// App metadata includes embedded assets and can exceed the local IPC frame
+// limit. This private provider transport has its own bounded message budget.
+const MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
 const REQUEST_LIMIT: usize = 128;
 const REQUEST_ID_LIMIT: usize = 4096;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -714,13 +716,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_app_metadata_can_exceed_sixteen_mib() {
+        // Real native startup replies include about 21 MiB of app assets.
+        let metadata =
+            json!({"id":"app-read","result":{"app":{"icon":"A".repeat(21 * 1024 * 1024)}}});
+        let mut bytes = serde_json::to_vec(&metadata).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(
+            read_message(&mut bytes.as_slice(), &mut Vec::new())
+                .await
+                .unwrap(),
+            metadata
+        );
+    }
+
+    #[tokio::test]
     async fn backend_messages_are_bounded_before_json_decoding() {
         let bytes = vec![b'x'; MESSAGE_LIMIT + 1];
+        let mut buffered = Vec::new();
         assert!(
-            read_message(&mut bytes.as_slice(), &mut Vec::new())
+            read_message(&mut bytes.as_slice(), &mut buffered)
                 .await
                 .is_err()
         );
+        assert!(buffered.len() <= MESSAGE_LIMIT);
         assert!(
             read_message(&mut b"not-json\n".as_slice(), &mut Vec::new())
                 .await
