@@ -5,6 +5,7 @@ mod background_process;
 mod browser;
 mod claude_discovery;
 pub mod client;
+mod codex_bridge;
 mod codex_discovery;
 pub mod config_store;
 pub mod daemon;

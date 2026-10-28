@@ -28,6 +28,7 @@ pub enum AuthenticationRequirement {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ProviderRuntimeCapabilities {
+    pub structured_input_events: bool,
     pub lifecycle_events: bool,
     pub recoverable_turn_failures: bool,
     pub remaining_background_work: bool,
@@ -305,6 +306,8 @@ pub struct LaunchSpec {
 #[derive(Clone, Debug)]
 pub struct ProviderRuntimeSpec {
     pub launch: LaunchSpec,
+    /// Launch this Codex terminal against a private, Session-owned app server.
+    pub codex_app_server: bool,
     /// Application-owned runtime-overlay paths that the daemon must clean up after revalidation.
     pub owned_paths: Vec<PathBuf>,
 }
@@ -469,6 +472,7 @@ mod tests {
                 effort_selection: true,
                 authentication: AuthenticationRequirement::ExistingLogin,
                 runtime: Some(ProviderRuntimeCapabilities {
+                    structured_input_events: false,
                     lifecycle_events: true,
                     recoverable_turn_failures: true,
                     remaining_background_work: true,
@@ -505,6 +509,7 @@ mod tests {
                 .map(|prompt| vec![OsString::from(prompt)])
                 .unwrap_or_default();
             Ok(ProviderRuntimeSpec {
+                codex_app_server: false,
                 launch: LaunchSpec {
                     executable: PathBuf::from("fake-provider"),
                     arguments: LaunchArguments::with_transient_tail(persisted, transient),
@@ -516,6 +521,7 @@ mod tests {
 
         fn configure_resume(&self, context: ResumeContext) -> Result<Option<ProviderRuntimeSpec>> {
             Ok(Some(ProviderRuntimeSpec {
+                codex_app_server: false,
                 launch: LaunchSpec {
                     executable: PathBuf::from("fake-provider"),
                     arguments: LaunchArguments::persisted(vec![

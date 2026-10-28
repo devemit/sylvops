@@ -25,6 +25,7 @@ subtle.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true

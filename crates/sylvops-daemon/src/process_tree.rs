@@ -56,7 +56,6 @@ mod platform {
         ffi::c_void,
         mem::size_of,
         os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
-        process::Child,
         ptr,
     };
 
@@ -126,13 +125,21 @@ mod platform {
             self.job.as_raw_handle().cast::<c_void>()
         }
 
-        pub fn assign(&self, child: &Child) -> Result<()> {
+        pub fn assign(&self, child: &impl AsRawHandle) -> Result<()> {
+            self.assign_handle(child.as_raw_handle())
+        }
+
+        pub fn assign_async(&self, child: &tokio::process::Child) -> Result<()> {
+            let handle = child.raw_handle().ok_or_else(|| {
+                DaemonError::ProcessTree("native child has no process handle".into())
+            })?;
+            self.assign_handle(handle)
+        }
+
+        fn assign_handle(&self, handle: HANDLE) -> Result<()> {
             // SAFETY: both handles are live and owned by `self` and `child` for this call.
             if unsafe {
-                AssignProcessToJobObject(
-                    self.job.as_raw_handle().cast::<c_void>(),
-                    child.as_raw_handle().cast::<c_void>(),
-                )
+                AssignProcessToJobObject(self.job.as_raw_handle().cast::<c_void>(), handle)
             } == 0
             {
                 return Err(last_os_error("assign native command to Windows Job Object"));

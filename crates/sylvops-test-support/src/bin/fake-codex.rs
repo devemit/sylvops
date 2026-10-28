@@ -10,6 +10,9 @@ use std::{
 
 use serde_json::{Value, json};
 
+#[path = "../fake_codex_bridge.rs"]
+mod bridge;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -30,7 +33,18 @@ fn run() -> io::Result<()> {
         // Real help places this option beyond the diagnostic display truncation.
         print!("{}", "Other supported options\n".repeat(40));
         println!("--no-daemon Run without the shared background server");
+        println!("--remote --remote-auth-token-env");
         return Ok(());
+    }
+    if arguments == ["app-server", "--help"] {
+        println!("--listen stdio://");
+        return Ok(());
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "app-server")
+    {
+        return bridge::server();
     }
     if arguments == ["login", "status"] {
         invalidate_codex_home_if_requested()?;
@@ -75,8 +89,15 @@ fn run() -> io::Result<()> {
 }
 
 fn run_interactive(external_id: &str) -> io::Result<()> {
+    let mut bridge = bridge::Terminal::connect()?;
     for line in io::stdin().lock().lines() {
         let line = line?;
+        if let Some(bridge) = &mut bridge
+            && bridge.input(line.trim(), external_id)?
+        {
+            io::stdout().flush()?;
+            continue;
+        }
         if emit_permission_fixture(line.trim(), external_id)? {
             continue;
         }
@@ -178,7 +199,7 @@ fn initial_prompt(arguments: &[String]) -> Option<&str> {
     while let Some(argument) = arguments.get(index) {
         if matches!(
             argument.as_str(),
-            "--profile" | "--cd" | "--model" | "--config"
+            "--profile" | "--cd" | "--model" | "--config" | "--remote" | "--remote-auth-token-env"
         ) {
             index += 2;
         } else if argument.starts_with('-') {
@@ -260,6 +281,7 @@ fn emit_hook(event: &str, external_id: &str, extra: Option<Value>) -> io::Result
     if let Some(home) = env::var_os("CODEX_HOME").map(std::path::PathBuf::from)
         && home.join(".fake-codex-shared-daemon").is_file()
         && !env::args().any(|argument| argument == "--no-daemon")
+        && !env::args().any(|argument| argument == "--remote")
     {
         return Ok(());
     }
@@ -328,26 +350,27 @@ fn execute_hook(home: &std::path::Path, event: &str, body: &[u8]) -> io::Result<
     // of the generated command, as doing so would hide serialization failures.
     #[cfg(windows)]
     let mut child = {
-        let mut child = if env::args().any(|argument| argument == "--no-daemon") {
-            let shell = std::path::PathBuf::from(
-                env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
-            )
-            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-            let mut child = tokio::process::Command::new(shell);
-            child.args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                command,
-            ]);
-            child
-        } else {
-            let shell = env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-            let mut child = tokio::process::Command::new(shell);
-            child.arg("/C").raw_arg(format!(r#""{command}""#));
-            child
-        };
+        let mut child =
+            if env::args().any(|argument| argument == "--no-daemon" || argument == "--remote") {
+                let shell = std::path::PathBuf::from(
+                    env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+                )
+                .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+                let mut child = tokio::process::Command::new(shell);
+                child.args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    command,
+                ]);
+                child
+            } else {
+                let shell = env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+                let mut child = tokio::process::Command::new(shell);
+                child.arg("/C").raw_arg(format!(r#""{command}""#));
+                child
+            };
         child.creation_flags(0x0800_0000);
         child
     };

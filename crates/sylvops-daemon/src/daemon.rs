@@ -39,7 +39,10 @@ use sylvops_core::{
         WorkspaceDeletionAuthorization, WorkspaceDeletionInspection, WorkspaceDeletionRefusal,
         read_frame, read_handshake_frame, validate_terminal_size, write_frame,
     },
-    provider::{AuthenticationRequirement, LaunchContext, ProviderRuntimeSpec, ResumeContext},
+    provider::{
+        AuthenticationRequirement, LaunchContext, ProviderLifecycleEvent, ProviderRuntimeSpec,
+        ResumeContext,
+    },
     session_state::{
         AttentionAcknowledgement, AttentionEvent, ProviderActivity, SessionLifecycle,
         lifecycle_allows_deletion, lifecycle_allows_resume, lifecycle_is_active,
@@ -289,6 +292,7 @@ fn frame_size(frame: &Frame) -> Result<u32> {
 
 #[derive(Clone, Debug)]
 struct ManagedSession {
+    structured_input: bool,
     handle: SessionHandle,
     record: Arc<RwLock<Session>>,
     completed: watch::Receiver<bool>,
@@ -4008,6 +4012,7 @@ async fn launch_new_session(
     spawn_managed_session(state, record, spec, columns, rows).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn spawn_managed_session(
     state: &DaemonState,
     record: NewSession,
@@ -4021,7 +4026,8 @@ async fn spawn_managed_session(
     let provider_kind = record.provider_kind;
     let cwd = PathBuf::from(&record.cwd);
     let owned_runtime_paths = Arc::new(runtime.owned_paths);
-    let launch = runtime.launch;
+    let structured_input = runtime.codex_app_server;
+    let mut launch = runtime.launch;
     if let Err(error) = state.database.create_session(record).await {
         state.hook_credentials.invalidate(session_id);
         state
@@ -4029,6 +4035,21 @@ async fn spawn_managed_session(
             .cleanup_runtime_paths(provider_kind, &owned_runtime_paths);
         return Err(error);
     }
+    let mut bridge = if structured_input {
+        match crate::codex_bridge::prepare(&mut launch, &cwd).await {
+            Ok(bridge) => Some(bridge),
+            Err(error) => {
+                state.hook_credentials.invalidate(session_id);
+                persist_session_start_failure(state, session_id, error.to_string()).await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let runtime_events = bridge
+        .as_mut()
+        .map(crate::codex_bridge::Bridge::take_events);
     let spec = SessionSpec {
         program: launch.executable,
         arguments: launch.arguments.into_all(),
@@ -4037,7 +4058,7 @@ async fn spawn_managed_session(
         rows,
         scrollback_bytes: state.scrollback_bytes,
     };
-    let handle = match SessionHandle::spawn_sanitized(&spec, &launch.environment) {
+    let handle = match SessionHandle::spawn_with_runtime(&spec, &launch.environment, bridge) {
         Ok(handle) => handle,
         Err(error) => {
             state.hook_credentials.invalidate(session_id);
@@ -4067,6 +4088,7 @@ async fn spawn_managed_session(
     let (completed_tx, completed) = watch::channel(false);
     let (deleted, _) = watch::channel(false);
     let managed = ManagedSession {
+        structured_input,
         handle: handle.clone(),
         record: Arc::new(RwLock::new(running.clone())),
         completed,
@@ -4085,6 +4107,20 @@ async fn spawn_managed_session(
         .entry(session_id)
         .or_insert_with(|| status_machine_from_session(&running));
     spawn_exit_monitor(state.clone(), session_id, managed.clone(), completed_tx);
+    if let Some(mut runtime_events) = runtime_events {
+        let runtime_state = state.clone();
+        tokio::spawn(async move {
+            while let Some(event) = runtime_events.recv().await {
+                if let Err(error) = apply_runtime_event(&runtime_state, session_id, event).await {
+                    tracing::warn!(%error, "Codex runtime event refused");
+                    if let Some(managed) = get_managed_session(&runtime_state, session_id).await {
+                        let _ = managed.handle.fail_runtime().await;
+                    }
+                    break;
+                }
+            }
+        });
+    }
     if provider_kind == ProviderKind::Claude {
         spawn_claude_session_start_monitor(state.clone(), session_id, managed);
     }
@@ -4179,6 +4215,77 @@ fn provider_external_id_update(
     }
 }
 
+async fn apply_runtime_event(
+    state: &DaemonState,
+    session_id: SessionId,
+    normalized: ProviderLifecycleEvent,
+) -> Result<()> {
+    let operation_lock = session_operation_lock(state, session_id).await;
+    let _operation_guard = operation_lock.lock().await;
+    let persisted = state.database.session(session_id).await?;
+    if !lifecycle_is_active(persisted.status.lifecycle) || persisted.process_id.is_none() {
+        return Ok(());
+    }
+    if persisted.provider_kind != ProviderKind::Codex {
+        return Err(DaemonError::Provider("runtime Provider mismatch".into()));
+    }
+    let event = normalized
+        .event
+        .ok_or_else(|| DaemonError::Provider("empty runtime event".into()))?;
+    let transition_kind = match &event {
+        NormalizedProviderEvent::TurnStarted {
+            conversation: Some(identity),
+        } => Some(identity.transition),
+        _ => None,
+    };
+    let identity = provider_external_id_update(
+        persisted.external_session_id.as_deref(),
+        normalized.conversation_id.as_ref(),
+        transition_kind,
+    )?
+    .map(|id| VerifiedConversationIdentityUpdate::new(id, transition_kind));
+    let mut machine = state
+        .status_machines
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_else(|| status_machine_from_session(&persisted));
+    machine
+        .apply(&event, status_timestamp())
+        .map_err(|message| DaemonError::Database(message.into()))?;
+    let (revision, session) = state
+        .database
+        .update_session_status(session_id, machine.transition(), identity)
+        .await?;
+    state
+        .status_machines
+        .lock()
+        .await
+        .insert(session_id, machine);
+    {
+        let mut tracking = state.hook_tracking.lock().await;
+        let tracking = tracking.entry(session_id).or_default();
+        tracking.callback_received = true;
+        tracking.record_applied(&event, session.status.activity);
+    }
+    let (revision, session) =
+        coordinate_attention_notification(state, persisted.status.attention, revision, session);
+    if let Some(managed) = get_managed_session(state, session_id).await {
+        *managed.record.write().await = session.clone();
+    }
+    let _ = state.events.send(DaemonEvent::ProviderEvent {
+        provider: ProviderKind::Codex,
+        session_id,
+        worktree_id: persisted.worktree_id,
+        event,
+    });
+    let _ = state
+        .events
+        .send(DaemonEvent::SessionStatusChanged { revision, session });
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Result<()> {
     tracing::debug!(session_id = %delivery.session_id, "authenticated provider hook received");
@@ -4255,6 +4362,19 @@ async fn apply_hook_delivery(state: &DaemonState, delivery: HookDelivery) -> Res
             "provider lifecycle event type is unknown".into(),
         ));
     };
+    if let Some(managed) = get_managed_session(state, delivery.session_id).await
+        && managed.structured_input
+        && persisted.status.activity == ProviderActivity::AwaitingInput
+        && !matches!(
+            event,
+            NormalizedProviderEvent::SubagentStarted { .. }
+                | NormalizedProviderEvent::SubagentStopped { .. }
+        )
+    {
+        // The private transport is authoritative. Older observational hooks may
+        // still run from the user's approved profile, but cannot clear a prompt.
+        return Ok(());
+    }
     let is_claude_session_start = delivery.provider == ProviderKind::Claude
         && matches!(
             &event,

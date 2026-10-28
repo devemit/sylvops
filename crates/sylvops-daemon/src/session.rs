@@ -271,7 +271,7 @@ impl SessionHandle {
     /// PTY handle cloning fails. A child that cannot be placed under process-tree control is killed
     /// and reaped before returning.
     pub fn spawn(spec: &SessionSpec) -> Result<Self> {
-        Self::spawn_inner(spec, None)
+        Self::spawn_inner(spec, None, None)
     }
 
     /// Spawns a session after clearing the inherited environment and applying an explicit map.
@@ -283,12 +283,21 @@ impl SessionHandle {
         spec: &SessionSpec,
         environment: &BTreeMap<OsString, OsString>,
     ) -> Result<Self> {
-        Self::spawn_inner(spec, Some(environment))
+        Self::spawn_inner(spec, Some(environment), None)
+    }
+
+    pub(crate) fn spawn_with_runtime(
+        spec: &SessionSpec,
+        environment: &BTreeMap<OsString, OsString>,
+        runtime: Option<crate::codex_bridge::Bridge>,
+    ) -> Result<Self> {
+        Self::spawn_inner(spec, Some(environment), runtime)
     }
 
     fn spawn_inner(
         spec: &SessionSpec,
         environment: Option<&BTreeMap<OsString, OsString>>,
+        runtime: Option<crate::codex_bridge::Bridge>,
     ) -> Result<Self> {
         spec.validate()?;
         let spawned = pty::spawn(spec, environment)?;
@@ -305,6 +314,7 @@ impl SessionHandle {
         spawn_waiter(spawned.child, actor_events.clone());
         tokio::spawn(
             Actor {
+                runtime,
                 master: spawned.master,
                 writer: Some(writer),
                 process_tree: spawned.process_tree,
@@ -324,6 +334,7 @@ impl SessionHandle {
                 controller: None,
                 observers: HashSet::new(),
                 stop_requested: false,
+                runtime_failed: false,
                 stop_replies: Vec::new(),
                 commands: command_rx,
                 events: actor_event_rx,
@@ -530,6 +541,13 @@ impl SessionHandle {
         receive.await.map_err(|_| DaemonError::RequestCancelled)?
     }
 
+    pub(crate) async fn fail_runtime(&self) -> Result<()> {
+        self.commands
+            .send(Command::RuntimeFailed)
+            .await
+            .map_err(|_| DaemonError::SessionStopped)
+    }
+
     /// Waits until the child has been reaped and returns its exit code.
     ///
     /// # Errors
@@ -615,6 +633,7 @@ enum Command {
     Stop {
         reply: oneshot::Sender<Result<()>>,
     },
+    RuntimeFailed,
     InspectProcessTree {
         reply: oneshot::Sender<Result<bool>>,
     },
@@ -639,6 +658,7 @@ enum WriterCommand {
 }
 
 struct Actor {
+    runtime: Option<crate::codex_bridge::Bridge>,
     master: Box<dyn pty::PtyMaster>,
     writer: Option<mpsc::Sender<WriterCommand>>,
     process_tree: process_tree::ProcessTree,
@@ -650,6 +670,7 @@ struct Actor {
     controller: Option<Uuid>,
     observers: HashSet<Uuid>,
     stop_requested: bool,
+    runtime_failed: bool,
     stop_replies: Vec<oneshot::Sender<Result<()>>>,
     commands: mpsc::Receiver<Command>,
     events: mpsc::Receiver<ActorEvent>,
@@ -668,6 +689,17 @@ impl Actor {
         let mut exit_published = false;
         loop {
             tokio::select! {
+            () = async {
+                if let Some(runtime) = &mut self.runtime {
+                    runtime.failed().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                self.runtime_failed = true;
+                drop(self.runtime.take());
+                let _ = self.process_tree.terminate();
+            }
             command = self.commands.recv() => {
                 let Some(command) = command else {
                     if !*self.process_tree_empty.borrow() {
@@ -676,6 +708,11 @@ impl Actor {
                     return;
                 };
                 match command {
+                    Command::RuntimeFailed => {
+                        self.runtime_failed = true;
+                        if let Some(runtime) = &self.runtime { let _ = runtime.terminate(); }
+                        let _ = self.process_tree.terminate();
+                    }
                     Command::Attach { client_id, from_sequence, columns, rows, reply } => {
                         let role = if self.controller.is_none() || self.controller == Some(client_id) {
                             self.controller = Some(client_id);
@@ -788,7 +825,9 @@ impl Actor {
                         }
                     }
                     Command::InspectProcessTree { reply } => {
-                        let result = self.process_tree.is_empty();
+                        let result = self.process_tree.is_empty().and_then(|empty| {
+                            self.runtime.as_ref().map_or(Ok(empty), |runtime| runtime.is_empty().map(|backend_empty| empty && backend_empty))
+                        });
                         if matches!(result, Ok(true)) {
                             self.process_tree_empty.send_replace(true);
                         }
@@ -813,6 +852,7 @@ impl Actor {
                         reader_closed = true;
                     }
                     ActorEvent::Exited(exit_code) => {
+                        if let Some(runtime) = &self.runtime { let _ = runtime.terminate(); }
                         if let Some(writer) = self.writer.take() {
                             let _ = writer.try_send(WriterCommand::Close);
                         }
@@ -833,7 +873,7 @@ impl Actor {
             }
             }
             if !exit_published
-                && (reader_closed || self.stop_requested)
+                && (reader_closed || self.stop_requested || self.runtime_failed)
                 && let Some(exit_code) = pending_exit
             {
                 if self.stop_requested {
@@ -855,7 +895,7 @@ impl Actor {
                 // Windows ConPTY readers do not consistently report EOF after a Job Object
                 // terminates the child. Once an explicit stop has reaped that child, returning
                 // drops the PTY master and releases the reader instead of waiting indefinitely.
-                if self.stop_requested {
+                if self.stop_requested || self.runtime_failed {
                     return;
                 }
             }
@@ -865,10 +905,18 @@ impl Actor {
 
 impl Actor {
     async fn terminate_process_tree(&mut self) -> Result<()> {
+        if let Some(runtime) = &self.runtime {
+            runtime.terminate()?;
+        }
         self.process_tree.terminate()?;
         let deadline = tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT;
         loop {
-            if self.process_tree.is_empty()? {
+            if self.process_tree.is_empty()?
+                && self
+                    .runtime
+                    .as_ref()
+                    .map_or(Ok(true), crate::codex_bridge::Bridge::is_empty)?
+            {
                 self.process_tree_empty.send_replace(true);
                 return Ok(());
             }

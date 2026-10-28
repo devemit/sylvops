@@ -1,0 +1,5 @@
+# Observe actual Codex input and pause asynchronous questions
+
+Codex PermissionRequest hooks precede both automatic review and human approval, and ordinary questions have no equivalent hook. Managed Codex Sessions therefore connect the native terminal through a Session-owned authenticated bridge to a private stdio app server, using real unanswered requests and confirmed resolutions for input attention; this supersedes ADR-0012's Codex tool-correlation approach while preserving its distinction between review and resolution.
+
+Codex can also deliver asynchronous questions as structured AgentMessage items. SylvOps interrupts that turn through the native protocol, preserves the question in Conversation history, and keeps Waiting for input until the user's next explicit reply is accepted as a new turn. It never fabricates an answer, auto-approves work, scrapes terminal text, or suspends operating-system processes. This changes the internal Codex transport, so cross-platform process cleanup and opt-in real-provider acceptance are required before preview promotion.

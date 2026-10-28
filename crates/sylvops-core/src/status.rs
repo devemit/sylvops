@@ -155,6 +155,10 @@ pub enum NormalizedProviderEvent {
     /// A provider permission check, which may be decided automatically without user input.
     PermissionCheckStarted,
     UserInputRequested,
+    /// A real, unanswered request delivered to the native Provider client.
+    InputRequestOpened,
+    /// The Provider confirmed resolution of every outstanding request in this turn.
+    InputRequestsResolved,
     /// Observational tool execution; does not imply a user-input request.
     ToolStarted,
     ToolCompleted,
@@ -250,6 +254,7 @@ impl SessionStatusMachine {
     ///
     /// # Errors
     /// Returns an error if the per-Session Attention Event identity is exhausted.
+    #[allow(clippy::too_many_lines)]
     pub fn apply(
         &mut self,
         event: &NormalizedProviderEvent,
@@ -266,6 +271,14 @@ impl SessionStatusMachine {
         }
         self.status.lifecycle = SessionLifecycle::Running;
         match event {
+            NormalizedProviderEvent::InputRequestOpened => {
+                self.renew_input_attention(occurred_at)?;
+            }
+            NormalizedProviderEvent::InputRequestsResolved => {
+                if self.status.activity == ProviderActivity::AwaitingInput {
+                    self.set_live_condition(ProviderActivity::Working, None, occurred_at)?;
+                }
+            }
             NormalizedProviderEvent::ToolStarted | NormalizedProviderEvent::ToolCompleted => {}
             NormalizedProviderEvent::PermissionCheckStarted => {
                 self.set_live_condition(ProviderActivity::Working, None, occurred_at)?;

@@ -2,14 +2,14 @@
 
 ## Transport
 
-The current protocol is 1.35. It adds the observational `PermissionCheckStarted` Provider event: Codex permission checks remain neutral working activity because the hook precedes both automatic review and user approval. They do not create input attention or notifications. Claude permission and user-input events retain their existing attention semantics. Clients and daemon must restart together when upgrading from 1.34; no database migration is introduced.
+The current protocol is 1.36. It adds the `structured_input_events` runtime capability and normalized `InputRequestOpened` / `InputRequestsResolved` events. Managed Codex Sessions use actual app-server requests to establish and resolve input attention; observational `PermissionCheckStarted` hooks remain neutral. Desktop and TUI retain Waiting for input until the Provider confirms resolution. Clients and daemon must restart together when upgrading from 1.35; no database migration is introduced.
 
 Protocol 1.34 added `ListCheckoutChanges` and `LoadFileChange` for grouped local file review, returning typed status, lossless relative identity, numbered diff lines, and explicit incomplete/unsupported states. The existing `GetDiff` operation remains available. Each review response fits the existing 1 MiB frame. See [Changes](../product/changes.md) for comparisons and resource limits.
 
 - Unix: a mode-`0600` Unix-domain socket below the user runtime directory, with peer credential validation where available.
 - Windows: a named pipe with a DACL restricted to the current user SID and client-token validation where practical.
 
-Control IPC never listens on TCP. The provider hook HTTP receiver is a separate loopback-only service.
+Control IPC never listens on TCP. The provider hook HTTP receiver and per-Session authenticated Codex terminal bridge are separate loopback-only services. The bridge connects the native terminal to a private stdio app server; neither its ephemeral endpoint nor its bearer token is persisted in Session launch arguments.
 
 ## Frame
 
