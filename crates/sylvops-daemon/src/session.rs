@@ -567,8 +567,8 @@ impl SessionHandle {
 
     /// Proves whether the daemon-owned process group or Job Object is empty.
     ///
-    /// A completed explicit stop has already terminated and released the owned tree; any other
-    /// unavailable actor fails closed as non-empty.
+    /// A completed stop or runtime-failure cleanup retains confirmation that both owned trees
+    /// are empty; an unavailable actor without that confirmation fails closed as non-empty.
     ///
     /// # Errors
     ///
@@ -695,9 +695,9 @@ impl Actor {
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => {
+            }, if !self.runtime_failed => {
                 self.runtime_failed = true;
-                drop(self.runtime.take());
+                // Keep backend ownership until the common exit path proves both trees empty.
                 let _ = self.process_tree.terminate();
             }
             command = self.commands.recv() => {
@@ -876,7 +876,7 @@ impl Actor {
                 && (reader_closed || self.stop_requested || self.runtime_failed)
                 && let Some(exit_code) = pending_exit
             {
-                if self.stop_requested {
+                if self.stop_requested || self.runtime_failed {
                     if let Err(error) = self.terminate_process_tree().await {
                         for reply in self.stop_replies.drain(..) {
                             let _ = reply.send(Err(DaemonError::ProcessTree(error.to_string())));
