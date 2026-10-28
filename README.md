@@ -110,7 +110,7 @@ Inactive Codex and Claude Code conversations can resume through a guarded succes
 
 ### 10. Optionally connect GitHub
 
-Install and authenticate GitHub CLI outside SylvOps, select a project, and associate it with one of the repository's validated GitHub remotes. The desktop and TUI can then browse Issues and Pull Requests. **Start Work** on an Issue can create an isolated worktree and Codex session while retaining the Issue as its work source.
+Install and authenticate GitHub CLI outside SylvOps, then select a project to browse Issues and Pull Requests in the desktop or TUI. SylvOps uses your saved repository choice, otherwise a validated `origin` remote or the sole unambiguous GitHub repository among the remotes. Choose a remote in Settings when the target is ambiguous or you want to override that default. **Start Work** still requires an explicit saved repository association and can create an isolated worktree and Codex session while retaining the Issue as its work source.
 
 See [GitHub Issues and Pull Requests](https://devemit.github.io/sylvops-docs/github) for setup and security boundaries.
 

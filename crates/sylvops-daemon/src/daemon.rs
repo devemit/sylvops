@@ -1586,7 +1586,7 @@ async fn handle_request(
             Ok(())
         }
         ClientRequest::ListGitHubItems { project_id, query } => {
-            let repository = associated_github_repository(state, project_id).await?;
+            let repository = browsable_github_repository(state, project_id).await?;
             let response = match state.github.list_items(&repository, &query).await {
                 Ok(page) => DaemonResponse::GitHubItems(page),
                 Err(failure) => DaemonResponse::GitHubBrowseFailure(failure),
@@ -1594,7 +1594,7 @@ async fn handle_request(
             send_response_queue(outgoing, request_id, &response).await
         }
         ClientRequest::ViewGitHubItem { project_id, query } => {
-            let repository = associated_github_repository(state, project_id).await?;
+            let repository = browsable_github_repository(state, project_id).await?;
             let response = match state.github.view_item(&repository, &query).await {
                 Ok(detail) => DaemonResponse::GitHubItem(detail),
                 Err(failure) => DaemonResponse::GitHubBrowseFailure(failure),
@@ -1605,7 +1605,7 @@ async fn handle_request(
             project_id,
             identity,
         } => {
-            let repository = associated_github_repository(state, project_id).await?;
+            let repository = browsable_github_repository(state, project_id).await?;
             if identity.repository != repository {
                 return Err(DaemonError::GitHub(GitHubFailure::InvalidRemote));
             }
@@ -5135,21 +5135,28 @@ async fn project_operation_lock(state: &DaemonState, id: ProjectId) -> Arc<Mutex
         .clone()
 }
 
-async fn associated_github_repository(
+async fn browsable_github_repository(
     state: &DaemonState,
     project_id: ProjectId,
 ) -> Result<GitHubRepositoryIdentity> {
-    state
+    let project = state
         .database
         .project(project_id)
         .await
         .map_err(|_| DaemonError::GitHub(GitHubFailure::ProjectUnavailable))?;
-    state
+    if let Some(association) = state
         .database
         .github_association(project_id)
         .await
         .map_err(|_| DaemonError::GitHub(GitHubFailure::PersistenceFailure))?
-        .map(|association| association.repository)
+    {
+        return Ok(association.repository);
+    }
+    let remotes = git::github_remotes(&project)
+        .await
+        .map_err(|_| DaemonError::GitHub(GitHubFailure::RepositoryUnavailable))?;
+    sylvops_core::github::default_github_remote(&remotes)
+        .map(|remote| remote.repository.clone())
         .ok_or(DaemonError::GitHub(GitHubFailure::RepositoryUnavailable))
 }
 

@@ -1352,9 +1352,8 @@ fn open_github(
     if let Some(identity) = source_identity {
         let repository_changed = app.github_status.as_ref().is_some_and(|status| {
             status
-                .association
-                .as_ref()
-                .is_none_or(|association| association.repository != identity.repository)
+                .browsing_repository()
+                .is_none_or(|repository| repository != &identity.repository)
         });
         let detail = modal.open_identity(&identity);
         if repository_changed {

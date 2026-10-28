@@ -115,6 +115,54 @@ async fn scenario() {
         sylvops_core::github::GitHubConnectionState::AuthenticationRequired
     );
     assert!(!authentication.diagnostic.contains(CREDENTIAL_SENTINEL));
+    assert!(
+        matches!(
+            client
+                .request(&ClientRequest::ListGitHubItems {
+                    project_id,
+                    query: GitHubListQuery {
+                        kind: GitHubItemKind::Issue,
+                        filters: GitHubListFilters::default(),
+                        page_size: GitHubPageSize::new(10).unwrap(),
+                        cursor: None,
+                        refresh: true,
+                    },
+                })
+                .await
+                .unwrap(),
+            DaemonResponse::GitHubItems(_)
+        ),
+        "read-only Issue browsing must use origin without requiring saved setup"
+    );
+    assert!(matches!(
+        client
+            .request(&ClientRequest::ViewGitHubItem {
+                project_id,
+                query: sylvops_core::github::GitHubViewQuery {
+                    kind: GitHubItemKind::Issue,
+                    number: GitHubItemNumber::new(42).unwrap(),
+                    comments_page_size: GitHubPageSize::new(10).unwrap(),
+                    comments_cursor: None,
+                    refresh: true,
+                },
+            })
+            .await
+            .unwrap(),
+        DaemonResponse::GitHubItem(_)
+    ));
+    let DaemonResponse::GitHubStatus(after_browsing) = client
+        .request(&ClientRequest::GetGitHubStatus {
+            project_id: Some(project_id),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("GitHub status");
+    };
+    assert!(
+        after_browsing.association.is_none(),
+        "browsing must not persist a repository choice"
+    );
     assert!(matches!(
         client
             .request(&ClientRequest::SetGitHubAssociation {

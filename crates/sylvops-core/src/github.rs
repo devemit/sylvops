@@ -372,6 +372,33 @@ pub struct GitHubIntegrationStatus {
     pub association: Option<GitHubAssociation>,
 }
 
+impl GitHubIntegrationStatus {
+    /// Resolves a read-only browsing target without creating a saved association.
+    #[must_use]
+    pub fn browsing_repository(&self) -> Option<&GitHubRepositoryIdentity> {
+        self.association
+            .as_ref()
+            .map(|association| &association.repository)
+            .or_else(|| default_github_remote(&self.remotes).map(|remote| &remote.repository))
+    }
+}
+
+/// Prefer origin; otherwise accept only remotes identifying one repository.
+#[must_use]
+pub fn default_github_remote(remotes: &[GitHubRemote]) -> Option<&GitHubRemote> {
+    if let Some(origin) = remotes
+        .iter()
+        .find(|remote| remote.name.as_str() == "origin")
+    {
+        return Some(origin);
+    }
+    let first = remotes.first()?;
+    remotes
+        .iter()
+        .all(|remote| remote.repository == first.repository)
+        .then_some(first)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitHubItemKind {
@@ -1744,6 +1771,49 @@ where
 mod tests {
     use super::*;
     use crate::{domain::WorktreeStatus, ids::SessionId};
+
+    #[test]
+    fn read_only_browsing_uses_origin_or_an_unambiguous_remote_without_saved_setup() {
+        let remote = |name: &str, owner: &str| GitHubRemote {
+            name: GitRemoteName::new(name).unwrap(),
+            repository: parse_github_remote(&format!("https://github.com/{owner}/widgets.git"))
+                .unwrap(),
+        };
+        let mut status = GitHubIntegrationStatus {
+            executable_path: None,
+            connections: Vec::new(),
+            remotes: Vec::new(),
+            association: None,
+        };
+        assert!(status.browsing_repository().is_none());
+        status.remotes.push(remote("upstream", "acme"));
+        let acme = status.remotes[0].repository.clone();
+        assert_eq!(status.browsing_repository(), Some(&acme));
+        status.remotes.push(remote("backup", "acme"));
+        assert_eq!(status.browsing_repository(), Some(&acme));
+        status.remotes.push(remote("fork", "other"));
+        assert!(
+            status.browsing_repository().is_none(),
+            "ambiguous repositories require an explicit choice"
+        );
+        status.remotes.push(remote("origin", "other"));
+        assert_eq!(
+            status.browsing_repository(),
+            Some(&status.remotes[3].repository)
+        );
+        status.association = Some(GitHubAssociation {
+            project_id: ProjectId::new(),
+            remote_name: GitRemoteName::new("upstream").unwrap(),
+            repository: acme.clone(),
+            created_at: 1,
+            updated_at: 1,
+        });
+        assert_eq!(
+            status.browsing_repository(),
+            Some(&acme),
+            "saved choices take priority over origin"
+        );
+    }
 
     #[test]
     fn parses_https_and_ssh_github_remotes_into_the_same_identity() {
