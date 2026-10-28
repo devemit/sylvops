@@ -22,6 +22,8 @@ CLI clients ─────┘                       ├─ Git coordinators
 
 Each session actor exclusively owns its PTY handles, child controller, attachment lease, output sequence, and scrollback. Blocking PTY reads occur on dedicated threads and feed bounded actor channels. Client delivery queues are bounded independently so a slow client cannot block PTY draining.
 
+A managed Codex Session additionally owns a private stdio app-server process tree and an authenticated loopback bridge to its native terminal. A runtime guard belongs to the Session actor, so terminal exit, Stop Session, startup failure, and daemon cleanup terminate the backend as well. The daemon persists normalized structured events; the bridge never owns authoritative Session state. Questions delivered asynchronously trigger a native turn interruption and retain input attention until an explicit user reply starts the next turn.
+
 Database access is serialized through a dedicated actor. Git mutations are serialized by short-lived per-project operation locks; session creation and removal additionally coordinate through a per-worktree lock. The lock maps themselves are never held across an async operation. No database transaction or global lock may span an asynchronous wait or subprocess execution.
 
 ## Restart behavior

@@ -282,6 +282,7 @@ impl ProviderRuntime for ShellAdapter {
         #[cfg(unix)]
         let arguments = Vec::new();
         Ok(ProviderRuntimeSpec {
+            codex_app_server: false,
             launch: LaunchSpec {
                 executable: self.executable.clone(),
                 // `/D` keeps cmd.exe interactive while disabling user AutoRun entries that can
@@ -827,6 +828,7 @@ impl ProviderRuntime for ClaudeAdapter {
         context: LaunchContext,
     ) -> sylvops_core::Result<ProviderRuntimeSpec> {
         Ok(ProviderRuntimeSpec {
+            codex_app_server: false,
             launch: self.build_launch_spec(&context)?,
             owned_paths: Vec::new(),
         })
@@ -837,6 +839,7 @@ impl ProviderRuntime for ClaudeAdapter {
         context: ResumeContext,
     ) -> sylvops_core::Result<Option<ProviderRuntimeSpec>> {
         Ok(Some(ProviderRuntimeSpec {
+            codex_app_server: false,
             launch: self.build_resume_spec(&context)?,
             owned_paths: Vec::new(),
         }))
@@ -1152,6 +1155,7 @@ struct CodexDiscovery {
     executable: Option<PathBuf>,
     error: Option<String>,
     supports_no_daemon: bool,
+    supports_remote: bool,
 }
 
 #[derive(Debug)]
@@ -1185,6 +1189,7 @@ impl CodexAdapter {
                 executable: Some(executable),
                 error: None,
                 supports_no_daemon: false,
+                supports_remote: false,
             }),
             hook_relay: None,
             hook_directory: None,
@@ -1204,6 +1209,7 @@ impl CodexAdapter {
                 executable: Some(executable),
                 error: None,
                 supports_no_daemon: false,
+                supports_remote: false,
             }),
             hook_relay: Some(hook_relay),
             hook_directory: Some(hook_directory),
@@ -1216,10 +1222,12 @@ impl CodexAdapter {
                 executable: Some(path),
                 error: None,
                 supports_no_daemon: false,
+                supports_remote: false,
             },
             Err(_) => CodexDiscovery {
                 executable: None,
                 supports_no_daemon: false,
+                supports_remote: false,
                 error: Some(
                     "Codex is not installed as a supported native CLI. Install Codex, then refresh Provider health."
                         .into(),
@@ -1321,8 +1329,9 @@ impl CodexAdapter {
 }
 
 impl CodexAdapter {
+    #[allow(clippy::too_many_lines)]
     async fn probe_health(&self) -> ProviderHealth {
-        let capabilities = ProviderCapabilities {
+        let mut capabilities = ProviderCapabilities {
             interactive: true,
             task_bootstrap: true,
             resume: true,
@@ -1377,7 +1386,8 @@ impl CodexAdapter {
                 checked_at: now_millis(),
             };
         };
-        let Ok(supports_no_daemon) = codex_supports_private_runtime(&executable).await else {
+        let Ok((supports_no_daemon, supports_remote)) = codex_runtime_options(&executable).await
+        else {
             return ProviderHealth {
                 kind: ProviderKind::Codex,
                 available: false,
@@ -1393,6 +1403,18 @@ impl CodexAdapter {
             && current.executable.as_ref() == Some(&executable)
         {
             current.supports_no_daemon = supports_no_daemon;
+            current.supports_remote = supports_remote;
+        }
+        if let Some(runtime) = &mut capabilities.runtime {
+            runtime.structured_input_events = supports_remote;
+        }
+        if self.hook_relay.is_some() && !supports_remote {
+            return ProviderHealth {
+                kind: ProviderKind::Codex, available: false, authenticated: false,
+                executable_path: path_text(&executable).ok(), version: Some(version), capabilities,
+                diagnostic: Some("Update Codex to a version supporting --remote and --remote-auth-token-env for reliable questions and approval monitoring, then refresh Provider health.".into()),
+                checked_at: now_millis(),
+            };
         }
         let (authenticated, diagnostic) =
             match run_probe(&executable, &["login", "status"]).await {
@@ -1543,6 +1565,7 @@ impl ProviderRuntime for CodexAdapter {
         let mut launch = self.build_launch_spec(context.clone())?;
         let owned_paths = self.configure_lifecycle_overlay(&context, &mut launch)?;
         Ok(ProviderRuntimeSpec {
+            codex_app_server: self.discovery().map_err(provider_error)?.supports_remote,
             launch,
             owned_paths,
         })
@@ -1566,6 +1589,7 @@ impl ProviderRuntime for CodexAdapter {
         };
         let owned_paths = self.configure_lifecycle_overlay(&launch_context, &mut launch)?;
         Ok(Some(ProviderRuntimeSpec {
+            codex_app_server: self.discovery().map_err(provider_error)?.supports_remote,
             launch,
             owned_paths,
         }))
@@ -2048,7 +2072,7 @@ fn codex_home() -> sylvops_core::Result<PathBuf> {
         .ok_or_else(|| provider_error("cannot locate Codex configuration directory"))
 }
 
-async fn codex_supports_private_runtime(executable: &Path) -> std::result::Result<bool, ()> {
+async fn codex_runtime_options(executable: &Path) -> std::result::Result<(bool, bool), ()> {
     let output = run_bounded_probe(executable, &["--help"], true)
         .await
         .map_err(|_| ())?;
@@ -2061,9 +2085,18 @@ async fn codex_supports_private_runtime(executable: &Path) -> std::result::Resul
         output.stdout
     };
     // Parse the full bounded output: display diagnostics truncate at 512 characters.
-    Ok(String::from_utf8_lossy(&bytes)
-        .split_whitespace()
-        .any(|word| word == "--no-daemon"))
+    let help = String::from_utf8_lossy(&bytes);
+    let has = |flag| help.split_whitespace().any(|word| word == flag);
+    let mut remote = has("--remote") && has("--remote-auth-token-env");
+    if remote {
+        let server_help = run_bounded_probe(executable, &["app-server", "--help"], true)
+            .await
+            .map_err(|_| ())?;
+        let text = String::from_utf8_lossy(&server_help.stdout);
+        remote =
+            server_help.status.success() && text.contains("--listen") && text.contains("stdio");
+    }
+    Ok((has("--no-daemon"), remote))
 }
 
 async fn run_probe(executable: &Path, arguments: &[&str]) -> std::result::Result<String, String> {

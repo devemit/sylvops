@@ -25,7 +25,7 @@ use crate::{
 
 pub const MAGIC: u32 = u32::from_be_bytes(*b"CSTL");
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 35;
+pub const PROTOCOL_MINOR: u16 = 36;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_PTY_CHUNK_SIZE: usize = 64 * 1024;
 pub const MIN_TERMINAL_COLUMNS: u16 = 1;
@@ -1183,7 +1183,7 @@ mod tests {
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 35);
+        assert_eq!(PROTOCOL_MINOR, 36);
 
         let desktop = ClientRequest::SaveDesktopState {
             state: crate::ui::DesktopState::default(),
@@ -1242,7 +1242,7 @@ mod tests {
             let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
             assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
         }
-        assert_eq!(PROTOCOL_MINOR, 35);
+        assert_eq!(PROTOCOL_MINOR, 36);
         let event = DaemonEvent::AttentionNotificationAvailable;
         let frame = Frame::message(MessageClass::Event, 11, &event).unwrap();
         assert_eq!(frame.payload_as::<DaemonEvent>().unwrap(), event);
@@ -1349,7 +1349,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &failure).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), failure);
-        assert_eq!(PROTOCOL_MINOR, 35);
+        assert_eq!(PROTOCOL_MINOR, 36);
     }
 
     #[test]
@@ -1389,7 +1389,7 @@ mod tests {
         };
         let frame = Frame::message(MessageClass::Request, 10, &request).unwrap();
         assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
-        assert_eq!(PROTOCOL_MINOR, 35);
+        assert_eq!(PROTOCOL_MINOR, 36);
     }
 
     #[test]
@@ -1461,7 +1461,7 @@ mod tests {
         ));
         let frame = Frame::message(MessageClass::Response, 10, &response).unwrap();
         assert_eq!(frame.payload_as::<DaemonResponse>().unwrap(), response);
-        assert_eq!(PROTOCOL_MINOR, 35);
+        assert_eq!(PROTOCOL_MINOR, 36);
     }
 
     #[test]
@@ -1475,6 +1475,7 @@ mod tests {
             effort_selection: true,
             authentication: AuthenticationRequirement::ExistingLogin,
             runtime: Some(ProviderRuntimeCapabilities {
+                structured_input_events: true,
                 lifecycle_events: true,
                 recoverable_turn_failures: true,
                 remaining_background_work: true,
@@ -1655,7 +1656,7 @@ mod tests {
             let frame = Frame::message(MessageClass::Request, 42, &request).unwrap();
             assert_eq!(frame.payload_as::<ClientRequest>().unwrap(), request);
         }
-        assert_eq!(PROTOCOL_MINOR, 35);
+        assert_eq!(PROTOCOL_MINOR, 36);
     }
 
     #[test]
