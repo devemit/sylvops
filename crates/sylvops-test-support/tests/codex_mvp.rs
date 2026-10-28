@@ -6,7 +6,7 @@ use rusqlite::OptionalExtension;
 use sylvops_core::{
     domain::{ProviderKind, Session},
     ids::{ProjectId, SessionId, WorkspaceId, WorktreeId},
-    protocol::{ClientRequest, DaemonResponse, SessionResumeOutcome},
+    protocol::{ClientRequest, DaemonResponse, SessionDeletionRefusal, SessionResumeOutcome},
     session_state::{
         AttentionAcknowledgement, AttentionReason, ProviderActivity, SessionLifecycle,
         SessionStatus,
@@ -1095,15 +1095,31 @@ async fn session_deletion_token(
     client: &DaemonClient,
     session_id: SessionId,
 ) -> sylvops_core::protocol::SessionDeletionAuthorization {
-    match client
-        .request(&ClientRequest::InspectSessionDeletion { session_id })
-        .await
-        .expect("Session deletion inspection")
-    {
-        DaemonResponse::SessionDeletionInspected(inspection) => inspection
-            .authorization_token
-            .expect("inactive fake-provider Session deletion token"),
-        response => panic!("unexpected Session deletion inspection: {response:?}"),
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let inspection = match client
+            .request(&ClientRequest::InspectSessionDeletion { session_id })
+            .await
+            .expect("Session deletion inspection")
+        {
+            DaemonResponse::SessionDeletionInspected(inspection) => inspection,
+            response => panic!("unexpected Session deletion inspection: {response:?}"),
+        };
+        if let Some(token) = inspection.authorization_token {
+            return token;
+        }
+        // A persisted exit precedes the backend reaper's process-tree confirmation.
+        // Retry that cleanup boundary only; a live or ineligible Session is a test error.
+        assert_eq!(
+            inspection.refusal,
+            Some(SessionDeletionRefusal::OwnedProcess),
+            "inactive fake-provider Session deletion refused: {inspection:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fake-provider process-tree cleanup timeout: {inspection:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
