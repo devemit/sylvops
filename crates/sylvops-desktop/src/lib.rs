@@ -2046,12 +2046,8 @@ impl DesktopApp {
         ]
         .spacing(density.region_spacing)
         .align_y(Center);
-        let github_available = github_surface_open
-            || self.github_status.as_ref().is_some_and(|status| {
-                status.association.as_ref().is_some_and(|association| {
-                    Some(association.project_id) == self.selected_project_id
-                })
-            });
+        let github_available =
+            github_surface_open || self.has_github_browsing_target(self.selected_project_id);
         let views: Element<'_, Message> = if github_available {
             let view_tabs = session_view_tabs
                 .push(github_tab_button(
@@ -2151,10 +2147,10 @@ impl DesktopApp {
         let repository = self
             .github_status
             .as_ref()
-            .and_then(|status| status.association.as_ref())
+            .and_then(GitHubIntegrationStatus::browsing_repository)
             .map_or_else(
                 || "GitHub Repository not connected".to_owned(),
-                |association| association.repository.to_string(),
+                ToString::to_string,
             );
         container(
             row![
@@ -2480,9 +2476,9 @@ impl DesktopApp {
         let Some(status) = &self.github_status else {
             return centered_message("Checking this Repository's GitHub connection…");
         };
-        if status.association.is_none() {
+        if status.browsing_repository().is_none() {
             return centered_action(
-                "Connect this Repository to a validated GitHub Repository in Settings.",
+                "No unambiguous GitHub remote was found. Choose this Repository's GitHub Repository in Settings.",
                 "Open settings",
                 Message::ToggleSettings,
             );
@@ -4611,15 +4607,12 @@ impl DesktopApp {
                 if expected == self.selected_project_id =>
             {
                 self.finish_github_request();
-                let associated_project = status
-                    .association
-                    .as_ref()
-                    .map(|association| association.project_id);
+                let browsable_project = expected.filter(|_| status.browsing_repository().is_some());
                 self.github_status = Some(status);
                 if self.content_surface == ContentSurface::GitHub
-                    && associated_project == self.github_surface.project_id()
+                    && browsable_project == self.github_surface.project_id()
                     && self.github_surface.list.ready().is_none()
-                    && let Some(project_id) = associated_project
+                    && let Some(project_id) = browsable_project
                 {
                     let query = self
                         .github_surface
@@ -5925,13 +5918,7 @@ impl DesktopApp {
             return;
         };
         let query = self.github_surface.open(project_id, kind);
-        let association_ready = self.github_status.as_ref().is_some_and(|status| {
-            status
-                .association
-                .as_ref()
-                .is_some_and(|association| association.project_id == project_id)
-        });
-        if association_ready {
+        if self.has_github_browsing_target(Some(project_id)) {
             self.send_github_list_query(project_id, query);
         } else {
             self.github_status = None;
@@ -5991,7 +5978,7 @@ impl DesktopApp {
 
     fn select_github_item(&mut self, identity: GitHubItemIdentity) {
         if self.github_request == RequestState::Pending
-            || !self.github_identity_matches_association(&identity)
+            || !self.github_identity_matches_repository(&identity)
         {
             return;
         }
@@ -6061,10 +6048,10 @@ impl DesktopApp {
         let Some(identity) = self.github_surface.begin_browser_open() else {
             return;
         };
-        if !self.github_identity_matches_association(&identity) {
+        if !self.github_identity_matches_repository(&identity) {
             self.github_surface.browser_opened();
             self.error = Some(
-                "Open in browser: the selected item no longer matches this Repository's GitHub association. Refresh and try again."
+                "Open in browser: the selected item no longer matches this Repository's GitHub Repository. Refresh and try again."
                     .into(),
             );
             return;
@@ -6097,7 +6084,7 @@ impl DesktopApp {
             return;
         };
         if identity.kind != sylvops_core::github::GitHubItemKind::Issue
-            || !self.github_identity_matches_association(&identity)
+            || !self.github_identity_matches_repository(&identity)
         {
             return;
         }
@@ -6426,13 +6413,25 @@ impl DesktopApp {
         }
     }
 
-    fn github_identity_matches_association(&self, identity: &GitHubItemIdentity) -> bool {
+    fn github_identity_matches_repository(&self, identity: &GitHubItemIdentity) -> bool {
         self.github_status.as_ref().is_some_and(|status| {
-            status.association.as_ref().is_some_and(|association| {
-                Some(association.project_id) == self.github_surface.project_id()
-                    && association.repository == identity.repository
-            })
+            self.selected_project_id == self.github_surface.project_id()
+                && status.browsing_repository() == Some(&identity.repository)
+                && status.association.as_ref().is_none_or(|association| {
+                    Some(association.project_id) == self.github_surface.project_id()
+                })
         })
+    }
+
+    fn has_github_browsing_target(&self, project_id: Option<ProjectId>) -> bool {
+        project_id.is_some()
+            && self.github_status.as_ref().is_some_and(|status| {
+                status.browsing_repository().is_some()
+                    && status
+                        .association
+                        .as_ref()
+                        .is_none_or(|association| Some(association.project_id) == project_id)
+            })
     }
 
     fn github_operation_matches_surface(&self, operation: Operation) -> bool {
@@ -10221,6 +10220,16 @@ mod tests {
         }
     }
 
+    fn github_status_with_origin(project_id: ProjectId) -> GitHubIntegrationStatus {
+        let mut status = github_status_for(project_id);
+        let association = status.association.take().unwrap();
+        status.remotes.push(sylvops_core::github::GitHubRemote {
+            name: sylvops_core::github::GitRemoteName::new("origin").unwrap(),
+            repository: association.repository,
+        });
+        status
+    }
+
     fn github_summary(
         kind: GitHubItemKind,
         number: u64,
@@ -13441,7 +13450,7 @@ mod tests {
 
         let (bridge, _harness) = Bridge::harness();
         let (mut app, project_id) = desktop_project_with_bridge(bridge);
-        app.github_status = Some(github_status_for(project_id));
+        app.github_status = Some(github_status_with_origin(project_id));
         app.content_surface = ContentSurface::GitHub;
         let _ = app
             .github_surface
@@ -13746,7 +13755,7 @@ mod tests {
 
         let (bridge, mut harness) = Bridge::harness();
         let (mut app, project_id) = desktop_project_with_bridge(bridge);
-        app.github_status = Some(github_status_for(project_id));
+        app.github_status = Some(github_status_with_origin(project_id));
         app.open_github_surface(GitHubSurfaceKind::Issues);
         let initial_operation = harness.take_request().0;
         assert_eq!(
@@ -13835,6 +13844,26 @@ mod tests {
             panic!("expected GitHub refresh request");
         };
         assert!(query.refresh);
+    }
+
+    #[test]
+    fn github_browsing_loads_from_discovered_origin_without_saved_setup() {
+        let (bridge, mut harness) = Bridge::harness();
+        let (mut app, project_id) = desktop_project_with_bridge(bridge);
+        app.open_github_surface(GitHubSurfaceKind::Issues);
+        let (operation, request) = harness.take_request();
+        assert!(
+            matches!(request, ClientRequest::GetGitHubStatus { project_id: Some(id) } if id == project_id)
+        );
+        app.handle_response(
+            operation,
+            DaemonResponse::GitHubStatus(github_status_with_origin(project_id)),
+        );
+        let (_, request) = harness.take_request();
+        assert!(
+            matches!(request, ClientRequest::ListGitHubItems { project_id: id, .. } if id == project_id)
+        );
+        assert!(app.github_status.as_ref().unwrap().association.is_none());
     }
 
     #[test]

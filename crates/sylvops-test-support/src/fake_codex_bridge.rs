@@ -52,6 +52,26 @@ impl Terminal {
         }
         socket.send(Message::Text(json!({"id":0,"method":"initialize","params":{"clientInfo":{"name":"fake-native","version":"1"}}}).to_string().into())).map_err(|_| error())?;
         socket.read().map_err(|_| error())?;
+        // Native Codex loads app metadata during startup. Bundled app assets can
+        // legitimately exceed the daemon IPC frame limit without being PTY data.
+        socket
+            .send(Message::Text(
+                json!({"id":"startup-app","method":"app/read","params":{"appId":"fixture-app"}})
+                    .to_string()
+                    .into(),
+            ))
+            .map_err(|_| error())?;
+        let metadata: Value = serde_json::from_str(
+            socket
+                .read()
+                .map_err(|_| error())?
+                .to_text()
+                .map_err(|_| error())?,
+        )
+        .map_err(|_| error())?;
+        if metadata["result"]["app"]["icon"].as_str().map(str::len) != Some(2 * 1024 * 1024) {
+            return Err(error());
+        }
         Ok(Some(Self {
             socket,
             pending: None,
@@ -167,6 +187,9 @@ pub fn server() -> io::Result<()> {
         match message["method"].as_str() {
             Some("fixture/backendExit") => return Ok(()),
             Some("initialize") => emit(&json!({"id":id,"result":{"userAgent":"fake-codex"}}))?,
+            Some("app/read") => emit(
+                &json!({"id":id,"result":{"app":{"id":"fixture-app","icon":"A".repeat(2 * 1024 * 1024)}}}),
+            )?,
             Some("thread/resume") => {
                 thread = message["params"]["threadId"]
                     .as_str()
