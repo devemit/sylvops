@@ -26,6 +26,8 @@ A managed Codex Session additionally owns a private stdio app-server process tre
 
 On runtime failure, the actor retains the backend guard until both the backend and PTY process trees are confirmed empty. That confirmation survives actor shutdown so later deletion checks can distinguish completed cleanup from an unavailable actor; missing confirmation continues to refuse deletion.
 
+The bridge monitors backend exit concurrently with terminal acceptance and forwarding. A backend that exits before its terminal connects is reaped promptly rather than remaining unreaped until the connection deadline.
+
 Database access is serialized through a dedicated actor. Git mutations are serialized by short-lived per-project operation locks; session creation and removal additionally coordinate through a per-worktree lock. The lock maps themselves are never held across an async operation. No database transaction or global lock may span an asynchronous wait or subprocess execution.
 
 ## Restart behavior

@@ -164,7 +164,11 @@ pub(crate) async fn prepare(launch: &mut LaunchSpec, cwd: &Path) -> Result<Bridg
     let (failed, failure) = watch::channel(false);
     let runtime_tree = tree.clone();
     let task = tokio::spawn(async move {
-        let _ = forward(listener, token, stdin, stdout, events).await;
+        // Reap an exited backend even when no terminal ever completes its connection.
+        tokio::select! {
+            _ = forward(listener, token, stdin, stdout, events) => {}
+            _ = child.wait() => {}
+        }
         let _ = runtime_tree.terminate();
         let _ = timeout(IO_TIMEOUT, child.wait()).await;
         // A native terminal closes its transport just before exiting. Let the
@@ -590,6 +594,22 @@ mod tests {
         session_state::{ProviderActivity, SessionLifecycle},
         status::SessionStatusMachine,
     };
+
+    #[tokio::test]
+    async fn exited_backend_is_reaped_without_waiting_for_a_terminal() {
+        // The test harness rejects app-server arguments and exits without connecting.
+        let mut launch = LaunchSpec {
+            executable: std::env::current_exe().unwrap(),
+            arguments: LaunchArguments::default(),
+            environment: std::collections::BTreeMap::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut bridge = prepare(&mut launch, directory.path()).await.unwrap();
+        timeout(Duration::from_secs(3), bridge.failed())
+            .await
+            .expect("backend exit must cancel terminal connection wait and reap the child");
+        assert!(bridge.is_empty().unwrap());
+    }
 
     fn tracker() -> InputTracker {
         let mut tracker = InputTracker::default();
